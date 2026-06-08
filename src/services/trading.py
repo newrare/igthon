@@ -330,6 +330,7 @@ class TradingService:
             epic=epic,
             epic_name=instrument.get("name", epic)[:10],
             deal_reference=deal_reference,
+            deal_id=deal_id,
             date=now.date(),
             time_open=now.time(),
             state=PositionState.OPEN,
@@ -434,17 +435,56 @@ class TradingService:
             close_level,
         )
 
-        # IG requires specific close payload
+        deal_id = position.deal_id
+        if not deal_id:
+            try:
+                # confirms is transient; fetch the live positions list instead
+                positions_data = await self._client.get(
+                    "/positions",
+                    version=2,
+                    priority=Priority.URGENT,
+                    label=f"close {position.epic}: resolve deal_id",
+                )
+                for entry in positions_data.get("positions", []):
+                    if entry.get("market", {}).get("epic") == position.epic:
+                        deal_id = entry.get("position", {}).get("dealId")
+                        if deal_id:
+                            position.deal_id = deal_id
+                            await self._db.commit()
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "Could not resolve dealId for %s from positions list: %s",
+                    position.epic,
+                    exc,
+                )
+
+        if not deal_id:
+            logger.warning(
+                "Position %s not found in IG live positions — marking as closed (phantom)",
+                position.epic,
+            )
+            now = datetime.now(UTC)
+            position.state = PositionState.CLOSE
+            position.time_close = now.time()
+            position.reason_close = "not_found_in_ig"
+            position.euro = Decimal("0")
+            position.win = 0
+            await self._db.commit()
+            return True
+
+        logger.info("Closing %s with dealId=%s", position.epic, deal_id)
         close_payload = {
-            "dealId": position.deal_reference,
+            "dealId": deal_id,
             "direction": "SELL",
-            "size": str(position.quantity or 1),
+            "size": position.quantity or 1,
             "orderType": "MARKET",
+            "timeInForce": "EXECUTE_AND_ELIMINATE",
+            "forceOpen": False,
         }
 
         try:
-            # IG close uses DELETE method with _method header workaround
-            result = await self._client.post(
+            result = await self._client.delete(
                 "/positions/otc",
                 close_payload,
                 version=1,

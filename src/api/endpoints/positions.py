@@ -30,17 +30,14 @@ async def open_position(client: IGClient, payload: dict) -> dict:
 async def close_position(client: IGClient, payload: dict) -> dict:
     """Close a position (DELETE /positions/otc).
 
-    Note: IG uses a DELETE with a body via _method override,
-    but their API accepts it as a POST with _method=DELETE header.
-
     Args:
         client: Authenticated IG client.
-        payload: Close payload (dealId, direction, size, orderType).
+        payload: Close payload (dealId, direction, size, orderType, expiry, forceOpen).
 
     Returns:
         Deal reference for confirmation.
     """
-    return await client.delete("/positions/otc", version=1)
+    return await client.delete("/positions/otc", payload, version=1)
 
 
 async def get_deal_confirmation(client: IGClient, deal_reference: str) -> dict:

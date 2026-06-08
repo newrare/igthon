@@ -225,6 +225,7 @@ class APIQueue:
     async def delete(
         self,
         endpoint: str,
+        payload: dict | None = None,
         *,
         version: int = 1,
         priority: int = Priority.NORMAL,
@@ -232,7 +233,7 @@ class APIQueue:
     ) -> dict:
         """Queue a DELETE request and await its parsed JSON result."""
         return await self._submit(
-            "DELETE", endpoint, None, version, False, priority, label
+            "DELETE", endpoint, payload, version, False, priority, label
         )
 
     def stats(self) -> APIQueueStats:
@@ -369,7 +370,9 @@ class APIQueue:
                 call.endpoint, call.payload or {}, version=call.version
             )
         if call.method == "DELETE":
-            return await self._client.delete(call.endpoint, version=call.version)
+            return await self._client.delete(
+                call.endpoint, call.payload, version=call.version
+            )
         raise ValueError(f"Unsupported method: {call.method}")
 
     async def _handle_failure(self, call: QueuedCall, exc: Exception) -> None:

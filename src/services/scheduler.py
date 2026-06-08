@@ -86,9 +86,8 @@ class BotScheduler:
         self._epic_last_refresh: datetime | None = None
         # Epics that returned 403 on /prices — skipped until next hourly refresh
         self._pricing_blacklist: set[str] = set()
-        # Epics whose buffer has been fully bootstrapped (50-candle seed fetch done).
-        # Cleared on each hourly active-epic refresh so the buffer is reseeded with
-        # fresh history once per hour instead of every 30-second cycle.
+        # Epics whose buffer has been bootstrapped (polling path only).
+        # Cleared at the daily reset so each epic fetches 50 candles once per day.
         self._bootstrapped_epics: set[str] = set()
 
         self._scanner = MarketScanner(
@@ -429,6 +428,10 @@ class BotScheduler:
         Runs hourly during market hours. Batch-fetches market details (v1, groups
         of 25) and applies the open/TRADEABLE filter. No spread filter is applied
         here — the spread is checked later at analysis time.
+
+        When streaming is active, subscriptions are updated immediately after the
+        filter so the Lightstreamer feed delivers prices for the new set. No
+        historical priming is done — prices arrive via the live stream.
         """
         logger.info(
             "Refreshing tradable epics from %d candidates", len(self._all_epics)
@@ -464,9 +467,6 @@ class BotScheduler:
         self._tradable_markets = tradeable
         self._tradable_epics = [m.epic for m in tradeable]
         self._tradable_last_refresh = datetime.now(UTC)
-        # Recovered epics get retried; the bootstrap cache is NOT cleared here —
-        # with a continuous stream an epic only needs reseeding if it drops out of
-        # the tradable set (then re-seeded on return) or at the daily reset.
         self._pricing_blacklist.clear()
         logger.info(
             "Tradable epics: %d / %d are open/TRADEABLE (pricing blacklist cleared)",
@@ -475,68 +475,10 @@ class BotScheduler:
         )
 
         if self._streaming is not None:
-            await self._sync_streaming_subscriptions()
+            await self._streaming.set_epics(self._tradable_epics)
         else:
             # Legacy polling path reseeds the 50-candle buffer once per hour.
             self._bootstrapped_epics.clear()
-
-    async def _sync_streaming_subscriptions(self) -> None:
-        """Seed new epics (DB first, /prices fallback) and update the stream set."""
-        for epic in self._tradable_epics:
-            if epic not in self._bootstrapped_epics:
-                await self._seed_epic(epic)
-        active = [e for e in self._tradable_epics if e not in self._pricing_blacklist]
-        if self._streaming is not None:
-            await self._streaming.set_epics(active)
-
-    async def _seed_epic(self, epic: str) -> None:
-        """Fill an epic's indicator buffer, preferring the DB over the IG API.
-
-        The candle table is already kept up to date by the streaming persistence
-        callback, so a restart (or a returning epic) rehydrates from the DB and
-        avoids consuming the IG historical-data allowance. ``/prices`` is only
-        used when the DB has too few recent candles to seed the indicators.
-        """
-        need = self._settings.strategy_sma_slow
-        # 1) Try the database first.
-        if self._candle_store is not None:
-            since = datetime.now(UTC) - timedelta(
-                minutes=self._settings.streaming_rehydrate_window_minutes
-            )
-            try:
-                candles = await self._candle_store.fetch_candles(epic, since=since)
-            except Exception as exc:
-                logger.warning("Could not read candles for %s from DB: %s", epic, exc)
-                candles = []
-            if len(candles) >= need:
-                self._buffer.update(epic, candles)
-                self._bootstrapped_epics.add(epic)
-                logger.info(
-                    "Seeded %s from DB (%d candles) — no /prices call",
-                    epic,
-                    len(candles),
-                )
-                return
-
-        # 2) Fallback: bootstrap from the IG historical endpoint.
-        try:
-            await self._market_data.fetch_candles(
-                epic, "MINUTE", self._settings.streaming_bootstrap_points
-            )
-            self._bootstrapped_epics.add(epic)
-            logger.info("Seeded %s from /prices (DB lacked recent history)", epic)
-        except IGAPIError as exc:
-            if exc.response is not None and exc.response.status_code == 403:
-                logger.warning(
-                    "Prices 403 for %s (IG code: %s) — blacklisted until next refresh",
-                    epic,
-                    exc.ig_error_code or "no errorCode in response",
-                )
-                self._pricing_blacklist.add(epic)
-            else:
-                logger.error("Failed to seed %s: %s", epic, exc)
-        except Exception as exc:
-            logger.error("Failed to seed %s: %s", epic, exc)
 
     # ------------------------------------------------------------------
     # Scheduled tasks

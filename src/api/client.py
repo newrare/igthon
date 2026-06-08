@@ -266,11 +266,17 @@ class IGClient:
         self._raise_for_status(response, "PUT", url)
         return response.json()
 
-    async def delete(self, endpoint: str, *, version: int = 1) -> dict:
+    async def delete(
+        self, endpoint: str, payload: dict | None = None, *, version: int = 1
+    ) -> dict:
         """Perform a DELETE request to the IG API.
 
+        IG's infrastructure does not reliably process DELETE bodies directly.
+        The officially supported workaround is POST with _method: DELETE header.
+
         Args:
-            endpoint: API path (e.g. "/positions/otc/{dealId}").
+            endpoint: API path (e.g. "/positions/otc").
+            payload: Optional JSON body (required by IG for position closes).
             version: API version number for the endpoint.
 
         Returns:
@@ -278,8 +284,9 @@ class IGClient:
         """
         url = f"{self._settings.ig_base_url}{endpoint}"
         headers = self._build_headers(version)
+        headers["_method"] = "DELETE"
         async with self._request_context():
-            logger.debug("DELETE %s", url)
-            response = await self.http.delete(url, headers=headers)
+            logger.debug("DELETE (via POST+_method) %s", url)
+            response = await self.http.post(url, json=payload, headers=headers)
         self._raise_for_status(response, "DELETE", url)
         return response.json()

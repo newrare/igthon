@@ -543,6 +543,21 @@ footer {
   border-top: 1px solid var(--border);
 }
 
+/* ── Icons (Lucide) ─────────────────────────────────────────── */
+.lc-icon {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  vertical-align: -0.1em;
+  flex-shrink: 0;
+}
+
+@keyframes lc-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.lc-spin { animation: lc-spin 1s linear infinite; }
+
 /* ── Responsive ─────────────────────────────────────────────── */
 @media (max-width: 768px) {
   .container { padding: 1rem; }

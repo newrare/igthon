@@ -2,7 +2,9 @@
 
 import asyncio
 import html
-from datetime import date, datetime
+import logging
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
@@ -10,9 +12,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
 
 from src.models.epic import Epic
-from src.models.position import Position, PositionState
+from src.models.position import Position, PositionState, PositionStrategy
 from src.services.api_error_log import APIErrorEntry
+from src.services.api_queue import Priority
 from src.services.market_scanner import MarketInfo
+
+logger = logging.getLogger(__name__)
 
 _PARIS = ZoneInfo("Europe/Paris")
 
@@ -143,6 +148,7 @@ async def dashboard(request: Request) -> HTMLResponse:
         queue_stats,
         queue_recent,
         queue_pending_tasks,
+        open_positions,
     )
     return HTMLResponse(content=html)
 
@@ -253,12 +259,14 @@ async def api_prices(request: Request, epic: str) -> JSONResponse:
     if not buf:
         return JSONResponse({"error": "Epic not tracked"}, status_code=404)
 
+    last_50 = list(buf.candles)[-50:]
     return JSONResponse(
         {
             "epic": epic,
             "candles": len(buf),
-            "bid_closes": buf.bid_closes[-50:],
-            "spreads": buf.spreads[-50:],
+            "bid_closes": [c.bid_close for c in last_50],
+            "timestamps": [c.timestamp.isoformat() for c in last_50],
+            "spreads": [c.spread for c in last_50],
             "last": (
                 {
                     "bid": buf.last.bid_close,
@@ -343,6 +351,145 @@ async def api_queue_status(request: Request) -> JSONResponse:
     )
 
 
+@router.post("/api/positions/open/{epic}")
+async def open_position_manual(request: Request, epic: str) -> JSONResponse:
+    """Open a BUY position at minimum deal size for the given epic (manual from dashboard)."""
+    api_queue = getattr(request.app.state, "api_queue", None)
+    session_factory = request.app.state.session_factory
+    buffer = request.app.state.buffer
+
+    if not api_queue or not session_factory:
+        return JSONResponse({"error": "Trading not available"}, status_code=503)
+
+    buf = buffer.get(epic)
+    if not buf or not buf.last:
+        return JSONResponse({"error": "No price data for this epic"}, status_code=400)
+
+    current_bid = buf.last.bid_close
+    current_spread = buf.last.spread
+
+    try:
+        market_data = await api_queue.get(
+            f"/markets/{epic}",
+            version=3,
+            priority=Priority.URGENT,
+            label=f"manual open {epic}: market",
+        )
+        instrument = market_data.get("instrument", {})
+        snapshot = market_data.get("snapshot", {})
+        dealing_rules = market_data.get("dealingRules", {})
+
+        if snapshot.get("marketStatus") != "TRADEABLE":
+            return JSONResponse(
+                {"error": f"Market not TRADEABLE: {snapshot.get('marketStatus')}"},
+                status_code=400,
+            )
+
+        min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
+        min_deal_size = float(dealing_rules.get("minDealSize", {}).get("value", 1))
+        min_stop = float(min_stop_rule.get("value", 5))
+        if min_stop_rule.get("unit") == "PERCENTAGE":
+            min_stop = min_stop * current_bid / 100
+
+        stop_distance = max(min_stop, 1)
+        quantity = max(int(min_deal_size), 1)
+        currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
+        expiry = instrument.get("expiry", "-")
+
+        order_payload = {
+            "epic": epic,
+            "expiry": expiry,
+            "direction": "BUY",
+            "size": str(quantity),
+            "orderType": "MARKET",
+            "currencyCode": currency,
+            "guaranteedStop": False,
+            "stopDistance": str(int(stop_distance)),
+            "forceOpen": True,
+        }
+
+        result = await api_queue.post(
+            "/positions/otc",
+            order_payload,
+            version=2,
+            priority=Priority.URGENT,
+            label=f"manual open {epic}: order",
+        )
+
+        deal_reference = result.get("dealReference")
+        if not deal_reference:
+            return JSONResponse({"error": "No dealReference returned"}, status_code=500)
+
+        # IG processes deals asynchronously — poll up to 4 times with 1 s delays
+        confirmation = None
+        for _attempt in range(4):
+            try:
+                confirmation = await api_queue.get(
+                    f"/confirms/{deal_reference}",
+                    version=1,
+                    priority=Priority.URGENT,
+                    label=f"manual open {epic}: confirm",
+                )
+                break
+            except Exception:
+                if _attempt < 3:
+                    await asyncio.sleep(1)
+                else:
+                    raise
+
+        if confirmation.get("dealStatus") != "ACCEPTED":
+            reason = confirmation.get("reason", "UNKNOWN")
+            return JSONResponse({"error": f"Deal rejected: {reason}"}, status_code=400)
+
+        deal_id = confirmation.get("dealId", "")
+        open_level = float(confirmation.get("level", current_bid))
+
+        now = datetime.now(UTC)
+        position = Position(
+            epic=epic,
+            epic_name=instrument.get("name", epic)[:10],
+            deal_reference=deal_reference,
+            date=now.date(),
+            time_open=now.time(),
+            state=PositionState.OPEN,
+            strategy=PositionStrategy.TARGET,
+            level_open=Decimal(str(round(open_level, 3))),
+            level_win=Decimal(str(round(open_level + stop_distance * 2, 3))),
+            level_zero=Decimal(str(round(open_level, 3))),
+            level_follower=Decimal(str(round(open_level - stop_distance * 0.5, 3))),
+            level_loose=Decimal(str(round(open_level - stop_distance, 3))),
+            level_security=Decimal(str(round(open_level - stop_distance * 0.8, 3))),
+            level_stop=Decimal(str(round(open_level - stop_distance, 3))),
+            pip_spread=Decimal(str(round(current_spread, 3))),
+            quantity=quantity,
+            size=int(stop_distance),
+        )
+        async with session_factory() as session:
+            session.add(position)
+            await session.commit()
+
+        logger.info(
+            "Manual position opened: %s qty=%d level=%.3f stop=%.0f",
+            epic,
+            quantity,
+            open_level,
+            stop_distance,
+        )
+        return JSONResponse(
+            {
+                "status": "opened",
+                "deal_id": deal_id,
+                "level": open_level,
+                "quantity": quantity,
+                "stop_distance": stop_distance,
+            }
+        )
+
+    except Exception as exc:
+        logger.error("Manual position open failed for %s: %s", epic, exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @router.get("/api/ig-errors")
 async def api_ig_errors(request: Request) -> JSONResponse:
     """JSON API: last 20 IG API errors."""
@@ -424,6 +571,7 @@ def _render_epic_list_page(
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Epic List</title>
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
 <div class="container">
@@ -440,7 +588,7 @@ def _render_epic_list_page(
     </nav>
 
     <div class="header-bar">
-        <h1>&#127760; Epic List</h1>
+        <h1><i data-lucide="globe" class="lc-icon"></i> Epic List</h1>
         <div class="stat-badge">
             <span class="stat-label">Total epics</span>
             <span class="stat-value" style="color:{count_color};">{count}</span>
@@ -489,6 +637,7 @@ function filterTable(q) {{
     }});
     document.getElementById('filter-count').textContent = shown + ' shown';
 }}
+lucide.createIcons();
 </script>
 </body>
 </html>"""
@@ -538,6 +687,7 @@ def _render_tradable_list_page(
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Tradable Epics</title>
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
 <div class="container">
@@ -553,7 +703,7 @@ def _render_tradable_list_page(
     </nav>
 
     <div class="header-bar">
-        <h1>&#9889; Tradable Epics</h1>
+        <h1><i data-lucide="zap" class="lc-icon"></i> Tradable Epics</h1>
         <div class="stat-badge">
             <span class="stat-label">Tradable now</span>
             <span class="stat-value" style="color:{count_color};">{count}</span>
@@ -604,6 +754,7 @@ function filterTable(q) {{
     }});
     document.getElementById('filter-count').textContent = shown + ' shown';
 }}
+lucide.createIcons();
 </script>
 </body>
 </html>"""
@@ -625,6 +776,7 @@ def _render_dashboard(
     queue_stats=None,
     queue_recent=None,
     queue_pending_tasks=None,
+    open_positions=None,
 ) -> str:
     """Render the dashboard with nav, KPIs, commands, config and market data."""
     if error_entries is None:
@@ -633,14 +785,45 @@ def _render_dashboard(
         queue_recent = []
     if queue_pending_tasks is None:
         queue_pending_tasks = []
+    if open_positions is None:
+        open_positions = []
+
+    # ── Open positions modal rows ──────────────────────────────────────────────
+    if open_positions:
+        pos_rows_html = ""
+        for p in open_positions:
+            t_open = p.time_open.strftime("%H:%M:%S") if p.time_open else "—"
+            lvl_open = f"{p.level_open:.3f}" if p.level_open else "—"
+            lvl_win = f"{p.level_win:.3f}" if p.level_win else "—"
+            lvl_stop = f"{p.level_stop:.3f}" if p.level_stop else "—"
+            qty = p.quantity or "—"
+            pnl_val = float(p.euro or 0)
+            pnl_color = "#4ade80" if pnl_val >= 0 else "#ef4444"
+            pnl_str = f"€{pnl_val:+.2f}" if p.euro is not None else "—"
+            strategy_str = (p.strategy.value if p.strategy else "—").upper()
+            pos_rows_html += f"""
+                    <tr>
+                        <td class="err-ts">{html.escape(t_open)}</td>
+                        <td class="epic-col">{html.escape(p.epic)}</td>
+                        <td class="desc-col">{html.escape(p.epic_name)}</td>
+                        <td class="number">{lvl_open}</td>
+                        <td class="number">{lvl_win}</td>
+                        <td class="number">{lvl_stop}</td>
+                        <td class="number">{qty}</td>
+                        <td class="number" style="color:{pnl_color};">{pnl_str}</td>
+                        <td class="err-ts">{html.escape(strategy_str)}</td>
+                    </tr>"""
+    else:
+        pos_rows_html = '<tr><td colspan="9" class="err-empty">No open positions right now.</td></tr>'
 
     market_rows = ""
     for s in market_summary:
         pct = _bid_pct(s["bid"], s["low"], s["high"])
         pct_color = "#4ade80" if pct >= 50 else "#f59e0b" if pct >= 25 else "#ef4444"
+        epic_esc = html.escape(str(s['epic']))
         market_rows += f"""
-        <tr>
-            <td class="epic-col">{html.escape(str(s['epic']))}</td>
+        <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
+            <td class="epic-col">{epic_esc}</td>
             <td class="number">{s['bid']:.1f}</td>
             <td class="number">{s['offer']:.1f}</td>
             <td class="number">{s['spread']:.3f}</td>
@@ -655,6 +838,9 @@ def _render_dashboard(
                 </div>
             </td>
             <td class="number">{s['candles']}</td>
+            <td style="text-align:center;">
+                <button class="buy-btn" onclick="event.stopPropagation(); openPosition('{epic_esc}', this)" title="Open BUY position at minimum size">Buy</button>
+            </td>
         </tr>"""
 
     pnl_color = "#4ade80" if kpis["daily_pnl"] >= 0 else "#ef4444"
@@ -723,21 +909,22 @@ def _render_dashboard(
         error_count = 0
 
     error_section_label = (
-        f"&#128308; API Errors ({error_count})"
+        f'<i data-lucide="circle-x" class="lc-icon" style="color:#ef4444;"></i> API Errors ({error_count})'
         if error_count
-        else "&#128994; API Errors (none)"
+        else '<i data-lucide="circle-check" class="lc-icon" style="color:#4ade80;"></i> API Errors (none)'
     )
 
     # ── API queue section ──────────────────────────────────────────────────────
     if queue_stats is None:
-        queue_section_label = "&#128230; API Queue (off)"
+        queue_section_label = '<i data-lucide="inbox" class="lc-icon"></i> API Queue (off)'
         queue_todo = queue_running = queue_succeeded = "—"
         queue_failed = queue_retried = queue_rate_limited = "—"
         queue_failed_color = queue_rl_color = "#94a3b8"
         queue_todo_color = "#94a3b8"
+        queue_kpi_border = "#475569"
     else:
         todo_count = queue_stats.pending
-        queue_section_label = f"&#128230; API Queue ({todo_count} todo)"
+        queue_section_label = f'<i data-lucide="inbox" class="lc-icon"></i> API Queue ({todo_count} todo)'
         queue_todo = todo_count
         queue_running = queue_stats.running
         queue_succeeded = queue_stats.succeeded
@@ -747,6 +934,7 @@ def _render_dashboard(
         queue_failed_color = "#ef4444" if queue_stats.failed else "#4ade80"
         queue_rl_color = "#f59e0b" if queue_stats.rate_limited else "#94a3b8"
         queue_todo_color = "#f59e0b" if todo_count else "#94a3b8"
+        queue_kpi_border = "#ef4444" if queue_stats.failed else ("#f59e0b" if todo_count else "#4ade80")
 
     _status_colors = {
         "done": "#4ade80",
@@ -826,7 +1014,7 @@ def _render_dashboard(
                 else label_short
             )
             retry_display = (
-                f" <span style='color:#f59e0b;'>↩{t.attempts}</span>"
+                f' <span style="color:#f59e0b;"><i data-lucide="undo-2" class="lc-icon"></i>{t.attempts}</span>'
                 if t.attempts
                 else ""
             )
@@ -874,109 +1062,265 @@ def _render_dashboard(
         .err-table tbody tr:nth-child(odd)  {{ background: #1c1714; }}
         .err-table tbody tr:nth-child(even) {{ background: #251e19; }}
         .err-table tbody tr:hover           {{ background: #2e261f; }}
+        /* KPI tiles — clickable variant and refresh icon */
+        .kpi-tile.clickable {{ cursor: pointer; transition: background 0.15s; }}
+        .kpi-tile.clickable:hover {{ background: #2a201a; }}
+        .kpi-refresh-btn {{
+            position: absolute; top: 0.4rem; right: 0.5rem;
+            background: none; border: none; color: #5f5248;
+            cursor: pointer; font-size: 1rem; line-height: 1;
+            padding: 0.3rem 0.4rem; margin: 0.1rem; border-radius: 4px;
+            transition: color 0.15s, background 0.15s;
+        }}
+        .kpi-refresh-btn:hover {{ color: #E07B39; background: rgba(224,123,57,0.12); }}
+        .kpi-refresh-btn:disabled {{ opacity: 0.35; cursor: default; }}
+        .clickable-row {{ cursor: pointer; transition: background 0.1s; }}
+        .clickable-row:hover {{ background: #2e261f !important; }}
+        /* Buy button in market table */
+        .buy-btn {{
+            background: #1a3a1a; border: 1px solid #2d5a2d; color: #4ade80;
+            cursor: pointer; font-size: 0.75rem; font-weight: 600;
+            padding: 0.2rem 0.6rem; border-radius: 4px;
+            transition: background 0.15s, color 0.15s;
+            white-space: nowrap;
+        }}
+        .buy-btn:hover {{ background: #16803c; color: #f0fdf4; border-color: #16803c; }}
+        .buy-btn:disabled {{ opacity: 0.4; cursor: default; }}
     </style>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
+<!-- Queue Modal -->
+<div id="queue-modal" onclick="if(event.target===this)closeQueueModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:8500;overflow-y:auto;padding:2rem 1rem;">
+    <div style="background:#1c1714;border:1px solid #4a3a30;border-radius:8px;max-width:960px;width:100%;margin:0 auto;padding:1.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+            <h2 style="margin:0;color:#E07B39;font-size:1.1rem;display:flex;align-items:center;gap:0.4rem;"><i data-lucide="inbox" class="lc-icon"></i> API Queue</h2>
+            <button onclick="closeQueueModal()" style="background:none;border:1px solid #4a3a30;color:#94a3b8;cursor:pointer;font-size:0.85rem;padding:0.3rem 0.7rem;border-radius:4px;display:inline-flex;align-items:center;gap:0.35rem;"><i data-lucide="x" class="lc-icon"></i> Close</button>
+        </div>
+        <div class="guard-stat-row" style="margin-bottom:1rem;">
+            <div class="guard-stat"><span class="guard-stat-label">TODO</span><span class="guard-stat-value" style="color:{queue_todo_color};">{queue_todo}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Running</span><span class="guard-stat-value">{queue_running}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Succeeded</span><span class="guard-stat-value" style="color:#4ade80;">{queue_succeeded}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Failed</span><span class="guard-stat-value" style="color:{queue_failed_color};">{queue_failed}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Retried</span><span class="guard-stat-value">{queue_retried}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Rate-limited</span><span class="guard-stat-value" style="color:{queue_rl_color};">{queue_rate_limited}</span></div>
+        </div>
+        {todo_table_html}
+        <table class="err-table" style="margin-top:0.6rem;">
+            <thead>
+                <tr>
+                    <th>Finished</th>
+                    <th>Method</th>
+                    <th>Task</th>
+                    <th>Status</th>
+                    <th>Tries</th>
+                    <th>Last error</th>
+                </tr>
+            </thead>
+            <tbody>
+                {queue_rows_html}
+            </tbody>
+        </table>
+    </div>
+</div>
+<!-- Chart Modal -->
+<div id="chart-modal" onclick="if(event.target===this)closeChartModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:8500;overflow-y:auto;padding:2rem 1rem;">
+    <div style="background:#1c1714;border:1px solid #4a3a30;border-radius:8px;max-width:960px;width:100%;margin:0 auto;padding:1.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+            <h2 id="chart-modal-title" style="margin:0;color:#E07B39;font-size:1.1rem;">Chart</h2>
+            <button onclick="closeChartModal()" style="background:none;border:1px solid #4a3a30;color:#94a3b8;cursor:pointer;font-size:0.85rem;padding:0.3rem 0.7rem;border-radius:4px;display:inline-flex;align-items:center;gap:0.35rem;"><i data-lucide="x" class="lc-icon"></i> Close</button>
+        </div>
+        <div id="chart-container" style="height:420px;"></div>
+    </div>
+</div>
+<!-- IG API Modal -->
+<div id="ig-api-modal" onclick="if(event.target===this)closeApiModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:8500;overflow-y:auto;padding:2rem 1rem;">
+    <div style="background:#1c1714;border:1px solid #4a3a30;border-radius:8px;max-width:860px;width:100%;margin:0 auto;padding:1.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+            <h2 style="margin:0;color:#E07B39;font-size:1.1rem;display:flex;align-items:center;gap:0.4rem;"><i data-lucide="plug" class="lc-icon"></i> IG API</h2>
+            <button onclick="closeApiModal()" style="background:none;border:1px solid #4a3a30;color:#94a3b8;cursor:pointer;font-size:0.85rem;padding:0.3rem 0.7rem;border-radius:4px;display:inline-flex;align-items:center;gap:0.35rem;"><i data-lucide="x" class="lc-icon"></i> Close</button>
+        </div>
+        <h3 style="color:#94a3b8;font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;margin:0 0 0.7rem;">Availability</h3>
+        <div class="guard-stat-row">
+            <div class="guard-stat">
+                <span class="guard-stat-label">Status</span>
+                <span class="guard-stat-value" style="color:{api_status_color};">{api_status_label}</span>
+            </div>
+            <div class="guard-stat">
+                <span class="guard-stat-label">Total calls</span>
+                <span class="guard-stat-value">{guard_stats.total_calls if guard_stats else "—"}</span>
+            </div>
+            <div class="guard-stat">
+                <span class="guard-stat-label">Last minute</span>
+                <span class="guard-stat-value">{guard_stats.calls_last_minute if guard_stats else "—"} / {guard_stats.max_per_minute if guard_stats else "—"}</span>
+            </div>
+            <div class="guard-stat">
+                <span class="guard-stat-label">Last second</span>
+                <span class="guard-stat-value">{guard_stats.calls_last_second if guard_stats else "—"} / {guard_stats.max_per_second if guard_stats else "—"}</span>
+            </div>
+        </div>
+        <div class="guard-bar-wrap" style="margin-bottom:0.8rem;">
+            <span style="font-size:0.7rem;color:#64748b;white-space:nowrap;">Calls/min</span>
+            <div class="guard-bar-bg">
+                <div class="guard-bar-fill" style="width:{min(100, (guard_stats.calls_last_minute / guard_stats.max_per_minute * 100) if guard_stats and guard_stats.max_per_minute else 0):.1f}%; background:{api_border_color};"></div>
+            </div>
+            <span style="font-size:0.72rem;color:#64748b;">
+                {f"{guard_stats.calls_last_minute / guard_stats.max_per_minute:.0%}" if guard_stats and guard_stats.max_per_minute else "—"}
+            </span>
+        </div>
+        {f'''<div class="guard-block-info" style="margin-bottom:0.8rem;">
+            <div class="guard-block-since">Blocked since {guard_stats.blocked_since.astimezone(_PARIS).strftime("%Y-%m-%d %H:%M:%S") if guard_stats.blocked_since else "?"} — {html.escape(str(guard_stats.blocked_reason))}</div>
+            <div class="guard-block-until"><i data-lucide="hourglass" class="lc-icon"></i> Auto-unblocks ~{guard_stats.blocked_until.astimezone(_PARIS).strftime("%H:%M:%S") if guard_stats.blocked_until else "?"}</div>
+        </div>''' if guard_stats and guard_stats.is_blocked else ""}
+        <h3 style="color:#94a3b8;font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;margin:1rem 0 0.4rem;">{error_section_label}</h3>
+        <div style="display:flex;justify-content:flex-end;padding:0.3rem 0 0.4rem;">
+            <button class="err-clear-btn" onclick="clearErrors()" style="display:inline-flex;align-items:center;gap:0.35rem;"><i data-lucide="x" class="lc-icon"></i> Clear</button>
+        </div>
+        <div style="overflow-x:auto;">
+            <table class="err-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Method</th>
+                        <th>Endpoint</th>
+                        <th>HTTP</th>
+                        <th>IG Error Code</th>
+                        <th>Translation</th>
+                    </tr>
+                </thead>
+                <tbody id="err-tbody">
+                    {error_rows_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+<!-- Buy Confirmation Modal -->
+<div id="buy-confirm-modal" onclick="if(event.target===this)closeBuyConfirmModal(false)" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9000;align-items:center;justify-content:center;">
+    <div style="background:#1c1714;border:1px solid #4a3a30;border-radius:8px;max-width:420px;width:90%;padding:1.5rem;">
+        <h2 style="margin:0 0 0.8rem;color:#E07B39;font-size:1.1rem;">Confirm BUY Order</h2>
+        <p style="color:#cbd5e1;margin:0 0 0.4rem;">Open BUY on <strong id="buy-confirm-epic" style="color:#f0fdf4;"></strong>?</p>
+        <p style="color:#94a3b8;font-size:0.83rem;margin:0 0 1.4rem;">This places a real market order at minimum deal size.</p>
+        <div style="display:flex;gap:0.7rem;justify-content:flex-end;">
+            <button onclick="closeBuyConfirmModal(false)" style="background:none;border:1px solid #4a3a30;color:#94a3b8;cursor:pointer;font-size:0.85rem;padding:0.4rem 1rem;border-radius:4px;">Cancel</button>
+            <button onclick="closeBuyConfirmModal(true)" style="background:#16803c;border:1px solid #16803c;color:#f0fdf4;cursor:pointer;font-size:0.85rem;font-weight:600;padding:0.4rem 1rem;border-radius:4px;">Confirm BUY</button>
+        </div>
+    </div>
+</div>
+<!-- Open Positions Modal -->
+<div id="positions-modal" onclick="if(event.target===this)closePositionsModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:8500;overflow-y:auto;padding:2rem 1rem;">
+    <div style="background:#1c1714;border:1px solid #4a3a30;border-radius:8px;max-width:960px;width:100%;margin:0 auto;padding:1.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+            <h2 style="margin:0;color:#E07B39;font-size:1.1rem;display:flex;align-items:center;gap:0.4rem;"><i data-lucide="activity" class="lc-icon"></i> Open Positions</h2>
+            <button onclick="closePositionsModal()" style="background:none;border:1px solid #4a3a30;color:#94a3b8;cursor:pointer;font-size:0.85rem;padding:0.3rem 0.7rem;border-radius:4px;display:inline-flex;align-items:center;gap:0.35rem;"><i data-lucide="x" class="lc-icon"></i> Close</button>
+        </div>
+        <div class="guard-stat-row" style="margin-bottom:1rem;">
+            <div class="guard-stat"><span class="guard-stat-label">Count</span><span class="guard-stat-value" style="color:#4ade80;">{kpis['open_trades']}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Total P&amp;L</span><span class="guard-stat-value" style="color:{open_pnl_color};">€{kpis['open_pnl']:.2f}</span></div>
+        </div>
+        <div style="overflow-x:auto;">
+            <table class="err-table">
+                <thead>
+                    <tr>
+                        <th>Opened</th>
+                        <th>Epic</th>
+                        <th>Name</th>
+                        <th>Level open</th>
+                        <th>Target</th>
+                        <th>Stop</th>
+                        <th>Qty</th>
+                        <th>P&amp;L</th>
+                        <th>Strategy</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {pos_rows_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
 <div id="refresh-bar-track"><div id="refresh-bar"></div></div>
 <div class="container">
 
-    <!-- Navigation -->
-    <nav>
-        <span class="nav-label">Nav</span>
-        <ul>
-            <li><a href="/epics">Epic List</a></li>
-            <li><a href="/epics/tradable">Tradable</a></li>
-            <li><a href="/charts">Charts</a></li>
-            <li><a href="/positions" target="_blank">Positions<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
-            <li><a href="/positions/summary" target="_blank">Daily Summary<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
-            <li><a href="/api/status" target="_blank">API Status<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
-            <li><a href="/api/prices/IX.D.DAX.IFMM.IP" target="_blank">Prices (DAX)<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
-        </ul>
-        <button id="btn-bot-pause" class="nav-btn" onclick="toggleBotPause()" disabled>⏸ Pause bot</button>
-        <button id="btn-pause" class="nav-btn" onclick="togglePause()">⏸ Pause</button>
-    </nav>
-
     <!-- KPI Bar -->
     <div class="kpi-bar">
-        <a class="kpi-tile" href="/epics" style="border-left-color:{kpis['epic_kpi_color']};">
+        <div class="kpi-tile clickable" style="border-left-color:{queue_kpi_border}; position:relative;" onclick="openQueueModal()">
+            <div class="kpi-label">Queue</div>
+            <div class="kpi-value" style="color:{queue_todo_color};">{queue_todo}</div>
+            <div class="kpi-sub"><span style="color:#4ade80;">{queue_succeeded} done</span>&nbsp;/&nbsp;<span style="color:{queue_failed_color};">{queue_failed} err</span></div>
+        </div>
+        <div class="kpi-tile clickable" style="border-left-color:{kpis['epic_kpi_color']}; position:relative;" onclick="location.href='/epics'">
             <div class="kpi-label">Epic list</div>
             <div class="kpi-value" style="color:{kpis['epic_kpi_color']};">{kpis['all_epics_count']}</div>
             <div class="kpi-sub">{kpis['refresh_label']}</div>
-        </a>
-        <a class="kpi-tile" href="/epics/tradable" style="border-left-color:{kpis['tradable_kpi_color']};">
-            <div class="kpi-label">Epic list tradable</div>
+            <button class="kpi-refresh-btn" onclick="event.stopPropagation(); runKpiAction('refresh_epic_list', this)" title="Refresh epic list"><i data-lucide="refresh-cw" class="lc-icon"></i></button>
+        </div>
+        <div class="kpi-tile clickable" style="border-left-color:{kpis['tradable_kpi_color']}; position:relative;" onclick="location.href='/epics/tradable'">
+            <div class="kpi-label">Epic tradable</div>
             <div class="kpi-value" style="color:{kpis['tradable_kpi_color']};">{kpis['tradable_count']}</div>
             <div class="kpi-sub">{kpis['tradable_refresh_label']}</div>
-        </a>
-        <div class="kpi-tile">
-            <div class="kpi-label">Epics tracked</div>
-            <div class="kpi-value">{kpis['available_epics']}</div>
+            <button class="kpi-refresh-btn" onclick="event.stopPropagation(); runKpiAction('refresh_tradable_epics', this)" title="Refresh tradable epics"><i data-lucide="refresh-cw" class="lc-icon"></i></button>
         </div>
-        <div class="kpi-tile">
-            <div class="kpi-label">Open trades</div>
-            <div class="kpi-value">{kpis['open_trades']}</div>
-        </div>
-        <div class="kpi-tile" style="border-left-color:{open_pnl_color};">
-            <div class="kpi-label">Open P&amp;L</div>
+        <div class="kpi-tile clickable" style="border-left-color:{open_pnl_color};" onclick="openPositionsModal()">
+            <div class="kpi-label">OPEN</div>
             <div class="kpi-value" style="color:{open_pnl_color};">€{kpis['open_pnl']:.2f}</div>
-        </div>
-        <div class="kpi-tile">
-            <div class="kpi-label">Closed today</div>
-            <div class="kpi-value">{kpis['closed_trades']}</div>
+            <div class="kpi-sub"><span style="color:#4ade80;">{kpis['open_trades']} position{'s' if kpis['open_trades'] != 1 else ''}</span></div>
         </div>
         <div class="kpi-tile" style="border-left-color:{pnl_color};">
-            <div class="kpi-label">Daily P&amp;L</div>
+            <div class="kpi-label">CLOSED {kpis['closed_trades']}</div>
             <div class="kpi-value" style="color:{pnl_color};">€{kpis['daily_pnl']:.2f}</div>
         </div>
         <div class="kpi-tile">
             <div class="kpi-label">Win rate</div>
             <div class="kpi-value">{kpis['win_rate']:.1%}</div>
         </div>
-        <div class="kpi-tile" style="border-left-color:{api_border_color};">
+        <div class="kpi-tile clickable" style="border-left-color:{api_border_color};" onclick="openApiModal()">
             <div class="kpi-label">IG API</div>
             <div class="kpi-value" style="color:{api_status_color};">{api_status_label}</div>
             <div class="kpi-sub">{api_status_sub}</div>
         </div>
+        <div class="kpi-tile clickable" id="kpi-bot" style="position:relative; border-left-color:#94a3b8;" onclick="toggleBotPause()">
+            <div class="kpi-label">Bot</div>
+            <div class="kpi-value" id="kpi-bot-value" style="color:#94a3b8;">…</div>
+            <div class="kpi-sub" id="kpi-bot-sub">Loading</div>
+        </div>
     </div>
 
-    <!-- Commands + Config side by side -->
-    <div class="grid-2">
-        <div class="section">
-            <div class="section-header" data-sid="commands">
-                <span class="section-title">📋 Python Commands</span>
-                <button class="section-toggle">−</button>
-            </div>
-            <div class="section-body">
-                <div class="command-list">
-                    <div class="command">
-                        <div class="command-name">python -m src.main</div>
-                        <div class="command-desc">Start the bot (scheduler only, no web UI)</div>
-                    </div>
-                    <div class="command">
-                        <div class="command-name">python -m src.main --web</div>
-                        <div class="command-desc">Start the bot + this web dashboard on port {settings.web_port}</div>
-                    </div>
-                    <div class="command">
-                        <div class="command-name">python -m src.main --analyze-only</div>
-                        <div class="command-desc">Single analysis pass, print signals, no trading</div>
-                    </div>
-                    <div class="command">
-                        <div class="command-name">python -m src.main --web --log-level DEBUG</div>
-                        <div class="command-desc">Bot + web + verbose debug logging</div>
-                    </div>
-                    <div class="command">
-                        <div class="command-name">python -m src.main --analyze-only --epics IX.D.DAX.IFMM.IP</div>
-                        <div class="command-desc">Analyze a specific epic only</div>
-                    </div>
-                </div>
-            </div>
+    <!-- Market Data -->
+    <div class="section">
+        <div class="section-header" data-sid="market">
+            <span class="section-title"><i data-lucide="trending-up" class="lc-icon"></i> Market Data — Real-time Prices</span>
+            <button class="section-toggle">&#8722;</button>
         </div>
+        <div class="section-body">
+            <table class="market-table">
+                <thead>
+                    <tr>
+                        <th>Epic</th>
+                        <th>Bid</th>
+                        <th>Offer</th>
+                        <th>Spread</th>
+                        <th>High / Low</th>
+                        <th>Bid % range</th>
+                        <th>Candles</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {market_rows}
+                </tbody>
+            </table>
+        </div>
+    </div>
 
-        <div class="section">
-            <div class="section-header" data-sid="config">
-                <span class="section-title">⚙️ Configuration</span>
-                <button class="section-toggle">−</button>
-            </div>
+    <!-- Configuration -->
+    <div class="section">
+        <div class="section-header" data-sid="config">
+            <span class="section-title"><i data-lucide="settings" class="lc-icon"></i> Configuration</span>
+            <button class="section-toggle">−</button>
+        </div>
             <div class="section-body">
                 <div class="config-grid">
                     <div class="config-item">
@@ -1030,28 +1374,15 @@ def _render_dashboard(
                 </div>
             </div>
         </div>
-    </div>
 
     <!-- Manual Actions -->
     <div class="section">
         <div class="section-header" data-sid="actions">
-            <span class="section-title">&#9889; Manual Actions</span>
+            <span class="section-title"><i data-lucide="zap" class="lc-icon"></i> Manual Actions</span>
             <button class="section-toggle">&#8722;</button>
         </div>
         <div class="section-body">
             <div class="actions-grid">
-                <div class="action-card">
-                    <div class="action-card-name">Refresh Epic List</div>
-                    <div class="action-card-desc">Crawl IG navigation tree and rebuild the full epic list.</div>
-                    <button class="action-btn safe" onclick="runAction('refresh_epic_list', this)">&#9654; Run</button>
-                    <div class="action-status"></div>
-                </div>
-                <div class="action-card">
-                    <div class="action-card-name">Refresh Tradable Epics</div>
-                    <div class="action-card-desc">Filter the epic list to currently OPEN/TRADEABLE epics &mdash; spread is applied later at analysis time.</div>
-                    <button class="action-btn safe" onclick="runAction('refresh_tradable_epics', this)">&#9654; Run</button>
-                    <div class="action-status"></div>
-                </div>
                 <div class="action-card">
                     <div class="action-card-name">Collect &amp; Analyze</div>
                     <div class="action-card-desc">Fetch latest prices, compute signals, open positions on BUY.</div>
@@ -1098,155 +1429,50 @@ def _render_dashboard(
         </div>
     </div>
 
-    <!-- API Monitor -->
-    <div class="grid-2">
-        <div class="section">
-            <div class="section-header" data-sid="api-guard">
-                <span class="section-title">&#128268; IG API Availability</span>
-                <button class="section-toggle">&#8722;</button>
-            </div>
-            <div class="section-body" id="guard-body">
-                <div class="guard-stat-row">
-                    <div class="guard-stat">
-                        <span class="guard-stat-label">Status</span>
-                        <span class="guard-stat-value" id="gs-status" style="color:{api_status_color};">{api_status_label}</span>
-                    </div>
-                    <div class="guard-stat">
-                        <span class="guard-stat-label">Total calls</span>
-                        <span class="guard-stat-value" id="gs-total">{guard_stats.total_calls if guard_stats else "—"}</span>
-                    </div>
-                    <div class="guard-stat">
-                        <span class="guard-stat-label">Last minute</span>
-                        <span class="guard-stat-value" id="gs-permin">{guard_stats.calls_last_minute if guard_stats else "—"} / {guard_stats.max_per_minute if guard_stats else "—"}</span>
-                    </div>
-                    <div class="guard-stat">
-                        <span class="guard-stat-label">Last second</span>
-                        <span class="guard-stat-value" id="gs-persec">{guard_stats.calls_last_second if guard_stats else "—"} / {guard_stats.max_per_second if guard_stats else "—"}</span>
-                    </div>
-                </div>
-                <div class="guard-bar-wrap">
-                    <span style="font-size:0.7rem;color:#64748b;white-space:nowrap;">Calls/min</span>
-                    <div class="guard-bar-bg">
-                        <div class="guard-bar-fill" id="gs-bar"
-                             style="width:{min(100, (guard_stats.calls_last_minute / guard_stats.max_per_minute * 100) if guard_stats and guard_stats.max_per_minute else 0):.1f}%;
-                                    background:{api_border_color};"></div>
-                    </div>
-                    <span style="font-size:0.72rem;color:#64748b;" id="gs-bar-label">
-                        {f"{guard_stats.calls_last_minute / guard_stats.max_per_minute:.0%}" if guard_stats and guard_stats.max_per_minute else "—"}
-                    </span>
-                </div>
-                {f'''<div class="guard-block-info">
-                    <div class="guard-block-since">Blocked since {guard_stats.blocked_since.astimezone(_PARIS).strftime("%Y-%m-%d %H:%M:%S") if guard_stats.blocked_since else "?"} — {html.escape(str(guard_stats.blocked_reason))}</div>
-                    <div class="guard-block-until">&#9203; Auto-unblocks ~{guard_stats.blocked_until.astimezone(_PARIS).strftime("%H:%M:%S") if guard_stats.blocked_until else "?"}</div>
-                </div>''' if guard_stats and guard_stats.is_blocked else ""}
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-header" data-sid="api-errors">
-                <span class="section-title">{error_section_label}</span>
-                <button class="section-toggle">&#8722;</button>
-            </div>
-            <div class="section-body" style="padding:0; overflow-x:auto;">
-                <div style="padding:0.6rem 1rem 0.5rem; display:flex; justify-content:flex-end;">
-                    <button class="err-clear-btn" onclick="clearErrors()">&#10005; Clear</button>
-                </div>
-                <table class="err-table">
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Method</th>
-                            <th>Endpoint</th>
-                            <th>HTTP</th>
-                            <th>IG Error Code</th>
-                            <th>Translation</th>
-                        </tr>
-                    </thead>
-                    <tbody id="err-tbody">
-                        {error_rows_html}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-
-    <!-- API Queue -->
+    <!-- Python Commands (bottom) -->
     <div class="section">
-        <div class="section-header" data-sid="api-queue">
-            <span class="section-title">{queue_section_label}</span>
+        <div class="section-header" data-sid="commands">
+            <span class="section-title"><i data-lucide="clipboard-list" class="lc-icon"></i> Python Commands</span>
             <button class="section-toggle">&#8722;</button>
         </div>
         <div class="section-body">
-            <div class="guard-stat-row">
-                <div class="guard-stat">
-                    <span class="guard-stat-label">TODO</span>
-                    <span class="guard-stat-value" id="qs-pending" style="color:{queue_todo_color};">{queue_todo}</span>
+            <div class="command-list">
+                <div class="command">
+                    <div class="command-name">python -m src.main</div>
+                    <div class="command-desc">Start the bot (scheduler only, no web UI)</div>
                 </div>
-                <div class="guard-stat">
-                    <span class="guard-stat-label">Running</span>
-                    <span class="guard-stat-value" id="qs-running">{queue_running}</span>
+                <div class="command">
+                    <div class="command-name">python -m src.main --web</div>
+                    <div class="command-desc">Start the bot + this web dashboard on port {settings.web_port}</div>
                 </div>
-                <div class="guard-stat">
-                    <span class="guard-stat-label">Succeeded</span>
-                    <span class="guard-stat-value" id="qs-succeeded" style="color:#4ade80;">{queue_succeeded}</span>
+                <div class="command">
+                    <div class="command-name">python -m src.main --analyze-only</div>
+                    <div class="command-desc">Single analysis pass, print signals, no trading</div>
                 </div>
-                <div class="guard-stat">
-                    <span class="guard-stat-label">Failed</span>
-                    <span class="guard-stat-value" id="qs-failed" style="color:{queue_failed_color};">{queue_failed}</span>
+                <div class="command">
+                    <div class="command-name">python -m src.main --web --log-level DEBUG</div>
+                    <div class="command-desc">Bot + web + verbose debug logging</div>
                 </div>
-                <div class="guard-stat">
-                    <span class="guard-stat-label">Retried</span>
-                    <span class="guard-stat-value" id="qs-retried">{queue_retried}</span>
-                </div>
-                <div class="guard-stat">
-                    <span class="guard-stat-label">Rate-limited</span>
-                    <span class="guard-stat-value" id="qs-ratelimited" style="color:{queue_rl_color};">{queue_rate_limited}</span>
+                <div class="command">
+                    <div class="command-name">python -m src.main --analyze-only --epics IX.D.DAX.IFMM.IP</div>
+                    <div class="command-desc">Analyze a specific epic only</div>
                 </div>
             </div>
-            {todo_table_html}
-            <table class="err-table" style="margin-top:0.6rem;">
-                <thead>
-                    <tr>
-                        <th>Finished</th>
-                        <th>Method</th>
-                        <th>Task</th>
-                        <th>Status</th>
-                        <th>Tries</th>
-                        <th>Last error</th>
-                    </tr>
-                </thead>
-                <tbody id="queue-tbody">
-                    {queue_rows_html}
-                </tbody>
-            </table>
         </div>
     </div>
 
-    <!-- Market Data -->
-    <div class="section">
-        <div class="section-header" data-sid="market">
-            <span class="section-title">📈 Market Data — Real-time Prices</span>
-            <button class="section-toggle">−</button>
-        </div>
-        <div class="section-body">
-            <table class="market-table">
-                <thead>
-                    <tr>
-                        <th>Epic</th>
-                        <th>Bid</th>
-                        <th>Offer</th>
-                        <th>Spread</th>
-                        <th>High / Low</th>
-                        <th>Bid % range</th>
-                        <th>Candles</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {market_rows}
-                </tbody>
-            </table>
-        </div>
-    </div>
+    <!-- Navigation (bottom) -->
+    <nav style="margin-bottom:0; margin-top:1.5rem;">
+        <span class="nav-label">Nav</span>
+        <ul>
+            <li><a href="/charts">Charts</a></li>
+            <li><a href="/positions" target="_blank">Positions<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+            <li><a href="/positions/summary" target="_blank">Daily Summary<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+            <li><a href="/api/status" target="_blank">API Status<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+            <li><a href="/api/prices/IX.D.DAX.IFMM.IP" target="_blank">Prices (DAX)<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+        </ul>
+        <button id="btn-pause" class="nav-btn" onclick="togglePause()" style="display:inline-flex;align-items:center;gap:0.4rem;"><i data-lucide="pause" class="lc-icon"></i> Pause</button>
+    </nav>
 
     <footer id="footer-refresh">Auto-refresh every 30 s</footer>
 </div>
@@ -1295,39 +1521,47 @@ document.addEventListener('DOMContentLoaded', function() {{
     }});
 }});
 
-// ── Bot pause / resume ──────────────────────────────────────────────────────
-const btnBot = document.getElementById('btn-bot-pause');
+// ── Bot pause / resume (KPI card) ──────────────────────────────────────────
+const kpiBotTile  = document.getElementById('kpi-bot');
+const kpiBotValue = document.getElementById('kpi-bot-value');
+const kpiBotSub   = document.getElementById('kpi-bot-sub');
+let _botAvailable = false;
+let _botPaused    = false;
 
 function _applyBotState(paused, available) {{
-    btnBot.disabled = !available;
+    _botAvailable = available;
+    _botPaused    = paused;
     if (!available) {{
-        btnBot.textContent = '⏸ Pause bot';
+        kpiBotValue.textContent          = '—';
+        kpiBotValue.style.color          = '#94a3b8';
+        kpiBotSub.textContent            = 'Unavailable';
+        kpiBotTile.style.borderLeftColor = '#94a3b8';
         return;
     }}
     if (paused) {{
-        btnBot.textContent = '▶ Resume bot';
-        btnBot.classList.add('bot-paused');
+        kpiBotValue.textContent          = 'PAUSED';
+        kpiBotValue.style.color          = '#ef4444';
+        kpiBotSub.textContent            = 'Click to resume';
+        kpiBotTile.style.borderLeftColor = '#ef4444';
     }} else {{
-        btnBot.textContent = '⏸ Pause bot';
-        btnBot.classList.remove('bot-paused');
+        kpiBotValue.textContent          = 'RUNNING';
+        kpiBotValue.style.color          = '#4ade80';
+        kpiBotSub.textContent            = 'Click to pause';
+        kpiBotTile.style.borderLeftColor = '#4ade80';
     }}
 }}
 
 async function toggleBotPause() {{
-    btnBot.disabled = true;
-    const isPaused = btnBot.classList.contains('bot-paused');
+    if (!_botAvailable) return;
     try {{
-        const res = await fetch(isPaused ? '/api/bot/resume' : '/api/bot/pause', {{ method: 'POST' }});
+        const res  = await fetch(_botPaused ? '/api/bot/resume' : '/api/bot/pause', {{ method: 'POST' }});
         const data = await res.json();
         _applyBotState(data.bot_paused, true);
     }} catch (e) {{
         console.error('Bot toggle failed', e);
-    }} finally {{
-        btnBot.disabled = false;
     }}
 }}
 
-// Fetch initial bot state from server
 (async function initBotState() {{
     try {{
         const res  = await fetch('/api/status');
@@ -1352,16 +1586,17 @@ let _timeoutId = null;
 
 function _applyPauseUI() {{
     if (_paused) {{
-        btnPause.textContent = '▶ Resume';
+        btnPause.innerHTML = '<i data-lucide="play" class="lc-icon"></i> Resume';
         btnPause.classList.add('paused');
         bar.style.width      = '100%';
         bar.style.background = '#f59e0b';
         footer.textContent   = 'Auto-refresh paused';
     }} else {{
-        btnPause.textContent = '⏸ Pause';
+        btnPause.innerHTML = '<i data-lucide="pause" class="lc-icon"></i> Pause';
         btnPause.classList.remove('paused');
         footer.textContent   = 'Auto-refresh every 30 s';
     }}
+    lucide.createIcons();
 }}
 
 function togglePause() {{
@@ -1452,6 +1687,25 @@ async function clearErrors() {{
     }} catch (e) {{ console.error('Clear errors failed', e); }}
 }}
 
+// ── KPI refresh buttons ─────────────────────────────────────────────────────
+async function runKpiAction(action, btn) {{
+    btn.disabled = true;
+    btn.innerHTML = '<i data-lucide="loader-circle" class="lc-icon lc-spin"></i>';
+    lucide.createIcons();
+    try {{
+        const res = await fetch('/api/actions/' + action, {{ method: 'POST' }});
+        btn.textContent = res.ok ? '✓' : '✗';
+    }} catch (e) {{
+        btn.textContent = '✗';
+    }} finally {{
+        setTimeout(() => {{
+            btn.innerHTML = '<i data-lucide="refresh-cw" class="lc-icon"></i>';
+            lucide.createIcons();
+            btn.disabled = false;
+        }}, 3000);
+    }}
+}}
+
 // ── Manual actions ──────────────────────────────────────────────────────────
 async function runAction(action, btn, needsConfirm) {{
     if (needsConfirm && !confirm('Run "' + action + '"? This action may affect live positions or data.')) return;
@@ -1459,7 +1713,8 @@ async function runAction(action, btn, needsConfirm) {{
     const status = card.querySelector('.action-status');
     btn.disabled = true;
     status.className = 'action-status running';
-    status.textContent = '⧗ running…';
+    status.innerHTML = '<i data-lucide="loader-circle" class="lc-icon lc-spin"></i> running…';
+    lucide.createIcons();
     try {{
         const res  = await fetch('/api/actions/' + action, {{ method: 'POST' }});
         const data = await res.json();
@@ -1506,6 +1761,160 @@ function showModal(el) {{
     document.getElementById('text-modal-body').textContent = full;
     document.getElementById('text-modal').style.display = 'flex';
 }}
+
+// ── Queue modal ──────────────────────────────────────────────────────────────
+function openQueueModal() {{
+    document.getElementById('queue-modal').style.display = 'block';
+}}
+function closeQueueModal() {{
+    document.getElementById('queue-modal').style.display = 'none';
+}}
+
+// ── IG API modal ──────────────────────────────────────────────────────────────
+function openApiModal() {{
+    document.getElementById('ig-api-modal').style.display = 'block';
+}}
+function closeApiModal() {{
+    document.getElementById('ig-api-modal').style.display = 'none';
+}}
+
+// ── Open Positions modal ──────────────────────────────────────────────────────
+function openPositionsModal() {{
+    document.getElementById('positions-modal').style.display = 'block';
+}}
+function closePositionsModal() {{
+    document.getElementById('positions-modal').style.display = 'none';
+}}
+
+// ── Buy Confirmation Modal ────────────────────────────────────────────────────
+let _buyConfirmResolve = null;
+
+function openBuyConfirmModal(epic) {{
+    return new Promise(function(resolve) {{
+        _buyConfirmResolve = resolve;
+        document.getElementById('buy-confirm-epic').textContent = epic;
+        document.getElementById('buy-confirm-modal').style.display = 'flex';
+    }});
+}}
+
+function closeBuyConfirmModal(confirmed) {{
+    document.getElementById('buy-confirm-modal').style.display = 'none';
+    if (_buyConfirmResolve) {{
+        _buyConfirmResolve(confirmed);
+        _buyConfirmResolve = null;
+    }}
+}}
+
+document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Escape') {{
+        if (document.getElementById('buy-confirm-modal').style.display !== 'none') closeBuyConfirmModal(false);
+        if (document.getElementById('positions-modal').style.display !== 'none') closePositionsModal();
+    }}
+}});
+
+// ── Open position (manual BUY from dashboard) ─────────────────────────────────
+async function openPosition(epic, btn) {{
+    const confirmed = await openBuyConfirmModal(epic);
+    if (!confirmed) return;
+    const origText  = btn.textContent;
+    const origBg    = btn.style.background;
+    const origColor = btn.style.color;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {{
+        const res  = await fetch('/api/positions/open/' + encodeURIComponent(epic), {{ method: 'POST' }});
+        const data = await res.json();
+        if (res.ok) {{
+            btn.textContent      = '✓';
+            btn.style.background = '#16803c';
+            btn.style.color      = '#f0fdf4';
+            btn.title = 'Opened @ ' + data.level + ' qty=' + data.quantity;
+        }} else {{
+            btn.textContent      = '✗';
+            btn.style.background = '#991b1b';
+            btn.style.color      = '#fef2f2';
+            btn.title = data.error || 'Error';
+        }}
+    }} catch(e) {{
+        btn.textContent      = '✗';
+        btn.style.background = '#991b1b';
+        btn.style.color      = '#fef2f2';
+        btn.title = e.message;
+    }} finally {{
+        setTimeout(function() {{
+            btn.textContent      = origText;
+            btn.style.background = origBg;
+            btn.style.color      = origColor;
+            btn.title            = 'Open BUY position at minimum size';
+            btn.disabled         = false;
+        }}, 5000);
+    }}
+}}
+
+// ── Chart modal ──────────────────────────────────────────────────────────────
+async function openChartModal(epic) {{
+    const modal     = document.getElementById('chart-modal');
+    const titleEl   = document.getElementById('chart-modal-title');
+    const container = document.getElementById('chart-container');
+    titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
+    lucide.createIcons();
+    container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
+    modal.style.display = 'block';
+    try {{
+        const res = await fetch('/api/prices/' + encodeURIComponent(epic));
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (!data.bid_closes || !data.bid_closes.length) {{
+            container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">No price data available yet.</div>';
+            return;
+        }}
+        const rawBids = data.bid_closes;
+        const timestamps = data.timestamps && data.timestamps.length ? data.timestamps : rawBids.map(function(_, i) {{ return i + 1; }});
+        const minBid = Math.min.apply(null, rawBids);
+        const maxBid = Math.max.apply(null, rawBids);
+        const range = maxBid - minBid;
+        const pctY = rawBids.map(function(v) {{ return range === 0 ? 50 : (v - minBid) / range * 100; }});
+        const xIsDate = data.timestamps && data.timestamps.length > 0;
+        Plotly.newPlot(container, [{{
+            x: timestamps,
+            y: pctY,
+            customdata: rawBids,
+            type: 'scatter',
+            mode: 'lines',
+            line: {{ color: '#E07B39', width: 1.5 }},
+            name: 'Bid close',
+            hovertemplate: 'Bid: %{{customdata:.4f}}<br>%{{y:.1f}}<extra></extra>'
+        }}], {{
+            paper_bgcolor: '#1c1714',
+            plot_bgcolor: '#1c1714',
+            font: {{ color: '#94a3b8', size: 11 }},
+            margin: {{ l: 55, r: 20, t: 10, b: 50 }},
+            xaxis: {{
+                gridcolor: '#2d2319',
+                zerolinecolor: '#2d2319',
+                type: xIsDate ? 'date' : 'linear',
+                tickformat: xIsDate ? '%H:%M' : '',
+                title: ''
+            }},
+            yaxis: {{
+                gridcolor: '#2d2319',
+                zerolinecolor: '#2d2319',
+                ticksuffix: '%',
+                range: [-3, 103],
+                title: ''
+            }},
+        }}, {{ responsive: true, displayModeBar: false }});
+    }} catch(e) {{
+        container.innerHTML = '<div style="color:#ef4444;padding:3rem;text-align:center;">Failed to load data: ' + e.message + '</div>';
+    }}
+}}
+
+function closeChartModal() {{
+    document.getElementById('chart-modal').style.display = 'none';
+    Plotly.purge(document.getElementById('chart-container'));
+}}
+
+lucide.createIcons();
 </script>
 </body>
 </html>"""

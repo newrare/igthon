@@ -83,12 +83,13 @@ async def charts_index(request: Request) -> HTMLResponse:
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Charts</title>
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
 <div class="container">
     {_nav("charts")}
     <div class="header-bar">
-        <h1>&#128200; Charts</h1>
+        <h1><i data-lucide="trending-up" class="lc-icon"></i> Charts</h1>
         <div class="stat-badge">
             <span class="stat-label">Epics with data</span>
             <span class="stat-value" style="color:#4ade80;">{len(stats)}</span>
@@ -104,6 +105,7 @@ async def charts_index(request: Request) -> HTMLResponse:
     </div>
     <footer>Price history is recorded passively during Collect &amp; Analyze — no extra API calls. Old candles are dumped to disk and purged nightly.</footer>
 </div>
+<script>lucide.createIcons();</script>
 </body>
 </html>""")
 
@@ -125,9 +127,11 @@ async def chart_epic(
         return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
             <link rel="stylesheet" href="/static/style.css"></head><body>
             <div class="container">{_nav("charts")}
-            <div class="header-bar"><h1>&#128200; {html.escape(epic)}</h1></div>
+            <div class="header-bar"><h1><i data-lucide="trending-up" class="lc-icon"></i> {html.escape(epic)}</h1></div>
             <div class="section"><p style="padding:2rem;text-align:center;color:#475569;">
-            No candle history for this epic yet.</p></div></div></body></html>""")
+            No candle history for this epic yet.</p></div></div>
+<script>lucide.createIcons();</script>
+</body></html>""")
 
     # Group available days (in Paris local time) for the day selector.
     available_days = sorted(
@@ -163,12 +167,13 @@ async def chart_epic(
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — {html.escape(epic)}</title>
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
 <div class="container">
     {_nav("charts")}
     <div class="header-bar">
-        <h1>&#128200; {html.escape(epic)}</h1>
+        <h1><i data-lucide="trending-up" class="lc-icon"></i> {html.escape(epic)}</h1>
         <div class="stat-badge">
             <span class="stat-label">Candles</span>
             <span class="stat-value" style="color:#4ade80;">{len(day_candles)}</span>
@@ -184,6 +189,7 @@ async def chart_epic(
     </div>
     <footer>Green &#9650; = position opened, red &#10005; = closed. Dashed lines = win target / stop level. Times shown in Europe/Paris.</footer>
 </div>
+<script>lucide.createIcons();</script>
 </body>
 </html>""")
 

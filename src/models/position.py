@@ -33,6 +33,7 @@ class Position(Base):
     epic: Mapped[str] = mapped_column(String(30), nullable=False)
     epic_name: Mapped[str] = mapped_column(String(10), nullable=False)
     deal_reference: Mapped[str | None] = mapped_column(String(30))
+    deal_id: Mapped[str | None] = mapped_column(String(50))
     fix_open: Mapped[int | None] = mapped_column(Integer)
     fix_close: Mapped[int | None] = mapped_column(Integer)
     date: Mapped[date] = mapped_column(Date, nullable=False)
