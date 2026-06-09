@@ -10,7 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.models.database import Base
 
 
-class DayState(str, enum.Enum):
+class DayState(enum.StrEnum):
     """Day trading state."""
 
     OPEN = "open"

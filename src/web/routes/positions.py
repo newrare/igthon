@@ -47,7 +47,7 @@ async def list_positions(
                     "direction": "BUY",
                     "level_open": float(p.level_open) if p.level_open else None,
                     "level_close": float(p.level_close) if p.level_close else None,
-                    "euro": float(p.euro) if p.euro else None,
+                    "euro": float(p.euro) if p.euro is not None else None,
                     "reason_close": p.reason_close,
                     "time_open": p.time_open.isoformat() if p.time_open else None,
                     "time_close": p.time_close.isoformat() if p.time_close else None,

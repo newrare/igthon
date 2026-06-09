@@ -26,6 +26,7 @@ type(scope): description
 ```
 
 **Types:**
+
 - `feat` — new feature
 - `fix` — bug fix
 - `refactor` — code changes without feature or bug changes

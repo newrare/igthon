@@ -3,8 +3,10 @@
 Provides structured logging and optional email notifications.
 """
 
+import collections
 import logging
 import smtplib
+from datetime import datetime
 from email.message import EmailMessage
 
 from src.config import Settings
@@ -12,11 +14,53 @@ from src.config import Settings
 logger = logging.getLogger("ig_bot")
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Configure application-wide logging.
+class LogBuffer(logging.Handler):
+    """Rolling in-memory log handler — keeps the last N INFO+ records.
+
+    Thread-safe: emit() is called within the handler's own lock (via handle()),
+    and get_all() also acquires it before reading the deque.
+    """
+
+    def __init__(self, max_entries: int = 30) -> None:
+        super().__init__(level=logging.INFO)
+        self._entries: collections.deque = collections.deque(maxlen=max_entries)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if record.exc_info and record.exc_info[0]:
+                import traceback
+
+                tb = traceback.format_exception_only(record.exc_info[0], record.exc_info[1])
+                msg += " | " + "".join(tb).strip()
+        except Exception:
+            msg = str(record.msg)
+        ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        self._entries.append(
+            {
+                "ts": ts,
+                "level": record.levelname,
+                "name": record.name,
+                "msg": msg,
+            }
+        )
+
+    def get_all(self) -> list[dict]:
+        self.acquire()
+        try:
+            return list(self._entries)
+        finally:
+            self.release()
+
+
+def setup_logging(level: str = "INFO") -> LogBuffer:
+    """Configure application-wide logging and return the in-memory log buffer.
 
     Args:
         level: Log level (DEBUG, INFO, WARNING, ERROR).
+
+    Returns:
+        LogBuffer handler attached to the root logger.
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
 
@@ -30,6 +74,10 @@ def setup_logging(level: str = "INFO") -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
+    buf = LogBuffer(max_entries=30)
+    logging.getLogger().addHandler(buf)
+    return buf
 
 
 def send_email(

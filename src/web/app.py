@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from src.services.api_guard import APIGuard
     from src.services.api_queue import APIQueue
     from src.services.candle_store import CandleStore
+    from src.services.recorder import LogBuffer
 
 templates = Jinja2Templates(directory="src/web/templates")
 
@@ -31,6 +32,7 @@ def create_app(
     guard: APIGuard | None = None,
     api_queue: APIQueue | None = None,
     candle_store: CandleStore | None = None,
+    log_buffer: LogBuffer | None = None,
 ) -> FastAPI:
     """Create the FastAPI application with injected dependencies.
 
@@ -63,6 +65,7 @@ def create_app(
     app.state.guard = guard
     app.state.api_queue = api_queue
     app.state.candle_store = candle_store
+    app.state.log_buffer = log_buffer
 
     # Include routes
     from src.web.routes.charts import router as charts_router

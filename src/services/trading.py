@@ -9,16 +9,17 @@ Implements the full trading workflow:
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.client import IGClient
+from src.api.client import IGAPIError, IGClient
 from src.models.position import Position, PositionState, PositionStrategy
 from src.services.api_queue import APIQueue, Priority
 from src.services.compute import TradingSignal
+from src.utils.tools import _to_float, euro_per_point, parse_ig_pnl
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +325,10 @@ class TradingService:
         deal_id = confirmation.get("dealId", "")
         open_level = float(confirmation.get("level", levels.bid))
 
+        # Currency-converted euro value of one point of movement for this
+        # position — the basis for every P&L figure (live and realized).
+        epp = euro_per_point(market_data, quantity, currency)
+
         # 6. Record in DB
         now = datetime.now(UTC)
         position = Position(
@@ -335,17 +340,19 @@ class TradingService:
             time_open=now.time(),
             state=PositionState.OPEN,
             strategy=PositionStrategy.TARGET,
-            level_open=Decimal(str(round(open_level, 3))),
-            level_win=Decimal(str(round(levels.level_win, 3))),
-            level_zero=Decimal(str(round(levels.level_zero, 3))),
-            level_follower=Decimal(str(round(levels.level_follower, 3))),
-            level_loose=Decimal(str(round(levels.level_loose, 3))),
-            level_security=Decimal(str(round(levels.level_security, 3))),
-            level_stop=Decimal(str(round(open_level - stop_distance, 3))),
-            pip_spread=Decimal(str(round(levels.spread, 3))),
+            reason_open="auto",
+            level_open=Decimal(str(round(open_level, 5))),
+            level_win=Decimal(str(round(levels.level_win, 5))),
+            level_zero=Decimal(str(round(levels.level_zero, 5))),
+            level_follower=Decimal(str(round(levels.level_follower, 5))),
+            level_loose=Decimal(str(round(levels.level_loose, 5))),
+            level_security=Decimal(str(round(levels.level_security, 5))),
+            level_stop=Decimal(str(round(open_level - stop_distance, 5))),
+            pip_spread=Decimal(str(round(levels.spread, 5))),
             quantity=quantity,
             size=int(stop_distance),
             euro_stop=Decimal(str(round(euro_risk, 3))),
+            euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
         )
 
         self._db.add(position)
@@ -361,6 +368,310 @@ class TradingService:
         )
 
         return position
+
+    def _euro_pnl(self, position: Position, level: float) -> float:
+        """Compute the euro P&L of a position at a given market level.
+
+        Preferred path: ``euro_per_point`` is the currency-converted euro value
+        of one full point of movement for the whole position, so the P&L is
+        simply ``(level - open) * euro_per_point``. This is correct for JPY/USD
+        pairs (currency conversion applied) and indices alike.
+
+        Legacy fallback (positions opened before ``euro_per_point`` existed):
+        derive a per-pip value from ``euro_stop`` / ``size`` / ``quantity``.
+        Note this fallback ignores currency conversion and is only an estimate
+        until ``reconcile_realized_pnl`` overwrites it with IG's figure.
+        """
+        open_level = float(position.level_open or 0)
+        move = level - open_level
+        if position.euro_per_point is not None and float(position.euro_per_point) != 0:
+            return move * float(position.euro_per_point)
+        euro_per_pip = (
+            float(position.euro_stop or 1)
+            / float(position.size or 1)
+            / float(position.quantity or 1)
+        )
+        return move * (position.quantity or 1) * euro_per_pip
+
+    async def _fetch_close_result(
+        self, deal_reference: str | None, epic: str
+    ) -> tuple[float | None, float | None]:
+        """Return ``(fill_level, realized_profit_eur)`` from a close confirmation.
+
+        Either element is ``None`` when the confirmation is missing or omits
+        that field. The confirmation's ``profit`` is already in the account
+        currency; it is only trusted when ``profitCurrency`` confirms EUR.
+        """
+        if not deal_reference:
+            return None, None
+        try:
+            confirm = await self._client.get(
+                f"/confirms/{deal_reference}",
+                version=1,
+                priority=Priority.URGENT,
+                label=f"close {epic}: confirm",
+            )
+        except Exception as exc:
+            logger.debug("Could not fetch close confirmation for %s: %s", epic, exc)
+            return None, None
+
+        level = confirm.get("level")
+        fill_level = float(level) if level is not None else None
+
+        profit = confirm.get("profit")
+        profit_ccy = confirm.get("profitCurrency")
+        ig_profit = (
+            float(profit)
+            if profit is not None and profit_ccy in (None, "", "EUR", "E", "€")
+            else None
+        )
+        return fill_level, ig_profit
+
+    async def reconcile_realized_pnl(self, day: date | None = None) -> int:
+        """Overwrite a day's realized P&L with IG's authoritative figures.
+
+        Source of truth is ``GET /history/transactions``: each deal carries
+        ``profitAndLoss`` already converted to the account currency, plus the
+        real ``openLevel`` / ``closeLevel``. This repairs every closed position —
+        including those closed outside the bot (``closed_externally`` /
+        ``not_found_in_ig``), whose levels and euro were only estimated.
+
+        Positions are matched to transactions by deal reference first, then by
+        instrument name when exactly one unmatched transaction remains for that
+        instrument. Returns the number of positions updated.
+        """
+        day = day or date.today()
+        result = await self._db.execute(
+            select(Position).where(
+                Position.date == day, Position.state == PositionState.CLOSE
+            )
+        )
+        closed = list(result.scalars().all())
+        if not closed:
+            return 0
+
+        midnight = datetime(day.year, day.month, day.day)
+        frm = midnight.strftime("%Y-%m-%dT00:00:00")
+        to = (midnight + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+        try:
+            data = await self._client.get(
+                f"/history/transactions?from={frm}&to={to}",
+                version=2,
+                priority=Priority.HIGH,
+                label="reconcile realized P&L",
+            )
+        except Exception as exc:
+            logger.error(
+                "Realized P&L reconcile failed — could not fetch history: %s", exc
+            )
+            return 0
+
+        transactions = [
+            t
+            for t in data.get("transactions", [])
+            if parse_ig_pnl(t.get("profitAndLoss")) is not None
+        ]
+
+        # IG's transaction ``reference`` is unrelated to our stored deal
+        # reference/id, so we match on instrument name (normalized: the
+        # "… converted at <rate>" suffix on currency-converted pairs is dropped)
+        # and disambiguate same-instrument positions by the closest open/close
+        # levels. Each transaction is consumed once.
+        remaining = list(transactions)
+        updated = 0
+        for position in closed:
+            candidates = [
+                t
+                for t in remaining
+                if self._names_match(position.epic_name, t.get("instrumentName"))
+            ]
+            if not candidates:
+                logger.debug(
+                    "No IG transaction matched closed position %s (%s)",
+                    position.id,
+                    position.epic,
+                )
+                continue
+            txn = min(candidates, key=lambda t: self._level_distance(position, t))
+            remaining.remove(txn)
+            if self._apply_transaction(position, txn):
+                updated += 1
+
+        if updated:
+            await self._db.commit()
+            logger.info(
+                "Realized P&L reconciled from IG: %d/%d closed positions on %s",
+                updated,
+                len(closed),
+                day.isoformat(),
+            )
+        return updated
+
+    def _apply_transaction(self, position: Position, txn: dict) -> bool:
+        """Write a transaction's authoritative P&L and levels onto a position."""
+        pnl = parse_ig_pnl(txn.get("profitAndLoss"))
+        if pnl is None:
+            return False
+        position.euro = Decimal(str(round(pnl, 3)))
+        position.win = 1 if pnl > 0 else 0
+        open_level = _to_float(txn.get("openLevel"), default=0.0)
+        close_level = _to_float(txn.get("closeLevel"), default=0.0)
+        if open_level:
+            position.level_open = Decimal(str(round(open_level, 5)))
+        if close_level:
+            position.level_close = Decimal(str(round(close_level, 5)))
+        return True
+
+    @staticmethod
+    def _names_match(epic_name: str | None, instrument_name: str | None) -> bool:
+        """Whether a stored ``epic_name`` and an IG ``instrumentName`` refer to
+        the same instrument.
+
+        IG appends "… converted at <rate>" to currency-converted pairs and uses
+        the full display name (e.g. "France 40 Cash (€10)"), while ``epic_name``
+        is the IG market name truncated to 10 chars. Comparison is therefore
+        prefix-based over the first (≤10) characters of both normalized names.
+        """
+        a = (epic_name or "").strip().lower()
+        base = (instrument_name or "").split(" converted at")[0].strip().lower()
+        if not a or not base:
+            return False
+        n = min(len(a), len(base), 10)
+        return a[:n] == base[:n]
+
+    @staticmethod
+    def _level_distance(position: Position, txn: dict) -> float:
+        """Sum of |open Δ| + |close Δ| between a position and a transaction.
+
+        Used to pick which transaction belongs to which position when several
+        share an instrument. Missing levels contribute nothing.
+        """
+        distance = 0.0
+        if position.level_open is not None:
+            distance += abs(
+                float(position.level_open) - _to_float(txn.get("openLevel"))
+            )
+        if position.level_close is not None:
+            distance += abs(
+                float(position.level_close) - _to_float(txn.get("closeLevel"))
+            )
+        return distance
+
+    async def sync_open_positions(self) -> dict[str, dict]:
+        """Reconcile DB open positions against IG's live position list.
+
+        A single ``GET /positions`` call is the source of truth for what is
+        actually open at the broker. For every position the DB still considers
+        OPEN this method:
+
+        - refreshes the stored ``deal_id`` when IG reports a different one,
+        - recomputes the live unrealized P&L from the current bid and updates
+          ``euro`` (running unrealized) plus ``euro_max`` / ``euro_min`` (the
+          favourable/adverse excursion),
+        - reconciles positions that no longer exist at IG (closed or expired
+          outside the bot) by marking them CLOSE with reason
+          ``closed_externally``.
+
+        Returns:
+            Map of ``epic -> live IG entry`` ({"position": ..., "market": ...})
+            for every position still open at IG, so callers can reuse the data
+            without issuing a second request.
+        """
+        result = await self._db.execute(
+            select(Position).where(Position.state == PositionState.OPEN)
+        )
+        db_positions = result.scalars().all()
+        if not db_positions:
+            return {}
+
+        try:
+            data = await self._client.get(
+                "/positions",
+                version=2,
+                priority=Priority.HIGH,
+                label="sync open positions",
+            )
+        except Exception as exc:
+            logger.error(
+                "Position sync failed — could not fetch live positions: %s", exc
+            )
+            return {}
+
+        live: dict[str, dict] = {}
+        for entry in data.get("positions", []):
+            epic = entry.get("market", {}).get("epic")
+            if epic:
+                live[epic] = entry
+
+        dirty = False
+        for position in db_positions:
+            entry = live.get(position.epic)
+            if entry is None:
+                # Position is gone at IG — closed or expired outside the bot.
+                self._reconcile_vanished(position)
+                dirty = True
+                continue
+
+            ig_position = entry.get("position", {})
+            market = entry.get("market", {})
+
+            # Refresh dealId if IG rotated it (stale id is the 404 root cause).
+            ig_deal_id = ig_position.get("dealId")
+            if ig_deal_id and ig_deal_id != position.deal_id:
+                logger.info(
+                    "Position %s dealId refreshed: %s -> %s",
+                    position.epic,
+                    position.deal_id,
+                    ig_deal_id,
+                )
+                position.deal_id = ig_deal_id
+                dirty = True
+
+            # Update live unrealized P&L and excursion from the current bid.
+            bid = market.get("bid")
+            if bid is not None:
+                euro_pnl = self._euro_pnl(position, float(bid))
+                position.euro = Decimal(str(round(euro_pnl, 3)))
+                position.euro_max = Decimal(
+                    str(round(max(euro_pnl, float(position.euro_max or euro_pnl)), 3))
+                )
+                position.euro_min = Decimal(
+                    str(round(min(euro_pnl, float(position.euro_min or euro_pnl)), 3))
+                )
+                dirty = True
+
+        if dirty:
+            await self._db.commit()
+
+        return live
+
+    def _reconcile_vanished(self, position: Position) -> None:
+        """Mark a position closed because IG no longer reports it as open.
+
+        The actual close happened outside the bot, so there is no fresh close
+        level to record; the best estimate is the last live unrealized P&L
+        computed by the most recent sync (stored in ``euro``). This estimate is
+        later overwritten by ``reconcile_realized_pnl`` with IG's true figure.
+        """
+        now = datetime.now(UTC)
+        close_level = float(position.level_close or position.level_open or 0)
+        euro_pnl = (
+            float(position.euro)
+            if position.euro is not None
+            else self._euro_pnl(position, close_level)
+        )
+        position.state = PositionState.CLOSE
+        position.time_close = now.time()
+        if position.level_close is None:
+            position.level_close = Decimal(str(round(close_level, 5)))
+        position.reason_close = "closed_externally"
+        position.euro = Decimal(str(round(euro_pnl, 3)))
+        position.win = 1 if euro_pnl > 0 else 0
+        logger.warning(
+            "Position %s no longer open at IG — reconciled as closed_externally (P&L=%.2f€)",
+            position.epic,
+            euro_pnl,
+        )
 
     async def check_and_close(self, position: Position, current_bid: float) -> bool:
         """Check if a position should be closed based on current price.
@@ -465,11 +776,15 @@ class TradingService:
                 position.epic,
             )
             now = datetime.now(UTC)
+            # Estimate P&L from close_level (current market price) even for
+            # phantom closes; reconcile_realized_pnl corrects it later from IG.
+            euro_pnl = self._euro_pnl(position, close_level)
             position.state = PositionState.CLOSE
             position.time_close = now.time()
+            position.level_close = Decimal(str(round(close_level, 5)))
             position.reason_close = "not_found_in_ig"
-            position.euro = Decimal("0")
-            position.win = 0
+            position.euro = Decimal(str(round(euro_pnl, 3)))
+            position.win = 1 if euro_pnl > 0 else 0
             await self._db.commit()
             return True
 
@@ -491,24 +806,39 @@ class TradingService:
                 priority=Priority.URGENT,
                 label=f"close {position.epic}: {reason}",
             )
+        except IGAPIError as exc:
+            if exc.response.status_code == 404:
+                # IG can't find the position — verify it's genuinely gone
+                return await self._handle_phantom_close(
+                    position, close_level, reason, exc
+                )
+            logger.error("Failed to close %s: %s", position.epic, exc)
+            return False
         except Exception as exc:
             logger.error("Failed to close %s: %s", position.epic, exc)
             return False
 
+        # Ask IG for the close confirmation: it carries the real fill level and
+        # the realized profit in the account currency — both authoritative,
+        # unlike our observed bid. Falls back to the observed level / computed
+        # P&L when the confirmation is unavailable.
+        fill_level, ig_profit = await self._fetch_close_result(
+            result.get("dealReference"), position.epic
+        )
+        if fill_level is not None:
+            close_level = fill_level
+
         # Update position in DB
         now = datetime.now(UTC)
-        open_level = float(position.level_open or 0)
-        pip_pnl = close_level - open_level
-        euro_per_pip = (
-            float(position.euro_stop or 1)
-            / float(position.size or 1)
-            / float(position.quantity or 1)
+        euro_pnl = (
+            ig_profit
+            if ig_profit is not None
+            else self._euro_pnl(position, close_level)
         )
-        euro_pnl = pip_pnl * (position.quantity or 1) * euro_per_pip
 
         position.state = PositionState.CLOSE
         position.time_close = now.time()
-        position.level_close = Decimal(str(round(close_level, 3)))
+        position.level_close = Decimal(str(round(close_level, 5)))
         position.reason_close = reason
         position.euro = Decimal(str(round(euro_pnl, 3)))
         position.euro_max = Decimal(
@@ -528,6 +858,67 @@ class TradingService:
             euro_pnl,
         )
 
+        return True
+
+    async def _handle_phantom_close(
+        self,
+        position: Position,
+        close_level: float,
+        reason: str,
+        original_exc: Exception,
+    ) -> bool:
+        """Handle a 404 from IG's close endpoint by checking the live positions list.
+
+        IG returns 404 / notional.details.null.error when the position no longer
+        exists on their side (expired, already closed, demo glitch). We verify by
+        fetching /positions and, if the epic is absent, record a phantom close so
+        the DB stays consistent.
+        """
+        logger.warning(
+            "IG returned 404 closing %s — verifying via live positions: %s",
+            position.epic,
+            original_exc,
+        )
+        try:
+            positions_data = await self._client.get(
+                "/positions",
+                version=2,
+                priority=Priority.URGENT,
+                label=f"close {position.epic}: phantom-verify",
+            )
+            still_open = any(
+                entry.get("market", {}).get("epic") == position.epic
+                for entry in positions_data.get("positions", [])
+            )
+        except Exception as verify_exc:
+            logger.error(
+                "Could not verify live positions for %s: %s",
+                position.epic,
+                verify_exc,
+            )
+            return False
+
+        if still_open:
+            logger.error(
+                "Failed to close %s (still open at IG): %s",
+                position.epic,
+                original_exc,
+            )
+            return False
+
+        logger.warning(
+            "Position %s not found in IG live positions after 404 — marking as closed (phantom)",
+            position.epic,
+        )
+        now = datetime.now(UTC)
+        euro_pnl = self._euro_pnl(position, close_level)
+        position.state = PositionState.CLOSE
+        position.time_close = now.time()
+        position.level_close = Decimal(str(round(close_level, 5)))
+        position.reason_close = "not_found_in_ig"
+        position.euro = Decimal(str(round(euro_pnl, 3)))
+        position.win = 1 if euro_pnl > 0 else 0
+        await self._db.commit()
         return True
 
     async def close_all_positions(self) -> int:

@@ -436,7 +436,6 @@ class MarketScanner:
         try:
             instrument = detail.get("instrument", {})
             snapshot = detail.get("snapshot", {})
-            dealing_rules = detail.get("dealingRules", {})
 
             epic = instrument.get("epic", "")
             name = instrument.get("name", "")

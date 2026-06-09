@@ -3,53 +3,86 @@
 General-purpose helpers for number formatting, data conversion, etc.
 """
 
+import re
 
-def num(value: float, decimals: int = 3) -> float:
-    """Round a number to N decimal places.
 
-    Equivalent to Tools::num() in PHP.
+def _to_float(value: object, default: float = 0.0) -> float:
+    """Best-effort float conversion tolerant of IG's string numbers.
+
+    IG returns numeric fields as strings that may carry thousands separators
+    (e.g. ``"100,000"``). Returns ``default`` when the value is missing or
+    cannot be parsed.
     """
-    return round(value, decimals)
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return default
 
 
-def scaling(level: float, stop_level: float) -> str:
-    """Format stop level for the IG API.
+def parse_ig_pnl(raw: object) -> float | None:
+    """Parse an IG ``profitAndLoss`` value (e.g. ``"E-2.73"``) into a float.
 
-    Some IG instruments require stop levels in specific formats.
+    IG prefixes the realized P&L with a currency symbol or letter
+    (``E`` = EUR, ``$``, ``£``, ``¥``) and may use ``,`` as a thousands
+    separator. Returns the signed amount in the account currency, or ``None``
+    when the value cannot be parsed.
     """
-    return str(round(stop_level, 1))
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    cleaned = re.sub(r"[^0-9+\-.]", "", str(raw).replace(",", ""))
+    if cleaned in ("", "+", "-", ".", "+.", "-."):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
-def spread_ratio(bid: float, offer: float) -> float:
-    """Calculate the spread ratio (spread / bid).
+def conversion_rate(instrument: dict, currency_code: str | None = None) -> float:
+    """Return the rate converting the instrument's quote currency to EUR.
 
-    Useful for filtering high-spread epics.
+    IG ships the conversion rate inside ``instrument.currencies[].exchangeRate``
+    (the "converted at …" figure shown on the broker's statement). Picks the
+    entry matching ``currency_code``, else the default currency, else the first
+    one. Falls back to ``1.0`` (no conversion) when nothing is available.
     """
-    if bid <= 0:
+    currencies = instrument.get("currencies") or []
+    entry = None
+    if currency_code:
+        entry = next((c for c in currencies if c.get("code") == currency_code), None)
+    if entry is None:
+        entry = next((c for c in currencies if c.get("isDefault")), None)
+    if entry is None and currencies:
+        entry = currencies[0]
+    if not entry:
         return 1.0
-    return (offer - bid) / bid
+    rate = entry.get("exchangeRate", entry.get("baseExchangeRate"))
+    return _to_float(rate, default=1.0) or 1.0
 
 
-def pip_value(scaling_factor: float) -> float:
-    """Calculate the euro value of 1 pip.
+def euro_per_point(
+    market_data: dict, size: float, currency_code: str | None = None
+) -> float:
+    """Euros of P&L per 1.0 of price movement for the whole position.
 
-    Args:
-        scaling_factor: Market scaling factor from IG.
-
-    Returns:
-        Euro value per pip movement.
+    ``P&L = (close - open) * euro_per_point``. Built from a single ``/markets``
+    payload: the instrument's contract size (value of one full point in the
+    quote currency) times the quote->EUR exchange rate times the deal size. This
+    is currency-aware (e.g. JPY pairs) and instrument-aware, unlike the legacy
+    ``1 / scalingFactor`` heuristic. Returns ``0.0`` when the contract size is
+    unknown so callers can fall back to the legacy estimate.
     """
-    if scaling_factor <= 0:
-        return 1.0
-    return 1.0 / scaling_factor
-
-
-def format_pnl(euro: float) -> str:
-    """Format P&L for display with color indicator."""
-    sign = "+" if euro >= 0 else ""
-    return f"{sign}{euro:.2f}€"
-
-
-def is_market_open(hour: int, *, start: int = 9, end: int = 17) -> bool:
-    """Check if the current hour is within market hours."""
-    return start <= hour < end
+    instrument = market_data.get("instrument", {})
+    contract = _to_float(instrument.get("contractSize"), default=0.0)
+    if contract <= 0:
+        contract = _to_float(instrument.get("lotSize"), default=0.0)
+    if contract <= 0:
+        return 0.0
+    rate = conversion_rate(instrument, currency_code)
+    return float(size) * contract * rate

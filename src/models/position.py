@@ -10,14 +10,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.models.database import Base
 
 
-class PositionState(str, enum.Enum):
+class PositionState(enum.StrEnum):
     """Position state."""
 
     OPEN = "open"
     CLOSE = "close"
 
 
-class PositionStrategy(str, enum.Enum):
+class PositionStrategy(enum.StrEnum):
     """Position closing strategy."""
 
     TARGET = "target"
@@ -45,15 +45,19 @@ class Position(Base):
         Enum(PositionState), default=PositionState.OPEN
     )
     strategy: Mapped[PositionStrategy | None] = mapped_column(Enum(PositionStrategy))
-    level_follower: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_win: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_zero: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_open: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_loose: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_security: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_close: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    level_stop: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    pip_spread: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
+    # Price levels are stored with 5 decimals: forex pairs (e.g. GBP/EUR at
+    # 1.15729) move below the 3rd decimal, so Numeric(10, 3) silently truncated
+    # the entire price move to zero. See migration a7b8c9d0e1f2.
+    level_follower: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_win: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_zero: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_open: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_loose: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_security: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_close: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    level_stop: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    pip_spread: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    reason_open: Mapped[str | None] = mapped_column(String(30))
     reason_close: Mapped[str | None] = mapped_column(String(30))
     size: Mapped[int | None] = mapped_column(Integer)
     negative: Mapped[int | None] = mapped_column(Integer)
@@ -62,5 +66,11 @@ class Position(Base):
     stop_update: Mapped[int | None] = mapped_column(Integer)
     euro: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro_stop: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
+    # Euros of realized/unrealized P&L per 1.0 of price movement for the whole
+    # position: P&L = (close - open) * euro_per_point. Derived at open from IG
+    # market data (contract size x quote->EUR exchange rate x deal size), so it
+    # already accounts for currency conversion (e.g. JPY pairs) and the real
+    # per-point value of the instrument. See migration a7b8c9d0e1f2.
+    euro_per_point: Mapped[Decimal | None] = mapped_column(Numeric(14, 6))
     euro_max: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro_min: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))

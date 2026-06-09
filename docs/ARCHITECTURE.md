@@ -53,7 +53,7 @@ igthon/
 │       ├── app.py            # FastAPI app factory
 │       ├── routes/
 │       │   ├── charts.py     # /api/prices — candle data for charts
-│       │   ├── dashboard.py  # / — live buffer status + bot state
+│       │   ├── dashboard.py  # / + /api/dashboard-fragments — live polled UI
 │       │   └── positions.py  # /positions/ — position list + P&L summary
 │       ├── static/
 │       └── templates/
@@ -154,3 +154,25 @@ of live price data. The REST `/prices` endpoint is used only as a **fallback** t
 1. Rehydrate after a gap in the feed.
 
 This avoids consuming the IG historical data allowance on every tick.
+
+______________________________________________________________________
+
+## Dashboard live updates
+
+The dashboard is server-rendered once, then kept current **client-side** without
+full-page reloads:
+
+- `_gather_dashboard_state()` collects a single snapshot (buffer, KPIs, guard,
+  queue, open positions) and is shared by the page route and the JSON poller.
+- `_build_fragments()` turns that snapshot into one HTML string per dynamic
+  region (`kpi_bar`, `market_rows`, `queue_modal`, `api_modal`,
+  `positions_modal`). It is the single source of truth, so the initial render
+  and the incremental updates can never drift.
+- `GET /api/dashboard-fragments` returns `{fragments, bot_paused, scheduler_available, server_time}`.
+- The browser polls that endpoint every **2 s** and replaces the inner HTML of a
+  `#frag-*` container **only when its markup changed** since the previous poll.
+  Each region also displays `server_time` as its "last refresh" label.
+
+This is the "unified Option A" model: one request per cycle (same network volume
+as the previous 30 s full reload, but at 2 s cadence) with surgical DOM updates,
+preserving scroll position, open modals and collapse state.

@@ -30,7 +30,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum, IntEnum
+from enum import IntEnum, StrEnum
 from itertools import count
 from typing import TYPE_CHECKING
 
@@ -51,7 +51,7 @@ class Priority(IntEnum):
     NORMAL = 10  # price collection, market reads
 
 
-class QueueStatus(str, Enum):
+class QueueStatus(StrEnum):
     """Lifecycle state of a queued call."""
 
     PENDING = "pending"

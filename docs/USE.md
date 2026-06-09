@@ -100,14 +100,25 @@ Start: `python -m src.main --web`
 
 ### Available endpoints
 
-| URL                                       | Description                                       |
-| ----------------------------------------- | ------------------------------------------------- |
-| `http://localhost:8000/`                  | Dashboard: live prices and buffer status per epic |
-| `http://localhost:8000/api/status`        | JSON: bot status, tracked epics                   |
-| `http://localhost:8000/api/prices/{epic}` | JSON: last 50 candles for an epic                 |
-| `http://localhost:8000/positions/`        | JSON: position list (all or filtered)             |
-| `http://localhost:8000/positions/summary` | JSON: today's P&L summary                         |
-| `http://localhost:8000/docs`              | Auto-generated Swagger UI                         |
+| URL                                             | Description                                       |
+| ----------------------------------------------- | ------------------------------------------------- |
+| `http://localhost:8000/`                        | Dashboard: live prices and buffer status per epic |
+| `http://localhost:8000/api/dashboard-fragments` | JSON: HTML fragments for every live region (poll) |
+| `http://localhost:8000/api/status`              | JSON: bot status, tracked epics                   |
+| `http://localhost:8000/api/prices/{epic}`       | JSON: last 50 candles for an epic                 |
+| `http://localhost:8000/positions/`              | JSON: position list (all or filtered)             |
+| `http://localhost:8000/positions/summary`       | JSON: today's P&L summary                         |
+| `http://localhost:8000/docs`                    | Auto-generated Swagger UI                         |
+
+### Live updates
+
+The dashboard no longer reloads the whole page. Every **2 seconds** it issues a
+single request to `/api/dashboard-fragments` and swaps **only the regions whose
+content changed** (KPI bar, market table, queue / IG API / positions modals).
+Each section shows its own "last refresh" time, and the **Pause** button (or
+`localStorage` key `ig_refresh_paused`) freezes the live updates without
+stopping the bot. Pausing the **bot** (the Bot KPI tile) is independent and
+suspends the scheduled API jobs instead.
 
 ### Position endpoint filters
 

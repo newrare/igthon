@@ -1,6 +1,6 @@
 """Application configuration loaded from environment variables."""
 
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _ENV_FILE = Path(__file__).parent.parent / ".env"
 
 
-class IGEnvironment(str, Enum):
+class IGEnvironment(StrEnum):
     """IG API environment selector."""
 
     DEMO = "demo"

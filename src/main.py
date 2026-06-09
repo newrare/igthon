@@ -25,7 +25,7 @@ from src.services.candle_store import CandleStore
 from src.services.compute import compute_signal
 from src.services.market_data import MarketDataService
 from src.services.price_buffer import PriceBuffer
-from src.services.recorder import Recorder, setup_logging
+from src.services.recorder import LogBuffer, Recorder, setup_logging
 from src.services.scheduler import BotScheduler
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ async def analyze_once(epics: list[str] | None = None) -> None:
         print()
 
 
-async def run_bot(*, with_web: bool = False) -> None:
+async def run_bot(*, with_web: bool = False, log_buffer: LogBuffer | None = None) -> None:
     """Start the full trading bot with scheduler.
 
     Args:
@@ -154,8 +154,12 @@ async def run_bot(*, with_web: bool = False) -> None:
         # shows the day's discovered epics immediately after a restart.
         await scheduler.load_persisted_state()
 
-        # Start scheduler
+        # Start scheduler (all jobs start in manual mode by default).
         scheduler.start()
+
+        # Restore the last-saved auto/manual mode for each job so the bot
+        # resumes exactly as the user left it before the server was stopped.
+        await scheduler.load_job_preferences()
 
         # Optionally start web server
         if with_web:
@@ -172,6 +176,7 @@ async def run_bot(*, with_web: bool = False) -> None:
                 guard=guard,
                 api_queue=api_queue,
                 candle_store=candle_store,
+                log_buffer=log_buffer,
             )
             config = uvicorn.Config(
                 app,
@@ -212,12 +217,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    setup_logging(args.log_level)
+    log_buffer = setup_logging(args.log_level)
 
     if args.analyze_only:
         asyncio.run(analyze_once(args.epics))
     else:
-        asyncio.run(run_bot(with_web=args.web))
+        asyncio.run(run_bot(with_web=args.web, log_buffer=log_buffer))
 
 
 if __name__ == "__main__":

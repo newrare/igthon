@@ -23,6 +23,7 @@ from src.api.client import IGAPIError, IGClient
 from src.config import Settings
 from src.models.day import Day, DayState
 from src.models.epic import Epic
+from src.models.job_preference import JobPreference
 from src.models.position import Position, PositionState
 from src.models.resume import Resume
 from src.services.api_queue import APIQueue
@@ -30,7 +31,7 @@ from src.services.candle_store import CandleStore
 from src.services.compute import compute_signal
 from src.services.market_data import MarketDataService
 from src.services.market_scanner import MarketInfo, MarketScanner
-from src.services.price_buffer import PriceBuffer
+from src.services.price_buffer import DEFAULT_MAX_CANDLES, PriceBuffer
 from src.services.recorder import Recorder
 from src.services.trading import TradeConfig, TradingService
 
@@ -38,6 +39,109 @@ if TYPE_CHECKING:
     from src.api.streaming import IGStreamingClient
 
 logger = logging.getLogger(__name__)
+
+
+# Registry of schedulable jobs surfaced in the dashboard "Actions" section.
+# ``action`` is the manual-trigger key (maps to ``trigger_<action>`` and the
+# ``/api/actions`` endpoint); ``job_id`` is the APScheduler job id, which differs
+# from the action for the analysis loop. ``danger`` drives the Run-button colour
+# and whether a confirmation prompt is shown on the dashboard.
+JOB_DEFINITIONS: list[dict[str, str]] = [
+    {
+        "action": "refresh_epic_list",
+        "job_id": "refresh_epic_list",
+        "name": "Refresh Epic List",
+        "description": "Crawl the IG navigation tree and rebuild the full epic list.",
+        "schedule": "Daily 07:30 · Mon–Fri",
+        "danger": "safe",
+    },
+    {
+        "action": "refresh_tradable_epics",
+        "job_id": "refresh_tradable_epics",
+        "name": "Refresh Tradable Epics",
+        "description": "Filter the epic list to those currently open and TRADEABLE.",
+        "schedule": "Hourly 08–17 · Mon–Fri",
+        "danger": "safe",
+    },
+    {
+        "action": "collect_and_analyze",
+        "job_id": "collect_analyze",
+        "name": "Collect & Analyze",
+        "description": "Fetch latest prices, compute signals, open positions on BUY.",
+        "schedule": "Every 30s · 08–17 · Mon–Fri",
+        "danger": "safe",
+    },
+    {
+        "action": "monitor_positions",
+        "job_id": "monitor_positions",
+        "name": "Monitor Positions",
+        "description": "Check all open positions and apply the close strategy.",
+        "schedule": "Every 30s · 08–18 · Mon–Fri",
+        "danger": "safe",
+    },
+    {
+        "action": "sync_positions",
+        "job_id": "sync_positions",
+        "name": "Sync Positions",
+        "description": (
+            "Reconcile DB positions against IG's live list: refresh euro/bid "
+            "and close positions shut outside the bot."
+        ),
+        "schedule": "Every 20s · 24/7",
+        "danger": "safe",
+    },
+    {
+        "action": "end_of_day",
+        "job_id": "end_of_day",
+        "name": "End of Day",
+        "description": "Force close ALL open positions immediately.",
+        "schedule": "Daily — close hour · Mon–Fri",
+        "danger": "danger",
+    },
+    {
+        "action": "reconcile_pnl",
+        "job_id": "reconcile_pnl",
+        "name": "Reconcile P&L",
+        "description": (
+            "Overwrite today's closed-position euro P&L and open/close levels "
+            "with IG's authoritative transaction history."
+        ),
+        "schedule": "Every 10 min · 09–19 · Mon–Fri",
+        "danger": "safe",
+    },
+    {
+        "action": "daily_summary",
+        "job_id": "daily_summary",
+        "name": "Daily Summary",
+        "description": "Generate or update today's P&L record in the database.",
+        "schedule": "Daily 18:00 · Mon–Fri",
+        "danger": "safe",
+    },
+    {
+        "action": "weekly_summary",
+        "job_id": "weekly_summary",
+        "name": "Weekly Summary",
+        "description": "Generate per-epic direction summaries for the current week.",
+        "schedule": "Friday 18:30",
+        "danger": "safe",
+    },
+    {
+        "action": "daily_reset",
+        "job_id": "daily_reset",
+        "name": "Daily Reset",
+        "description": "Clear the price buffer — all in-memory candle history is lost.",
+        "schedule": "Daily 00:00",
+        "danger": "warn",
+    },
+    {
+        "action": "dump_and_purge_candles",
+        "job_id": "dump_and_purge_candles",
+        "name": "Dump & Purge Candles",
+        "description": "Export candles past the retention window to CSV, then delete them.",
+        "schedule": "Daily 02:00",
+        "danger": "warn",
+    },
+]
 
 
 class BotScheduler:
@@ -86,9 +190,6 @@ class BotScheduler:
         self._epic_last_refresh: datetime | None = None
         # Epics that returned 403 on /prices — skipped until next hourly refresh
         self._pricing_blacklist: set[str] = set()
-        # Epics whose buffer has been bootstrapped (polling path only).
-        # Cleared at the daily reset so each epic fetches 50 candles once per day.
-        self._bootstrapped_epics: set[str] = set()
 
         self._scanner = MarketScanner(
             client=client,
@@ -141,6 +242,21 @@ class BotScheduler:
             name="Monitor open positions",
         )
 
+        # Position sync: every 20 seconds — reconcile DB against IG's live list.
+        # A single GET /positions call (cheap, well under the rate-limit guard)
+        # keeps euro/bid fresh and catches positions closed outside the bot.
+        # No hour/day restriction: CFD/forex positions can be open (and closed by
+        # broker-side stops) outside index-market hours and over weekends. When no
+        # position is OPEN in the DB, ``sync_open_positions`` returns early without
+        # any API call, so running continuously is free off-session.
+        self._scheduler.add_job(
+            self._sync_positions,
+            "cron",
+            second="*/20",
+            id="sync_positions",
+            name="Sync open positions with IG",
+        )
+
         # End of day: force close + summary
         self._scheduler.add_job(
             self._end_of_day,
@@ -150,6 +266,20 @@ class BotScheduler:
             minute=30,
             id="end_of_day",
             name="End of day close",
+        )
+
+        # Realized P&L reconciliation: pull IG's transaction history and overwrite
+        # today's closed-position euro/levels with the broker's true figures.
+        # Runs every 10 min during/after market hours so externally-closed
+        # positions are corrected without waiting for the daily summary.
+        self._scheduler.add_job(
+            self._reconcile_pnl,
+            "cron",
+            day_of_week="mon-fri",
+            hour="9-19",
+            minute="*/10",
+            id="reconcile_pnl",
+            name="Reconcile realized P&L with IG",
         )
 
         # Daily summary at 18:00
@@ -216,9 +346,16 @@ class BotScheduler:
 
         self._scheduler.start()
         self._running = True
-        self.pause_bot()  # Start paused — user must resume via web dashboard
+        # Start every job in manual mode (individually paused) — the user enables
+        # jobs one by one from the dashboard "Actions" section. Pausing per-job
+        # (rather than the whole scheduler) is what allows mixing automatic and
+        # manual jobs afterwards.
+        for job in self._scheduler.get_jobs():
+            job.pause()
+        self._paused = True
         logger.info(
-            "Scheduler started in paused state — %d seed epics — resume via web dashboard",
+            "Scheduler started — all jobs in manual mode — %d seed epics — "
+            "enable jobs via web dashboard",
             len(self._all_epics),
         )
 
@@ -236,22 +373,154 @@ class BotScheduler:
 
     @property
     def is_paused(self) -> bool:
-        """Return True when all scheduled jobs are suspended."""
-        return self._paused
+        """Return True when no registered job is currently active (all manual)."""
+        if not self._running:
+            return True
+        return not any(
+            (job := self._scheduler.get_job(entry["job_id"])) is not None
+            and job.next_run_time is not None
+            for entry in JOB_DEFINITIONS
+        )
 
-    def pause_bot(self) -> None:
-        """Suspend all scheduled jobs — no API calls will fire until resumed."""
-        if self._running and not self._paused:
-            self._scheduler.pause()
-            self._paused = True
-            logger.info("Bot paused — all scheduled jobs suspended")
+    def jobs_status(self) -> list[dict]:
+        """Return every registered job with its current auto/manual mode.
 
-    def resume_bot(self) -> None:
-        """Resume all suspended scheduled jobs."""
-        if self._paused:
-            self._scheduler.resume()
-            self._paused = False
-            logger.info("Bot resumed — all scheduled jobs active")
+        ``auto`` is True when the APScheduler job has a pending next run time; a
+        paused (manual) job reports ``next_run_time is None``. The end-of-day
+        schedule label is derived from the configured close hour.
+        """
+        statuses: list[dict] = []
+        for entry in JOB_DEFINITIONS:
+            job = self._scheduler.get_job(entry["job_id"]) if self._running else None
+            schedule = entry["schedule"]
+            if entry["action"] == "end_of_day":
+                schedule = f"Daily {self._settings.strategy_hour_close}:30 · Mon–Fri"
+            statuses.append(
+                {
+                    "action": entry["action"],
+                    "name": entry["name"],
+                    "description": entry["description"],
+                    "schedule": schedule,
+                    "danger": entry["danger"],
+                    "auto": bool(job and job.next_run_time is not None),
+                }
+            )
+        return statuses
+
+    async def set_job_mode(self, action: str, auto: bool) -> bool:
+        """Switch a single job between automatic (active) and manual (paused).
+
+        Persists the choice to the database so the mode survives restarts.
+        Returns False when the scheduler is not running or the action is unknown.
+        """
+        if not self._running:
+            return False
+        entry = next((e for e in JOB_DEFINITIONS if e["action"] == action), None)
+        if entry is None:
+            return False
+        job = self._scheduler.get_job(entry["job_id"])
+        if job is None:
+            return False
+        if auto:
+            job.resume()
+            logger.info("Job '%s' switched to automatic", action)
+        else:
+            job.pause()
+            logger.info("Job '%s' switched to manual", action)
+        await self._save_job_preference(action, auto)
+        return True
+
+    async def pause_bot(self) -> None:
+        """Switch every registered job to manual mode (all paused)."""
+        if not self._running:
+            return
+        for entry in JOB_DEFINITIONS:
+            job = self._scheduler.get_job(entry["job_id"])
+            if job:
+                job.pause()
+        self._paused = True
+        await self._save_all_job_preferences(auto=False)
+        logger.info("All jobs switched to manual (paused)")
+
+    async def resume_bot(self) -> None:
+        """Switch every registered job to automatic mode (all active)."""
+        if not self._running:
+            return
+        for entry in JOB_DEFINITIONS:
+            job = self._scheduler.get_job(entry["job_id"])
+            if job:
+                job.resume()
+        self._paused = False
+        await self._save_all_job_preferences(auto=True)
+        logger.info("All jobs switched to automatic (active)")
+
+    async def load_job_preferences(self) -> None:
+        """Restore the last-saved auto/manual mode for each registered job.
+
+        Called once on startup (after ``start()``) so the bot resumes with the
+        same job configuration the user had before the server was stopped.
+        Jobs with no persisted preference stay in manual (the startup default).
+        """
+        try:
+            async with self._session_factory() as session:
+                rows = await session.scalars(select(JobPreference))
+                prefs = {row.action: row.auto for row in rows}
+        except Exception as exc:
+            logger.warning("Could not load job preferences: %s", exc)
+            return
+
+        for entry in JOB_DEFINITIONS:
+            action = entry["action"]
+            if action not in prefs:
+                continue
+            job = self._scheduler.get_job(entry["job_id"])
+            if job is None:
+                continue
+            if prefs[action]:
+                job.resume()
+                logger.debug("Job '%s' restored to automatic", action)
+            else:
+                job.pause()
+
+        active = sum(1 for a, v in prefs.items() if v)
+        logger.info(
+            "Job preferences restored: %d/%d automatic", active, len(JOB_DEFINITIONS)
+        )
+
+    async def _save_job_preference(self, action: str, auto: bool) -> None:
+        """Upsert a single job preference row."""
+        now = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                existing = await session.get(JobPreference, action)
+                if existing:
+                    existing.auto = auto
+                    existing.updated_at = now
+                else:
+                    session.add(JobPreference(action=action, auto=auto, updated_at=now))
+                await session.commit()
+        except Exception as exc:
+            logger.error("Failed to save job preference for '%s': %s", action, exc)
+
+    async def _save_all_job_preferences(self, auto: bool) -> None:
+        """Overwrite every registered job preference with the same mode."""
+        now = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                for entry in JOB_DEFINITIONS:
+                    existing = await session.get(JobPreference, entry["action"])
+                    if existing:
+                        existing.auto = auto
+                        existing.updated_at = now
+                    else:
+                        session.add(
+                            JobPreference(
+                                action=entry["action"], auto=auto, updated_at=now
+                            )
+                        )
+                await session.commit()
+        except Exception as exc:
+            logger.error("Failed to save all job preferences: %s", exc)
 
     # ------------------------------------------------------------------
     # Manual trigger methods (called from web dashboard)
@@ -273,9 +542,17 @@ class BotScheduler:
         """Manually run one position monitoring pass."""
         await self._monitor_positions()
 
+    async def trigger_sync_positions(self) -> None:
+        """Manually run one position sync (reconcile DB against IG's live list)."""
+        await self._sync_positions()
+
     async def trigger_end_of_day(self) -> None:
         """Manually trigger end-of-day force close."""
         await self._end_of_day()
+
+    async def trigger_reconcile_pnl(self) -> None:
+        """Manually reconcile today's realized P&L against IG's history."""
+        await self._reconcile_pnl()
 
     async def trigger_daily_summary(self) -> None:
         """Manually generate today's P&L summary."""
@@ -323,13 +600,21 @@ class BotScheduler:
     # ------------------------------------------------------------------
 
     async def load_persisted_state(self) -> None:
-        """Restore the epic list from the database on startup.
+        """Restore the epic list, tradable subset, and price buffer from the database.
 
         The navigation-tree crawl is expensive and runs at most once per day, so
         its result is persisted to the ``epic`` table. Loading it here means a
         restart keeps the day's discovered epics instead of falling back to the
         small seed list. ``_epic_last_refresh`` is restored from the newest
         ``updated_at`` so the dashboard KPI still reflects freshness.
+
+        The tradable subset (``is_tradable=True``) is also restored so the
+        streaming subscriptions and analysis loop have a valid epic set immediately
+        on startup, without waiting for the +30 s ``startup_tradable_refresh`` job.
+
+        Finally, today's candles are loaded from the ``candle`` table back into the
+        ``PriceBuffer`` so the indicator pipeline is not blind on restart — it
+        resumes with the same history it had before the stop.
         """
         try:
             async with self._session_factory() as session:
@@ -339,6 +624,15 @@ class BotScheduler:
                 last = (
                     await session.scalars(select(func.max(Epic.updated_at)))
                 ).one_or_none()
+                tradable = list(
+                    (
+                        await session.scalars(
+                            select(Epic.name)
+                            .where(Epic.is_tradable.is_(True))
+                            .order_by(Epic.name)
+                        )
+                    ).all()
+                )
         except Exception as exc:
             logger.warning("Could not load persisted epic list: %s", exc)
             return
@@ -350,6 +644,29 @@ class BotScheduler:
                 "Restored %d epics from database (last refresh: %s)",
                 len(names),
                 last.isoformat() if last else "unknown",
+            )
+
+        if tradable:
+            self._tradable_epics = tradable
+            # Treat the restore time as the effective refresh so the KPI card turns
+            # green ("Today HH:MM") instead of red ("Not refreshed") on startup.
+            self._tradable_last_refresh = datetime.now(UTC)
+            logger.info("Restored %d tradable epics from database", len(tradable))
+
+        if tradable and self._candle_store is not None:
+            await self._rehydrate_buffer(tradable)
+
+        # Re-establish the Lightstreamer subscriptions from the persisted set so
+        # the feed resumes immediately on restart. Without this, the client stays
+        # connected with zero subscriptions until the user manually enables the
+        # hourly refresh job — leaving large gaps in candle history. This does not
+        # depend on the scheduler's job state (the one-shot startup refresh job is
+        # paused by the manual-mode default and may never run).
+        if tradable and self._streaming is not None:
+            await self._streaming.set_epics(tradable)
+            logger.info(
+                "Streaming: re-subscribed %d persisted tradable epics on startup",
+                len(tradable),
             )
 
     async def _persist_epic_list(
@@ -384,6 +701,60 @@ class BotScheduler:
             logger.info("Persisted %d epics to database", len(epics))
         except Exception as exc:
             logger.error("Failed to persist epic list: %s", exc)
+
+    async def _persist_tradable_flags(self, tradable_epics: list[str]) -> None:
+        """Mark which epics are currently tradable in the database.
+
+        Resets all ``is_tradable`` flags to False, then sets True only for the
+        given subset. Called after each successful ``_refresh_tradable_epics`` run
+        so the flag survives server restarts.
+        """
+        try:
+            async with self._session_factory() as session:
+                await session.execute(Epic.__table__.update().values(is_tradable=False))
+                if tradable_epics:
+                    await session.execute(
+                        Epic.__table__.update()
+                        .where(Epic.name.in_(tradable_epics))
+                        .values(is_tradable=True)
+                    )
+                await session.commit()
+            logger.debug("Persisted tradable flags for %d epics", len(tradable_epics))
+        except Exception as exc:
+            logger.error("Failed to persist tradable flags: %s", exc)
+
+    async def _rehydrate_buffer(self, epics: list[str]) -> None:
+        """Load today's candles from the DB into the price buffer.
+
+        Avoids a cold-start after a restart: the indicator pipeline resumes with
+        the same intra-day history it had before the server stopped, without any
+        extra IG API calls.  Only candles from today (midnight UTC) are loaded to
+        match the scope of the daily buffer reset in ``_daily_reset``.
+        """
+        if self._candle_store is None:
+            return
+
+        today_midnight = datetime.now(UTC).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        max_candles = DEFAULT_MAX_CANDLES
+        loaded = 0
+        for epic in epics:
+            try:
+                candles = await self._candle_store.fetch_candles(
+                    epic, since=today_midnight
+                )
+                if candles:
+                    self._buffer.update(epic, candles[-max_candles:])
+                    loaded += 1
+            except Exception as exc:
+                logger.warning("Buffer rehydration failed for %s: %s", epic, exc)
+        if loaded:
+            logger.info(
+                "Buffer rehydrated from DB: %d / %d epics had candles for today",
+                loaded,
+                len(epics),
+            )
 
     def _build_trade_config(self) -> TradeConfig:
         """Create TradeConfig from current settings."""
@@ -474,11 +845,10 @@ class BotScheduler:
             len(self._all_epics),
         )
 
+        await self._persist_tradable_flags(self._tradable_epics)
+
         if self._streaming is not None:
             await self._streaming.set_epics(self._tradable_epics)
-        else:
-            # Legacy polling path reseeds the 50-candle buffer once per hour.
-            self._bootstrapped_epics.clear()
 
     # ------------------------------------------------------------------
     # Scheduled tasks
@@ -525,13 +895,9 @@ class BotScheduler:
         # Phase 1 — fill the queue with all price fetches at once.
         async def _fetch(epic: str) -> tuple[str, BaseException | None]:
             try:
-                if epic not in self._bootstrapped_epics:
-                    candles = await self._market_data.fetch_candles(epic, "MINUTE", 50)
-                    self._bootstrapped_epics.add(epic)
-                else:
-                    candles = await self._market_data.fetch_latest_candles(
-                        epic, "MINUTE", 2
-                    )
+                candles = await self._market_data.fetch_latest_candles(
+                    epic, "MINUTE", 2
+                )
                 # Tap the freshly fetched candles into durable storage. This
                 # reuses the data already pulled for the buffer — no extra API
                 # call — so the chart pages keep a full history per epic.
@@ -651,6 +1017,28 @@ class BotScheduler:
                 except Exception as exc:
                     logger.error("Error monitoring position %s: %s", position.epic, exc)
 
+    async def _sync_positions(self) -> None:
+        """Reconcile DB open positions against IG's live position list.
+
+        Source of truth is a single ``GET /positions`` call. For every position
+        the DB still considers OPEN, ``TradingService.sync_open_positions`` refreshes
+        the live unrealized P&L (``euro`` / ``euro_max`` / ``euro_min``) from the
+        current bid, repairs a stale ``deal_id``, and marks as ``closed_externally``
+        any position IG no longer reports (closed by a broker-side stop/limit or
+        manually outside the bot). This is what keeps the dashboard in step with the
+        broker between strategy passes.
+        """
+        config = self._build_trade_config()
+        async with self._session_factory() as session:
+            trading = TradingService(self._client, session, config)
+            try:
+                live = await trading.sync_open_positions()
+            except Exception as exc:
+                logger.error("Position sync failed: %s", exc)
+                return
+        if live:
+            logger.debug("Position sync: %d position(s) live at IG", len(live))
+
     async def _end_of_day(self) -> None:
         """Force close all positions and generate daily summary."""
         logger.info("End of day: closing all positions")
@@ -663,9 +1051,29 @@ class BotScheduler:
 
         self._recorder.info(f"End of day: {closed} positions force-closed")
 
+        # Replace the just-recorded estimates with IG's authoritative figures.
+        await self._reconcile_pnl()
+
+    async def _reconcile_pnl(self) -> None:
+        """Reconcile today's realized P&L with IG's authoritative transactions."""
+        config = self._build_trade_config()
+        async with self._session_factory() as session:
+            trading = TradingService(self._client, session, config)
+            try:
+                updated = await trading.reconcile_realized_pnl()
+            except Exception as exc:
+                logger.error("Realized P&L reconcile failed: %s", exc)
+                return
+        if updated:
+            logger.info("Realized P&L reconcile: %d position(s) corrected", updated)
+
     async def _daily_summary(self) -> None:
         """Generate or update daily summary in the Day table."""
         today = date.today()
+
+        # Pull IG's authoritative realized P&L first so the summary totals are
+        # computed from the broker's figures, not our intra-day estimates.
+        await self._reconcile_pnl()
 
         async with self._session_factory() as session:
             # Get all closed positions for today
@@ -761,12 +1169,9 @@ class BotScheduler:
         logger.info("Weekly summary generated for week %s", week_str)
 
     async def _daily_reset(self) -> None:
-        """Reset price buffer at start of new day."""
+        """Clear the price buffer at midnight for a clean start of the new trading day."""
         self._buffer.clear()
-        # Force a fresh seed on the new day (the previous day's candles fall
-        # outside the rehydrate window anyway).
-        self._bootstrapped_epics.clear()
-        logger.info("Daily reset: buffer + bootstrap cache cleared")
+        logger.info("Daily reset: price buffer cleared")
 
     async def _dump_and_purge_candles(self) -> None:
         """Export candles past the retention window to disk, then delete them."""
