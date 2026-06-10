@@ -32,6 +32,8 @@ _QUOTA_EXCEEDED_CODES: frozenset[str] = frozenset(
     {
         "error.request.too.frequent",
         "error.public-api.exceeded-api-key-allowance",
+        "error.public-api.exceeded-account-allowance",
+        "error.public-api.exceeded-account-trading-allowance",
         "access.denied.reason.ip.blocked",
     }
 )
@@ -41,6 +43,13 @@ _QUOTA_EXCEEDED_CODES: frozenset[str] = frozenset(
 _BLOCK_COOLDOWNS: dict[str, int] = {
     "error.request.too.frequent": 120,  # 60 s window + 60 s margin
     "error.public-api.exceeded-api-key-allowance": 120,  # 60 s window + 60 s margin
+    "error.public-api.exceeded-account-allowance": 120,  # per-minute window + margin
+    "error.public-api.exceeded-account-trading-allowance": 120,  # per-minute + margin
+    # NOTE: ``error.public-api.exceeded-account-historical-data-allowance`` is
+    # deliberately NOT a global-block code. It is a *weekly* quota scoped to the
+    # price-history endpoints; a global block would freeze unrelated market and
+    # trading calls for no benefit (the weekly window does not reset for days).
+    # Those calls are instead left to fail fast and be abandoned by the queue.
     "access.denied.reason.ip.blocked": 3900,  # IP blocks need longer — 1 h + 5 min
 }
 _DEFAULT_BLOCK_COOLDOWN: int = 120
@@ -165,7 +174,8 @@ class APIGuard:
                         until.strftime("%H:%M:%S UTC") if until else "unknown time"
                     )
                     raise RuntimeError(
-                        f"IG API blocked since {since} — reason: {self._blocked_reason}. "
+                        f"IG API blocked since {since} — "
+                        f"reason: {self._blocked_reason}. "
                         f"Auto-unblocks at {until_str}."
                     )
 

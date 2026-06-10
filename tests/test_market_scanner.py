@@ -22,10 +22,13 @@ def _ig_error(epics_str: str, status_code: int, ig_error_code: str = "") -> IGAP
 def _make_settings(
     max_spread: float = 0.002,
     search_terms: list[str] | None = None,
+    max_funds: float = 0.0,
 ) -> MagicMock:
     s = MagicMock()
     s.strategy_max_spread_ratio = max_spread
     s.scanner_search_terms = search_terms if search_terms is not None else []
+    # 0 disables the funds filter — most tests don't supply margin data.
+    s.max_funds_per_position = max_funds
     return s
 
 
@@ -36,16 +39,25 @@ def _make_market_detail(
     status: str = "TRADEABLE",
     force_open: bool = True,
     stops_limits: bool = True,
+    margin_factor: float | None = None,
+    contract_size: float = 1.0,
+    min_deal: float = 1.0,
 ) -> dict:
+    instrument: dict = {
+        "epic": epic,
+        "name": f"Market {epic}",
+        "forceOpenAllowed": force_open,
+        "stopsLimitsAllowed": stops_limits,
+        "contractSize": contract_size,
+        "currencies": [{"code": "EUR", "exchangeRate": 1.0, "isDefault": True}],
+    }
+    if margin_factor is not None:
+        instrument["marginFactor"] = margin_factor
+        instrument["marginFactorUnit"] = "PERCENTAGE"
     return {
-        "instrument": {
-            "epic": epic,
-            "name": f"Market {epic}",
-            "forceOpenAllowed": force_open,
-            "stopsLimitsAllowed": stops_limits,
-        },
+        "instrument": instrument,
         "snapshot": {"bid": bid, "offer": offer, "marketStatus": status},
-        "dealingRules": {},
+        "dealingRules": {"minDealSize": {"value": min_deal}},
     }
 
 
@@ -84,7 +96,11 @@ def _make_client(
 
 @pytest.mark.asyncio
 async def test_search_discovers_epics_for_configured_terms() -> None:
-    """Should return epics from all matching search results."""
+    """Should return epics from all matching search results.
+
+    Product variants of the same underlying market (TODAY vs CFD on EUR/USD)
+    collapse to a single representative epic, preferring CFD.
+    """
     client = _make_client(
         search_results={
             "EUR/USD": [
@@ -99,8 +115,9 @@ async def test_search_discovers_epics_for_configured_terms() -> None:
 
     epics = await scanner.get_tradeable_epics()
 
-    assert "CS.D.EURUSD.TODAY.IP" in epics
+    # EUR/USD's two product variants collapse to one (CFD preferred).
     assert "CS.D.EURUSD.CFD.IP" in epics
+    assert "CS.D.EURUSD.TODAY.IP" not in epics
     assert "CS.D.GOLD.TODAY.IP" in epics
 
 
@@ -265,6 +282,96 @@ async def test_get_tradeable_markets_excludes_zero_price() -> None:
 
     assert "NO.PRICE" not in epics
     assert "HAS.PRICE" in epics
+
+
+# ------------------------------------------------------------------
+# Market-level dedup + funds filter (select_tradable)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tradable_collapses_product_variants_keeping_tightest_spread() -> None:
+    """IFMM/IMF variants of the same index collapse to one (tightest spread)."""
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value={
+            "marketDetails": [
+                # Same underlying DAX market, different product codes.
+                _make_market_detail("IX.D.DAX.IFMM.IP", bid=18000.0, offer=18010.0),
+                _make_market_detail("IX.D.DAX.IMF.IP", bid=18000.0, offer=18002.0),
+                _make_market_detail("CS.D.EURGBP.CFD.IP", bid=0.85, offer=0.8501),
+            ]
+        }
+    )
+    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.01))
+
+    result = await scanner.get_tradeable_markets(
+        ["IX.D.DAX.IFMM.IP", "IX.D.DAX.IMF.IP", "CS.D.EURGBP.CFD.IP"]
+    )
+    epics = [m.epic for m in result]
+
+    # Only one DAX variant survives — the tighter-spread IMF one.
+    assert "IX.D.DAX.IMF.IP" in epics
+    assert "IX.D.DAX.IFMM.IP" not in epics
+    assert "CS.D.EURGBP.CFD.IP" in epics
+
+
+@pytest.mark.asyncio
+async def test_tradable_drops_unaffordable_epics_keeps_unknown() -> None:
+    """Epics above the funds cap are dropped; unknown-funds epics are kept."""
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value={
+            "marketDetails": [
+                # margin = 1 * 1 * 20000 * 50% = 10000€ — over the 500€ cap.
+                _make_market_detail(
+                    "EXPENSIVE.EPIC",
+                    bid=20000.0,
+                    offer=20000.0,
+                    margin_factor=50.0,
+                ),
+                # margin = 1 * 1 * 100 * 5% = 5€ — under the cap.
+                _make_market_detail(
+                    "CHEAP.EPIC", bid=100.0, offer=100.0, margin_factor=5.0
+                ),
+                # No margin data → funds unknown → kept.
+                _make_market_detail("UNKNOWN.EPIC", bid=100.0, offer=100.1),
+            ]
+        }
+    )
+    scanner = MarketScanner(
+        client=client, settings=_make_settings(max_spread=0.01, max_funds=500.0)
+    )
+
+    result = await scanner.get_tradeable_markets(
+        ["EXPENSIVE.EPIC", "CHEAP.EPIC", "UNKNOWN.EPIC"]
+    )
+    epics = [m.epic for m in result]
+
+    assert "EXPENSIVE.EPIC" not in epics
+    assert "CHEAP.EPIC" in epics
+    assert "UNKNOWN.EPIC" in epics
+
+
+@pytest.mark.asyncio
+async def test_market_info_carries_funds_needed() -> None:
+    """funds_needed is computed onto MarketInfo from the /markets payload."""
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value={
+            "marketDetails": [
+                _make_market_detail(
+                    "FX.EPIC", bid=100.0, offer=200.0, margin_factor=10.0
+                ),
+            ]
+        }
+    )
+    scanner = MarketScanner(client=client, settings=_make_settings())
+
+    infos = await scanner.get_all_market_infos(["FX.EPIC"])
+
+    # funds = euro_per_point(1) * offer(200) * 10% = 1 * 200 * 0.10 = 20€
+    assert infos[0].funds_needed == pytest.approx(20.0)
 
 
 # ------------------------------------------------------------------

@@ -27,6 +27,7 @@ from urllib.parse import quote
 
 from src.api.client import IGAPIError, IGClient
 from src.config import Settings
+from src.utils.tools import funds_needed_for_one_buy, stop_loss_eur_for_one_buy
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,12 @@ class MarketInfo:
     spread_ratio: float
     dealing_enabled: bool
     status: str
+    # Estimated margin (EUR) to open one minimum-size BUY, or None when the
+    # /markets payload lacks the margin/contract/price data to compute it.
+    funds_needed: float | None = None
+    # Estimated EUR loss if that minimum-size BUY is stopped out at IG's minimum
+    # stop distance, or None when the contract/price/stop-rule data is missing.
+    stop_loss_eur: float | None = None
 
 
 @dataclass
@@ -115,16 +122,46 @@ class MarketScanner:
         )
         return market_unique
 
-    async def get_tradeable_markets(self, epics: list[str]) -> list[MarketInfo]:
-        """Fetch market details and keep only currently open/TRADEABLE markets.
+    async def get_all_market_infos(self, epics: list[str]) -> list[MarketInfo]:
+        """Fetch and parse market details for every epic (no filtering).
 
-        No spread filtering is applied here — the spread is checked later at
-        analysis time (``compute_signal``) against the live price buffer, so a
-        momentarily wide spread no longer drops an epic from tracking for a whole
-        hour.
+        Returns one ``MarketInfo`` per successfully-parsed market — including
+        closed/non-tradeable ones — so callers can enrich the full epic list
+        (name, funds needed) before narrowing it down to the tradable subset.
         """
-        markets = await self._fetch_market_details(epics)
-        return self._filter_open_tradeable(markets)
+        details = await self._fetch_market_details(epics)
+        infos: list[MarketInfo] = []
+        for detail in details:
+            info = self._parse_market(detail)
+            if info is not None:
+                infos.append(info)
+        return infos
+
+    async def get_tradeable_markets(self, epics: list[str]) -> list[MarketInfo]:
+        """Fetch market details and keep only the currently tradable subset.
+
+        Convenience wrapper around ``get_all_market_infos`` + ``select_tradable``
+        for callers that don't need the full (unfiltered) market list.
+        """
+        infos = await self.get_all_market_infos(epics)
+        return self.select_tradable(infos)
+
+    def select_tradable(self, infos: list[MarketInfo]) -> list[MarketInfo]:
+        """Narrow parsed markets down to the tradable subscription set.
+
+        Three stages, in order:
+        1. Keep only currently open/TRADEABLE markets with a live price
+           (``_filter_open_tradeable``). No spread filtering — the spread is
+           checked later at analysis time against the live price buffer.
+        2. Drop markets too expensive to ever open (funds needed for one BUY
+           above ``max_funds_per_position``). Markets with unknown funds are
+           kept, since we can't prove they're unaffordable.
+        3. Deduplicate by underlying market, keeping the tightest-spread variant
+           (e.g. IX.D.DAX.IFMM.IP vs IX.D.DAX.IMF.IP → one DAX subscription).
+        """
+        open_tradeable = self._filter_open_tradeable(infos)
+        affordable = self._filter_affordable(open_tradeable)
+        return self._dedupe_markets(affordable)
 
     # ------------------------------------------------------------------
     # Market-level deduplication
@@ -132,12 +169,23 @@ class MarketScanner:
 
     @staticmethod
     def _market_base_key(epic: str) -> str:
-        """Strip product-type segments to get the underlying market key.
+        """Strip the product-type segment to get the underlying market key.
 
         CS.D.EURGBP.CFD.IP  →  CS.D.EURGBP.IP
         CS.D.EURGBP.MINI.IP →  CS.D.EURGBP.IP
+        IX.D.DAX.IFMM.IP    →  IX.D.DAX.IP
+        IX.D.DAX.IMF.IP     →  IX.D.DAX.IP
+
+        IG epics follow ``A.B.NAME.PRODUCT.SUFFIX`` (5 segments) where the 4th
+        segment is the product type. For that canonical shape we drop the 4th
+        segment generically so variants the fixed ``_PRODUCT_SEGMENTS`` list
+        doesn't know about (IFMM/IMF/… for indices) still collapse together.
+        Non-canonical epics fall back to stripping only known product segments.
         """
-        return ".".join(p for p in epic.split(".") if p not in _PRODUCT_SEGMENTS)
+        parts = epic.split(".")
+        if len(parts) == 5:
+            return ".".join(parts[:3] + parts[4:])
+        return ".".join(p for p in parts if p not in _PRODUCT_SEGMENTS)
 
     def _deduplicate_by_market(self, epics: list[str]) -> list[str]:
         """Return one epic per underlying market, preserving discovery order.
@@ -332,7 +380,8 @@ class MarketScanner:
             if len(epics) == 1:
                 self._poison_epics.add(epics[0])
                 logger.warning(
-                    "MarketScanner: dropping unresolvable epic %s — %s (cached, won't retry)",
+                    "MarketScanner: dropping unresolvable epic %s — %s "
+                    "(cached, won't retry)",
                     epics[0],
                     exc,
                 )
@@ -385,7 +434,7 @@ class MarketScanner:
             result.append(info)
         return result
 
-    def _filter_open_tradeable(self, market_details: list[dict]) -> list[MarketInfo]:
+    def _filter_open_tradeable(self, infos: list[MarketInfo]) -> list[MarketInfo]:
         """Keep only markets that are currently open and tradeable.
 
         Mirrors the PHP trade-time check (apiGetMarketAndPostOpenClose.php) minus
@@ -398,14 +447,9 @@ class MarketScanner:
         result is diagnosable.
         """
         result: list[MarketInfo] = []
-        unparseable = 0
         no_price = 0
         status_counts: dict[str, int] = {}
-        for detail in market_details:
-            info = self._parse_market(detail)
-            if info is None:
-                unparseable += 1
-                continue
+        for info in infos:
             if info.status != "TRADEABLE":
                 status_counts[info.status] = status_counts.get(info.status, 0) + 1
                 continue
@@ -414,21 +458,72 @@ class MarketScanner:
                 continue
             result.append(info)
 
-        if len(result) < len(market_details):
+        if len(result) < len(infos):
             non_tradeable = ", ".join(
                 f"{status}={count}" for status, count in sorted(status_counts.items())
             )
             logger.info(
                 "MarketScanner: filter — %d/%d open/tradeable "
-                "(rejected: %d non-tradeable [%s], %d no-price, %d unparseable)",
+                "(rejected: %d non-tradeable [%s], %d no-price)",
                 len(result),
-                len(market_details),
+                len(infos),
                 sum(status_counts.values()),
                 non_tradeable or "none",
                 no_price,
-                unparseable,
             )
         return result
+
+    def _filter_affordable(self, infos: list[MarketInfo]) -> list[MarketInfo]:
+        """Drop markets too expensive to ever open one minimum-size BUY.
+
+        Removes markets whose ``funds_needed`` exceeds
+        ``settings.max_funds_per_position``. Markets with an unknown
+        ``funds_needed`` (None) are kept — we can't prove they're unaffordable,
+        and dropping them silently would hide tradable markets.
+        """
+        cap = self.settings.max_funds_per_position
+        if cap <= 0:
+            return infos
+        result = [
+            info
+            for info in infos
+            if info.funds_needed is None or info.funds_needed <= cap
+        ]
+        dropped = len(infos) - len(result)
+        if dropped:
+            logger.info(
+                "MarketScanner: dropped %d epic(s) needing > %.0f€ to open one BUY",
+                dropped,
+                cap,
+            )
+        return result
+
+    def _dedupe_markets(self, infos: list[MarketInfo]) -> list[MarketInfo]:
+        """Collapse product variants of the same underlying to one market.
+
+        Groups by ``_market_base_key`` (which ignores the product-type segment)
+        and keeps the tightest-spread variant per group — so the same price curve
+        is never analyzed twice (e.g. IX.D.DAX.IFMM.IP and IX.D.DAX.IMF.IP yield a
+        single DAX subscription).
+        """
+        groups: dict[str, MarketInfo] = {}
+        dropped = 0
+        for info in infos:
+            key = self._market_base_key(info.epic)
+            best = groups.get(key)
+            if best is None:
+                groups[key] = info
+            else:
+                dropped += 1
+                if info.spread_ratio < best.spread_ratio:
+                    groups[key] = info
+        if dropped:
+            logger.info(
+                "MarketScanner: collapsed %d product-variant duplicate(s) "
+                "(kept tightest spread per market)",
+                dropped,
+            )
+        return list(groups.values())
 
     @staticmethod
     def _parse_market(detail: dict) -> MarketInfo | None:
@@ -438,7 +533,16 @@ class MarketScanner:
             snapshot = detail.get("snapshot", {})
 
             epic = instrument.get("epic", "")
-            name = instrument.get("name", "")
+            # The instrument name lives under ``instrument.name`` in the rich
+            # /markets payload, but some endpoint versions surface it as
+            # ``instrumentName`` (search-style) instead — fall back so the Epic
+            # List "Name" column is never blank when a name is available.
+            name = (
+                instrument.get("name")
+                or instrument.get("marketName")
+                or detail.get("instrumentName")
+                or ""
+            )
             bid = float(snapshot.get("bid") or 0)
             offer = float(snapshot.get("offer") or 0)
             status = snapshot.get("marketStatus", "CLOSED")
@@ -462,6 +566,8 @@ class MarketScanner:
                 spread_ratio=spread_ratio,
                 dealing_enabled=dealing_enabled,
                 status=status,
+                funds_needed=funds_needed_for_one_buy(detail),
+                stop_loss_eur=stop_loss_eur_for_one_buy(detail),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("MarketScanner: failed to parse market detail: %s", exc)

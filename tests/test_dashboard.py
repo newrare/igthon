@@ -6,6 +6,7 @@ which the client swaps in place every two seconds instead of reloading the page.
 """
 
 from datetime import UTC, date, datetime, time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,7 @@ _FRAGMENT_KEYS = {
     "day_history",
     "queue_modal",
     "api_modal",
+    "epic_list_modal",
     "positions_modal",
     "closed_positions_modal",
     "actions",
@@ -52,6 +54,8 @@ def _base_kpis() -> dict:
         "tradable_count": 40,
         "tradable_kpi_color": "#4ade80",
         "tradable_refresh_label": "Today 10:00",
+        "wallet_available": 1234.5,
+        "wallet_used": 200.0,
     }
 
 
@@ -146,10 +150,61 @@ class TestBuildFragments:
         assert "IX.D.DAX.IFMM.IP" in rows
         assert "18000.0" in rows
 
+    def test_market_rows_render_value_per_point(self):
+        state = _base_state(
+            market_summary=[
+                {
+                    "epic": "IX.D.DAX.IFMM.IP",
+                    "bid": 18000.0,
+                    "offer": 18002.0,
+                    "spread": 2.0,
+                    "candles": 30,
+                    "high": 18100.0,
+                    "low": 17900.0,
+                    "value_per_point": 1.5,
+                }
+            ]
+        )
+        rows = _build_fragments(state)["market_rows"]
+        assert "1.50€" in rows
+
+    def test_market_rows_value_per_point_dash_when_zero(self):
+        state = _base_state(
+            market_summary=[
+                {
+                    "epic": "IX.D.DAX.IFMM.IP",
+                    "bid": 18000.0,
+                    "offer": 18002.0,
+                    "spread": 2.0,
+                    "candles": 30,
+                    "high": 18100.0,
+                    "low": 17900.0,
+                    "value_per_point": 0.0,
+                }
+            ]
+        )
+        rows = _build_fragments(state)["market_rows"]
+        assert "0.00€" not in rows
+
     def test_no_bot_tile_in_kpi_bar(self):
         # The Bot pause/resume KPI tile was replaced by the Actions section.
         frags = _build_fragments(_base_state())
         assert 'id="kpi-bot"' not in frags["kpi_bar"]
+
+    def test_wallet_tile_shows_available_and_used(self):
+        frags = _build_fragments(_base_state())
+        kpi_bar = frags["kpi_bar"]
+        assert "Wallet" in kpi_bar
+        assert "1,234.50€" in kpi_bar  # available
+        assert "In use: 200.00€" in kpi_bar
+
+    def test_wallet_tile_handles_missing_balance(self):
+        state = _base_state(
+            kpis={**_base_kpis(), "wallet_available": None, "wallet_used": None}
+        )
+        kpi_bar = _build_fragments(state)["kpi_bar"]
+        assert "Wallet" in kpi_bar
+        assert "In use: —" in kpi_bar
 
     def test_open_positions_rendered_in_modal(self):
         pos = SimpleNamespace(
@@ -244,9 +299,18 @@ class TestRenderDashboard:
 
     def test_page_polls_instead_of_reloading(self):
         html = _render_dashboard(_settings(), _base_state())
-        assert "/api/dashboard-fragments" in html
+        # The polling engine now lives in the external static script.
+        assert "/static/dashboard.js" in html
         assert "location.reload()" not in html
         assert "Live — updating every 2 s" in html
+
+    def test_engine_script_polls_fragments_endpoint(self):
+        # The extracted JS engine still drives the live fragment polling.
+        js = (
+            Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
+        ).read_text()
+        assert "/api/dashboard-fragments" in js
+        assert "location.reload()" not in js
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -321,3 +385,109 @@ class TestFragmentsEndpoint:
             resp = await client.get("/")
         assert resp.status_code == 200
         assert 'id="frag-kpi_bar"' in resp.text
+
+
+# ── /api/positions/funds/{epic} endpoint (BUY hover) ─────────────────────────
+
+
+def _candle(bid: float) -> "object":
+    """Build a minimal candle whose close prices are ``bid`` (offer = bid + 1)."""
+    from src.services.price_buffer import Candle
+
+    return Candle(
+        timestamp=datetime(2026, 6, 9, 10, 0, tzinfo=UTC),
+        bid_open=bid,
+        bid_close=bid,
+        bid_high=bid,
+        bid_low=bid,
+        offer_open=bid + 1,
+        offer_close=bid + 1,
+        offer_high=bid + 1,
+        offer_low=bid + 1,
+    )
+
+
+class _FakeQueue:
+    """Stand-in for APIQueue: returns a fixed ``/markets`` payload, counts calls."""
+
+    def __init__(self, market_data: dict) -> None:
+        self._market_data = market_data
+        self.calls = 0
+
+    async def get(self, endpoint: str, **kwargs) -> dict:
+        self.calls += 1
+        return self._market_data
+
+
+_MARKET_DATA = {
+    "instrument": {
+        "marginFactor": "5",
+        "marginFactorUnit": "PERCENTAGE",
+        "contractSize": "1",
+        "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+    },
+    "dealingRules": {"minDealSize": {"value": 1}},
+    "snapshot": {"marketStatus": "TRADEABLE"},
+}
+
+
+def _funds_app(market_data: dict, balance: dict | None = None) -> object:
+    epic = "IX.D.DAX.IFMM.IP"
+    buffer = PriceBuffer()
+    buffer.add_candle(epic, _candle(1000.0))
+    queue = _FakeQueue(market_data)
+    app = create_app(settings=_settings(), buffer=buffer, api_queue=queue)
+    if balance is not None:
+        app.state.account_balance = balance
+    return app, queue, epic
+
+
+class TestPositionFundsEndpoint:
+    async def test_returns_margin_and_sufficient_verdict(self):
+        app, _queue, epic = _funds_app(_MARKET_DATA, balance={"available": 1000.0})
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/positions/funds/{epic}")).json()
+        # margin = euro_per_point(1) × price(1000) × 5% = 50.
+        assert data["margin_eur"] == 50.0
+        assert data["available_eur"] == 1000.0
+        assert data["sufficient"] is True
+
+    async def test_insufficient_when_balance_below_margin(self):
+        app, _queue, epic = _funds_app(_MARKET_DATA, balance={"available": 10.0})
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/positions/funds/{epic}")).json()
+        assert data["margin_eur"] == 50.0
+        assert data["sufficient"] is False
+
+    async def test_market_data_cached_across_hovers(self):
+        app, queue, epic = _funds_app(_MARKET_DATA, balance={"available": 1000.0})
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get(f"/api/positions/funds/{epic}")
+            await client.get(f"/api/positions/funds/{epic}")
+        # Second hover is served from the per-epic cache — only one IG call.
+        assert queue.calls == 1
+
+    async def test_unknown_margin_factor_yields_null_margin(self):
+        market = {
+            **_MARKET_DATA,
+            "instrument": {
+                "contractSize": "1",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+        }
+        app, _queue, epic = _funds_app(market, balance={"available": 1000.0})
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/positions/funds/{epic}")).json()
+        assert data["margin_eur"] is None
+        assert data["sufficient"] is False
+
+    async def test_no_price_data_returns_400(self):
+        app, _queue, _epic = _funds_app(_MARKET_DATA)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/positions/funds/UNKNOWN.EPIC")
+        assert resp.status_code == 400

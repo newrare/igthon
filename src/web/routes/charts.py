@@ -40,7 +40,6 @@ def _nav(active: str) -> str:
         <span class="nav-label">Nav</span>
         <ul>
             <li><a href="/"{cls("dashboard")}>Dashboard</a></li>
-            <li><a href="/epics"{cls("epics")}>Epic List</a></li>
             <li><a href="/epics/tradable"{cls("tradable")}>Tradable</a></li>
             <li><a href="/charts"{cls("charts")}>Charts</a></li>
             <li><a href="/positions" target="_blank">Positions</a></li>

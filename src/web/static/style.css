@@ -303,29 +303,9 @@ a.kpi-tile:hover {
 .config-key  { font-family: var(--mono); color: var(--amber); font-size: 0.72rem; font-weight: 700; }
 .config-value { color: var(--text-muted); font-size: 0.83rem; margin-top: 0.15rem; }
 
-/* ── Market table ───────────────────────────────────────────── */
-.market-table { width: 100%; border-collapse: collapse; }
-
-.market-table th {
-  background: var(--bg);
-  color: var(--primary);
-  padding: 0.6rem 0.75rem;
-  text-align: left;
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  border-bottom: 2px solid var(--border-strong);
-  font-weight: 700;
-}
-
-.market-table td {
-  padding: 0.6rem 0.75rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.82rem;
-}
-
-.market-table tbody tr:hover { background: var(--surface-2); }
-
+/* ── Shared table cell helpers ──────────────────────────────────
+   The market table now shares the `.err-table` look (single source of
+   truth); only these cell-content helpers remain table-agnostic. */
 .epic-col { color: var(--primary); font-weight: 700; font-family: var(--mono); font-size: 0.77rem; }
 .number    { text-align: right; font-family: var(--mono); color: var(--text-muted); }
 
@@ -603,7 +583,8 @@ a.kpi-tile:hover {
 
 .filter-wrap { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; }
 
-#filter-input {
+#filter-input,
+#epic-modal-filter {
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
@@ -614,10 +595,13 @@ a.kpi-tile:hover {
   width: 220px;
   transition: border-color var(--transition);
 }
-#filter-input:focus       { outline: none; border-color: var(--primary); }
-#filter-input::placeholder { color: var(--text-dim); }
+#filter-input:focus,
+#epic-modal-filter:focus       { outline: none; border-color: var(--primary); }
+#filter-input::placeholder,
+#epic-modal-filter::placeholder { color: var(--text-dim); }
 
-#filter-count { font-size: 0.73rem; color: var(--text-dim); white-space: nowrap; }
+#filter-count,
+#epic-modal-count { font-size: 0.73rem; color: var(--text-dim); white-space: nowrap; }
 
 /* Epic list table */
 table { width: 100%; border-collapse: collapse; }
@@ -739,3 +723,156 @@ footer {
   #toast-container { left: 1rem; right: 1rem; bottom: 1rem; }
   .toast { max-width: 100%; }
 }
+
+/* ── Dashboard-specific rules (migrated from the former inline <style>) ── */
+/* Table overrides — inlined to bypass browser CSS cache */
+.err-table     { border: 1px solid #4a3a30; border-radius: 4px; overflow: hidden; }
+.err-table td,
+.err-table th  { text-align: left !important; }
+.err-table td  { border-right: 1px solid #4a3a30; border-bottom: 1px solid #4a3a30; }
+.err-table th  { border-right: 1px solid #4a3a30; }
+.err-table td:last-child,
+.err-table th:last-child { border-right: none; }
+.err-table tbody tr:last-child td { border-bottom: none; }
+.err-table tbody tr:nth-child(odd)  { background: #1c1714; }
+.err-table tbody tr:nth-child(even) { background: #251e19; }
+.err-table tbody tr:hover           { background: #2e261f; }
+/* KPI tiles — clickable variant and refresh icon */
+.kpi-tile.clickable { cursor: pointer; transition: background 0.15s; }
+.kpi-tile.clickable:hover { background: #2a201a; }
+.kpi-refresh-btn {
+    position: absolute; top: 0.4rem; right: 0.5rem;
+    background: none; border: none; color: #5f5248;
+    cursor: pointer; font-size: 1rem; line-height: 1;
+    padding: 0.3rem 0.4rem; margin: 0.1rem; border-radius: 4px;
+    transition: color 0.15s, background 0.15s;
+}
+.kpi-refresh-btn:hover { color: #E07B39; background: rgba(224,123,57,0.12); }
+.kpi-refresh-btn:disabled { opacity: 0.35; cursor: default; }
+.clickable-row { cursor: pointer; transition: background 0.1s; }
+.clickable-row:hover { background: #2e261f !important; }
+/* Buy button in market table */
+.buy-btn {
+    background: #1a3a1a; border: 1px solid #2d5a2d; color: #4ade80;
+    cursor: pointer; font-size: 0.75rem; font-weight: 600;
+    padding: 0.2rem 0.6rem; border-radius: 4px;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+}
+.buy-btn:hover { background: #16803c; color: #f0fdf4; border-color: #16803c; }
+.buy-btn:disabled { opacity: 0.4; cursor: default; }
+/* Close position button in open positions modal */
+.close-pos-btn {
+    background: #3a1a1a; border: 1px solid #5a2d2d; color: #ef4444;
+    cursor: pointer; font-size: 0.75rem; font-weight: 600;
+    padding: 0.2rem 0.6rem; border-radius: 4px;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+}
+.close-pos-btn:hover { background: #991b1b; color: #fef2f2; border-color: #991b1b; }
+.close-pos-btn:disabled { opacity: 0.4; cursor: default; }
+/* Toast notifications */
+#toast-container {
+    position: fixed; bottom: 1.5rem; right: 1.5rem;
+    z-index: 9999; display: flex; flex-direction: column-reverse;
+    gap: 0.5rem; pointer-events: none;
+}
+.toast {
+    display: flex; align-items: flex-start; gap: 0.65rem;
+    padding: 0.7rem 1rem; border-radius: 6px; border-left: 3px solid;
+    background: #1e293b; color: #e2e8f0; font-size: 0.82rem;
+    line-height: 1.4; min-width: 220px; max-width: 340px;
+    pointer-events: all; cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.45);
+    animation: toast-in 0.22s ease forwards;
+}
+.toast.toast-out { animation: toast-out 0.28s ease forwards; pointer-events: none; }
+.toast-success { border-left-color: #4ade80; }
+.toast-success .toast-icon { color: #4ade80; }
+.toast-error   { border-left-color: #ef4444; }
+.toast-error   .toast-icon { color: #ef4444; }
+.toast-warning { border-left-color: #f59e0b; }
+.toast-warning .toast-icon { color: #f59e0b; }
+.toast-info    { border-left-color: #60a5fa; }
+.toast-info    .toast-icon { color: #60a5fa; }
+.toast-icon { flex-shrink: 0; margin-top: 0.1rem; display: flex; }
+.toast-icon svg { width: 14px; height: 14px; }
+.toast-body { flex: 1; min-width: 0; }
+.toast-title { font-weight: 600; margin-bottom: 0.1rem; }
+.toast-msg   { color: #94a3b8; word-break: break-word; }
+@keyframes toast-in {
+    from { opacity: 0; transform: translateX(1.5rem); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes toast-out {
+    from { opacity: 1; transform: translateX(0); max-height: 120px; }
+    to   { opacity: 0; transform: translateX(1.5rem); max-height: 0; padding-top: 0; padding-bottom: 0; }
+}
+/* Log section */
+.log-pause-btn {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    margin-left: auto;
+    background: #1c1714; border: 1px solid #4a3a30; color: #94a3b8;
+    cursor: pointer; font-size: 0.68rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    padding: 0.2rem 0.6rem; border-radius: 4px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.log-pause-btn:hover  { border-color: #94a3b8; color: #e2e8f0; }
+.log-pause-btn.paused { background: var(--amber); color: #0f172a; border-color: var(--amber); }
+.logs-toolbar { display: flex; gap: 0.5rem; margin-bottom: 0.6rem; align-items: center; flex-wrap: wrap; }
+.log-filter-btn {
+    background: #1c1714; border: 1px solid #4a3a30; color: #94a3b8;
+    cursor: pointer; font-size: 0.75rem; font-weight: 600;
+    padding: 0.25rem 0.75rem; border-radius: 4px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.log-filter-btn:hover { border-color: #94a3b8; color: #e2e8f0; }
+.log-filter-btn.active[data-level="all"]     { background: #252525; color: #e2e8f0; border-color: #94a3b8; }
+.log-filter-btn.active[data-level="INFO"]    { background: #0f2233; color: #60a5fa; border-color: #60a5fa; }
+.log-filter-btn.active[data-level="WARNING"] { background: #2a1c08; color: #f59e0b; border-color: #f59e0b; }
+.log-filter-btn.active[data-level="ERROR"]   { background: #2a0f0f; color: #ef4444; border-color: #ef4444; }
+.logs-list { display: flex; flex-direction: column; gap: 0.1rem; font-family: monospace; font-size: 0.78rem; }
+.log-row { display: flex; align-items: baseline; gap: 0.5rem; padding: 0.18rem 0.4rem; border-radius: 3px; }
+.log-row:hover { background: #2e261f; }
+.log-ts { color: #4b5563; white-space: nowrap; flex-shrink: 0; min-width: 5rem; }
+.log-badge { font-size: 0.67rem; font-weight: 700; padding: 0.05rem 0.3rem; border-radius: 3px; flex-shrink: 0; min-width: 2.5rem; text-align: center; }
+.log-badge.info    { background: #0f2233; color: #60a5fa; }
+.log-badge.warning { background: #2a1c08; color: #f59e0b; }
+.log-badge.error   { background: #2a0f0f; color: #ef4444; }
+.log-badge.debug   { background: #1a1a2a; color: #64748b; }
+.log-name { color: #4b5563; flex-shrink: 0; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-msg  { color: #cbd5e1; word-break: break-all; flex: 1; }
+.log-empty { color: #475569; padding: 1rem; text-align: center; }
+
+/* ── BUY funds tooltip (margin required, on hover) ───────────────────────────── */
+#funds-tooltip {
+  position: fixed;
+  z-index: 9998;
+  background: #1c1714;
+  border: 1px solid #4a3a30;
+  border-radius: 6px;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.78rem;
+  color: #e2e8f0;
+  min-width: 168px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+#funds-tooltip .ft-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  line-height: 1.5;
+}
+#funds-tooltip .ft-row span { color: #94a3b8; }
+#funds-tooltip .ft-verdict {
+  margin-top: 0.35rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid #4a3a30;
+  font-weight: 600;
+  text-align: center;
+}
+#funds-tooltip .ft-ok   { color: #4ade80; }
+#funds-tooltip .ft-low  { color: #ef4444; }
+#funds-tooltip .ft-muted { color: #94a3b8; }

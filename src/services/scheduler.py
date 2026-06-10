@@ -137,7 +137,9 @@ JOB_DEFINITIONS: list[dict[str, str]] = [
         "action": "dump_and_purge_candles",
         "job_id": "dump_and_purge_candles",
         "name": "Dump & Purge Candles",
-        "description": "Export candles past the retention window to CSV, then delete them.",
+        "description": (
+            "Export candles past the retention window to CSV, then delete them."
+        ),
         "schedule": "Daily 02:00",
         "danger": "warn",
     },
@@ -676,7 +678,8 @@ class BotScheduler:
 
         Existing rows are pruned and the new list inserted so the table always
         mirrors the current day's navigation-tree crawl. Enrichment columns
-        (description/type/deposit) are intentionally not touched here.
+        (name/funds) are populated separately by ``_persist_epic_enrichment``
+        during the hourly tradable refresh.
         """
         try:
             async with self._session_factory() as session:
@@ -701,6 +704,45 @@ class BotScheduler:
             logger.info("Persisted %d epics to database", len(epics))
         except Exception as exc:
             logger.error("Failed to persist epic list: %s", exc)
+
+    async def _persist_epic_enrichment(self, infos: list) -> None:
+        """Store the human name and funds-needed for each fetched epic.
+
+        Reuses the existing ``Epic.description`` (instrument name) and
+        ``Epic.deposit`` (margin in EUR to open one minimum-size BUY) columns,
+        plus ``Epic.stop_loss`` (EUR loss if that BUY is stopped out), so the
+        Epic List modal can show real data. Only updates rows that already exist
+        (created by ``_persist_epic_list``); a missing figure is stored as NULL
+        so the UI renders it as unknown.
+        """
+        if not infos:
+            return
+        try:
+            async with self._session_factory() as session:
+                for info in infos:
+                    funds = (
+                        round(float(info.funds_needed), 3)
+                        if info.funds_needed is not None
+                        else None
+                    )
+                    stop_loss = (
+                        round(float(info.stop_loss_eur), 3)
+                        if info.stop_loss_eur is not None
+                        else None
+                    )
+                    await session.execute(
+                        Epic.__table__.update()
+                        .where(Epic.name == info.epic)
+                        .values(
+                            description=info.name or None,
+                            deposit=funds,
+                            stop_loss=stop_loss,
+                        )
+                    )
+                await session.commit()
+            logger.debug("Persisted enrichment for %d epics", len(infos))
+        except Exception as exc:
+            logger.error("Failed to persist epic enrichment: %s", exc)
 
     async def _persist_tradable_flags(self, tradable_epics: list[str]) -> None:
         """Mark which epics are currently tradable in the database.
@@ -812,10 +854,16 @@ class BotScheduler:
             return
 
         try:
-            tradeable = await self._scanner.get_tradeable_markets(self._all_epics)
+            infos = await self._scanner.get_all_market_infos(self._all_epics)
         except Exception as exc:
             logger.error("Tradable epic refresh failed: %s", exc)
             return
+
+        # Enrich the persisted epic list (name + funds needed) from the same
+        # batch fetch — the Epic List modal reads these columns from the DB.
+        await self._persist_epic_enrichment(infos)
+
+        tradeable = self._scanner.select_tradable(infos)
 
         # IG caps Lightstreamer at 40 subscriptions per connection. When streaming
         # is active, keep only the tightest-spread markets (best liquidity proxy,
@@ -917,7 +965,8 @@ class BotScheduler:
                 if isinstance(error, IGAPIError):
                     if error.response.status_code == 403:
                         logger.warning(
-                            "Prices 403 for %s (IG code: %s) — blacklisted until next hourly refresh",
+                            "Prices 403 for %s (IG code: %s) — "
+                            "blacklisted until next hourly refresh",
                             epic,
                             error.ig_error_code or "no errorCode in response",
                         )
@@ -1169,7 +1218,8 @@ class BotScheduler:
         logger.info("Weekly summary generated for week %s", week_str)
 
     async def _daily_reset(self) -> None:
-        """Clear the price buffer at midnight for a clean start of the new trading day."""
+        """Clear the price buffer at midnight for a clean start of the new
+        trading day."""
         self._buffer.clear()
         logger.info("Daily reset: price buffer cleared")
 

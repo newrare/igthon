@@ -15,15 +15,23 @@ logger = logging.getLogger("ig_bot")
 
 
 class LogBuffer(logging.Handler):
-    """Rolling in-memory log handler — keeps the last N INFO+ records.
+    """Rolling in-memory log handler — keeps the last N records *per level*.
+
+    Each severity (INFO, WARNING, ERROR, …) has its own bounded deque, so a
+    flood of INFO records can never evict the most recent WARNING/ERROR ones:
+    the last ``max_per_level`` of each level are always retained. A monotonic
+    sequence number stamped on every record lets get_all() merge the buckets
+    back into chronological order.
 
     Thread-safe: emit() is called within the handler's own lock (via handle()),
-    and get_all() also acquires it before reading the deque.
+    and get_all() also acquires it before reading the buckets.
     """
 
-    def __init__(self, max_entries: int = 30) -> None:
+    def __init__(self, max_per_level: int = 30) -> None:
         super().__init__(level=logging.INFO)
-        self._entries: collections.deque = collections.deque(maxlen=max_entries)
+        self._max_per_level = max_per_level
+        self._buckets: dict[str, collections.deque] = {}
+        self._seq = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -31,13 +39,21 @@ class LogBuffer(logging.Handler):
             if record.exc_info and record.exc_info[0]:
                 import traceback
 
-                tb = traceback.format_exception_only(record.exc_info[0], record.exc_info[1])
+                tb = traceback.format_exception_only(
+                    record.exc_info[0], record.exc_info[1]
+                )
                 msg += " | " + "".join(tb).strip()
         except Exception:
             msg = str(record.msg)
         ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
-        self._entries.append(
+        bucket = self._buckets.get(record.levelname)
+        if bucket is None:
+            bucket = collections.deque(maxlen=self._max_per_level)
+            self._buckets[record.levelname] = bucket
+        self._seq += 1
+        bucket.append(
             {
+                "seq": self._seq,
                 "ts": ts,
                 "level": record.levelname,
                 "name": record.name,
@@ -46,11 +62,14 @@ class LogBuffer(logging.Handler):
         )
 
     def get_all(self) -> list[dict]:
+        """Return all retained entries, oldest first, merged across levels."""
         self.acquire()
         try:
-            return list(self._entries)
+            merged = [entry for bucket in self._buckets.values() for entry in bucket]
         finally:
             self.release()
+        merged.sort(key=lambda e: e["seq"])
+        return [{k: v for k, v in e.items() if k != "seq"} for e in merged]
 
 
 def setup_logging(level: str = "INFO") -> LogBuffer:
@@ -75,7 +94,7 @@ def setup_logging(level: str = "INFO") -> LogBuffer:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
-    buf = LogBuffer(max_entries=30)
+    buf = LogBuffer(max_per_level=30)
     logging.getLogger().addHandler(buf)
     return buf
 

@@ -5,7 +5,10 @@ import pytest
 from src.utils.tools import (
     conversion_rate,
     euro_per_point,
+    funds_needed_for_one_buy,
+    margin_factor_pct,
     parse_ig_pnl,
+    stop_loss_eur_for_one_buy,
 )
 
 
@@ -121,3 +124,123 @@ class TestEuroPerPoint:
             }
         }
         assert euro_per_point(market_data, 3, "EUR") == pytest.approx(300000.0)
+
+
+class TestMarginFactorPct:
+    """margin_factor_pct reads marginFactor or marginDepositBands."""
+
+    def test_flat_percentage(self):
+        instrument = {"marginFactor": "5", "marginFactorUnit": "PERCENTAGE"}
+        assert margin_factor_pct(instrument) == pytest.approx(5.0)
+
+    def test_fraction_unit_scaled_to_percent(self):
+        instrument = {"marginFactor": "0.05", "marginFactorUnit": "POINTS"}
+        assert margin_factor_pct(instrument) == pytest.approx(5.0)
+
+    def test_margin_deposit_bands_fallback(self):
+        instrument = {"marginDepositBands": [{"margin": "10"}, {"margin": "20"}]}
+        assert margin_factor_pct(instrument) == pytest.approx(10.0)
+
+    def test_none_when_absent(self):
+        assert margin_factor_pct({}) is None
+
+
+class TestFundsNeededForOneBuy:
+    """funds = euro_per_point(min_size) * offer * margin_pct / 100."""
+
+    def test_computes_margin_in_eur(self):
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "marginFactor": "10",
+                "marginFactorUnit": "PERCENTAGE",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+            "snapshot": {"offer": 200.0},
+            "dealingRules": {"minDealSize": {"value": 1}},
+        }
+        # 1 * 200 * 10% = 20€
+        assert funds_needed_for_one_buy(market_data) == pytest.approx(20.0)
+
+    def test_uses_min_deal_size(self):
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "marginFactor": "10",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+            "snapshot": {"offer": 100.0},
+            "dealingRules": {"minDealSize": {"value": 4}},
+        }
+        # 4 * 100 * 10% = 40€
+        assert funds_needed_for_one_buy(market_data) == pytest.approx(40.0)
+
+    def test_none_without_price(self):
+        market_data = {
+            "instrument": {"contractSize": "1", "marginFactor": "10"},
+            "snapshot": {"offer": 0.0},
+        }
+        assert funds_needed_for_one_buy(market_data) is None
+
+    def test_none_without_margin(self):
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+            "snapshot": {"offer": 100.0},
+        }
+        assert funds_needed_for_one_buy(market_data) is None
+
+
+class TestStopLossEurForOneBuy:
+    """loss = euro_per_point(min_size) * stop_distance (points)."""
+
+    def test_computes_loss_in_eur(self):
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+            "snapshot": {"offer": 200.0},
+            "dealingRules": {
+                "minDealSize": {"value": 1},
+                "minNormalStopOrLimitDistance": {"value": 8, "unit": "POINTS"},
+            },
+        }
+        # euro_per_point = 1 * 1 * 1.0 = 1 ; loss = 1 * 8 = 8€
+        assert stop_loss_eur_for_one_buy(market_data) == pytest.approx(8.0)
+
+    def test_percentage_stop_uses_offer_price(self):
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+            "snapshot": {"offer": 200.0},
+            "dealingRules": {
+                "minDealSize": {"value": 2},
+                "minNormalStopOrLimitDistance": {"value": 5, "unit": "PERCENTAGE"},
+            },
+        }
+        # stop_distance = 5% * 200 = 10 points ; loss = (2 * 1 * 1.0) * 10 = 20€
+        assert stop_loss_eur_for_one_buy(market_data) == pytest.approx(20.0)
+
+    def test_none_without_stop_rule(self):
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0}],
+            },
+            "snapshot": {"offer": 100.0},
+            "dealingRules": {"minDealSize": {"value": 1}},
+        }
+        assert stop_loss_eur_for_one_buy(market_data) is None
+
+    def test_none_without_price(self):
+        market_data = {
+            "instrument": {"contractSize": "1"},
+            "snapshot": {"offer": 0.0},
+            "dealingRules": {"minNormalStopOrLimitDistance": {"value": 8}},
+        }
+        assert stop_loss_eur_for_one_buy(market_data) is None

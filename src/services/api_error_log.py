@@ -21,7 +21,8 @@ class APIErrorEntry:
 # Kept here (not in client.py) so both layers can reference them.
 IG_ERROR_TRANSLATIONS: dict[str, str] = {
     "error.public-api.failure.encryption.not-enabled": (
-        "Encryption not enabled — enable password encryption in your IG account settings."
+        "Encryption not enabled — enable password encryption in your IG "
+        "account settings."
     ),
     "error.public-api.failure.kyc.required": (
         "KYC verification required — complete identity verification on IG."

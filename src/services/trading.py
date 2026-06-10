@@ -668,7 +668,8 @@ class TradingService:
         position.euro = Decimal(str(round(euro_pnl, 3)))
         position.win = 1 if euro_pnl > 0 else 0
         logger.warning(
-            "Position %s no longer open at IG — reconciled as closed_externally (P&L=%.2f€)",
+            "Position %s no longer open at IG — reconciled as "
+            "closed_externally (P&L=%.2f€)",
             position.epic,
             euro_pnl,
         )
@@ -772,7 +773,8 @@ class TradingService:
 
         if not deal_id:
             logger.warning(
-                "Position %s not found in IG live positions — marking as closed (phantom)",
+                "Position %s not found in IG live positions — "
+                "marking as closed (phantom)",
                 position.epic,
             )
             now = datetime.now(UTC)
@@ -907,7 +909,8 @@ class TradingService:
             return False
 
         logger.warning(
-            "Position %s not found in IG live positions after 404 — marking as closed (phantom)",
+            "Position %s not found in IG live positions after 404 — "
+            "marking as closed (phantom)",
             position.epic,
         )
         now = datetime.now(UTC)

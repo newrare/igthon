@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     strategy_close_target: str = "follower"
     strategy_compensate_loose: bool = False
     strategy_euro_loss: float = 4000.0
+    # Max margin (EUR) to open one minimum-size BUY; epics above this are dropped
+    # from the tradable/streaming set — pointless to analyze (and subscribe to)
+    # markets we could never afford to open. Set to 0 to disable the filter.
+    max_funds_per_position: float = 5000.0
 
     @property
     def ig_base_url(self) -> str:

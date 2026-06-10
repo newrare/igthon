@@ -118,7 +118,8 @@ class PriceBuffer:
         logger.debug("Buffer updated: %s (%d candles)", epic, len(buf))
 
     def append_candles(self, epic: str, candles: list[Candle]) -> None:
-        """Append candles to the buffer, skipping those already present (by timestamp)."""
+        """Append candles to the buffer, skipping those already present
+        (matched by timestamp)."""
         buf = self.get_or_create(epic)
         last_ts = buf.last.timestamp if buf.last else None
         added = 0

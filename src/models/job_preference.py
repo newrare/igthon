@@ -20,4 +20,6 @@ class JobPreference(Base):
 
     action: Mapped[str] = mapped_column(String(80), primary_key=True)
     auto: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

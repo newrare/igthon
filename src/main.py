@@ -79,7 +79,9 @@ async def analyze_once(epics: list[str] | None = None) -> None:
         print()
 
 
-async def run_bot(*, with_web: bool = False, log_buffer: LogBuffer | None = None) -> None:
+async def run_bot(
+    *, with_web: bool = False, log_buffer: LogBuffer | None = None
+) -> None:
     """Start the full trading bot with scheduler.
 
     Args:

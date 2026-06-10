@@ -49,6 +49,15 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 
+# The web layer renders HTML/JS as inline f-string templates. Wrapping those
+# string literals at 88 columns hurts readability far more than it helps, so
+# E501 is waived only for the template-heavy modules — all logic still obeys it.
+[tool.ruff.lint.per-file-ignores]
+"src/web/routes/dashboard/fragments.py" = ["E501"]
+"src/web/routes/dashboard/shell.py" = ["E501"]
+"src/web/routes/dashboard/pages.py" = ["E501"]
+"src/web/routes/charts.py" = ["E501"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

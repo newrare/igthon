@@ -41,12 +41,18 @@ class IGAPIError(httpx.HTTPStatusError):
 # Known IG error codes mapped to short human-readable hints (legacy; full
 # translations live in api_error_log.IG_ERROR_TRANSLATIONS).
 _IG_ERROR_HINTS: dict[str, str] = {
-    "error.public-api.failure.encryption.not-enabled": "Encryption not enabled on this account",
+    "error.public-api.failure.encryption.not-enabled": (
+        "Encryption not enabled on this account"
+    ),
     "error.public-api.failure.kyc.required": "KYC verification required",
     "error.public-api.failure.stockbroking-not-supported": "Stockbroking not supported",
-    "error.service.financial.stockbroking-account-type.not.supported": "Account type not supported",
+    "error.service.financial.stockbroking-account-type.not.supported": (
+        "Account type not supported"
+    ),
     "error.public-api.failure.preferred-account-not-set": "No preferred account set",
-    "error.public.api.failure.trading.position.not.enabled.for.this.epic": "Trading not enabled for this epic",
+    "error.public.api.failure.trading.position.not.enabled.for.this.epic": (
+        "Trading not enabled for this epic"
+    ),
     "error.request.too.frequent": "API rate limit hit — too many requests",
     "access.denied.reason.ip.blocked": "IP address blocked by IG",
 }
