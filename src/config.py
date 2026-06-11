@@ -38,24 +38,26 @@ class Settings(BaseSettings):
     web_host: str = "0.0.0.0"
     web_port: int = 8000
 
-    # Market scanner — search-term based discovery
-    # Each term is passed to GET /markets?searchTerm=X (v1).
-    # Override via SCANNER_SEARCH_TERMS='["EUR/USD","Gold",...]' in .env
+    # Market scanner — search-term based discovery.
+    # Each term is passed to GET /markets?searchTerm=X (v1). Broad terms are used
+    # deliberately: a currency code like "USD" returns every pair containing it,
+    # so a handful of codes cover all FX majors/minors/crosses. Off-class results
+    # (SHARES/RATES/…) that broad terms also return are dropped by the
+    # instrument-type filter (``scanner_allowed_instrument_types``), so widening
+    # the terms improves coverage without polluting the universe.
+    # Override via SCANNER_SEARCH_TERMS='["USD","Gold",...]' in .env
     scanner_search_terms: list[str] = [
-        # Forex — major pairs
-        "EUR/USD",
-        "GBP/USD",
-        "USD/JPY",
-        "AUD/USD",
-        "USD/CHF",
-        "USD/CAD",
-        "NZD/USD",
-        "EUR/GBP",
-        "EUR/JPY",
-        "EUR/CHF",
-        "GBP/JPY",
-        "AUD/JPY",
-        # Indices
+        # Forex — broad currency-code searches (each returns all pairs with it).
+        "USD",
+        "EUR",
+        "GBP",
+        "JPY",
+        "AUD",
+        "CAD",
+        "CHF",
+        "NZD",
+        # Indices — broad term plus regional names not always surfaced by "Index".
+        "Index",
         "Germany 40",
         "UK 100",
         "Wall Street",
@@ -65,11 +67,14 @@ class Settings(BaseSettings):
         "Japan 225",
         "Australia 200",
         "EU Stocks 50",
-        # Commodities
+        "Netherlands 25",
+        "Spain 35",
+        "Hong Kong",
+        # Commodities — broad terms plus named contracts.
+        "Oil",
         "Gold",
         "Silver",
         "Brent Crude",
-        "US Crude",
         "Natural Gas",
         "Copper",
         "Wheat",
@@ -77,6 +82,21 @@ class Settings(BaseSettings):
         "Coffee",
         "Cocoa",
         "Corn",
+        "Platinum",
+    ]
+
+    # Asset classes to keep in the tradable universe. IG search returns
+    # instruments of every kind (including SHARES whose name matches a commodity
+    # or index term — e.g. gold miners for "Gold", with epics ending in
+    # ``.CASH``). Only these ``instrumentType`` values are retained, applied both
+    # at search time and on the fetched market details; everything else (SHARES,
+    # RATES, SECTORS, BINARY, …) is dropped. Markets whose type is unknown/blank
+    # are kept (we can't prove they're out of scope).
+    # Override via SCANNER_ALLOWED_INSTRUMENT_TYPES='["CURRENCIES",...]' in .env
+    scanner_allowed_instrument_types: list[str] = [
+        "CURRENCIES",
+        "INDICES",
+        "COMMODITIES",
     ]
 
     # Candle persistence — durable price history for charts + backtesting.
@@ -114,6 +134,14 @@ class Settings(BaseSettings):
     strategy_stop_multiplier: float = 2.5
     strategy_target_multiplier: float = 4.0
     strategy_tactic: str = "spread"
+
+    # Trailing stop (ATR-based adaptive follower)
+    # Distance = k x ATR(period). k widens before break-even to let the trade
+    # breathe, then tightens once price clears level_zero to lock in the gain.
+    strategy_atr_period: int = 14
+    strategy_atr_k_pre: float = 2.5  # multiplier before break-even
+    strategy_atr_k_post: float = 1.5  # tighter multiplier once past level_zero
+    strategy_trailing_step_ratio: float = 0.3  # min gain (xATR) before a PUT
 
     # Position / Risk management
     strategy_max_positions: int = 6

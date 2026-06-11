@@ -33,7 +33,7 @@ async def dashboard(request: Request) -> HTMLResponse:
 async def api_dashboard_fragments(request: Request) -> JSONResponse:
     """JSON API: HTML fragments for every live dashboard region.
 
-    Polled by the dashboard every two seconds. The client swaps only the
+    Polled by the dashboard every second. The client swaps only the
     fragments whose markup changed since the previous poll, so a single request
     keeps the KPI bar, market table and modals current without a full-page
     reload. ``server_time`` is the Europe/Paris timestamp shown as each

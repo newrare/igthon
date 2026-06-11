@@ -30,6 +30,27 @@ from src.services.scheduler import BotScheduler
 
 logger = logging.getLogger(__name__)
 
+
+class _SuppressEndpointAccessLog(logging.Filter):
+    """Drop uvicorn access-log lines for a high-frequency polled endpoint.
+
+    The dashboard polls ``/api/dashboard-fragments`` once a second, which would
+    otherwise emit one ``200 OK`` access line per second and drown the log. The
+    request still serves normally; only its access-log record is filtered.
+    """
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self._path = path
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn.access record args: (client, method, full_path, http_ver, status)
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            return self._path not in str(args[2])
+        return True
+
+
 # Default epics to track
 DEFAULT_EPICS = [
     "IX.D.DAX.IFMM.IP",  # DAX 40 (1€)
@@ -57,24 +78,31 @@ async def analyze_once(epics: list[str] | None = None) -> None:
         )
         print("-" * 75)
 
-        for epic in target_epics:
-            try:
-                await service.fetch_candles(epic, "MINUTE", 50)
-                buf = buffer.get(epic)
-                if buf and len(buf) >= 20:
-                    sig = compute_signal(epic, buf)
-                    if sig:
-                        print(
-                            f"  {epic:<33} {sig.score:>6.2f} "
-                            f"{sig.direction:>7} {sig.regression.r_squared:>5.2f} "
-                            f"{sig.roc:>6.2f} {sig.spread:>7.2f}"
-                        )
-                    else:
-                        print(f"  {epic:<33} {'N/A':>6} {'—':>7}")
+        # Phase 1 — fetch every epic's candles at once; results stay in the
+        # buffer. Errors are captured per epic so one failure doesn't abort all.
+        errors = await asyncio.gather(
+            *[service.fetch_candles(epic, "MINUTE", 50) for epic in target_epics],
+            return_exceptions=True,
+        )
+
+        # Phase 2 — pure CPU: compute and print signals in table order.
+        for epic, result in zip(target_epics, errors):
+            if isinstance(result, BaseException):
+                print(f"  {epic:<33} {'ERROR':>6} — {result}")
+                continue
+            buf = buffer.get(epic)
+            if buf and len(buf) >= 20:
+                sig = compute_signal(epic, buf)
+                if sig:
+                    print(
+                        f"  {epic:<33} {sig.score:>6.2f} "
+                        f"{sig.direction:>7} {sig.regression.r_squared:>5.2f} "
+                        f"{sig.roc:>6.2f} {sig.spread:>7.2f}"
+                    )
                 else:
-                    print(f"  {epic:<33} {'NO DATA':>6}")
-            except Exception as exc:
-                print(f"  {epic:<33} {'ERROR':>6} — {exc}")
+                    print(f"  {epic:<33} {'N/A':>6} {'—':>7}")
+            else:
+                print(f"  {epic:<33} {'NO DATA':>6}")
 
         print()
 
@@ -187,6 +215,12 @@ async def run_bot(
                 log_level="info",
             )
             server = uvicorn.Server(config)
+            # Silence the once-a-second dashboard poll in the access log (keeps
+            # every other request visible). Attaching to the logger (not a
+            # handler) means it survives uvicorn's own logging setup in serve().
+            logging.getLogger("uvicorn.access").addFilter(
+                _SuppressEndpointAccessLog("/api/dashboard-fragments")
+            )
             asyncio.create_task(server.serve())
             logger.info(
                 "Web interface started on %s:%d", settings.web_host, settings.web_port

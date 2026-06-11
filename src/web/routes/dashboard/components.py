@@ -84,7 +84,7 @@ def render_modal(
     close_fn: str,
     title: str = "",
     title_id: str = "",
-    max_width: str = "960px",
+    max_width: str = "90vw",
     z_index: int = 8500,
     refresh_id: str = "",
 ) -> str:
@@ -92,12 +92,19 @@ def render_modal(
 
     ``title`` is the inner HTML of the header ``<h2>`` (may carry a lucide icon).
     ``refresh_id`` adds the "Live · updated" row used by the live-data modals.
+
+    The dialog box fills 90% of the viewport (width and height) so large data
+    tables and charts have room to breathe; the header/refresh stay pinned while
+    the body scrolls. ``max_width`` caps the width (defaults to ``90vw``).
     """
     overlay = (
         f"display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);"
-        f"z-index:{z_index};overflow-y:auto;padding:2rem 1rem;"
+        f"z-index:{z_index};overflow-y:auto;padding:5vh 5vw;box-sizing:border-box;"
     )
-    box = f"{_MODAL_BOX}max-width:{max_width};width:100%;margin:0 auto;padding:1.5rem;"
+    box = (
+        f"{_MODAL_BOX}width:90vw;max-width:{max_width};height:90vh;margin:0 auto;"
+        "padding:1.5rem;box-sizing:border-box;display:flex;flex-direction:column;"
+    )
     header = ""
     if title:
         tid = f' id="{title_id}"' if title_id else ""
@@ -118,7 +125,8 @@ def render_modal(
         )
     return (
         f'<div id="{modal_id}" onclick="if(event.target===this){close_fn}()" '
-        f'style="{overlay}"><div style="{box}">{header}{refresh}{body}</div></div>'
+        f'style="{overlay}"><div style="{box}">{header}{refresh}'
+        f'<div style="flex:1;min-height:0;overflow:auto;">{body}</div></div></div>'
     )
 
 

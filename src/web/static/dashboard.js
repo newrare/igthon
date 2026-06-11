@@ -142,8 +142,8 @@ async function setAllJobs(auto, btn) {
 // Only the fragments whose markup actually changed are swapped into the DOM, so
 // there is no full-page reload, no scroll jump and no lost UI state.
 const PAUSE_KEY     = 'ig_refresh_paused';
-const POLL_INTERVAL = 2000; // ms
-const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-week', 'refresh-day', 'refresh-queue', 'refresh-api', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-actions', 'refresh-logs'];
+const POLL_INTERVAL = 1000; // ms
+const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-week', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-actions', 'refresh-logs'];
 const btnPause  = document.getElementById('btn-pause');
 const footer    = document.getElementById('footer-refresh');
 
@@ -385,14 +385,6 @@ function openQueueModal() {
 }
 function closeQueueModal() {
     document.getElementById('queue-modal').style.display = 'none';
-}
-
-// ── IG API modal ──────────────────────────────────────────────────────────────
-function openApiModal() {
-    document.getElementById('ig-api-modal').style.display = 'block';
-}
-function closeApiModal() {
-    document.getElementById('ig-api-modal').style.display = 'none';
 }
 
 // ── Epic List modal ───────────────────────────────────────────────────────────
@@ -677,7 +669,12 @@ function _toParisNaive(utcISOStr) {
     }
 }
 
-async function openChartModal(epic) {
+// openChartModal(epic) renders the price curve. When called from a position row
+// it also receives an `overlay` object with the position levels/markers:
+//   { open, zero, stop, target, close, openTime, closeTime }
+// — numeric price levels are drawn as horizontal reference lines and the
+// entry/exit times (UTC ISO strings) as vertical markers on the time axis.
+async function openChartModal(epic, overlay) {
     const modal     = document.getElementById('chart-modal');
     const titleEl   = document.getElementById('chart-modal-title');
     const container = document.getElementById('chart-container');
@@ -699,12 +696,26 @@ async function openChartModal(epic) {
         const timestamps = utcTimestamps
             ? utcTimestamps.map(_toParisNaive)
             : rawBids.map(function(_, i) { return i + 1; });
-        const minBid = Math.min.apply(null, rawBids);
-        const maxBid = Math.max.apply(null, rawBids);
-        const range = maxBid - minBid;
-        const pctY = rawBids.map(function(v) { return range === 0 ? 50 : (v - minBid) / range * 100; });
         const xIsDate = utcTimestamps !== null;
-        Plotly.newPlot(container, [{
+
+        // Normalisation bounds: include the overlay price levels so their lines
+        // stay inside the [0, 100]% view even when stop/target sit outside the
+        // recent bid range.
+        const ov = overlay || {};
+        let lo = Math.min.apply(null, rawBids);
+        let hi = Math.max.apply(null, rawBids);
+        ['open', 'zero', 'stop', 'target', 'close'].forEach(function(k) {
+            const v = ov[k];
+            if (typeof v === 'number' && isFinite(v)) {
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+        });
+        const range = hi - lo;
+        const toPct = function(v) { return range === 0 ? 50 : (v - lo) / range * 100; };
+        const pctY = rawBids.map(toPct);
+
+        const traces = [{
             x: timestamps,
             y: pctY,
             customdata: rawBids,
@@ -713,11 +724,59 @@ async function openChartModal(epic) {
             line: { color: '#E07B39', width: 1.5 },
             name: 'Bid close',
             hovertemplate: 'Bid: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
-        }], {
+        }];
+        const shapes = [];
+        const annotations = [];
+
+        // Horizontal reference line + right-anchored price label for one level.
+        function addLevelLine(value, color, dash, label) {
+            if (typeof value !== 'number' || !isFinite(value)) return;
+            const y = toPct(value);
+            shapes.push({
+                type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: y, y1: y,
+                line: { color: color, width: 1.2, dash: dash }
+            });
+            annotations.push({
+                xref: 'paper', x: 1, xanchor: 'right', yref: 'y', y: y, yanchor: 'bottom',
+                text: label + ' ' + value.toFixed(4), showarrow: false,
+                font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
+            });
+        }
+        addLevelLine(ov.target, '#4ade80', 'solid', 'Target');
+        addLevelLine(ov.open,   '#cbd5e1', 'solid', 'Open');
+        // Break-even (0€, spread recovered) — dotted; skip if it coincides with open.
+        if (typeof ov.zero === 'number' && isFinite(ov.zero) &&
+            !(typeof ov.open === 'number' && Math.abs(ov.zero - ov.open) < 1e-6)) {
+            addLevelLine(ov.zero, '#94a3b8', 'dot', 'Break-even 0€');
+        }
+        addLevelLine(ov.stop, '#ef4444', 'solid', 'Stop');
+
+        // Vertical time marker + diamond point for an entry/exit event.
+        function addEventMarker(timeStr, value, color, label) {
+            if (!xIsDate || !timeStr || typeof value !== 'number' || !isFinite(value)) return;
+            const xParis = _toParisNaive(timeStr);
+            shapes.push({
+                type: 'line', xref: 'x', x0: xParis, x1: xParis, yref: 'paper', y0: 0, y1: 1,
+                line: { color: color, width: 1, dash: 'dash' }
+            });
+            traces.push({
+                x: [xParis], y: [toPct(value)], customdata: [value],
+                type: 'scatter', mode: 'markers', name: label,
+                marker: { color: color, size: 9, symbol: 'diamond', line: { color: '#1c1714', width: 1 } },
+                hovertemplate: label + ': %{customdata:.4f}<extra></extra>'
+            });
+        }
+        addEventMarker(ov.openTime, ov.open, '#E0B341', 'Entry');
+        addEventMarker(ov.closeTime, ov.close, '#60a5fa', 'Exit');
+
+        Plotly.newPlot(container, traces, {
             paper_bgcolor: '#1c1714',
             plot_bgcolor: '#1c1714',
             font: { color: '#94a3b8', size: 11 },
             margin: { l: 55, r: 20, t: 10, b: 50 },
+            showlegend: false,
+            shapes: shapes,
+            annotations: annotations,
             xaxis: {
                 gridcolor: '#2d2319',
                 zerolinecolor: '#2d2319',

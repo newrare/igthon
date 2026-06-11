@@ -1,5 +1,7 @@
 """Dashboard data gathering and pure display helpers (no HTML markup)."""
 
+import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -13,17 +15,20 @@ from src.models.resume import Resume
 from src.services.api_queue import Priority
 from src.utils.tools import euro_per_point
 
+logger = logging.getLogger(__name__)
+
 _PARIS = ZoneInfo("Europe/Paris")
 
-# How long a fetched account balance stays fresh. The dashboard polls every 2 s;
-# caching the balance avoids one ``GET /accounts`` per poll (which would burn the
-# rate-limit guard for a figure that barely moves between polls).
+# How long a fetched account balance stays fresh. The dashboard polls every 1 s;
+# caching the balance bounds the background ``GET /accounts`` refresh to once per
+# TTL (the figure barely moves between polls).
 _BALANCE_TTL = timedelta(seconds=15)
 
-# How long a fetched per-point value stays fresh. Contract size, currency and
-# min deal size are effectively static intraday, so we memoize them well past
-# the 2 s poll to avoid re-hitting ``GET /markets`` for figures that never move.
-_VALUE_PER_POINT_TTL = timedelta(minutes=5)
+# How long a fetched spread cost stays fresh. Unlike contract size or currency,
+# the dealing spread does move intraday (it widens around the open/close and on
+# news), so we refresh it on a short cadence rather than memoizing it for long —
+# while still keeping it off the 1 s poll's critical path.
+_SPREAD_COST_TTL = timedelta(seconds=60)
 # IG caps ``GET /markets?epics=`` at 50 epics per call.
 _MARKET_BATCH_SIZE = 50
 
@@ -38,27 +43,47 @@ def _to_float_or_none(value: object) -> float | None:
         return None
 
 
-async def _fetch_account_balance(request: Request) -> dict | None:
-    """Return the active account's balance dict, cached for a short TTL.
+def _fetch_account_balance(request: Request) -> dict | None:
+    """Return the cached account balance, refreshing it in the background.
 
     Shape (from IG ``GET /accounts`` v1): ``{"balance", "deposit", "profitLoss",
-    "available"}`` where ``available`` is the cash free to open new positions and
-    ``deposit`` is the margin currently tied up by open positions. Returns the last
-    good value on a fetch failure, or ``None`` when never successfully fetched.
+    "available"}``. This is a NON-BLOCKING read: the dashboard poll must never
+    ``await`` an external IG call (it would stall the whole fragments endpoint —
+    and the queue view it renders — whenever the queue is busy or rate-limited).
+    When the cached value is stale, a fire-and-forget refresh is scheduled and
+    the last known value is returned immediately; the fresh figure lands on a
+    later poll.
     """
     app_state = request.app.state
-    api_queue = getattr(app_state, "api_queue", None)
     cached = getattr(app_state, "account_balance", None)
     fetched_at = getattr(app_state, "account_balance_at", None)
     now = datetime.now(UTC)
-    if (
+    fresh = (
         cached is not None
         and fetched_at is not None
         and now - fetched_at < _BALANCE_TTL
-    ):
-        return cached
-    if api_queue is None:
-        return cached
+    )
+    if not fresh:
+        _schedule_account_balance_refresh(app_state)
+    return cached
+
+
+def _schedule_account_balance_refresh(app_state) -> None:
+    """Spawn a background ``GET /accounts`` refresh, deduplicated.
+
+    A single in-flight refresh is allowed at a time (guarded by the
+    ``account_balance_refreshing`` flag) so the 1 s poll cadence can't pile up
+    duplicate balance fetches in the queue.
+    """
+    api_queue = getattr(app_state, "api_queue", None)
+    if api_queue is None or getattr(app_state, "account_balance_refreshing", False):
+        return
+    app_state.account_balance_refreshing = True
+    asyncio.create_task(_refresh_account_balance(app_state, api_queue))
+
+
+async def _refresh_account_balance(app_state, api_queue) -> None:
+    """Fetch the balance via the queue and update the in-memory cache."""
     try:
         data = await api_queue.get(
             "/accounts",
@@ -66,69 +91,108 @@ async def _fetch_account_balance(request: Request) -> dict | None:
             suppress_error_logging=True,
             label="dashboard: account balance",
         )
-    except Exception:
-        return cached
-    account_id = getattr(app_state.settings, "ig_account_id", None)
-    accounts = data.get("accounts", []) if isinstance(data, dict) else []
-    balance: dict | None = None
-    for account in accounts:
-        if account.get("accountId") == account_id:
-            balance = account.get("balance")
-            break
-    if balance is None and accounts:
-        # Configured id absent from the response — fall back to the first account.
-        balance = accounts[0].get("balance")
-    app_state.account_balance = balance
-    app_state.account_balance_at = now
-    return balance
+        account_id = getattr(app_state.settings, "ig_account_id", None)
+        accounts = data.get("accounts", []) if isinstance(data, dict) else []
+        balance: dict | None = None
+        for account in accounts:
+            if account.get("accountId") == account_id:
+                balance = account.get("balance")
+                break
+        if balance is None and accounts:
+            # Configured id absent from the response — fall back to first account.
+            balance = accounts[0].get("balance")
+        app_state.account_balance = balance
+        app_state.account_balance_at = datetime.now(UTC)
+    except Exception as exc:
+        logger.debug("Background balance refresh failed: %s", exc)
+    finally:
+        app_state.account_balance_refreshing = False
 
 
-async def _value_per_point_map(request: Request, epics: list[str]) -> dict[str, float]:
-    """Return ``{epic: euros per point for a minimum-size buy}``.
+def _spread_cost_map(request: Request, epics: list[str]) -> dict[str, float]:
+    """Return cached ``{epic: euro cost of crossing the spread once at min size}``.
 
-    The figure is ``euro_per_point(market, minDealSize, currency)`` — the euro
-    value of one point of movement for the smallest buy the dealing rules allow,
-    i.e. what a single click on the row's Buy button is exposed to per point.
+    The figure is ``(offer - bid) * euro_per_point(minDealSize, currency)`` — what
+    a single minimum-size round trip pays away to the broker's spread, the simplest
+    gauge of how expensive a market is to trade. The bid/offer used is the live
+    dealing spread from the market ``snapshot``, NOT the historical-candle close
+    (whose bid and offer are often equal, which is where the misleading ``0`` came
+    from).
 
-    Contract size, currency and min deal size live in IG market details, not in
-    the price buffer, so they are fetched live via a batched ``GET /markets``.
-    Results are memoized per epic for :data:`_VALUE_PER_POINT_TTL` because those
-    fields are static intraday; only epics whose cache entry is missing or stale
-    trigger a fetch, so the 2 s fragment poll stays cheap.
+    The dealing spread and the contract details live in IG market details, not in
+    the price buffer. Like the balance, this is a NON-BLOCKING read: stale/missing
+    epics trigger a fire-and-forget batched ``GET /markets`` refresh and the poll
+    returns whatever is already cached.
     """
     app_state = request.app.state
-    api_queue = getattr(app_state, "api_queue", None)
     cache: dict[str, tuple[datetime, float]] = getattr(
-        app_state, "value_per_point_cache", {}
+        app_state, "spread_cost_cache", {}
     )
-    app_state.value_per_point_cache = cache
+    app_state.spread_cost_cache = cache
     now = datetime.now(UTC)
     stale = [
-        e for e in epics if e not in cache or now - cache[e][0] >= _VALUE_PER_POINT_TTL
+        e for e in epics if e not in cache or now - cache[e][0] >= _SPREAD_COST_TTL
     ]
-    if api_queue is not None and stale:
-        for start in range(0, len(stale), _MARKET_BATCH_SIZE):
-            batch = stale[start : start + _MARKET_BATCH_SIZE]
+    if stale:
+        _schedule_spread_cost_refresh(app_state, stale)
+    return {e: cache[e][1] for e in epics if e in cache}
+
+
+def _schedule_spread_cost_refresh(app_state, stale: list[str]) -> None:
+    """Spawn a background batched ``GET /markets`` refresh for stale epics.
+
+    Epics already being fetched are tracked in ``spread_cost_inflight`` so
+    repeated polls don't enqueue duplicate batches for the same markets while a
+    refresh is pending.
+    """
+    api_queue = getattr(app_state, "api_queue", None)
+    if api_queue is None:
+        return
+    inflight: set[str] = getattr(app_state, "spread_cost_inflight", set())
+    app_state.spread_cost_inflight = inflight
+    todo = [e for e in stale if e not in inflight]
+    if not todo:
+        return
+    inflight.update(todo)
+    asyncio.create_task(_refresh_spread_cost(app_state, api_queue, todo))
+
+
+async def _refresh_spread_cost(app_state, api_queue, epics: list[str]) -> None:
+    """Fetch market details for ``epics`` and update the spread-cost cache."""
+    cache: dict[str, tuple[datetime, float]] = app_state.spread_cost_cache
+    inflight: set[str] = app_state.spread_cost_inflight
+    try:
+        for start in range(0, len(epics), _MARKET_BATCH_SIZE):
+            batch = epics[start : start + _MARKET_BATCH_SIZE]
             try:
                 data = await api_queue.get(
                     f"/markets?epics={','.join(batch)}",
                     version=1,
                     suppress_error_logging=True,
                     priority=Priority.NORMAL,
-                    label="dashboard: value per point",
+                    label="dashboard: spread cost",
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("Background spread-cost refresh failed: %s", exc)
                 continue
+            now = datetime.now(UTC)
             for detail in data.get("marketDetails", []):
                 instrument = detail.get("instrument", {})
                 epic = instrument.get("epic")
                 if not epic:
                     continue
+                snapshot = detail.get("snapshot", {})
+                bid = _to_float_or_none(snapshot.get("bid"))
+                offer = _to_float_or_none(snapshot.get("offer"))
+                if bid is None or offer is None:
+                    continue
                 rules = detail.get("dealingRules", {})
                 min_size = float(rules.get("minDealSize", {}).get("value", 1) or 1)
                 currency = (instrument.get("currencies") or [{}])[0].get("code", "EUR")
-                cache[epic] = (now, euro_per_point(detail, min_size, currency))
-    return {e: cache[e][1] for e in epics if e in cache}
+                epp = euro_per_point(detail, min_size, currency)
+                cache[epic] = (now, (offer - bid) * epp)
+    finally:
+        inflight.difference_update(epics)
 
 
 def _kpi_freshness(last_refresh: datetime | None) -> tuple[str, str]:
@@ -230,19 +294,19 @@ async def _gather_dashboard_state(request: Request) -> dict:
                 {
                     "epic": epic,
                     "bid": buf.last.bid_close,
-                    "offer": buf.last.offer_close,
-                    "spread": buf.last.spread,
-                    "candles": len(buf),
+                    "dots": len(buf),
                     "high": max(buf.bid_closes) if buf.bid_closes else 0,
                     "low": min(buf.bid_closes) if buf.bid_closes else 0,
                 }
             )
 
-    # Euro value of one point for a minimum-size buy on each tracked epic. Not in
-    # the price buffer — fetched live (cached) from IG market details.
-    value_per_point = await _value_per_point_map(request, epics)
+    # Euro cost of crossing the spread once at minimum deal size on each tracked
+    # epic. Built from the live dealing spread and contract details, neither of
+    # which is in the price buffer — read from cache (refreshed in the background,
+    # never awaited here so the poll can't stall on the IG queue).
+    spread_cost = _spread_cost_map(request, epics)
     for entry in market_summary:
-        entry["value_per_point"] = value_per_point.get(entry["epic"], 0.0)
+        entry["spread_cost"] = spread_cost.get(entry["epic"])
 
     # Fetch database statistics
     kpis: dict = {}
@@ -395,7 +459,8 @@ async def _gather_dashboard_state(request: Request) -> dict:
     kpis["tradable_refresh_label"] = tradable_refresh_label
 
     # Wallet KPI — cash available to open vs. margin tied up by open positions.
-    balance = await _fetch_account_balance(request)
+    # Cached read; a stale value triggers a background refresh (never awaited).
+    balance = _fetch_account_balance(request)
     if balance:
         kpis["wallet_available"] = _to_float_or_none(balance.get("available"))
         kpis["wallet_used"] = _to_float_or_none(balance.get("deposit"))
@@ -418,6 +483,13 @@ async def _gather_dashboard_state(request: Request) -> dict:
     # Server log buffer
     log_buffer = getattr(request.app.state, "log_buffer", None)
     log_entries = log_buffer.get_all() if log_buffer else []
+
+    # Human-readable instrument name (IG description), mirrored from the Epic
+    # List. Sourced from the DB epic rows keyed by epic identifier; a dash when
+    # the epic has not been enriched (discovered) yet.
+    for entry in market_summary:
+        epic_row = epic_db_map.get(entry["epic"])
+        entry["name"] = (epic_row.description or "—") if epic_row else "—"
 
     return {
         "market_summary": market_summary,

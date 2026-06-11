@@ -1,14 +1,66 @@
 """Tests for the compute module — indicator calculations."""
 
+from datetime import UTC, datetime
+
 import pytest
 
 from src.services.compute import (
+    atr,
     compute_levels,
     linear_regression,
     position_in_range,
     rate_of_change,
     sma,
 )
+from src.services.price_buffer import Candle
+
+
+def _candle(high: float, low: float, close: float) -> Candle:
+    """Build a candle with the bid OHLC values that ATR relies on."""
+    return Candle(
+        timestamp=datetime(2026, 1, 1, 10, 0, tzinfo=UTC),
+        bid_open=close,
+        bid_close=close,
+        bid_high=high,
+        bid_low=low,
+        offer_open=close,
+        offer_close=close,
+        offer_high=high,
+        offer_low=low,
+    )
+
+
+class TestATR:
+    """Tests for the Average True Range calculation."""
+
+    def test_basic_atr(self):
+        # TR(c1)=max(3, |103-100|, |100-100|)=3 ; TR(c2)=max(3, |104-102|, |101-102|)=3
+        candles = [
+            _candle(high=101, low=99, close=100),
+            _candle(high=103, low=100, close=102),
+            _candle(high=104, low=101, close=101),
+        ]
+        assert atr(candles, period=2) == pytest.approx(3.0)
+
+    def test_gap_dominates_true_range(self):
+        # A jump from prev_close 100 to a 109-111 candle: TR driven by the gap.
+        candles = [
+            _candle(high=100, low=100, close=100),
+            _candle(high=111, low=109, close=110),
+        ]
+        assert atr(candles, period=1) == pytest.approx(11.0)
+
+    def test_insufficient_data(self):
+        # period + 1 candles are required.
+        candles = [_candle(101, 99, 100), _candle(103, 100, 102)]
+        assert atr(candles, period=2) == 0.0
+
+    def test_non_positive_period(self):
+        candles = [_candle(101, 99, 100), _candle(103, 100, 102)]
+        assert atr(candles, period=0) == 0.0
+
+    def test_empty(self):
+        assert atr([], period=14) == 0.0
 
 
 class TestLinearRegression:

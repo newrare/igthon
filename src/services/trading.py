@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.client import IGAPIError, IGClient
 from src.models.position import Position, PositionState, PositionStrategy
 from src.services.api_queue import APIQueue, Priority
-from src.services.compute import TradingSignal
+from src.services.compute import TradingSignal, atr
+from src.services.price_buffer import EpicBuffer
 from src.utils.tools import _to_float, euro_per_point, parse_ig_pnl
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,11 @@ class TradeConfig:
     close_strategy: str = "follower"  # win | follower | now | zero
     max_trades_day: int = 50
     min_win_rate: float = 0.40
+    # Trailing stop (ATR-based adaptive follower)
+    atr_period: int = 14
+    atr_k_pre: float = 2.5
+    atr_k_post: float = 1.5
+    trailing_step_ratio: float = 0.3
 
     @classmethod
     def from_settings(cls, settings) -> "TradeConfig":
@@ -55,6 +61,10 @@ class TradeConfig:
             close_strategy=settings.strategy_close_target,
             max_trades_day=settings.strategy_max_trades_day,
             min_win_rate=settings.strategy_min_win_rate,
+            atr_period=settings.strategy_atr_period,
+            atr_k_pre=settings.strategy_atr_k_pre,
+            atr_k_post=settings.strategy_atr_k_post,
+            trailing_step_ratio=settings.strategy_trailing_step_ratio,
         )
 
 
@@ -674,7 +684,12 @@ class TradingService:
             euro_pnl,
         )
 
-    async def check_and_close(self, position: Position, current_bid: float) -> bool:
+    async def check_and_close(
+        self,
+        position: Position,
+        current_bid: float,
+        buf: EpicBuffer | None = None,
+    ) -> bool:
         """Check if a position should be closed based on current price.
 
         Implements closing strategies from apiCheckPosition.php:
@@ -685,12 +700,13 @@ class TradingService:
         Args:
             position: Open position to evaluate.
             current_bid: Current market bid price.
+            buf: Price buffer for the epic, used to compute the ATR-based
+                trailing distance. Without it the follower stop is not updated.
 
         Returns:
             True if position was closed, False otherwise.
         """
         level_win = float(position.level_win or 0)
-        level_follower = float(position.level_follower or 0)
         level_loose = float(position.level_loose or 0)
         level_open = float(position.level_open or 0)
 
@@ -708,17 +724,9 @@ class TradingService:
         elif current_bid <= level_loose:
             reason = "loose"
 
-        # Follower strategy: update trailing stop
+        # Follower strategy: trail the stop upward with an ATR-based distance
         elif current_bid > level_open and self._config.close_strategy == "follower":
-            # Move follower level up as price rises
-            new_follower = current_bid - float(position.pip_spread or 0) * 3
-            if new_follower > level_follower:
-                position.level_follower = Decimal(str(round(new_follower, 3)))
-                position.stop_update = (position.stop_update or 0) + 1
-                await self._db.commit()
-                logger.debug(
-                    "Trailing stop updated for %s: %.3f", position.epic, new_follower
-                )
+            await self._update_trailing_stop(position, current_bid, buf)
             return False
 
         if reason is None:
@@ -726,6 +734,129 @@ class TradingService:
 
         # Close the position
         return await self._close_position(position, current_bid, reason)
+
+    async def _update_trailing_stop(
+        self, position: Position, current_bid: float, buf: EpicBuffer | None
+    ) -> None:
+        """Trail the stop upward with a volatility-adaptive (ATR) distance.
+
+        The distance is sized from the recent ATR so the stop sits beyond
+        normal market noise: wide before break-even to let the trade breathe,
+        tighter once the price clears ``level_zero`` to lock in the gain. The
+        stop only ratchets up, never down, and is pushed to IG so it survives a
+        bot restart.
+        """
+        if buf is None or buf.last is None:
+            return
+
+        atr_value = atr(list(buf.candles), self._config.atr_period)
+        if atr_value <= 0:
+            return
+
+        level_zero = float(position.level_zero or 0)
+        level_follower = float(position.level_follower or 0)
+        spread = buf.last.spread
+
+        # Two-speed regime: looser before break-even, tighter once secured.
+        past_zero = level_zero > 0 and current_bid >= level_zero
+        k = self._config.atr_k_post if past_zero else self._config.atr_k_pre
+        distance = self._clamp_trailing_distance(k * atr_value, position, spread)
+
+        new_stop = current_bid - distance
+        # Once break-even is cleared, never let the stop fall back into a loss.
+        if past_zero:
+            new_stop = max(new_stop, level_zero)
+
+        # Ratchet: only move up, and only when the gain is worth an API write.
+        step = self._config.trailing_step_ratio * atr_value
+        if new_stop <= level_follower + step:
+            return
+
+        position.level_follower = Decimal(str(round(new_stop, 3)))
+        position.stop_update = (position.stop_update or 0) + 1
+        await self._push_stop_to_ig(position, new_stop)
+        await self._db.commit()
+        logger.debug(
+            "Trailing stop for %s -> %.3f (k=%.1f, ATR=%.3f, dist=%.3f)",
+            position.epic,
+            new_stop,
+            k,
+            atr_value,
+            distance,
+        )
+
+    def _clamp_trailing_distance(
+        self, raw_distance: float, position: Position, spread: float
+    ) -> float:
+        """Bound the trailing distance between two safety limits.
+
+        Floor: a couple of spreads, so the bid/offer oscillation alone cannot
+        trigger the stop (avoids closing on noise). Ceiling: the initial planned
+        euro risk (``euro_stop`` / ``euro_per_point``), so the trailing stop is
+        never further from price than the loss accepted at open.
+        """
+        distance = raw_distance
+
+        euro_per_point = float(position.euro_per_point or 0)
+        euro_stop = abs(float(position.euro_stop or 0))
+        if euro_per_point > 0 and euro_stop > 0:
+            distance = min(distance, euro_stop / euro_per_point)
+
+        floor = max(spread * 2.0, 0.0)
+        return max(distance, floor)
+
+    async def _push_stop_to_ig(self, position: Position, stop_level: float) -> None:
+        """Send the new stop level to IG via PUT /positions/otc/{dealId}.
+
+        Uses URGENT priority so the write jumps ahead of price-collection reads.
+        Failures are logged but not raised: the local ``level_follower`` still
+        guards the position through ``check_and_close``.
+        """
+        deal_id = await self._ensure_deal_id(position, f"trail {position.epic}")
+        if not deal_id:
+            logger.warning(
+                "Cannot push trailing stop for %s: no dealId", position.epic
+            )
+            return
+
+        payload = {
+            "stopLevel": round(stop_level, 3),
+            "trailingStop": False,
+        }
+        try:
+            await self._client.put(
+                f"/positions/otc/{deal_id}",
+                payload,
+                version=2,
+                priority=Priority.URGENT,
+                label=f"trail {position.epic}: stop->{stop_level:.3f}",
+            )
+        except IGAPIError as exc:
+            logger.warning("Failed to update IG stop for %s: %s", position.epic, exc)
+
+    async def _ensure_deal_id(self, position: Position, label: str) -> str | None:
+        """Return the position's dealId, resolving it from IG's list if missing."""
+        if position.deal_id:
+            return position.deal_id
+        try:
+            positions_data = await self._client.get(
+                "/positions",
+                version=2,
+                priority=Priority.URGENT,
+                label=f"{label}: resolve deal_id",
+            )
+        except Exception as exc:
+            logger.warning("Could not resolve dealId for %s: %s", position.epic, exc)
+            return None
+
+        for entry in positions_data.get("positions", []):
+            if entry.get("market", {}).get("epic") == position.epic:
+                deal_id = entry.get("position", {}).get("dealId")
+                if deal_id:
+                    position.deal_id = deal_id
+                    await self._db.commit()
+                return deal_id
+        return None
 
     async def _close_position(
         self, position: Position, close_level: float, reason: str

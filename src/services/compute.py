@@ -13,7 +13,7 @@ import logging
 import math
 from dataclasses import dataclass
 
-from src.services.price_buffer import EpicBuffer
+from src.services.price_buffer import Candle, EpicBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,41 @@ def rate_of_change(values: list[float], period: int) -> float:
     if len(values) <= period or values[-period - 1] == 0:
         return 0.0
     return (values[-1] - values[-period - 1]) / values[-period - 1] * 100
+
+
+def atr(candles: list[Candle], period: int = 14) -> float:
+    """Average True Range over the last ``period`` candles (bid OHLC).
+
+    The True Range of a candle captures its real movement, including overnight
+    gaps relative to the previous close:
+
+        TR_i = max(high - low, |high - prev_close|, |low - prev_close|)
+
+    ATR is the simple mean of the True Ranges over ``period``. It is expressed
+    in price points and is the natural measure of "market noise" used to size a
+    trailing stop so it sits beyond normal oscillation.
+
+    Args:
+        candles: Ordered candles (oldest first); needs at least ``period`` + 1.
+        period: Number of true-range values to average.
+
+    Returns:
+        ATR in price points, or 0.0 if there is insufficient data.
+    """
+    if period < 1 or len(candles) < period + 1:
+        return 0.0
+
+    true_ranges: list[float] = []
+    for prev, current in zip(candles[-period - 1 :], candles[-period:]):
+        prev_close = prev.bid_close
+        tr = max(
+            current.bid_high - current.bid_low,
+            abs(current.bid_high - prev_close),
+            abs(current.bid_low - prev_close),
+        )
+        true_ranges.append(tr)
+
+    return sum(true_ranges) / period
 
 
 def position_in_range(current: float, high: float, low: float) -> float:

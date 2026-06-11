@@ -5,7 +5,7 @@ Uses APScheduler to run periodic tasks:
 - Position monitoring (every 30s)
 - End-of-day forced close and summary
 - Daily/weekly summaries
-- Daily epic list refresh from IG navigation tree (7:30 AM)
+- Daily epic list refresh from IG market search (7:30 AM)
 - Hourly active epic refresh (filter by TRADEABLE status)
 """
 
@@ -51,7 +51,7 @@ JOB_DEFINITIONS: list[dict[str, str]] = [
         "action": "refresh_epic_list",
         "job_id": "refresh_epic_list",
         "name": "Refresh Epic List",
-        "description": "Crawl the IG navigation tree and rebuild the full epic list.",
+        "description": "Search IG markets and rebuild the full epic list.",
         "schedule": "Daily 07:30 · Mon–Fri",
         "danger": "safe",
     },
@@ -152,8 +152,8 @@ class BotScheduler:
     Replaces the PHP CRON-based architecture with in-process scheduling.
 
     Epic list lifecycle:
-    - ``_all_epics``: full deduplicated list discovered from the IG navigation
-      tree, refreshed once daily at 07:30.
+    - ``_all_epics``: full deduplicated list discovered from IG market search
+      (term-based + watchlists), refreshed once daily at 07:30.
     - ``_tradable_epics``: subset of ``_all_epics`` that are currently open and
       TRADEABLE, refreshed hourly during market hours. No spread filter is
       applied here — the spread is checked later at analysis time.
@@ -200,7 +200,7 @@ class BotScheduler:
 
     def start(self) -> None:
         """Start the scheduler with all configured jobs."""
-        # Daily navigation tree crawl at 07:30 (before market open)
+        # Daily epic discovery at 07:30 (before market open)
         self._scheduler.add_job(
             self._refresh_epic_list,
             "cron",
@@ -208,7 +208,7 @@ class BotScheduler:
             hour=7,
             minute=30,
             id="refresh_epic_list",
-            name="Daily epic list refresh (navigation tree)",
+            name="Daily epic list refresh (market search)",
         )
 
         # Hourly tradable-epic refresh during market hours
@@ -326,7 +326,7 @@ class BotScheduler:
             name="Dump and purge old candles",
         )
 
-        # Trigger an immediate navigation tree crawl on startup so we don't wait
+        # Trigger an immediate epic discovery on startup so we don't wait
         # until 07:30 the next day when the bot is launched mid-session.
         self._scheduler.add_job(
             self._refresh_epic_list,
@@ -589,12 +589,12 @@ class BotScheduler:
 
     @property
     def all_epics(self) -> list[str]:
-        """Full deduplicated epic list from the last navigation tree crawl."""
+        """Full deduplicated epic list from the last market-search discovery."""
         return list(self._all_epics)
 
     @property
     def epic_last_refresh(self) -> datetime | None:
-        """UTC timestamp of the last successful navigation tree crawl."""
+        """UTC timestamp of the last successful epic-list discovery."""
         return self._epic_last_refresh
 
     # ------------------------------------------------------------------
@@ -604,8 +604,8 @@ class BotScheduler:
     async def load_persisted_state(self) -> None:
         """Restore the epic list, tradable subset, and price buffer from the database.
 
-        The navigation-tree crawl is expensive and runs at most once per day, so
-        its result is persisted to the ``epic`` table. Loading it here means a
+        Epic discovery is expensive and runs at most once per day, so its
+        result is persisted to the ``epic`` table. Loading it here means a
         restart keeps the day's discovered epics instead of falling back to the
         small seed list. ``_epic_last_refresh`` is restored from the newest
         ``updated_at`` so the dashboard KPI still reflects freshness.
@@ -677,7 +677,7 @@ class BotScheduler:
         """Replace the persisted epic list with the latest crawl result.
 
         Existing rows are pruned and the new list inserted so the table always
-        mirrors the current day's navigation-tree crawl. Enrichment columns
+        mirrors the current day's epic discovery. Enrichment columns
         (name/funds) are populated separately by ``_persist_epic_enrichment``
         during the hourly tradable refresh.
         """
@@ -807,13 +807,17 @@ class BotScheduler:
     # ------------------------------------------------------------------
 
     async def _refresh_epic_list(self) -> None:
-        """Crawl the full IG navigation tree and rebuild the epic list.
+        """Discover the full epic list from IG and rebuild ``_all_epics``.
 
-        Runs at 07:30 daily. Results are deduplicated and stored in
-        ``_all_epics``. The tradable list is NOT updated here — that happens
-        separately via ``_refresh_tradable_epics`` at 08:00.
+        Runs at 07:30 daily. Candidates come from the scanner (search terms +
+        watchlists), already narrowed to the configured asset classes — the
+        scanner drops off-class instruments (chiefly SHARES with ``.CASH`` epics
+        surfaced by broad commodity/index terms) at the source via each result's
+        ``instrumentType``, so the Epic List never lists them. Results are stored
+        in ``_all_epics``; the tradable list is refreshed separately via
+        ``_refresh_tradable_epics`` at 08:00.
         """
-        logger.info("Starting daily epic list refresh (navigation tree crawl)")
+        logger.info("Starting daily epic list refresh")
         try:
             epics = await self._scanner.get_tradeable_epics()
         except Exception as exc:
@@ -821,19 +825,14 @@ class BotScheduler:
             return
 
         if not epics:
-            logger.warning("Navigation tree returned 0 epics — keeping current list")
+            logger.warning("Epic discovery returned 0 epics — keeping current list")
             return
 
         self._all_epics = epics
         self._epic_last_refresh = datetime.now(UTC)
         await self._persist_epic_list(epics, self._epic_last_refresh)
-        logger.info(
-            "Epic list refreshed: %d epics discovered from navigation tree",
-            len(epics),
-        )
-        self._recorder.info(
-            f"Daily epic refresh: {len(epics)} epics in navigation tree"
-        )
+        logger.info("Epic list refreshed: %d epics discovered", len(epics))
+        self._recorder.info(f"Daily epic refresh: {len(epics)} epics")
 
     async def _refresh_tradable_epics(self) -> None:
         """Filter ``_all_epics`` to those currently open and TRADEABLE.
@@ -1056,7 +1055,9 @@ class BotScheduler:
                         current_bid = float(market.get("snapshot", {}).get("bid", 0))
 
                     if current_bid > 0:
-                        closed = await trading.check_and_close(position, current_bid)
+                        closed = await trading.check_and_close(
+                            position, current_bid, buf=buf
+                        )
                         if closed:
                             self._recorder.info(
                                 f"Position closed: {position.epic} "

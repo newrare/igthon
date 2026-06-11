@@ -22,7 +22,7 @@ class Epic(Base):
     # Estimated EUR loss if a minimum-size BUY is stopped out at IG's minimum
     # stop distance. Populated alongside ``deposit`` by _persist_epic_enrichment.
     stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
-    # Timestamp of the last navigation-tree crawl that included this epic.
+    # Timestamp of the last epic discovery that included this epic.
     # Persists the daily epic list across restarts (see BotScheduler).
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Whether this epic is in the current tradable subset (open + TRADEABLE filter).

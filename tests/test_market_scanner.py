@@ -23,12 +23,18 @@ def _make_settings(
     max_spread: float = 0.002,
     search_terms: list[str] | None = None,
     max_funds: float = 0.0,
+    allowed_types: list[str] | None = None,
 ) -> MagicMock:
     s = MagicMock()
     s.strategy_max_spread_ratio = max_spread
     s.scanner_search_terms = search_terms if search_terms is not None else []
     # 0 disables the funds filter — most tests don't supply margin data.
     s.max_funds_per_position = max_funds
+    # Empty list disables the asset-class filter — most tests omit instrument
+    # types, so the default keeps them all.
+    s.scanner_allowed_instrument_types = (
+        allowed_types if allowed_types is not None else []
+    )
     return s
 
 
@@ -42,6 +48,7 @@ def _make_market_detail(
     margin_factor: float | None = None,
     contract_size: float = 1.0,
     min_deal: float = 1.0,
+    instrument_type: str | None = None,
 ) -> dict:
     instrument: dict = {
         "epic": epic,
@@ -51,6 +58,8 @@ def _make_market_detail(
         "contractSize": contract_size,
         "currencies": [{"code": "EUR", "exchangeRate": 1.0, "isDefault": True}],
     }
+    if instrument_type is not None:
+        instrument["type"] = instrument_type
     if margin_factor is not None:
         instrument["marginFactor"] = margin_factor
         instrument["marginFactorUnit"] = "PERCENTAGE"
@@ -206,6 +215,38 @@ async def test_fallback_when_all_sources_empty() -> None:
     epics = await scanner.get_tradeable_epics()
 
     assert epics == []
+
+
+@pytest.mark.asyncio
+async def test_search_drops_off_class_results_by_instrument_type() -> None:
+    """SHARES/RATES returned by broad terms are dropped at search time.
+
+    The asset-class allow-list is applied using each search result's
+    ``instrumentType``; a result with no type is kept (verified later on the
+    fetched details).
+    """
+    client = _make_client(
+        search_results={
+            "Gold": [
+                {"epic": "MT.D.GC.CFD.IP", "instrumentType": "COMMODITIES"},
+                {"epic": "SD.D.BARRICK.CASH.IP", "instrumentType": "SHARES"},
+                {"epic": "EUR.RATE.IP", "instrumentType": "RATES"},
+                {"epic": "UNKNOWN.EPIC"},  # no type → kept
+            ]
+        }
+    )
+    settings = _make_settings(
+        search_terms=["Gold"],
+        allowed_types=["CURRENCIES", "INDICES", "COMMODITIES"],
+    )
+    scanner = MarketScanner(client=client, settings=settings)
+
+    epics = await scanner.get_tradeable_epics()
+
+    assert "MT.D.GC.CFD.IP" in epics
+    assert "UNKNOWN.EPIC" in epics
+    assert "SD.D.BARRICK.CASH.IP" not in epics  # SHARES dropped at source
+    assert "EUR.RATE.IP" not in epics  # RATES dropped at source
 
 
 # ------------------------------------------------------------------
@@ -372,6 +413,69 @@ async def test_market_info_carries_funds_needed() -> None:
 
     # funds = euro_per_point(1) * offer(200) * 10% = 1 * 200 * 0.10 = 20€
     assert infos[0].funds_needed == pytest.approx(20.0)
+
+
+# ------------------------------------------------------------------
+# Asset-class filter (instrument type)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_off_class_instruments_are_dropped() -> None:
+    """SHARES (e.g. gold miners with .CASH epics) are filtered out.
+
+    Allowed asset classes are kept; an unknown/blank type is kept too (we can't
+    prove it's out of scope).
+    """
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value={
+            "marketDetails": [
+                _make_market_detail(
+                    "CC.D.LCO.CFD.IP", 100.0, 100.1, instrument_type="COMMODITIES"
+                ),
+                _make_market_detail(
+                    "IX.D.DAX.IFMM.IP", 100.0, 100.1, instrument_type="INDICES"
+                ),
+                _make_market_detail(
+                    "SD.D.BARRICK.CASH.IP", 100.0, 100.1, instrument_type="SHARES"
+                ),
+                _make_market_detail("MYSTERY.EPIC", 100.0, 100.1),  # no type → kept
+            ]
+        }
+    )
+    settings = _make_settings(allowed_types=["CURRENCIES", "INDICES", "COMMODITIES"])
+    scanner = MarketScanner(client=client, settings=settings)
+
+    infos = await scanner.get_all_market_infos(
+        ["CC.D.LCO.CFD.IP", "IX.D.DAX.IFMM.IP", "SD.D.BARRICK.CASH.IP", "MYSTERY.EPIC"]
+    )
+    epics = [i.epic for i in infos]
+
+    assert "SD.D.BARRICK.CASH.IP" not in epics
+    assert "CC.D.LCO.CFD.IP" in epics
+    assert "IX.D.DAX.IFMM.IP" in epics
+    assert "MYSTERY.EPIC" in epics  # unknown type is kept
+
+
+@pytest.mark.asyncio
+async def test_empty_allow_list_disables_asset_class_filter() -> None:
+    """An empty allow-list keeps every asset class, including SHARES."""
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value={
+            "marketDetails": [
+                _make_market_detail(
+                    "SD.D.BARRICK.CASH.IP", 100.0, 100.1, instrument_type="SHARES"
+                ),
+            ]
+        }
+    )
+    scanner = MarketScanner(client=client, settings=_make_settings(allowed_types=[]))
+
+    infos = await scanner.get_all_market_infos(["SD.D.BARRICK.CASH.IP"])
+
+    assert [i.epic for i in infos] == ["SD.D.BARRICK.CASH.IP"]
 
 
 # ------------------------------------------------------------------

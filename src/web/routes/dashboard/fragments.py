@@ -1,7 +1,7 @@
 """Dashboard HTML fragment builders (dynamically refreshed regions)."""
 
 import html
-from datetime import date
+from datetime import date, datetime, time
 
 from src.services.api_error_log import APIErrorEntry
 from src.web.routes.dashboard.components import (
@@ -17,6 +17,47 @@ from src.web.routes.dashboard.state import (
     _open_reason_label,
     _pnl_color,
 )
+
+
+def _utc_iso(d: date | None, t: time | None) -> str | None:
+    """Combine a stored UTC date + time into an ISO string with a UTC offset.
+
+    Position dates/times are persisted as UTC wall-clock values (``datetime.now(UTC)``),
+    so we tag the combined value with ``+00:00`` and let the browser convert it to the
+    Europe/Paris local hour used by the chart x-axis.
+    """
+    if d is None or t is None:
+        return None
+    return datetime.combine(d, t).isoformat() + "+00:00"
+
+
+def _chart_overlay_js(p, *, closed: bool) -> str:
+    """Build a JS object literal with a position's chart overlay levels/markers.
+
+    Consumed by ``openChartModal(epic, overlay)`` in dashboard.js to draw the
+    open/break-even/stop/target lines and the entry (and exit) time markers.
+    """
+    parts: list[str] = []
+
+    def _num(name: str, attr: str) -> None:
+        value = getattr(p, attr, None)
+        if value is not None:
+            # str(Decimal) keeps the exact stored precision and is a valid JS number.
+            parts.append(f"{name}:{value}")
+
+    _num("open", "level_open")
+    _num("zero", "level_zero")
+    _num("stop", "level_stop")
+    _num("target", "level_win")
+    open_time = _utc_iso(getattr(p, "date", None), getattr(p, "time_open", None))
+    if open_time:
+        parts.append(f"openTime:'{open_time}'")
+    if closed:
+        _num("close", "level_close")
+        close_time = _utc_iso(getattr(p, "date", None), getattr(p, "time_close", None))
+        if close_time:
+            parts.append(f"closeTime:'{close_time}'")
+    return "{" + ",".join(parts) + "}"
 
 
 def _render_logs_section(entries: list[dict]) -> str:
@@ -267,7 +308,7 @@ def _render_epic_list_modal(
     Mirrors the columns of the former standalone ``/epics`` page, but as a
     fragment embedded in an overlay modal. The whole body lives inside the
     polled ``frag-epic_list_modal`` container, so it stays current with the
-    daily navigation-tree crawl without a page reload.
+    daily epic discovery without a page reload.
     """
     count = len(epics)
     count_color = "#4ade80" if count > 0 else "#ef4444"
@@ -324,8 +365,8 @@ def _build_fragments(state: dict) -> dict[str, str]:
     (``/api/dashboard-fragments``). Keeping a single source of truth here means
     the page and the incremental updates can never drift apart.
 
-    Fragment ids: ``kpi_bar``, ``market_rows``, ``queue_modal``, ``api_modal``,
-    ``positions_modal``.
+    Fragment ids: ``kpi_bar``, ``market_rows``, ``queue_modal`` (which now also
+    carries the IG API guard detail), ``positions_modal``.
     """
     market_summary: list[dict] = state["market_summary"]
     kpis: dict = state["kpis"]
@@ -351,14 +392,15 @@ def _build_fragments(state: dict) -> dict[str, str]:
             pnl_str = f"{pnl_val:+.2f}€" if p.euro is not None else "—"
             strategy_str = (p.strategy.value if p.strategy else "—").upper()
             epic_esc = html.escape(p.epic)
+            overlay_js = _chart_overlay_js(p, closed=False)
             close_btn = render_button(
                 "Close",
                 cls="close-pos-btn",
-                onclick=f"closePosition({p.id}, '{epic_esc}', this)",
+                onclick=f"event.stopPropagation(); closePosition({p.id}, '{epic_esc}', this)",
                 title="Close this position manually",
             )
             pos_rows_html += f"""
-                    <tr>
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', {overlay_js})">
                         <td class="err-ts">{html.escape(t_open)}</td>
                         <td class="epic-col">{epic_esc}</td>
                         <td class="desc-col">{html.escape(p.epic_name)}</td>
@@ -390,12 +432,12 @@ def _build_fragments(state: dict) -> dict[str, str]:
             pnl_str = f"{pnl_val:+.2f}€"
             open_label, open_color = _open_reason_label(p.reason_open)
             close_label, close_color = _close_reason_label(p.reason_close)
+            epic_esc = html.escape(p.epic)
+            overlay_js = _chart_overlay_js(p, closed=True)
             closed_rows_html += f"""
-                    <tr>
-                        <td class="err-ts">{html.escape(d_str)}</td>
-                        <td class="err-ts">{html.escape(t_open)}</td>
-                        <td class="err-ts">{html.escape(d_str)}</td>
-                        <td class="err-ts">{html.escape(t_close)}</td>
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', {overlay_js})">
+                        <td class="err-ts" title="{html.escape(d_str)}">{html.escape(t_open)}</td>
+                        <td class="err-ts" title="{html.escape(d_str)}">{html.escape(t_close)}</td>
                         <td class="epic-col">{html.escape(p.epic)}</td>
                         <td class="desc-col">{html.escape(p.epic_name)}</td>
                         <td class="number">{lvl_open}</td>
@@ -406,15 +448,15 @@ def _build_fragments(state: dict) -> dict[str, str]:
                         <td style="color:{close_color};">{html.escape(close_label)}</td>
                     </tr>"""
     else:
-        closed_rows_html = '<tr><td colspan="12" class="err-empty">No closed positions today.</td></tr>'
+        closed_rows_html = '<tr><td colspan="10" class="err-empty">No closed positions today.</td></tr>'
 
     market_rows = ""
     for s in market_summary:
         pct = _bid_pct(s["bid"], s["low"], s["high"])
         pct_color = "#4ade80" if pct >= 50 else "#f59e0b" if pct >= 25 else "#ef4444"
         epic_esc = html.escape(str(s["epic"]))
-        vpp = s.get("value_per_point", 0.0)
-        vpp_str = f"{vpp:.2f}€" if vpp else "—"
+        spread_cost = s.get("spread_cost")
+        spread_str = f"{spread_cost:.2f}€" if spread_cost else "—"
         buy_btn = render_button(
             "Buy",
             cls="buy-btn",
@@ -428,10 +470,8 @@ def _build_fragments(state: dict) -> dict[str, str]:
         market_rows += f"""
         <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
             <td class="epic-col">{epic_esc}</td>
-            <td class="number">{s['bid']:.1f}</td>
-            <td class="number">{s['offer']:.1f}</td>
-            <td class="number">{s['spread']:.3f}</td>
-            <td class="number">{vpp_str}</td>
+            <td class="desc-col">{html.escape(str(s.get('name', '—')))}</td>
+            <td class="number">{spread_str}</td>
             <td class="number">{s['high']:.1f} / {s['low']:.1f}</td>
             <td>
                 <div class="range-bar-wrap">
@@ -442,7 +482,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
                     <span class="range-pct" style="color:{pct_color};">{pct:.0f}%</span>
                 </div>
             </td>
-            <td class="number">{s['candles']}</td>
+            <td class="number">{s['dots']}</td>
             <td style="text-align:center;">
                 {buy_btn}
             </td>
@@ -472,26 +512,14 @@ def _build_fragments(state: dict) -> dict[str, str]:
             <div class="kpi-sub">{wallet_sub}</div>
         </div>"""
 
-    # API Guard KPI tile
+    # API Guard status (rendered inside the Queue modal, no longer its own tile).
     if guard_stats is None:
         api_status_color = "#475569"
         api_status_label = "N/A"
-        api_status_sub = "Guard not configured"
         api_border_color = "#475569"
     elif guard_stats.is_blocked:
         api_status_color = "#ef4444"
         api_status_label = "BLOCKED"
-        since_str = (
-            guard_stats.blocked_since.astimezone(_PARIS).strftime("%H:%M")
-            if guard_stats.blocked_since
-            else "?"
-        )
-        until_str = (
-            guard_stats.blocked_until.astimezone(_PARIS).strftime("%H:%M")
-            if guard_stats.blocked_until
-            else "?"
-        )
-        api_status_sub = f"Since {since_str} — auto-unblocks ~{until_str}"
         api_border_color = "#ef4444"
     else:
         used_pct = (
@@ -506,9 +534,6 @@ def _build_fragments(state: dict) -> dict[str, str]:
             api_status_color = "#4ade80"
             api_border_color = "#4ade80"
         api_status_label = "OK"
-        api_status_sub = (
-            f"{guard_stats.calls_last_minute}/{guard_stats.max_per_minute} calls/min"
-        )
 
     # Error log section HTML
     if error_entries:
@@ -548,7 +573,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
         queue_todo_color = "#94a3b8"
         queue_kpi_border = "#475569"
     else:
-        todo_count = queue_stats.pending
+        todo_count = queue_stats.pending + queue_stats.running
         queue_todo = todo_count
         queue_running = queue_stats.running
         queue_succeeded = queue_stats.succeeded
@@ -563,6 +588,11 @@ def _build_fragments(state: dict) -> dict[str, str]:
             if queue_stats.failed
             else ("#f59e0b" if todo_count else "#4ade80")
         )
+
+    # The Queue tile now also surfaces the IG guard state: a blocked API turns
+    # the tile border red regardless of the queue's own counters.
+    if guard_stats is not None and guard_stats.is_blocked:
+        queue_kpi_border = "#ef4444"
 
     _status_colors = {
         "done": "#4ade80",
@@ -698,39 +728,17 @@ def _build_fragments(state: dict) -> dict[str, str]:
             <div class="kpi-value" style="color:{'#4ade80' if kpis['win_rate'] >= 0.5 else '#ef4444'};">{kpis['win_rate']:.1%}</div>
             <div class="kpi-sub"><span style="color:#4ade80;">{kpis['total_wins']} win</span>&nbsp;/&nbsp;<span style="color:#ef4444;">{kpis['total_losses']} Loose</span></div>
         </div>
-        {wallet_tile}
-        <div class="kpi-tile clickable" style="border-left-color:{api_border_color};" onclick="openApiModal()">
-            <div class="kpi-label">IG API</div>
-            <div class="kpi-value" style="color:{api_status_color};">{api_status_label}</div>
-            <div class="kpi-sub">{api_status_sub}</div>
-        </div>"""
+        {wallet_tile}"""
 
-    # ── Queue modal fragment (inner content) ────────────────────────────────────
-    queue_finished_table = render_table(
-        ["Finished", "Method", "Task", "Status", "Tries", "Last error"],
-        queue_rows_html,
-        style="margin-top:0.6rem;",
-        wrap_scroll=False,
-    )
-    queue_modal = f"""
-        <div class="guard-stat-row" style="margin-bottom:1rem;">
-            <div class="guard-stat"><span class="guard-stat-label">TODO</span><span class="guard-stat-value" style="color:{queue_todo_color};">{queue_todo}</span></div>
-            <div class="guard-stat"><span class="guard-stat-label">Running</span><span class="guard-stat-value">{queue_running}</span></div>
-            <div class="guard-stat"><span class="guard-stat-label">Succeeded</span><span class="guard-stat-value" style="color:#4ade80;">{queue_succeeded}</span></div>
-            <div class="guard-stat"><span class="guard-stat-label">Failed</span><span class="guard-stat-value" style="color:{queue_failed_color};">{queue_failed}</span></div>
-            <div class="guard-stat"><span class="guard-stat-label">Retried</span><span class="guard-stat-value">{queue_retried}</span></div>
-            <div class="guard-stat"><span class="guard-stat-label">Rate-limited</span><span class="guard-stat-value" style="color:{queue_rl_color};">{queue_rate_limited}</span></div>
-        </div>
-        {todo_table_html}
-        {queue_finished_table}"""
-
-    # ── IG API modal fragment (availability + error log) ────────────────────────
+    # ── IG API guard detail (availability + error log) ──────────────────────────
+    # Folded into the bottom of the Queue modal — there is no standalone IG API
+    # card/modal anymore; the guard state lives alongside the queue it throttles.
     error_log_table = render_table(
         ["Time", "Method", "Endpoint", "HTTP", "IG Error Code", "Translation"],
         error_rows_html,
         tbody_id="err-tbody",
     )
-    api_modal = f"""
+    api_detail = f"""
         <h3 style="color:#94a3b8;font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;margin:0 0 0.7rem;">Availability</h3>
         <div class="guard-stat-row">
             <div class="guard-stat">
@@ -769,6 +777,29 @@ def _build_fragments(state: dict) -> dict[str, str]:
         </div>
         {error_log_table}"""
 
+    # ── Queue modal fragment (inner content) ────────────────────────────────────
+    # The IG API guard detail (api_detail) is appended at the bottom so the queue
+    # and the guard that throttles it are inspected from a single modal.
+    queue_finished_table = render_table(
+        ["Finished", "Method", "Task", "Status", "Tries", "Last error"],
+        queue_rows_html,
+        style="margin-top:0.6rem;",
+        wrap_scroll=False,
+    )
+    queue_modal = f"""
+        <div class="guard-stat-row" style="margin-bottom:1rem;">
+            <div class="guard-stat"><span class="guard-stat-label">TODO</span><span class="guard-stat-value" style="color:{queue_todo_color};">{queue_todo}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Running</span><span class="guard-stat-value">{queue_running}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Succeeded</span><span class="guard-stat-value" style="color:#4ade80;">{queue_succeeded}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Failed</span><span class="guard-stat-value" style="color:{queue_failed_color};">{queue_failed}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Retried</span><span class="guard-stat-value">{queue_retried}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Rate-limited</span><span class="guard-stat-value" style="color:{queue_rl_color};">{queue_rate_limited}</span></div>
+        </div>
+        {todo_table_html}
+        {queue_finished_table}
+        <h3 style="color:#e2e8f0;font-size:0.9rem;font-weight:600;margin:1.6rem 0 0.9rem;padding-top:1rem;border-top:1px solid #1e293b;"><i data-lucide="plug" class="lc-icon"></i> IG API</h3>
+        {api_detail}"""
+
     # ── Open positions modal fragment ───────────────────────────────────────────
     positions_table = render_table(
         [
@@ -797,9 +828,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
     win_rate_pct = kpis["win_rate_today"] * 100
     closed_table = render_table(
         [
-            "Date open",
             "Opened",
-            "Date close",
             "Closed",
             "Epic",
             "Name",
@@ -833,7 +862,6 @@ def _build_fragments(state: dict) -> dict[str, str]:
             state.get("day_records") or [], _today
         ),
         "queue_modal": queue_modal,
-        "api_modal": api_modal,
         "epic_list_modal": _render_epic_list_modal(
             state.get("all_epics") or [],
             state.get("epic_db_map") or {},

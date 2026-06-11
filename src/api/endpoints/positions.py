@@ -27,6 +27,20 @@ async def open_position(client: IGClient, payload: dict) -> dict:
     return await client.post("/positions/otc", payload, version=2)
 
 
+async def update_position(client: IGClient, deal_id: str, payload: dict) -> dict:
+    """Update a position's stop/limit (PUT /positions/otc/{dealId}).
+
+    Args:
+        client: Authenticated IG client.
+        deal_id: IG deal identifier of the open position.
+        payload: Update payload (e.g. stopLevel, limitLevel, trailingStop).
+
+    Returns:
+        Deal reference for confirmation.
+    """
+    return await client.put(f"/positions/otc/{deal_id}", payload, version=2)
+
+
 async def close_position(client: IGClient, payload: dict) -> dict:
     """Close a position (DELETE /positions/otc).
 

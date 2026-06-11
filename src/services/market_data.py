@@ -6,6 +6,7 @@ Prices are fetched on demand from the IG API and kept in memory only.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -120,13 +121,23 @@ class MarketDataService:
     ) -> None:
         """Refresh candle data for all tracked epics.
 
+        All fetches are enqueued at once via ``asyncio.gather`` so the APIQueue
+        receives every request immediately and drains them under its own
+        rate-limit control — the queue counter then reflects the real backlog.
+        A single epic failing does not abort the others.
+
         Args:
             epics: List of epic identifiers to refresh.
             resolution: Candle resolution.
             num_points: Number of candles per epic.
         """
-        for epic in epics:
-            await self.fetch_candles(epic, resolution, num_points)
+        results = await asyncio.gather(
+            *[self.fetch_candles(epic, resolution, num_points) for epic in epics],
+            return_exceptions=True,
+        )
+        for epic, result in zip(epics, results):
+            if isinstance(result, BaseException):
+                logger.warning("Failed to refresh candles for %s: %s", epic, result)
 
     async def fetch_latest_candles(
         self,

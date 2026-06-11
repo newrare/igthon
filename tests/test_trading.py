@@ -1,17 +1,52 @@
 """Tests for the trading service."""
 
+from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 
 from src.models.position import Position
 from src.services.compute import RegressionResult, TradingLevels, TradingSignal
+from src.services.price_buffer import Candle, EpicBuffer
 from src.services.trading import TradeConfig, TradingService
 
 
 def _service() -> TradingService:
     """A TradingService with no client/session — for testing pure helpers."""
     return TradingService(client=None, db_session=None, config=TradeConfig())
+
+
+def _buffer_with_atr2(n: int = 20, close: float = 100.0, spread: float = 0.0):
+    """Buffer whose candles have a constant True Range of 2 -> ATR == 2.0.
+
+    Each candle spans [close-1, close+1] with a flat close, so every TR is 2
+    regardless of the offset, giving a deterministic ATR for trailing tests.
+    """
+    buf = EpicBuffer(epic="X", max_candles=200)
+    for _ in range(n):
+        buf.add(
+            Candle(
+                timestamp=datetime(2026, 1, 1, 10, 0, tzinfo=UTC),
+                bid_open=close,
+                bid_close=close,
+                bid_high=close + 1,
+                bid_low=close - 1,
+                offer_open=close + spread,
+                offer_close=close + spread,
+                offer_high=close + 1 + spread,
+                offer_low=close - 1 + spread,
+            )
+        )
+    return buf
+
+
+def _trailing_service():
+    """Service with mocked client/db for exercising the trailing-stop path."""
+    client = AsyncMock()
+    db = AsyncMock()
+    service = TradingService(client=client, db_session=db, config=TradeConfig())
+    return service, client, db
 
 
 class TestEuroPnl:
@@ -141,3 +176,105 @@ class TestTradingSignalStructure:
         assert signal.levels.stop_distance > 0
         assert signal.levels.level_win > signal.levels.bid
         assert signal.levels.level_loose < signal.levels.bid
+
+
+class TestClampTrailingDistance:
+    """_clamp_trailing_distance bounds the ATR distance between two limits."""
+
+    def test_ceiling_is_initial_euro_risk(self):
+        # euro_stop 10 / euro_per_point 5 -> max distance 2; raw 5 is clamped.
+        svc = _service()
+        pos = Position(euro_stop=Decimal("10"), euro_per_point=Decimal("5"))
+        assert svc._clamp_trailing_distance(5.0, pos, spread=0.0) == pytest.approx(2.0)
+
+    def test_floor_is_two_spreads(self):
+        # No euro ceiling; raw 2 lifted to floor 2 x spread (3) = 6.
+        svc = _service()
+        pos = Position()
+        assert svc._clamp_trailing_distance(2.0, pos, spread=3.0) == pytest.approx(6.0)
+
+    def test_unbounded_passes_through(self):
+        svc = _service()
+        pos = Position()
+        assert svc._clamp_trailing_distance(5.0, pos, spread=0.0) == pytest.approx(5.0)
+
+
+class TestTrailingStop:
+    """ATR-based trailing stop: ratchet, two-speed regime, IG push."""
+
+    async def test_ratchets_up_before_break_even(self):
+        svc, client, db = _trailing_service()
+        buf = _buffer_with_atr2()  # ATR == 2 -> k_pre 2.5 -> distance 5
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),  # not yet reached at bid 105
+            level_follower=None,
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        assert float(pos.level_follower) == pytest.approx(100.0)  # 105 - 5
+        assert pos.stop_update == 1
+        client.put.assert_awaited_once()
+        endpoint = client.put.await_args.args[0]
+        assert endpoint == "/positions/otc/DEAL1"
+        assert client.put.await_args.kwargs["version"] == 2
+        db.commit.assert_awaited()
+
+    async def test_tightens_after_break_even(self):
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2()
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("101"),  # cleared at bid 105 -> k_post 1.5 -> dist 3
+            level_follower=Decimal("100"),
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        assert float(pos.level_follower) == pytest.approx(102.0)  # 105 - 3
+        client.put.assert_awaited_once()
+
+    async def test_never_falls_below_level_zero_once_secured(self):
+        svc, _, _ = _trailing_service()
+        buf = _buffer_with_atr2()
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("104"),  # 105 - 3 = 102 < 104 -> floored to 104
+            level_follower=Decimal("100"),
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        assert float(pos.level_follower) == pytest.approx(104.0)
+
+    async def test_does_not_move_down_or_below_step(self):
+        svc, client, db = _trailing_service()
+        buf = _buffer_with_atr2()
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),
+            level_follower=Decimal("103"),  # candidate 100 < current -> no change
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        assert float(pos.level_follower) == pytest.approx(103.0)
+        client.put.assert_not_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_no_buffer_is_noop(self):
+        svc, client, _ = _trailing_service()
+        pos = Position(epic="X", deal_id="DEAL1", level_follower=Decimal("100"))
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=None)
+
+        client.put.assert_not_awaited()

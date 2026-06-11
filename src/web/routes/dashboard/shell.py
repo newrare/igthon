@@ -23,21 +23,16 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 close_fn="closeChartModal",
                 title="Chart",
                 title_id="chart-modal-title",
-                body='<div id="chart-container" style="height:420px;"></div>',
-            ),
-            render_modal(
-                modal_id="ig-api-modal",
-                close_fn="closeApiModal",
-                title='<i data-lucide="plug" class="lc-icon"></i> IG API',
-                max_width="860px",
-                refresh_id="refresh-api",
-                body=f'<div id="frag-api_modal">{frags["api_modal"]}</div>',
+                # Above the other live-data modals (default 8500) so the chart
+                # opens on top when launched from an open/closed positions row,
+                # rather than behind their dark overlay (which hid the indicators).
+                z_index=8700,
+                body='<div id="chart-container" style="height:100%;min-height:420px;"></div>',
             ),
             render_modal(
                 modal_id="epics-modal",
                 close_fn="closeEpicsModal",
                 title='<i data-lucide="globe" class="lc-icon"></i> Epic List',
-                max_width="1100px",
                 refresh_id="refresh-epics",
                 body=f'<div id="frag-epic_list_modal">{frags["epic_list_modal"]}</div>',
             ),
@@ -91,7 +86,6 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     '<i data-lucide="check-circle" class="lc-icon"></i> '
                     "Closed Positions — Today"
                 ),
-                max_width="1100px",
                 refresh_id="refresh-closed",
                 body=(
                     '<div id="frag-closed_positions_modal">'
@@ -102,7 +96,6 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 modal_id="winrate-modal",
                 close_fn="closeWinRateModal",
                 title='<i data-lucide="settings" class="lc-icon"></i> Configuration',
-                max_width="860px",
                 body=_render_config_grid(settings),
             ),
         ]
@@ -114,8 +107,8 @@ def _render_dashboard(settings, state: dict) -> str:
     dynamically refreshed fragments (KPI bar, market data, modals).
 
     The dynamic regions are produced by :func:`_build_fragments` and embedded in
-    containers (``id="frag-*"``) that the client refreshes in place every two
-    seconds via ``/api/dashboard-fragments`` — no full-page reload.
+    containers (``id="frag-*"``) that the client refreshes in place every
+    second via ``/api/dashboard-fragments`` — no full-page reload.
     """
     frags = _build_fragments(state)
     modals = _render_modals(settings, frags)
@@ -151,13 +144,11 @@ def _render_dashboard(settings, state: dict) -> str:
                     <thead>
                         <tr>
                             <th>Epic</th>
-                            <th>Bid</th>
-                            <th>Offer</th>
-                            <th>Spread</th>
-                            <th title="Euro value of one point of movement for a minimum-size buy">€/pt (min buy)</th>
+                            <th>Name</th>
+                            <th title="Euro cost of crossing the spread once at minimum deal size: (offer − bid) × € per point">Spread (€)</th>
                             <th>High / Low</th>
                             <th>Bid % range</th>
-                            <th>Candles</th>
+                            <th title="Number of price points (readings) currently buffered for this epic">Dots</th>
                             <th>Action</th>
                         </tr>
                     </thead>
@@ -269,9 +260,9 @@ def _render_dashboard(settings, state: dict) -> str:
         <button id="btn-pause" class="nav-btn" onclick="togglePause()" style="display:inline-flex;align-items:center;gap:0.4rem;"><i data-lucide="pause" class="lc-icon"></i> Pause</button>
     </nav>
 
-    <footer id="footer-refresh">Live — updating every 2 s</footer>
+    <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js"></script>
+<script src="/static/dashboard.js?v=2"></script>
 </body>
 </html>"""

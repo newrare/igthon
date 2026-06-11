@@ -5,6 +5,7 @@ These cover the "unified Option A" live-update mechanism: a single
 which the client swaps in place every two seconds instead of reloading the page.
 """
 
+import asyncio
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +25,6 @@ _FRAGMENT_KEYS = {
     "week_summary",
     "day_history",
     "queue_modal",
-    "api_modal",
     "epic_list_modal",
     "positions_modal",
     "closed_positions_modal",
@@ -138,53 +138,49 @@ class TestBuildFragments:
                 {
                     "epic": "IX.D.DAX.IFMM.IP",
                     "bid": 18000.0,
-                    "offer": 18002.0,
-                    "spread": 2.0,
-                    "candles": 30,
+                    "dots": 30,
                     "high": 18100.0,
                     "low": 17900.0,
+                    "spread_cost": 2.5,
                 }
             ]
         )
         rows = _build_fragments(state)["market_rows"]
         assert "IX.D.DAX.IFMM.IP" in rows
-        assert "18000.0" in rows
+        assert "18100.0" in rows
+        assert "30" in rows
 
-    def test_market_rows_render_value_per_point(self):
+    def test_market_rows_render_spread_cost(self):
         state = _base_state(
             market_summary=[
                 {
                     "epic": "IX.D.DAX.IFMM.IP",
                     "bid": 18000.0,
-                    "offer": 18002.0,
-                    "spread": 2.0,
-                    "candles": 30,
+                    "dots": 30,
                     "high": 18100.0,
                     "low": 17900.0,
-                    "value_per_point": 1.5,
+                    "spread_cost": 1.5,
                 }
             ]
         )
         rows = _build_fragments(state)["market_rows"]
         assert "1.50€" in rows
 
-    def test_market_rows_value_per_point_dash_when_zero(self):
+    def test_market_rows_spread_cost_dash_when_missing(self):
         state = _base_state(
             market_summary=[
                 {
                     "epic": "IX.D.DAX.IFMM.IP",
                     "bid": 18000.0,
-                    "offer": 18002.0,
-                    "spread": 2.0,
-                    "candles": 30,
+                    "dots": 30,
                     "high": 18100.0,
                     "low": 17900.0,
-                    "value_per_point": 0.0,
+                    "spread_cost": None,
                 }
             ]
         )
         rows = _build_fragments(state)["market_rows"]
-        assert "0.00€" not in rows
+        assert "€" not in rows
 
     def test_no_bot_tile_in_kpi_bar(self):
         # The Bot pause/resume KPI tile was replaced by the Actions section.
@@ -209,10 +205,12 @@ class TestBuildFragments:
     def test_open_positions_rendered_in_modal(self):
         pos = SimpleNamespace(
             id=1,
+            date=date(2026, 6, 8),
             time_open=time(10, 0, 0),
             epic="IX.D.DAX.IFMM.IP",
             epic_name="DAX",
             level_open=18000.0,
+            level_zero=18000.0,
             level_win=18050.0,
             level_stop=17950.0,
             quantity=2,
@@ -226,6 +224,14 @@ class TestBuildFragments:
         modal = _build_fragments(state)["positions_modal"]
         assert "DAX" in modal
         assert "No open positions" not in modal
+        # Row opens the chart modal with the position's overlay levels/markers.
+        assert "openChartModal('IX.D.DAX.IFMM.IP'" in modal
+        assert "open:18000.0" in modal
+        assert "stop:17950.0" in modal
+        assert "target:18050.0" in modal
+        assert "openTime:'2026-06-08T10:00:00+00:00'" in modal
+        # The Close button must not bubble up into the row's chart handler.
+        assert "event.stopPropagation(); closePosition" in modal
 
     def test_positions_modal_empty_state(self):
         modal = _build_fragments(_base_state())["positions_modal"]
@@ -263,6 +269,11 @@ class TestBuildFragments:
         assert "Manual" in modal  # open reason label
         assert "Target hit" in modal  # close reason label
         assert "No closed positions" not in modal
+        # Row opens the chart modal with entry + exit markers.
+        assert "openChartModal('IX.D.DAX.IFMM.IP'" in modal
+        assert "close:18050.0" in modal
+        assert "openTime:'2026-06-08T10:00:00+00:00'" in modal
+        assert "closeTime:'2026-06-08T11:30:00+00:00'" in modal
 
     def test_closed_positions_modal_empty_state(self):
         modal = _build_fragments(_base_state())["closed_positions_modal"]
@@ -282,8 +293,14 @@ class TestBuildFragments:
             max_per_second=5,
         )
         frags = _build_fragments(_base_state(guard_stats=guard))
-        assert "BLOCKED" in frags["kpi_bar"]
-        assert "Blocked since" in frags["api_modal"]
+        # A blocked guard turns the Queue tile border red...
+        assert (
+            'border-left-color:#ef4444; position:relative;" onclick="openQueueModal()"'
+            in frags["kpi_bar"]
+        )
+        # ...and the guard detail (status + block info) lives in the Queue modal.
+        assert "BLOCKED" in frags["queue_modal"]
+        assert "Blocked since" in frags["queue_modal"]
 
 
 # ── Shell rendering ──────────────────────────────────────────────────────────
@@ -302,7 +319,7 @@ class TestRenderDashboard:
         # The polling engine now lives in the external static script.
         assert "/static/dashboard.js" in html
         assert "location.reload()" not in html
-        assert "Live — updating every 2 s" in html
+        assert "Live — updating every 1 s" in html
 
     def test_engine_script_polls_fragments_endpoint(self):
         # The extracted JS engine still drives the live fragment polling.
@@ -318,7 +335,6 @@ class TestRenderDashboard:
             "refresh-kpi",
             "refresh-market",
             "refresh-queue",
-            "refresh-api",
             "refresh-positions",
         ):
             assert f'id="{stamp_id}"' in html
@@ -385,6 +401,55 @@ class TestFragmentsEndpoint:
             resp = await client.get("/")
         assert resp.status_code == 200
         assert 'id="frag-kpi_bar"' in resp.text
+
+    async def test_poll_never_blocks_on_a_busy_queue(self):
+        """The fragments poll must not await external IG calls.
+
+        Regression: the dashboard renders the queue view, so if its data
+        gathering awaited a queued ``/accounts`` or ``/markets`` call, a busy or
+        rate-limited queue (e.g. during a market scan) would stall the poll and
+        freeze the whole UI. The poll must return promptly from cache and only
+        *schedule* the refreshes in the background.
+        """
+
+        class _BlockingQueue:
+            def __init__(self) -> None:
+                self.calls = 0
+                self._never = asyncio.Event()
+
+            async def get(self, endpoint: str, **kwargs) -> dict:
+                self.calls += 1
+                await self._never.wait()  # simulates a stuck/rate-limited worker
+                return {}
+
+            # Read-only snapshots the dashboard reads from memory (never blocks).
+            def stats(self):
+                return None
+
+            def recent(self):
+                return []
+
+            def pending_tasks(self):
+                return []
+
+        buffer = PriceBuffer()
+        buffer.add_candle("IX.D.DAX.IFMM.IP", _candle(1000.0))
+        queue = _BlockingQueue()
+        app = create_app(settings=_settings(), buffer=buffer, api_queue=queue)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Would hang forever before the fix; wait_for makes the failure a
+            # timeout rather than a hung test.
+            resp = await asyncio.wait_for(
+                client.get("/api/dashboard-fragments"), timeout=3.0
+            )
+        assert resp.status_code == 200
+
+        # The poll scheduled the background refresh (it just didn't await it).
+        await asyncio.sleep(0.05)
+        assert queue.calls >= 1
+        queue._never.set()  # let the background tasks unwind cleanly
 
 
 # ── /api/positions/funds/{epic} endpoint (BUY hover) ─────────────────────────

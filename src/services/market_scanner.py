@@ -55,6 +55,10 @@ class MarketInfo:
     spread_ratio: float
     dealing_enabled: bool
     status: str
+    # IG instrument class (e.g. CURRENCIES, INDICES, COMMODITIES, SHARES).
+    # Empty when the /markets payload omits it. Used by the asset-class filter
+    # to keep shares (gold miners, etc. with .CASH epics) out of the universe.
+    instrument_type: str = ""
     # Estimated margin (EUR) to open one minimum-size BUY, or None when the
     # /markets payload lacks the margin/contract/price data to compute it.
     funds_needed: float | None = None
@@ -95,9 +99,15 @@ class MarketScanner:
     async def get_tradeable_epics(self) -> list[str]:
         """Return a deduplicated list of epic codes, one per underlying market.
 
-        Combines term-based search results with user watchlists sequentially,
-        deduplicates exact epic strings, then collapses product-type variants
-        (CFD/MINI/DAILY/DFB) that map to the same underlying market into a
+        Combines term-based search results with user watchlists, keeping only
+        the configured asset classes (``scanner_allowed_instrument_types``) using
+        the ``instrumentType`` field present on every search/watchlist result —
+        so off-class instruments (chiefly SHARES with ``.CASH`` epics surfaced by
+        broad commodity/index terms) are dropped at the source, before any market
+        detail is fetched.
+
+        Exact-epic duplicates are removed, then product-type variants
+        (CFD/MINI/DAILY/DFB) that map to the same underlying market collapse to a
         single representative epic (preferring CFD > MINI > DAILY > DFB).
         """
         search_epics = await self._epics_from_search()
@@ -123,11 +133,17 @@ class MarketScanner:
         return market_unique
 
     async def get_all_market_infos(self, epics: list[str]) -> list[MarketInfo]:
-        """Fetch and parse market details for every epic (no filtering).
+        """Fetch and parse market details for every epic.
 
         Returns one ``MarketInfo`` per successfully-parsed market — including
         closed/non-tradeable ones — so callers can enrich the full epic list
         (name, funds needed) before narrowing it down to the tradable subset.
+
+        The only filtering applied here is by asset class: instruments whose
+        ``type`` is known and not in ``settings.scanner_allowed_instrument_types``
+        (typically SHARES surfaced by broad commodity/index search terms, with
+        ``.CASH`` epics) are dropped so they never reach the Epic List or the
+        tradable set. Markets with a blank/unknown type are kept.
         """
         details = await self._fetch_market_details(epics)
         infos: list[MarketInfo] = []
@@ -135,7 +151,40 @@ class MarketScanner:
             info = self._parse_market(detail)
             if info is not None:
                 infos.append(info)
-        return infos
+        return self._filter_instrument_type(infos)
+
+    def _filter_instrument_type(self, infos: list[MarketInfo]) -> list[MarketInfo]:
+        """Drop markets whose asset class is not in the configured allow-list.
+
+        Keeps only the instrument types listed in
+        ``settings.scanner_allowed_instrument_types`` (e.g. CURRENCIES, INDICES,
+        COMMODITIES). A market with a blank/unknown type is kept — we can't prove
+        it's out of scope, mirroring ``_filter_affordable``'s treatment of
+        unknown funds. Logs a per-type breakdown so an unexpected drop is
+        diagnosable.
+        """
+        if not self.settings.scanner_allowed_instrument_types:
+            return infos
+        result: list[MarketInfo] = []
+        dropped_counts: dict[str, int] = {}
+        for info in infos:
+            if not self._type_allowed(info.instrument_type):
+                dropped_counts[info.instrument_type.upper()] = (
+                    dropped_counts.get(info.instrument_type.upper(), 0) + 1
+                )
+                continue
+            result.append(info)
+        if dropped_counts:
+            breakdown = ", ".join(
+                f"{kind}={count}" for kind, count in sorted(dropped_counts.items())
+            )
+            logger.info(
+                "MarketScanner: dropped %d off-class epic(s) [%s] — keeping %s",
+                sum(dropped_counts.values()),
+                breakdown,
+                ", ".join(self.settings.scanner_allowed_instrument_types),
+            )
+        return result
 
     async def get_tradeable_markets(self, epics: list[str]) -> list[MarketInfo]:
         """Fetch market details and keep only the currently tradable subset.
@@ -221,33 +270,45 @@ class MarketScanner:
 
         return result
 
+    def _type_allowed(self, instrument_type: str | None) -> bool:
+        """Return True if an instrument's asset class passes the allow-list.
+
+        An empty allow-list or a missing/blank type is treated as allowed — we
+        can't prove a typeless result is out of scope, and the authoritative
+        filter re-runs later on the fetched market details.
+        """
+        allowed = {t.upper() for t in self.settings.scanner_allowed_instrument_types}
+        if not allowed or not instrument_type:
+            return True
+        return instrument_type.upper() in allowed
+
     # ------------------------------------------------------------------
     # Search-based discovery
     # ------------------------------------------------------------------
 
     async def _epics_from_search(self) -> list[str]:
-        """Search all configured terms sequentially, sleeping between calls.
+        """Submit all search-term calls concurrently and collect results.
 
-        Each term hits GET /markets?searchTerm=X (v1). The ``inter_call_delay``
-        sleep between terms keeps the burst rate well below the IG per-minute
-        quota.  asyncio.sleep() yields to the event loop so other tasks are not
-        blocked during the wait.
+        Each term hits GET /markets?searchTerm=X (v1). All calls are enqueued
+        at once so the APIQueue/APIGuard fills up and drains visibly in the UI;
+        rate-limit serialisation is handled by the guard, not by manual sleeps.
         """
         terms = self.settings.scanner_search_terms
         if not terms:
             return []
 
+        results = await asyncio.gather(
+            *[self._search_term(term) for term in terms],
+            return_exceptions=True,
+        )
         epics: list[str] = []
         ok = 0
-        for i, term in enumerate(terms):
-            if i > 0 and self.inter_call_delay > 0:
-                await asyncio.sleep(self.inter_call_delay)
-            try:
-                result = await self._search_term(term)
+        for term, result in zip(terms, results):
+            if isinstance(result, BaseException):
+                logger.warning("MarketScanner: search error for '%s': %s", term, result)
+            else:
                 epics.extend(result)
                 ok += 1
-            except Exception as exc:
-                logger.warning("MarketScanner: search error for '%s': %s", term, exc)
 
         logger.info(
             "MarketScanner: search discovery — %d epics across %d/%d terms",
@@ -258,12 +319,15 @@ class MarketScanner:
         return epics
 
     async def _search_term(self, term: str) -> list[str]:
-        """Search markets for a single term and return epic codes.
+        """Search markets for a single term and return keepable epic codes.
 
-        IG search results include option-chain epics (OPTCALL/OPTPUT segments)
-        which cannot be fetched via the batch /markets?epics= endpoint — IG
-        returns HTTP 500 "Transformation failure" for them. Filter them out here
-        before they reach the batch pipeline.
+        Broad terms (e.g. "USD", "Oil") return many off-class instruments —
+        SHARES, RATES, etc. — alongside the wanted markets. Each result carries
+        an ``instrumentType``, so the asset-class allow-list is applied here to
+        drop them at the source. Option-chain epics (OPTCALL/OPTPUT segments) are
+        also skipped: they cannot be fetched via the batch /markets?epics=
+        endpoint (IG returns HTTP 500 "Transformation failure") and would poison
+        the batch pipeline.
         """
         data = await self.client.get(
             f"/markets?searchTerm={quote(term, safe='')}", version=1
@@ -275,6 +339,8 @@ class MarketScanner:
                 continue
             if self._is_option_epic(epic):
                 logger.debug("MarketScanner: skipping option-chain epic %s", epic)
+                continue
+            if not self._type_allowed(m.get("instrumentType")):
                 continue
             epics.append(epic)
         return epics
@@ -293,30 +359,43 @@ class MarketScanner:
     # ------------------------------------------------------------------
 
     async def _epics_from_watchlists(self) -> list[str]:
-        """Collect all epics from every user watchlist sequentially."""
-        epics: list[str] = []
+        """Collect all epics from every user watchlist concurrently.
+
+        First fetches the watchlist index (one call), then enqueues all
+        individual watchlist fetches at once so the queue fills visibly.
+        """
         try:
             watchlists_data = await self.client.get("/watchlists", version=1)
-            watchlists = watchlists_data.get("watchlists", [])
-            logger.info("MarketScanner: found %d watchlists", len(watchlists))
-
-            valid = [wl for wl in watchlists if wl.get("id")]
-            for i, wl in enumerate(valid):
-                if i > 0 and self.inter_call_delay > 0:
-                    await asyncio.sleep(self.inter_call_delay)
-                try:
-                    result = await self._fetch_watchlist_epics(wl["id"])
-                    epics.extend(result)
-                except Exception as exc:
-                    logger.warning("MarketScanner: watchlist fetch error: %s", exc)
-
         except Exception as exc:
             logger.error("MarketScanner: failed to fetch watchlists: %s", exc)
+            return []
 
+        watchlists = watchlists_data.get("watchlists", [])
+        logger.info("MarketScanner: found %d watchlists", len(watchlists))
+
+        valid = [wl for wl in watchlists if wl.get("id")]
+        if not valid:
+            return []
+
+        results = await asyncio.gather(
+            *[self._fetch_watchlist_epics(wl["id"]) for wl in valid],
+            return_exceptions=True,
+        )
+        epics: list[str] = []
+        for wl, result in zip(valid, results):
+            if isinstance(result, BaseException):
+                logger.warning("MarketScanner: watchlist fetch error: %s", result)
+            else:
+                epics.extend(result)
         return epics
 
     async def _fetch_watchlist_epics(self, watchlist_id: str) -> list[str]:
-        """Fetch epic codes from a single watchlist, excluding option chains."""
+        """Fetch epic codes from a single watchlist.
+
+        Excludes option chains and off-class instruments (via the asset-class
+        allow-list on each result's ``instrumentType``), consistent with search
+        discovery.
+        """
         data = await self.client.get(f"/watchlists/{watchlist_id}", version=1)
         epics = []
         for m in data.get("markets", []):
@@ -326,6 +405,8 @@ class MarketScanner:
             if self._is_option_epic(epic):
                 logger.debug("MarketScanner: skipping option-chain epic %s", epic)
                 continue
+            if not self._type_allowed(m.get("instrumentType")):
+                continue
             epics.append(epic)
         return epics
 
@@ -334,8 +415,12 @@ class MarketScanner:
     # ------------------------------------------------------------------
 
     async def _fetch_market_details(self, epics: list[str]) -> list[dict]:
-        """Batch-fetch market details sequentially in chunks of 25."""
-        # Skip epics already known to cause HTTP 500 "Transformation failure".
+        """Batch-fetch market details for all epics concurrently in chunks of 25.
+
+        All batches are enqueued at once — the APIGuard serialises actual HTTP
+        calls so the per-minute quota is respected while the queue counter fills
+        and drains visibly in the UI.
+        """
         skipped = [e for e in epics if e in self._poison_epics]
         if skipped:
             logger.debug(
@@ -345,13 +430,13 @@ class MarketScanner:
             )
         filtered = [e for e in epics if e not in self._poison_epics]
 
-        all_details: list[dict] = []
         batches = [
             filtered[i : i + _BATCH_SIZE] for i in range(0, len(filtered), _BATCH_SIZE)
         ]
-        for batch in batches:
-            all_details.extend(await self._fetch_batch(batch))
-        return all_details
+        results = await asyncio.gather(
+            *[self._fetch_batch(batch) for batch in batches],
+        )
+        return [detail for batch_result in results for detail in batch_result]
 
     async def _fetch_batch(self, epics: list[str]) -> list[dict]:
         """Fetch market details for a batch of epics, isolating poison epics.
@@ -566,6 +651,7 @@ class MarketScanner:
                 spread_ratio=spread_ratio,
                 dealing_enabled=dealing_enabled,
                 status=status,
+                instrument_type=str(instrument.get("type") or ""),
                 funds_needed=funds_needed_for_one_buy(detail),
                 stop_loss_eur=stop_loss_eur_for_one_buy(detail),
             )
