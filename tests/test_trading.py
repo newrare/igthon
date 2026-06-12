@@ -2,14 +2,18 @@
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.models.position import Position
 from src.services.compute import RegressionResult, TradingLevels, TradingSignal
 from src.services.price_buffer import Candle, EpicBuffer
-from src.services.trading import TradeConfig, TradingService
+from src.services.trading import (
+    TradeConfig,
+    TradingService,
+    compute_breakeven_stop,
+)
 
 
 def _service() -> TradingService:
@@ -199,6 +203,62 @@ class TestClampTrailingDistance:
         assert svc._clamp_trailing_distance(5.0, pos, spread=0.0) == pytest.approx(5.0)
 
 
+class TestBreakevenStop:
+    """ATR-independent break-even lock: only fires with a safe margin, ratchets up."""
+
+    def test_locks_just_above_zero_when_safely_above(self):
+        # bid 110, level_zero 100, spread 1: target 101, gap 9 >= margin 2 -> lock.
+        stop = compute_breakeven_stop(
+            110.0, level_zero=100.0, current_stop=95.0, spread=1.0
+        )
+        assert stop == pytest.approx(101.0)  # level_zero + 1 x spread
+
+    def test_none_when_bid_too_close_to_target(self):
+        # bid 102, target 101: gap 1 < margin (2 x spread = 2) -> wait, do not push.
+        assert (
+            compute_breakeven_stop(
+                102.0, level_zero=100.0, current_stop=95.0, spread=1.0
+            )
+            is None
+        )
+
+    def test_respects_ig_min_stop_distance_over_spread_margin(self):
+        # margin from spread is 2, but IG min distance is 6: bid 105 (gap 4) waits.
+        assert (
+            compute_breakeven_stop(
+                105.0,
+                level_zero=100.0,
+                current_stop=95.0,
+                spread=1.0,
+                min_stop_distance=6.0,
+            )
+            is None
+        )
+        # bid 108 -> gap 7 >= 6 -> lock.
+        assert compute_breakeven_stop(
+            108.0,
+            level_zero=100.0,
+            current_stop=95.0,
+            spread=1.0,
+            min_stop_distance=6.0,
+        ) == pytest.approx(101.0)
+
+    def test_ratchets_up_never_down(self):
+        # Current stop already above the break-even target -> no move.
+        assert (
+            compute_breakeven_stop(
+                110.0, level_zero=100.0, current_stop=103.0, spread=1.0
+            )
+            is None
+        )
+
+    def test_none_without_level_zero(self):
+        assert (
+            compute_breakeven_stop(110.0, level_zero=0.0, current_stop=0.0, spread=1.0)
+            is None
+        )
+
+
 class TestTrailingStop:
     """ATR-based trailing stop: ratchet, two-speed regime, IG push."""
 
@@ -278,3 +338,113 @@ class TestTrailingStop:
         await svc._update_trailing_stop(pos, current_bid=105.0, buf=None)
 
         client.put.assert_not_awaited()
+
+
+def _open_signal(*, bid: float, level_security: float) -> TradingSignal:
+    """Minimal BUY signal for open_position; only epic/levels are read."""
+    spread = 0.0003
+    return TradingSignal(
+        epic="CS.D.AUDNZD.CFD.IP",
+        score=0.9,
+        direction="BUY",
+        regression=RegressionResult(slope=0.1, intercept=bid, r_squared=0.9),
+        sma_fast=bid,
+        sma_slow=bid,
+        roc=0.1,
+        spread=spread,
+        avg_spread=spread,
+        position_in_range=55.0,
+        levels=TradingLevels(
+            bid=bid,
+            offer=bid + spread,
+            spread=spread,
+            high=bid + 0.01,
+            low=bid - 0.01,
+            scope=0.02,
+            average=bid,
+            level_follower=bid - 0.001,
+            level_win=bid + 0.01,
+            level_zero=bid + spread,
+            level_loose=bid - 0.003,
+            level_security=level_security,
+            stop_distance=1,  # the legacy (buggy) ceil value — must be ignored now
+        ),
+    )
+
+
+def _open_market(*, scaling_factor: str = "10000", min_stop: float = 4.0) -> dict:
+    """A TRADEABLE AUD/NZD-style /markets payload for open_position."""
+    return {
+        "instrument": {
+            "name": "AUD/NZD",
+            "expiry": "-",
+            "currencies": [{"code": "AUD", "exchangeRate": 0.6, "isDefault": True}],
+            "contractSize": "1",
+        },
+        "snapshot": {"marketStatus": "TRADEABLE", "scalingFactor": scaling_factor},
+        "dealingRules": {
+            "minNormalStopOrLimitDistance": {"value": min_stop, "unit": "POINTS"},
+            "maxStopOrLimitDistance": {"value": 1000, "unit": "POINTS"},
+            "minDealSize": {"value": 1},
+        },
+    }
+
+
+def _open_service():
+    """Service wired for the open_position path with sync DB.add."""
+    client = AsyncMock()
+    db = AsyncMock()
+    db.add = MagicMock()  # add() is synchronous in the code path
+    svc = TradingService(client=client, db_session=db, config=TradeConfig())
+    return svc, client, db
+
+
+class TestOpenPosition:
+    """open_position sends an absolute stopLevel and records a sane stop price.
+
+    Regression guard for the unit-mismatch bug where the stop distance was
+    computed in price terms, math.ceil'd to a tiny integer, sent to IG as a
+    point distance (~1 pip), and subtracted from the entry price to record a
+    nonsensical (often negative) ``level_stop``.
+    """
+
+    async def test_sends_stop_level_and_records_price(self):
+        svc, client, db = _open_service()
+        # Open at 1.21000 with the protective stop 45 points (0.0045) below.
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        payload = client.post.await_args.args[1]
+        # Absolute level, NOT a point distance.
+        assert "stopDistance" not in payload
+        assert payload["stopLevel"] == pytest.approx(1.20550)
+        # Recorded stop is a real price just below entry — never negative.
+        assert float(pos.level_stop) == pytest.approx(1.20550)
+        assert float(pos.level_stop) > 0
+        # size is the distance expressed in IG points (0.0045 * 10000).
+        assert pos.size == 45
+
+    async def test_clamps_stop_out_to_minimum_distance(self):
+        svc, client, _ = _open_service()
+        # Strategy stop only 1 point away; IG minimum is 8 points (0.0008).
+        signal = _open_signal(bid=1.21000, level_security=1.20990)
+        client.get.side_effect = [
+            _open_market(min_stop=8.0),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        payload = client.post.await_args.args[1]
+        # Clamped to the 8-point minimum: 1.21000 - 0.0008.
+        assert payload["stopLevel"] == pytest.approx(1.20920)
+        assert float(pos.level_stop) == pytest.approx(1.20920)

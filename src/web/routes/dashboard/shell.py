@@ -1,6 +1,10 @@
 """Full-page dashboard shell (skeleton embedding the dynamic fragments)."""
 
-from src.web.routes.dashboard.components import render_confirm_modal, render_modal
+from src.web.routes.dashboard.components import (
+    render_button,
+    render_confirm_modal,
+    render_modal,
+)
 from src.web.routes.dashboard.fragments import (
     _build_fragments,
     _render_config_grid,
@@ -27,6 +31,20 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 # opens on top when launched from an open/closed positions row,
                 # rather than behind their dark overlay (which hid the indicators).
                 z_index=8700,
+                # A Buy button next to the title opens a BUY on the epic
+                # currently displayed (tracked client-side in
+                # ``_chartModalEpic``), reusing the same confirm + funds-tooltip
+                # flow as the market-data table rows.
+                header_actions=render_button(
+                    "Buy",
+                    cls="buy-btn",
+                    onclick="openPosition(_chartModalEpic, this)",
+                    title="Open BUY position at minimum size",
+                    attrs=(
+                        'onmouseenter="showFundsTooltip(event, _chartModalEpic)" '
+                        'onmouseleave="hideFundsTooltip()"'
+                    ),
+                ),
                 body='<div id="chart-container" style="height:100%;min-height:420px;"></div>',
             ),
             render_modal(
@@ -119,7 +137,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=2">
+    <link rel="stylesheet" href="/static/style.css?v=3">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -252,6 +270,7 @@ def _render_dashboard(settings, state: dict) -> str:
         <span class="nav-label">Nav</span>
         <ul>
             <li><a href="/charts">Charts</a></li>
+            <li><a href="/simulator">Simulator</a></li>
             <li><a href="/positions" target="_blank">Positions<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
             <li><a href="/positions/summary" target="_blank">Daily Summary<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
             <li><a href="/api/status" target="_blank">API Status<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
@@ -263,6 +282,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=2"></script>
+<script src="/static/dashboard.js?v=3"></script>
 </body>
 </html>"""

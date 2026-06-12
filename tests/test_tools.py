@@ -226,6 +226,26 @@ class TestStopLossEurForOneBuy:
         # stop_distance = 5% * 200 = 10 points ; loss = (2 * 1 * 1.0) * 10 = 20€
         assert stop_loss_eur_for_one_buy(market_data) == pytest.approx(20.0)
 
+    def test_points_distance_scaled_by_scaling_factor(self):
+        # Forex pairs (e.g. AUD/CAD) quote a large scalingFactor; the points
+        # distance must be scaled back to a price distance before being valued,
+        # mirroring open_position_manual. Without this the loss is inflated by
+        # the scalingFactor (the source of the bogus -275000€ figures).
+        market_data = {
+            "instrument": {
+                "contractSize": "10000",
+                "currencies": [{"code": "CAD", "exchangeRate": 0.65}],
+            },
+            "snapshot": {"offer": 0.9123, "scalingFactor": "10000"},
+            "dealingRules": {
+                "minDealSize": {"value": 1},
+                "minNormalStopOrLimitDistance": {"value": 30, "unit": "POINTS"},
+            },
+        }
+        # stop_price_distance = 30 / 10000 = 0.003
+        # euro_per_point = 1 * 10000 * 0.65 = 6500 ; loss = 6500 * 0.003 = 19.5€
+        assert stop_loss_eur_for_one_buy(market_data) == pytest.approx(19.5)
+
     def test_none_without_stop_rule(self):
         market_data = {
             "instrument": {

@@ -149,14 +149,17 @@ def stop_loss_eur_for_one_buy(market_data: dict) -> float | None:
 
     Mirrors the manual-open path (``open_position_manual``): one minimum deal
     size opened with a stop at IG's ``minNormalStopOrLimitDistance``. The loss is
-    that stop distance (in points) times the currency-aware value of one point
-    for the whole position:
+    that stop distance, expressed as a *price* distance, times the currency-aware
+    value of one full point of price movement for the whole position:
 
-        loss = euro_per_point(size) * stop_distance
+        loss = euro_per_point(size) * stop_price_distance
 
-    A PERCENTAGE stop rule is converted to points using the current offer price.
-    Returns ``None`` when the contract size, price or stop rule is missing, so the
-    caller can render the figure as unknown rather than a misleading ``0``.
+    IG quotes the dealing-rule distance in *points* (1 point = 1 / scalingFactor
+    in price terms), so it must be scaled back to a price distance before being
+    multiplied by ``euro_per_point`` — exactly as ``open_position_manual`` does.
+    A PERCENTAGE stop rule is already a fraction of the price. Returns ``None``
+    when the contract size, price or stop rule is missing, so the caller can
+    render the figure as unknown rather than a misleading ``0``.
     """
     instrument = market_data.get("instrument", {})
     snapshot = market_data.get("snapshot", {})
@@ -169,10 +172,16 @@ def stop_loss_eur_for_one_buy(market_data: dict) -> float | None:
     stop_rule = dealing_rules.get("minNormalStopOrLimitDistance") or {}
     if stop_rule.get("value") is None:
         return None
-    stop_distance = _to_float(stop_rule.get("value"), default=0.0)
+    value = _to_float(stop_rule.get("value"), default=0.0)
     if stop_rule.get("unit") == "PERCENTAGE":
-        stop_distance = stop_distance * price / 100
-    stop_distance = max(stop_distance, 1.0)
+        # A PERCENTAGE rule is already a fraction of the price.
+        stop_distance = value * price / 100
+    else:
+        # POINTS (the IG default): scale points back to a price distance.
+        scaling_factor = _to_float(snapshot.get("scalingFactor"), default=1.0) or 1.0
+        stop_distance = value / scaling_factor
+    if stop_distance <= 0:
+        return None
 
     currency = (instrument.get("currencies") or [{}])[0].get("code")
     min_deal = _to_float(

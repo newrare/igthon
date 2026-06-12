@@ -31,3 +31,7 @@ class Epic(Base):
     is_tradable: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Primary reason this epic was excluded from the tradable set on the last
+    # hourly refresh. NULL when is_tradable=True. Examples: "CLOSED", "OFFLINE",
+    # "no_price", "too_expensive".
+    not_tradable_reason: Mapped[str | None] = mapped_column(String(50))

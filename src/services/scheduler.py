@@ -46,7 +46,16 @@ logger = logging.getLogger(__name__)
 # ``/api/actions`` endpoint); ``job_id`` is the APScheduler job id, which differs
 # from the action for the analysis loop. ``danger`` drives the Run-button colour
 # and whether a confirmation prompt is shown on the dashboard.
-JOB_DEFINITIONS: list[dict[str, str]] = [
+#
+# ``catch_up`` (optional, default False) marks fixed-time jobs that should be
+# replayed once on startup if their scheduled time was missed while the server
+# was down — see ``BotScheduler.run_catch_up``. Only idempotent jobs that simply
+# refresh or recompute from the database are enabled: re-running them late is
+# harmless. Frequent recurring jobs (collect/monitor/sync/reconcile/hourly
+# refresh) self-heal on their next tick and are never caught up; ``end_of_day``
+# (would force-close live positions) and ``daily_reset`` (would wipe the buffer
+# already rehydrated for today) are deliberately excluded.
+JOB_DEFINITIONS: list[dict[str, str | bool]] = [
     {
         "action": "refresh_epic_list",
         "job_id": "refresh_epic_list",
@@ -54,6 +63,7 @@ JOB_DEFINITIONS: list[dict[str, str]] = [
         "description": "Search IG markets and rebuild the full epic list.",
         "schedule": "Daily 07:30 · Mon–Fri",
         "danger": "safe",
+        "catch_up": True,
     },
     {
         "action": "refresh_tradable_epics",
@@ -116,6 +126,7 @@ JOB_DEFINITIONS: list[dict[str, str]] = [
         "description": "Generate or update today's P&L record in the database.",
         "schedule": "Daily 18:00 · Mon–Fri",
         "danger": "safe",
+        "catch_up": True,
     },
     {
         "action": "weekly_summary",
@@ -124,6 +135,7 @@ JOB_DEFINITIONS: list[dict[str, str]] = [
         "description": "Generate per-epic direction summaries for the current week.",
         "schedule": "Friday 18:30",
         "danger": "safe",
+        "catch_up": True,
     },
     {
         "action": "daily_reset",
@@ -142,6 +154,7 @@ JOB_DEFINITIONS: list[dict[str, str]] = [
         ),
         "schedule": "Daily 02:00",
         "danger": "warn",
+        "catch_up": True,
     },
 ]
 
@@ -525,6 +538,113 @@ class BotScheduler:
             logger.error("Failed to save all job preferences: %s", exc)
 
     # ------------------------------------------------------------------
+    # Missed-run catch-up (server started after a fixed-time job's slot)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _last_scheduled_fire(
+        trigger, now: datetime, lookback_days: int = 8
+    ) -> datetime | None:
+        """Return the most recent scheduled fire time at or before ``now``.
+
+        Walks the APScheduler ``trigger`` forward from ``lookback_days`` ago up to
+        ``now`` and returns the last fire that should have happened. ``None`` if the
+        trigger fires nowhere in that window. The 8-day window covers weekly
+        triggers; daily triggers simply yield yesterday's (or today's) slot.
+        """
+        window_start = now - timedelta(days=lookback_days)
+        fire = trigger.get_next_fire_time(None, window_start)
+        last: datetime | None = None
+        while fire is not None and fire <= now:
+            last = fire
+            # Passing (fire, fire) advances strictly past the current fire.
+            fire = trigger.get_next_fire_time(fire, fire)
+        return last
+
+    async def run_catch_up(self) -> None:
+        """Replay fixed-time jobs whose scheduled slot was missed while down.
+
+        APScheduler's in-memory jobstore keeps no record of fires that should have
+        happened while the process was stopped, so a server started after (say)
+        07:30 never runs that day's epic refresh. For each ``catch_up``-eligible
+        job the user has left in automatic mode, this compares the most recent
+        scheduled fire time with the last successful run persisted in
+        ``job_preference``; if a slot was missed, it runs the job once now.
+
+        Manual (paused) jobs are skipped — a disabled job is not silently run.
+        Called once on startup, after ``load_job_preferences``.
+        """
+        if not self._running:
+            return
+        now = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                rows = await session.scalars(select(JobPreference))
+                last_runs = {row.action: row.last_run_at for row in rows}
+        except Exception as exc:
+            logger.warning("Could not load job run history for catch-up: %s", exc)
+            return
+
+        replayed = 0
+        for entry in JOB_DEFINITIONS:
+            if not entry.get("catch_up"):
+                continue
+            action = entry["action"]
+            job = self._scheduler.get_job(entry["job_id"])
+            # Only catch up jobs the user has enabled (automatic mode has a
+            # pending next_run_time; a paused/manual job reports None).
+            if job is None or job.next_run_time is None:
+                continue
+            scheduled = self._last_scheduled_fire(job.trigger, now)
+            if scheduled is None:
+                continue
+            last_run = last_runs.get(action)
+            # last_run is always persisted in UTC; some drivers (SQLite) return it
+            # naive, so coerce before comparing with the tz-aware fire time.
+            if last_run is not None and last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=UTC)
+            if last_run is not None and last_run >= scheduled:
+                continue  # already ran on or after the last scheduled slot
+            logger.info(
+                "Catch-up: '%s' missed its %s slot (last run: %s) — running now",
+                action,
+                scheduled.isoformat(),
+                last_run.isoformat() if last_run else "never",
+            )
+            try:
+                await getattr(self, f"trigger_{action}")()
+                replayed += 1
+            except Exception as exc:
+                logger.error("Catch-up run for '%s' failed: %s", action, exc)
+
+        if replayed:
+            logger.info("Catch-up complete: %d missed job(s) replayed", replayed)
+
+    async def _record_job_run(self, action: str) -> None:
+        """Persist the last successful-run time for a catch-up-eligible job.
+
+        Called at the end of each eligible job (scheduled or manually triggered)
+        so ``run_catch_up`` can tell a missed slot from one already covered.
+        """
+        now = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                existing = await session.get(JobPreference, action)
+                if existing:
+                    existing.last_run_at = now
+                else:
+                    # No mode preference saved yet: create the row in manual mode
+                    # (the startup default) and only stamp the run time.
+                    session.add(
+                        JobPreference(
+                            action=action, auto=False, updated_at=now, last_run_at=now
+                        )
+                    )
+                await session.commit()
+        except Exception as exc:
+            logger.error("Failed to record job run for '%s': %s", action, exc)
+
+    # ------------------------------------------------------------------
     # Manual trigger methods (called from web dashboard)
     # ------------------------------------------------------------------
 
@@ -744,22 +864,38 @@ class BotScheduler:
         except Exception as exc:
             logger.error("Failed to persist epic enrichment: %s", exc)
 
-    async def _persist_tradable_flags(self, tradable_epics: list[str]) -> None:
+    async def _persist_tradable_flags(
+        self,
+        tradable_epics: list[str],
+        reasons: dict[str, str] | None = None,
+    ) -> None:
         """Mark which epics are currently tradable in the database.
 
-        Resets all ``is_tradable`` flags to False, then sets True only for the
-        given subset. Called after each successful ``_refresh_tradable_epics`` run
-        so the flag survives server restarts.
+        Resets all ``is_tradable`` flags to False and clears reasons, then sets
+        True only for the given subset. When ``reasons`` is provided, each
+        non-tradable epic gets its exclusion reason persisted so the Epic List
+        modal can show it.
         """
         try:
             async with self._session_factory() as session:
-                await session.execute(Epic.__table__.update().values(is_tradable=False))
+                await session.execute(
+                    Epic.__table__.update().values(
+                        is_tradable=False, not_tradable_reason=None
+                    )
+                )
                 if tradable_epics:
                     await session.execute(
                         Epic.__table__.update()
                         .where(Epic.name.in_(tradable_epics))
                         .values(is_tradable=True)
                     )
+                if reasons:
+                    for epic_name, reason in reasons.items():
+                        await session.execute(
+                            Epic.__table__.update()
+                            .where(Epic.name == epic_name)
+                            .values(not_tradable_reason=reason)
+                        )
                 await session.commit()
             logger.debug("Persisted tradable flags for %d epics", len(tradable_epics))
         except Exception as exc:
@@ -833,6 +969,7 @@ class BotScheduler:
         await self._persist_epic_list(epics, self._epic_last_refresh)
         logger.info("Epic list refreshed: %d epics discovered", len(epics))
         self._recorder.info(f"Daily epic refresh: {len(epics)} epics")
+        await self._record_job_run("refresh_epic_list")
 
     async def _refresh_tradable_epics(self) -> None:
         """Filter ``_all_epics`` to those currently open and TRADEABLE.
@@ -862,24 +999,39 @@ class BotScheduler:
         # batch fetch — the Epic List modal reads these columns from the DB.
         await self._persist_epic_enrichment(infos)
 
-        tradeable = self._scanner.select_tradable(infos)
+        # Full set passing the open/affordable/dedupe filters, before any
+        # streaming-subscription cap. Reasons are computed against THIS set so
+        # the only exclusions it explains are genuine ones (closed, no price,
+        # too expensive, product-variant duplicate) — never the cap below.
+        selected = self._scanner.select_tradable(infos)
+        tradeable = selected
 
         # IG caps Lightstreamer at 40 subscriptions per connection. When streaming
-        # is active, keep only the tightest-spread markets (best liquidity proxy,
-        # already computed by the scanner — no extra API call) up to that cap.
+        # is active and more markets are tradable than fit, pick a subset balanced
+        # across asset classes (indices / forex / commodities) rather than the
+        # globally tightest spreads — which would otherwise fill every slot with
+        # FX pairs and starve the other classes.
+        capped_out: list[str] = []
         if (
             self._streaming is not None
-            and len(tradeable) > self._settings.streaming_max_epics
+            and len(selected) > self._settings.streaming_max_epics
         ):
-            dropped = len(tradeable) - self._settings.streaming_max_epics
-            tradeable = sorted(tradeable, key=lambda m: m.spread_ratio)[
-                : self._settings.streaming_max_epics
-            ]
+            tradeable = self._scanner.select_diversified_subset(
+                selected, self._settings.streaming_max_epics
+            )
+            kept = {m.epic for m in tradeable}
+            capped_out = [m.epic for m in selected if m.epic not in kept]
+            mix: dict[str, int] = {}
+            for m in tradeable:
+                cls = m.instrument_type.upper() or "OTHER"
+                mix[cls] = mix.get(cls, 0) + 1
+            breakdown = ", ".join(f"{k}={v}" for k, v in sorted(mix.items()))
             logger.info(
-                "Tradable epics capped to %d (tightest spread) — dropped %d over the "
-                "IG streaming limit",
+                "Tradable epics capped to %d (diversified across classes: %s) — "
+                "dropped %d over the IG streaming limit",
                 self._settings.streaming_max_epics,
-                dropped,
+                breakdown,
+                len(capped_out),
             )
 
         self._tradable_markets = tradeable
@@ -892,7 +1044,13 @@ class BotScheduler:
             len(self._all_epics),
         )
 
-        await self._persist_tradable_flags(self._tradable_epics)
+        # Reasons against the pre-cap set, then overlay the streaming-cap reason
+        # for markets that were tradable but cut to fit the 40-subscription limit
+        # — so the Epic List doesn't mislabel them as "duplicate".
+        reasons = self._scanner.get_non_tradable_reasons(infos, selected)
+        for epic in capped_out:
+            reasons[epic] = "streaming_cap"
+        await self._persist_tradable_flags(self._tradable_epics, reasons)
 
         if self._streaming is not None:
             await self._streaming.set_epics(self._tradable_epics)
@@ -1163,6 +1321,7 @@ class BotScheduler:
         self._recorder.info(
             f"Daily summary: {len(positions)} trades, P&L={euro_total:.2f}€"
         )
+        await self._record_job_run("daily_summary")
 
     async def _weekly_summary(self) -> None:
         """Generate per-epic direction summaries for the week."""
@@ -1217,6 +1376,7 @@ class BotScheduler:
             await session.commit()
 
         logger.info("Weekly summary generated for week %s", week_str)
+        await self._record_job_run("weekly_summary")
 
     async def _daily_reset(self) -> None:
         """Clear the price buffer at midnight for a clean start of the new
@@ -1235,3 +1395,4 @@ class BotScheduler:
             return
         if count:
             self._recorder.info(f"Candle retention: dumped {count} rows to {path}")
+        await self._record_job_run("dump_and_purge_candles")

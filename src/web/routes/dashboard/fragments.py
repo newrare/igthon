@@ -1,7 +1,7 @@
 """Dashboard HTML fragment builders (dynamically refreshed regions)."""
 
 import html
-from datetime import date, datetime, time
+from datetime import date
 
 from src.services.api_error_log import APIErrorEntry
 from src.web.routes.dashboard.components import (
@@ -17,47 +17,6 @@ from src.web.routes.dashboard.state import (
     _open_reason_label,
     _pnl_color,
 )
-
-
-def _utc_iso(d: date | None, t: time | None) -> str | None:
-    """Combine a stored UTC date + time into an ISO string with a UTC offset.
-
-    Position dates/times are persisted as UTC wall-clock values (``datetime.now(UTC)``),
-    so we tag the combined value with ``+00:00`` and let the browser convert it to the
-    Europe/Paris local hour used by the chart x-axis.
-    """
-    if d is None or t is None:
-        return None
-    return datetime.combine(d, t).isoformat() + "+00:00"
-
-
-def _chart_overlay_js(p, *, closed: bool) -> str:
-    """Build a JS object literal with a position's chart overlay levels/markers.
-
-    Consumed by ``openChartModal(epic, overlay)`` in dashboard.js to draw the
-    open/break-even/stop/target lines and the entry (and exit) time markers.
-    """
-    parts: list[str] = []
-
-    def _num(name: str, attr: str) -> None:
-        value = getattr(p, attr, None)
-        if value is not None:
-            # str(Decimal) keeps the exact stored precision and is a valid JS number.
-            parts.append(f"{name}:{value}")
-
-    _num("open", "level_open")
-    _num("zero", "level_zero")
-    _num("stop", "level_stop")
-    _num("target", "level_win")
-    open_time = _utc_iso(getattr(p, "date", None), getattr(p, "time_open", None))
-    if open_time:
-        parts.append(f"openTime:'{open_time}'")
-    if closed:
-        _num("close", "level_close")
-        close_time = _utc_iso(getattr(p, "date", None), getattr(p, "time_close", None))
-        if close_time:
-            parts.append(f"closeTime:'{close_time}'")
-    return "{" + ",".join(parts) + "}"
 
 
 def _render_logs_section(entries: list[dict]) -> str:
@@ -320,11 +279,16 @@ def _render_epic_list_modal(
         instrument_name = (e.description or "—") if e else "—"
         funds = f"{e.deposit:.2f}€" if (e and e.deposit) else "—"
         stop_loss = f"-{e.stop_loss:.2f}€" if (e and e.stop_loss) else "—"
-        tradable = (
-            '<span style="color:#4ade80;">✓</span>'
-            if (e and e.is_tradable)
-            else '<span style="color:#475569;">✗</span>'
-        )
+        if e and e.is_tradable:
+            tradable = '<span style="color:#4ade80;">✓</span>'
+        elif e and e.not_tradable_reason:
+            reason = html.escape(e.not_tradable_reason)
+            tradable = (
+                f'<span style="color:#475569;">✗</span>'
+                f'<span style="color:#64748b;font-size:0.7rem;margin-left:0.3rem;">{reason}</span>'
+            )
+        else:
+            tradable = '<span style="color:#475569;">✗</span>'
         rows += f"""
             <tr>
                 <td class="number dim">{html.escape(epic_id)}</td>
@@ -375,6 +339,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
     queue_stats = state.get("queue_stats")
     queue_recent = state.get("queue_recent") or []
     queue_pending_tasks = state.get("queue_pending_tasks") or []
+    queue_errors = state.get("queue_errors") or []
     open_positions = state.get("open_positions") or []
     closed_positions = state.get("closed_positions") or []
 
@@ -392,7 +357,6 @@ def _build_fragments(state: dict) -> dict[str, str]:
             pnl_str = f"{pnl_val:+.2f}€" if p.euro is not None else "—"
             strategy_str = (p.strategy.value if p.strategy else "—").upper()
             epic_esc = html.escape(p.epic)
-            overlay_js = _chart_overlay_js(p, closed=False)
             close_btn = render_button(
                 "Close",
                 cls="close-pos-btn",
@@ -400,7 +364,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
                 title="Close this position manually",
             )
             pos_rows_html += f"""
-                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', {overlay_js})">
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
                         <td class="err-ts">{html.escape(t_open)}</td>
                         <td class="epic-col">{epic_esc}</td>
                         <td class="desc-col">{html.escape(p.epic_name)}</td>
@@ -433,9 +397,8 @@ def _build_fragments(state: dict) -> dict[str, str]:
             open_label, open_color = _open_reason_label(p.reason_open)
             close_label, close_color = _close_reason_label(p.reason_close)
             epic_esc = html.escape(p.epic)
-            overlay_js = _chart_overlay_js(p, closed=True)
             closed_rows_html += f"""
-                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', {overlay_js})">
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
                         <td class="err-ts" title="{html.escape(d_str)}">{html.escape(t_open)}</td>
                         <td class="err-ts" title="{html.escape(d_str)}">{html.escape(t_close)}</td>
                         <td class="epic-col">{html.escape(p.epic)}</td>
@@ -694,6 +657,48 @@ def _build_fragments(state: dict) -> dict[str, str]:
     else:
         todo_table_html = ""
 
+    # ── Errors table ───────────────────────────────────────────────────────────
+    # A dedicated, persistent log of abandoned calls (kept in its own larger ring
+    # buffer than `queue_recent`, so a failure survives a burst of later success).
+    # The full error and the exact API route/version are shown to ease debugging.
+    if queue_errors:
+        err_rows = ""
+        for e in queue_errors:
+            ts = e.failed_at.astimezone(_PARIS).strftime("%H:%M:%S")
+            route = f"{e.method} {e.endpoint} (v{e.version})"
+            http_display = e.http_status if e.http_status is not None else "—"
+            code_display = e.ig_error_code or "—"
+            full_err = html.escape(e.error or "—")
+            err_rows += f"""
+                    <tr>
+                        <td class="err-ts">{html.escape(ts)}</td>
+                        <td class="err-method">{html.escape(str(e.method))}</td>
+                        <td class="err-endpoint" style="white-space:nowrap;">{html.escape(str(e.endpoint))} <span style="color:#64748b;">v{e.version}</span></td>
+                        <td class="err-status">{html.escape(str(http_display))}</td>
+                        <td class="err-code">{html.escape(str(code_display))}</td>
+                        <td class="err-status">{e.attempts}</td>
+                        <td class="err-hint" style="white-space:pre-wrap;word-break:break-word;max-width:520px;" title="{html.escape(route)}">{full_err}</td>
+                    </tr>"""
+        queue_errors_count = len(queue_errors)
+        queue_errors_table = render_table(
+            ["Time", "Method", "Route", "HTTP", "IG Code", "Tries", "Full error"],
+            err_rows,
+            tbody_id="queue-err-tbody",
+        )
+    else:
+        queue_errors_count = 0
+        queue_errors_table = (
+            '<table class="err-table"><tbody id="queue-err-tbody">'
+            '<tr><td colspan="7" class="err-empty">No queue errors recorded this session.</td></tr>'
+            "</tbody></table>"
+        )
+
+    queue_errors_label = (
+        f'<i data-lucide="circle-x" class="lc-icon" style="color:#ef4444;"></i> Queue errors ({queue_errors_count})'
+        if queue_errors_count
+        else '<i data-lucide="circle-check" class="lc-icon" style="color:#4ade80;"></i> Queue errors (none)'
+    )
+
     # ── KPI bar fragment (the tiles, inner HTML of .kpi-bar) ────────────────────
     kpi_bar = f"""
         <div class="kpi-tile clickable" style="border-left-color:{queue_kpi_border}; position:relative;" onclick="openQueueModal()">
@@ -797,6 +802,11 @@ def _build_fragments(state: dict) -> dict[str, str]:
         </div>
         {todo_table_html}
         {queue_finished_table}
+        <h3 style="color:#94a3b8;font-size:0.78rem;text-transform:uppercase;letter-spacing:1px;margin:1.6rem 0 0.4rem;">{queue_errors_label}</h3>
+        <div style="display:flex;justify-content:flex-end;padding:0.3rem 0 0.4rem;">
+            <button class="err-clear-btn" onclick="clearQueueErrors()" style="display:inline-flex;align-items:center;gap:0.35rem;"><i data-lucide="x" class="lc-icon"></i> Clear</button>
+        </div>
+        {queue_errors_table}
         <h3 style="color:#e2e8f0;font-size:0.9rem;font-weight:600;margin:1.6rem 0 0.9rem;padding-top:1rem;border-top:1px solid #1e293b;"><i data-lucide="plug" class="lc-icon"></i> IG API</h3>
         {api_detail}"""
 

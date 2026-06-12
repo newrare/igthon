@@ -191,6 +191,14 @@ async def run_bot(
         # resumes exactly as the user left it before the server was stopped.
         await scheduler.load_job_preferences()
 
+        # Replay any fixed-time job whose scheduled slot was missed while the
+        # server was down (e.g. started after the 07:30 epic refresh). Run it in
+        # the background: a missed job (the epic refresh in particular) can be
+        # slow and may stall behind the rate-limited APIQueue, and it must not
+        # block the web server from coming up. run_catch_up handles its own
+        # errors internally, so a bare task is safe.
+        catch_up_task = asyncio.create_task(scheduler.run_catch_up())
+
         # Optionally start web server
         if with_web:
             import uvicorn
@@ -229,6 +237,8 @@ async def run_bot(
         # Wait for shutdown
         await stop_event.wait()
 
+        # Stop the catch-up replay if it is still draining the queue.
+        catch_up_task.cancel()
         scheduler.stop()
         if streaming is not None:
             await streaming.stop()

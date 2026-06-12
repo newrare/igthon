@@ -185,6 +185,87 @@ async def test_rate_limit_waits_then_resumes_without_counting_a_strike():
 
 
 @pytest.mark.asyncio
+async def test_abandoned_call_recorded_in_error_log_with_full_details():
+    """An abandoned call lands in the persistent error log with route + full error."""
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=_ig_error(400, "validation.failed"))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with pytest.raises(IGAPIError):
+            await queue.post("/positions/otc", {"epic": "X"}, version=2, label="open X")
+
+        errors = queue.errors()
+        assert len(errors) == 1
+        e = errors[0]
+        assert e.label == "open X"
+        assert e.method == "POST"
+        assert e.endpoint == "/positions/otc"
+        assert e.version == 2
+        assert e.http_status == 400
+        assert e.ig_error_code == "validation.failed"
+        assert "boom" in e.error
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_excluded_from_error_log():
+    """Probe (bisection) failures are expected — they stay out of the error log."""
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=_ig_error(500, "Transformation failure"))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with pytest.raises(IGAPIError):
+            await queue.get(
+                "/markets?epics=BAD", version=1, suppress_error_logging=True
+            )
+        assert queue.errors() == []
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_clear_errors_empties_the_error_log():
+    """clear_errors() drops every recorded error (UI 'Clear' button)."""
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=_ig_error(400, "validation.failed"))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with pytest.raises(IGAPIError):
+            await queue.post("/positions/otc", {"epic": "X"}, version=2)
+        assert len(queue.errors()) == 1
+        queue.clear_errors()
+        assert queue.errors() == []
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_error_log_is_bounded_by_errors_size():
+    """The error buffer is a bounded ring buffer keeping only the newest entries."""
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=_ig_error(400, "validation.failed"))
+    queue = _make_queue(client, max_attempts=3, errors_size=2)
+    await queue.start()
+    try:
+        for i in range(4):
+            with pytest.raises(IGAPIError):
+                await queue.post(
+                    "/positions/otc", {"i": i}, version=2, label=f"call {i}"
+                )
+        errors = queue.errors()
+        assert len(errors) == 2
+        # Newest first; only the last two survive.
+        assert errors[0].label == "call 3"
+        assert errors[1].label == "call 2"
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
 async def test_guard_wait_until_ready_returns_when_idle():
     """wait_until_ready returns immediately when the guard is not blocked."""
     guard = APIGuard(max_per_minute=25, max_per_second=3)

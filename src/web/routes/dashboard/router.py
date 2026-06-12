@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import select
 
 from src.models.position import Position, PositionState, PositionStrategy
 from src.services.api_queue import Priority
@@ -192,6 +193,85 @@ async def api_prices(request: Request, epic: str) -> JSONResponse:
     )
 
 
+def _iso_utc(ts: datetime) -> str:
+    """ISO-8601 string with an explicit UTC offset (naive values are tagged UTC)."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.isoformat()
+
+
+def _trade_overlay(p: Position) -> dict:
+    """Serialise one position's chart levels/markers for the chart modal.
+
+    ``openTime``/``closeTime`` are UTC ISO strings (date + stored UTC time); the
+    browser converts them to Europe/Paris for display.
+    """
+
+    def _num(attr: str) -> float | None:
+        value = getattr(p, attr, None)
+        return float(value) if value is not None else None
+
+    def _ts(t: time | None) -> str | None:
+        if p.date is None or t is None:
+            return None
+        return datetime.combine(p.date, t, tzinfo=UTC).isoformat()
+
+    return {
+        "id": p.id,
+        "open": _num("level_open"),
+        "zero": _num("level_zero"),
+        "stop": _num("level_stop"),
+        "target": _num("level_win"),
+        "close": _num("level_close"),
+        "openTime": _ts(p.time_open),
+        "closeTime": _ts(p.time_close),
+        "pnl": _num("euro"),
+    }
+
+
+@router.get("/api/chart/{epic}")
+async def api_chart(request: Request, epic: str) -> JSONResponse:
+    """JSON API: whole-day price curve for an epic plus every trade taken on it.
+
+    Candles come from the durable candle store (the full Paris trading day, not
+    just the in-memory window), falling back to the in-memory ``PriceBuffer``
+    when the store is unavailable or has nothing yet. ``trades`` lists *every*
+    open/close cycle for the epic today so the chart can mark each entry/exit —
+    not only the most recent one.
+    """
+    today = date.today()
+    candles: list[dict] = []
+
+    store = getattr(request.app.state, "candle_store", None)
+    if store is not None:
+        start = datetime.combine(today, time.min, tzinfo=_PARIS).astimezone(UTC)
+        end = datetime.combine(today, time.max, tzinfo=_PARIS).astimezone(UTC)
+        records = await store.fetch(epic, since=start, until=end)
+        candles = [{"t": _iso_utc(c.timestamp), "bid": c.bid_close} for c in records]
+
+    # Fall back to the live buffer when the store has no rows for today yet.
+    if not candles:
+        buf = request.app.state.buffer.get(epic)
+        if buf:
+            candles = [
+                {"t": _iso_utc(c.timestamp), "bid": c.bid_close} for c in buf.candles
+            ]
+
+    # Every trade on this epic today (all open/close cycles, oldest first).
+    trades: list[dict] = []
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is not None:
+        async with session_factory() as session:
+            rows = await session.scalars(
+                select(Position)
+                .where(Position.epic == epic, Position.date == today)
+                .order_by(Position.id)
+            )
+            trades = [_trade_overlay(p) for p in rows]
+
+    return JSONResponse({"epic": epic, "candles": candles, "trades": trades})
+
+
 @router.get("/api/ig-guard")
 async def api_ig_guard(request: Request) -> JSONResponse:
     """JSON API: IG API guard stats (rate-limit counters + blocked state)."""
@@ -258,8 +338,33 @@ async def api_queue_status(request: Request) -> JSONResponse:
                 }
                 for t in api_queue.pending_tasks()
             ],
+            "errors": [
+                {
+                    "label": e.label,
+                    "method": e.method,
+                    "endpoint": e.endpoint,
+                    "version": e.version,
+                    "http_status": e.http_status,
+                    "ig_error_code": e.ig_error_code,
+                    "error": e.error,
+                    "attempts": e.attempts,
+                    "total_attempts": e.total_attempts,
+                    "priority": e.priority,
+                    "failed_at": e.failed_at.isoformat(),
+                }
+                for e in api_queue.errors()
+            ],
         }
     )
+
+
+@router.post("/api/queue/errors/clear")
+async def api_queue_errors_clear(request: Request) -> JSONResponse:
+    """Clear the persistent queue-error log."""
+    api_queue = getattr(request.app.state, "api_queue", None)
+    if api_queue is not None:
+        api_queue.clear_errors()
+    return JSONResponse({"cleared": True})
 
 
 @router.get("/api/positions/funds/{epic}")
@@ -377,19 +482,32 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
 
         min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
         min_deal_size = float(dealing_rules.get("minDealSize", {}).get("value", 1))
-        min_stop = float(min_stop_rule.get("value", 5))
-        if min_stop_rule.get("unit") == "PERCENTAGE":
-            min_stop = min_stop * current_bid / 100
+        scaling_factor = (
+            float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
+        )
 
-        stop_distance = max(min_stop, 1)
+        # A manual open uses IG's minimum allowed stop. Express it as a price
+        # *distance* (not points): IG quotes the rule in points where
+        # 1 point = 1 / scalingFactor in price terms, so everything below — the
+        # stop level and the derived levels — stays consistently in price units.
+        min_stop_raw = float(min_stop_rule.get("value", 5))
+        if min_stop_rule.get("unit") == "PERCENTAGE":
+            stop_distance = min_stop_raw * current_bid / 100
+        else:
+            stop_distance = min_stop_raw / scaling_factor
+        stop_distance = max(stop_distance, 1.0 / scaling_factor)
+
         quantity = max(int(min_deal_size), 1)
-        scaling_factor = float(str(snapshot.get("scalingFactor", "1")).replace(",", ""))
-        euro_per_pip_unit = 1.0 / scaling_factor if scaling_factor > 0 else 1.0
-        euro_risk = quantity * stop_distance * euro_per_pip_unit
         currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
         # Currency-converted euro value of one point of movement (basis for P&L).
         epp = euro_per_point(market_data, quantity, currency)
+        euro_risk = stop_distance * epp if epp else quantity * stop_distance
         expiry = instrument.get("expiry", "-")
+
+        # Absolute stop level, based on the expected entry (current bid). IG
+        # validates it against the actual fill; sending a level avoids any
+        # point/price unit ambiguity.
+        stop_level = round(current_bid - stop_distance, 5)
 
         order_payload = {
             "epic": epic,
@@ -399,7 +517,7 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             "orderType": "MARKET",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "stopDistance": str(int(stop_distance)),
+            "stopLevel": stop_level,
             "forceOpen": True,
         }
 
@@ -459,7 +577,7 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             level_stop=Decimal(str(round(open_level - stop_distance, 5))),
             pip_spread=Decimal(str(round(current_spread, 5))),
             quantity=quantity,
-            size=int(stop_distance),
+            size=int(round(stop_distance * scaling_factor)),
             euro_stop=Decimal(str(round(euro_risk, 3))),
             euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
         )
@@ -468,11 +586,11 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             await session.commit()
 
         logger.info(
-            "Manual position opened: %s qty=%d level=%.3f stop=%.0f",
+            "Manual position opened: %s qty=%d level=%.5f stop_level=%.5f",
             epic,
             quantity,
             open_level,
-            stop_distance,
+            round(open_level - stop_distance, 5),
         )
         return JSONResponse(
             {

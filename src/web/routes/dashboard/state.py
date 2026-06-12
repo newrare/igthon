@@ -479,6 +479,7 @@ async def _gather_dashboard_state(request: Request) -> dict:
     queue_stats = api_queue.stats() if api_queue else None
     queue_recent = api_queue.recent() if api_queue else []
     queue_pending_tasks = api_queue.pending_tasks() if api_queue else []
+    queue_errors = api_queue.errors() if api_queue else []
 
     # Server log buffer
     log_buffer = getattr(request.app.state, "log_buffer", None)
@@ -501,6 +502,7 @@ async def _gather_dashboard_state(request: Request) -> dict:
         "queue_stats": queue_stats,
         "queue_recent": queue_recent,
         "queue_pending_tasks": queue_pending_tasks,
+        "queue_errors": queue_errors,
         "open_positions": open_positions,
         "closed_positions": closed_positions,
         "day_records": day_records,

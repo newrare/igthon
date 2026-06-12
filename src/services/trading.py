@@ -68,6 +68,187 @@ class TradeConfig:
         )
 
 
+def evaluate_open_gates(
+    *,
+    epic: str,
+    direction: str,
+    in_trading_hours: bool,
+    epic_already_open: bool,
+    open_count: int,
+    daily_pnl: float,
+    trade_count: int,
+    win_rate: float,
+    config: TradeConfig,
+) -> tuple[bool, str]:
+    """Pure pre-open rule evaluation shared by live trading and the simulator.
+
+    Mirrors ``TradingService.can_open_position``: the service gathers the live
+    state (DB counts, daily P&L) and this function applies the rules to it.
+
+    Returns:
+        (allowed, reason) — reason explains the first failed gate.
+    """
+    if not in_trading_hours:
+        return False, "Outside trading hours"
+
+    if direction != "BUY":
+        return False, f"Signal direction is {direction}"
+
+    if epic_already_open:
+        return False, f"Epic {epic} already open"
+
+    if open_count >= config.max_positions:
+        return False, f"Max positions reached ({open_count})"
+
+    if daily_pnl <= config.day_euro_finish_loose:
+        return False, f"Daily loss limit reached ({daily_pnl:.2f}€)"
+    if daily_pnl >= config.day_euro_finish_win:
+        return False, f"Daily target reached ({daily_pnl:.2f}€)"
+
+    if trade_count >= config.max_trades_day:
+        return False, f"Max daily trades reached ({trade_count})"
+    if trade_count >= 10 and win_rate < config.min_win_rate:
+        return (
+            False,
+            f"Win rate too low ({win_rate:.0%} after {trade_count} trades)",
+        )
+
+    return True, "OK"
+
+
+def decide_close_reason(
+    current_bid: float,
+    *,
+    level_win: float,
+    level_loose: float,
+    is_close_hour: bool,
+) -> str | None:
+    """Pure close-rule evaluation shared by live trading and the simulator.
+
+    Returns the close reason ("end_of_day" | "win" | "loose") or None when the
+    position should stay open (the follower/trailing update is handled
+    separately by the caller).
+    """
+    if is_close_hour:
+        return "end_of_day"
+    if current_bid >= level_win:
+        return "win"
+    if current_bid <= level_loose:
+        return "loose"
+    return None
+
+
+def clamp_trailing_distance(
+    raw_distance: float,
+    *,
+    spread: float,
+    euro_per_point: float,
+    euro_stop: float,
+) -> float:
+    """Bound the trailing distance between two safety limits.
+
+    Floor: a couple of spreads, so the bid/offer oscillation alone cannot
+    trigger the stop (avoids closing on noise). Ceiling: the initial planned
+    euro risk (``euro_stop`` / ``euro_per_point``), so the trailing stop is
+    never further from price than the loss accepted at open.
+    """
+    distance = raw_distance
+    if euro_per_point > 0 and euro_stop > 0:
+        distance = min(distance, euro_stop / euro_per_point)
+    floor = max(spread * 2.0, 0.0)
+    return max(distance, floor)
+
+
+def compute_trailing_stop(
+    current_bid: float,
+    *,
+    atr_value: float,
+    spread: float,
+    level_zero: float,
+    level_follower: float,
+    euro_per_point: float,
+    euro_stop: float,
+    config: TradeConfig,
+) -> float | None:
+    """Pure ATR trailing-stop computation shared by live trading and the simulator.
+
+    Implements the two-speed regime (looser before break-even, tighter once
+    past ``level_zero``) and the upward-only ratchet with a minimum step.
+
+    Returns:
+        The new stop level, or None when no update is warranted.
+    """
+    if atr_value <= 0:
+        return None
+
+    past_zero = level_zero > 0 and current_bid >= level_zero
+    k = config.atr_k_post if past_zero else config.atr_k_pre
+    distance = clamp_trailing_distance(
+        k * atr_value,
+        spread=spread,
+        euro_per_point=euro_per_point,
+        euro_stop=euro_stop,
+    )
+
+    new_stop = current_bid - distance
+    # Once break-even is cleared, never let the stop fall back into a loss.
+    if past_zero:
+        new_stop = max(new_stop, level_zero)
+
+    # Ratchet: only move up, and only when the gain is worth an API write.
+    step = config.trailing_step_ratio * atr_value
+    if new_stop <= level_follower + step:
+        return None
+    return new_stop
+
+
+def compute_breakeven_stop(
+    current_bid: float,
+    *,
+    level_zero: float,
+    current_stop: float,
+    spread: float,
+    min_stop_distance: float = 0.0,
+    buffer_mult: float = 1.0,
+    margin_mult: float = 2.0,
+) -> float | None:
+    """Lock the stop just above break-even once price has moved safely past it.
+
+    This is deliberately *independent* of the ATR ratchet in
+    :func:`compute_trailing_stop`: its sole purpose is to make a trade that has
+    gone positive risk-free. As soon as the bid sits a safe distance above
+    ``level_zero`` the stop is pulled up to ``level_zero + buffer_mult * spread``
+    — a hair above break-even — so a later reversal closes the trade flat (or
+    marginally green) instead of at the opening loss-stop. Because it does not
+    need an ATR value, it still protects early in a session or after a restart,
+    when the candle buffer is too short for ``atr()`` to return a value.
+
+    The move is only proposed when the broker would accept it: the locked stop
+    is kept at least ``safe_distance`` below the current bid, where
+    ``safe_distance`` is the larger of IG's minimum stop distance
+    (``min_stop_distance``, a price distance) and ``margin_mult * spread``. While
+    the bid is not yet that far above break-even, None is returned (wait for more
+    room) rather than pushing a stop IG would refuse for being too tight — the
+    margin the caller must keep between the new stop and the live market.
+
+    Returns:
+        The break-even stop level, or None when locking is not yet safe or would
+        not improve on ``current_stop`` (ratchet: the stop never moves down).
+    """
+    if level_zero <= 0:
+        return None
+    target = level_zero + buffer_mult * spread
+    # Ratchet: never move the stop down — only lock in once it beats the live one.
+    if target <= current_stop:
+        return None
+    # Keep a safety margin so IG neither rejects the update (too tight) nor
+    # triggers it on the spread alone.
+    safe_distance = max(min_stop_distance, margin_mult * spread)
+    if current_bid - target < safe_distance:
+        return None
+    return target
+
+
 class TradingService:
     """Service for opening and closing trading positions.
 
@@ -154,36 +335,18 @@ class TradingService:
         5. Daily P&L circuit breaker
         6. Market is TRADEABLE (checked during open_position)
         """
-        if not self._is_trading_hours():
-            return False, "Outside trading hours"
-
-        if signal.direction != "BUY":
-            return False, f"Signal direction is {signal.direction}"
-
-        if await self._is_epic_open(signal.epic):
-            return False, f"Epic {signal.epic} already open"
-
-        open_count = await self._count_open_positions()
-        if open_count >= self._config.max_positions:
-            return False, f"Max positions reached ({open_count})"
-
-        daily_pnl = await self._get_daily_pnl()
-        if daily_pnl <= self._config.day_euro_finish_loose:
-            return False, f"Daily loss limit reached ({daily_pnl:.2f}€)"
-        if daily_pnl >= self._config.day_euro_finish_win:
-            return False, f"Daily target reached ({daily_pnl:.2f}€)"
-
-        # Trade count and win rate circuit breaker
         trade_count, win_rate = await self._get_daily_stats()
-        if trade_count >= self._config.max_trades_day:
-            return False, f"Max daily trades reached ({trade_count})"
-        if trade_count >= 10 and win_rate < self._config.min_win_rate:
-            return (
-                False,
-                f"Win rate too low ({win_rate:.0%} after {trade_count} trades)",
-            )
-
-        return True, "OK"
+        return evaluate_open_gates(
+            epic=signal.epic,
+            direction=signal.direction,
+            in_trading_hours=self._is_trading_hours(),
+            epic_already_open=await self._is_epic_open(signal.epic),
+            open_count=await self._count_open_positions(),
+            daily_pnl=await self._get_daily_pnl(),
+            trade_count=trade_count,
+            win_rate=win_rate,
+            config=self._config,
+        )
 
     async def open_position(self, signal: TradingSignal) -> Position | None:
         """Open a position based on a trading signal.
@@ -223,47 +386,68 @@ class TradingService:
             )
             return None
 
-        # 2. Validate stop distance against dealing rules
+        # 2. Validate the protective stop against the dealing rules.
+        #
+        # The strategy computes ``level_security`` as an absolute *price* (e.g.
+        # 1.2059 for AUD/NZD). IG's dealing-rule distances, however, are quoted
+        # in *points* (1 point = 1 / scalingFactor in price terms). To compare
+        # apples with apples we convert every rule to a price distance and work
+        # exclusively in price units from here on — this is the same convention
+        # used by ``_push_stop_to_ig`` for trailing updates.
         min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
         max_stop_rule = dealing_rules.get("maxStopOrLimitDistance", {})
         min_deal_size = dealing_rules.get("minDealSize", {}).get("value", 1)
 
-        min_stop = float(min_stop_rule.get("value", 1))
-        max_stop = float(max_stop_rule.get("value", 9999))
+        scaling_factor = (
+            float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
+        )
 
-        # Convert percentage stops to points
-        if min_stop_rule.get("unit") == "PERCENTAGE":
-            min_stop = min_stop * levels.bid / 100
-        if max_stop_rule.get("unit") == "PERCENTAGE":
-            max_stop = max_stop * levels.bid / 100
+        def _rule_to_price_distance(rule: dict, default: float) -> float:
+            raw = rule.get("value")
+            if raw is None:
+                return default
+            value = float(raw)
+            if rule.get("unit") == "PERCENTAGE":
+                return value * levels.bid / 100
+            # POINTS (the IG default): scale points back to a price distance.
+            return value / scaling_factor
 
-        stop_distance = levels.stop_distance
+        min_stop_price = _rule_to_price_distance(min_stop_rule, 0.0)
+        max_stop_price = _rule_to_price_distance(max_stop_rule, float("inf"))
 
-        if stop_distance < min_stop:
+        # Absolute stop level chosen by the strategy, and its distance below the
+        # entry in price terms.
+        stop_level = levels.level_security
+        stop_price_distance = levels.bid - stop_level
+
+        # Never place the stop tighter than IG allows: clamp out to the minimum.
+        if stop_price_distance < min_stop_price:
+            stop_price_distance = min_stop_price
+            stop_level = levels.bid - stop_price_distance
+
+        if stop_price_distance > max_stop_price:
             logger.info(
-                "Stop too small for %s: %s < min %s",
+                "Stop too large for %s: %.5f > max %.5f",
                 epic,
-                stop_distance,
-                min_stop,
-            )
-            return None
-
-        if stop_distance > max_stop:
-            logger.info(
-                "Stop too large for %s: %s > max %s",
-                epic,
-                stop_distance,
-                max_stop,
+                stop_price_distance,
+                max_stop_price,
             )
             return None
 
         # 3. Quantity
         quantity = max(int(min_deal_size), 1)
 
-        # Check euro risk
-        scaling_factor = float(str(snapshot.get("scalingFactor", "1")).replace(",", ""))
-        euro_per_pip = 1.0 / scaling_factor if scaling_factor > 0 else 1.0
-        euro_risk = quantity * stop_distance * euro_per_pip
+        # 4. Check euro risk. ``euro_per_point`` is the currency-converted euro
+        # value of one full point of price movement for the whole position, so
+        # the worst-case loss is simply distance × euro_per_point. Fall back to a
+        # rough estimate only when the contract size is unknown.
+        currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
+        expiry = instrument.get("expiry", "-")
+        epp = euro_per_point(market_data, quantity, currency)
+        if epp:
+            euro_risk = stop_price_distance * epp
+        else:
+            euro_risk = quantity * stop_price_distance
 
         if euro_risk > self._config.euro_loss_max:
             logger.info(
@@ -274,10 +458,8 @@ class TradingService:
             )
             return None
 
-        # 4. Send order
-        currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
-        expiry = instrument.get("expiry", "-")
-
+        # 5. Send order with an absolute stop level (avoids any point/price
+        # unit conversion on the IG side).
         order_payload = {
             "epic": epic,
             "expiry": expiry,
@@ -286,15 +468,16 @@ class TradingService:
             "orderType": "MARKET",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "stopDistance": str(int(stop_distance)),
+            "stopLevel": round(stop_level, 5),
             "forceOpen": True,
         }
 
         logger.info(
-            "Opening position: epic=%s, qty=%d, stop=%d, risk=%.2f€",
+            "Opening position: epic=%s, qty=%d, stop=%.5f (-%.5f), risk=%.2f€",
             epic,
             quantity,
-            stop_distance,
+            stop_level,
+            stop_price_distance,
             euro_risk,
         )
 
@@ -335,9 +518,9 @@ class TradingService:
         deal_id = confirmation.get("dealId", "")
         open_level = float(confirmation.get("level", levels.bid))
 
-        # Currency-converted euro value of one point of movement for this
-        # position — the basis for every P&L figure (live and realized).
-        epp = euro_per_point(market_data, quantity, currency)
+        # ``epp`` (currency-converted euro value of one point of movement) was
+        # already computed above for the risk check; it is the basis for every
+        # P&L figure (live and realized).
 
         # 6. Record in DB
         now = datetime.now(UTC)
@@ -357,10 +540,10 @@ class TradingService:
             level_follower=Decimal(str(round(levels.level_follower, 5))),
             level_loose=Decimal(str(round(levels.level_loose, 5))),
             level_security=Decimal(str(round(levels.level_security, 5))),
-            level_stop=Decimal(str(round(open_level - stop_distance, 5))),
+            level_stop=Decimal(str(round(stop_level, 5))),
             pip_spread=Decimal(str(round(levels.spread, 5))),
             quantity=quantity,
-            size=int(stop_distance),
+            size=int(round(stop_price_distance * scaling_factor)),
             euro_stop=Decimal(str(round(euro_risk, 3))),
             euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
         )
@@ -370,11 +553,11 @@ class TradingService:
         await self._db.refresh(position)
 
         logger.info(
-            "Position opened: epic=%s, deal=%s, level=%.2f, stop=%.2f",
+            "Position opened: epic=%s, deal=%s, level=%.5f, stop=%.5f",
             epic,
             deal_id,
             open_level,
-            open_level - stop_distance,
+            stop_level,
         )
 
         return position
@@ -706,30 +889,19 @@ class TradingService:
         Returns:
             True if position was closed, False otherwise.
         """
-        level_win = float(position.level_win or 0)
-        level_loose = float(position.level_loose or 0)
         level_open = float(position.level_open or 0)
 
-        reason = None
-
-        # Forced close at end of day
-        if self._is_close_hours():
-            reason = "end_of_day"
-
-        # Win level reached
-        elif current_bid >= level_win:
-            reason = "win"
-
-        # Below loose level
-        elif current_bid <= level_loose:
-            reason = "loose"
-
-        # Follower strategy: trail the stop upward with an ATR-based distance
-        elif current_bid > level_open and self._config.close_strategy == "follower":
-            await self._update_trailing_stop(position, current_bid, buf)
-            return False
+        reason = decide_close_reason(
+            current_bid,
+            level_win=float(position.level_win or 0),
+            level_loose=float(position.level_loose or 0),
+            is_close_hour=self._is_close_hours(),
+        )
 
         if reason is None:
+            # Follower strategy: trail the stop upward with an ATR-based distance
+            if current_bid > level_open and self._config.close_strategy == "follower":
+                await self._update_trailing_stop(position, current_bid, buf)
             return False
 
         # Close the position
@@ -750,26 +922,18 @@ class TradingService:
             return
 
         atr_value = atr(list(buf.candles), self._config.atr_period)
-        if atr_value <= 0:
-            return
 
-        level_zero = float(position.level_zero or 0)
-        level_follower = float(position.level_follower or 0)
-        spread = buf.last.spread
-
-        # Two-speed regime: looser before break-even, tighter once secured.
-        past_zero = level_zero > 0 and current_bid >= level_zero
-        k = self._config.atr_k_post if past_zero else self._config.atr_k_pre
-        distance = self._clamp_trailing_distance(k * atr_value, position, spread)
-
-        new_stop = current_bid - distance
-        # Once break-even is cleared, never let the stop fall back into a loss.
-        if past_zero:
-            new_stop = max(new_stop, level_zero)
-
-        # Ratchet: only move up, and only when the gain is worth an API write.
-        step = self._config.trailing_step_ratio * atr_value
-        if new_stop <= level_follower + step:
+        new_stop = compute_trailing_stop(
+            current_bid,
+            atr_value=atr_value,
+            spread=buf.last.spread,
+            level_zero=float(position.level_zero or 0),
+            level_follower=float(position.level_follower or 0),
+            euro_per_point=float(position.euro_per_point or 0),
+            euro_stop=abs(float(position.euro_stop or 0)),
+            config=self._config,
+        )
+        if new_stop is None:
             return
 
         position.level_follower = Decimal(str(round(new_stop, 3)))
@@ -777,33 +941,22 @@ class TradingService:
         await self._push_stop_to_ig(position, new_stop)
         await self._db.commit()
         logger.debug(
-            "Trailing stop for %s -> %.3f (k=%.1f, ATR=%.3f, dist=%.3f)",
+            "Trailing stop for %s -> %.3f (ATR=%.3f)",
             position.epic,
             new_stop,
-            k,
             atr_value,
-            distance,
         )
 
     def _clamp_trailing_distance(
         self, raw_distance: float, position: Position, spread: float
     ) -> float:
-        """Bound the trailing distance between two safety limits.
-
-        Floor: a couple of spreads, so the bid/offer oscillation alone cannot
-        trigger the stop (avoids closing on noise). Ceiling: the initial planned
-        euro risk (``euro_stop`` / ``euro_per_point``), so the trailing stop is
-        never further from price than the loss accepted at open.
-        """
-        distance = raw_distance
-
-        euro_per_point = float(position.euro_per_point or 0)
-        euro_stop = abs(float(position.euro_stop or 0))
-        if euro_per_point > 0 and euro_stop > 0:
-            distance = min(distance, euro_stop / euro_per_point)
-
-        floor = max(spread * 2.0, 0.0)
-        return max(distance, floor)
+        """Bound the trailing distance — see :func:`clamp_trailing_distance`."""
+        return clamp_trailing_distance(
+            raw_distance,
+            spread=spread,
+            euro_per_point=float(position.euro_per_point or 0),
+            euro_stop=abs(float(position.euro_stop or 0)),
+        )
 
     async def _push_stop_to_ig(self, position: Position, stop_level: float) -> None:
         """Send the new stop level to IG via PUT /positions/otc/{dealId}.
@@ -814,9 +967,7 @@ class TradingService:
         """
         deal_id = await self._ensure_deal_id(position, f"trail {position.epic}")
         if not deal_id:
-            logger.warning(
-                "Cannot push trailing stop for %s: no dealId", position.epic
-            )
+            logger.warning("Cannot push trailing stop for %s: no dealId", position.epic)
             return
 
         payload = {

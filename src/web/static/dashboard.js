@@ -293,6 +293,18 @@ async function clearErrors() {
     }
 }
 
+async function clearQueueErrors() {
+    try {
+        await fetch('/api/queue/errors/clear', { method: 'POST' });
+        document.getElementById('queue-err-tbody').innerHTML =
+            '<tr><td colspan="7" class="err-empty">No queue errors recorded this session.</td></tr>';
+        showToast('Queue error log cleared', null, 'info');
+    } catch (e) {
+        console.error('Clear queue errors failed', e);
+        showToast('Error', 'Failed to clear queue error log', 'error');
+    }
+}
+
 // ── KPI refresh buttons ─────────────────────────────────────────────────────
 async function runKpiAction(action, btn) {
     btn.disabled = true;
@@ -649,6 +661,10 @@ async function closePosition(positionId, epic, btn) {
 
 // ── Chart modal ──────────────────────────────────────────────────────────────
 
+// Epic currently shown in the chart modal — read by the modal's Buy button so
+// it opens a position on the right market without re-passing the epic.
+let _chartModalEpic = null;
+
 // Convert a UTC ISO string (e.g. "2026-06-08T08:30:00+00:00") to a naive local
 // datetime string in Europe/Paris (e.g. "2026-06-08T10:30:00") so that Plotly
 // displays the correct French hour without applying any extra offset.
@@ -669,47 +685,49 @@ function _toParisNaive(utcISOStr) {
     }
 }
 
-// openChartModal(epic) renders the price curve. When called from a position row
-// it also receives an `overlay` object with the position levels/markers:
-//   { open, zero, stop, target, close, openTime, closeTime }
-// — numeric price levels are drawn as horizontal reference lines and the
-// entry/exit times (UTC ISO strings) as vertical markers on the time axis.
-async function openChartModal(epic, overlay) {
+// openChartModal(epic) renders the whole-day price curve for an epic and overlays
+// EVERY trade taken on it today. Data comes from /api/chart/{epic}:
+//   { candles: [{t, bid}], trades: [{ id, open, zero, stop, target, close,
+//                                     openTime, closeTime, pnl }] }
+// Each trade draws its break-even (zero)/stop/target reference lines plus a
+// labelled entry and exit vertical marker (with the Paris time), so multiple
+// open/close cycles on the same epic are all visible at once.
+async function openChartModal(epic) {
     const modal     = document.getElementById('chart-modal');
     const titleEl   = document.getElementById('chart-modal-title');
     const container = document.getElementById('chart-container');
+    _chartModalEpic = epic;
     titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
     lucide.createIcons();
     container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
     modal.style.display = 'block';
     try {
-        const res = await fetch('/api/prices/' + encodeURIComponent(epic));
+        const res = await fetch('/api/chart/' + encodeURIComponent(epic));
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        if (!data.bid_closes || !data.bid_closes.length) {
+        const candles = data.candles || [];
+        if (!candles.length) {
             container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">No price data available yet.</div>';
             return;
         }
-        const rawBids = data.bid_closes;
-        const utcTimestamps = data.timestamps && data.timestamps.length ? data.timestamps : null;
+        const trades = data.trades || [];
+        const rawBids = candles.map(function(c) { return c.bid; });
         // Convert UTC → Paris naive strings so Plotly displays the correct local hour.
-        const timestamps = utcTimestamps
-            ? utcTimestamps.map(_toParisNaive)
-            : rawBids.map(function(_, i) { return i + 1; });
-        const xIsDate = utcTimestamps !== null;
+        const timestamps = candles.map(function(c) { return _toParisNaive(c.t); });
 
-        // Normalisation bounds: include the overlay price levels so their lines
+        // Normalisation bounds: include every trade's price levels so their lines
         // stay inside the [0, 100]% view even when stop/target sit outside the
         // recent bid range.
-        const ov = overlay || {};
         let lo = Math.min.apply(null, rawBids);
         let hi = Math.max.apply(null, rawBids);
-        ['open', 'zero', 'stop', 'target', 'close'].forEach(function(k) {
-            const v = ov[k];
-            if (typeof v === 'number' && isFinite(v)) {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
+        trades.forEach(function(t) {
+            ['open', 'zero', 'stop', 'target', 'close'].forEach(function(k) {
+                const v = t[k];
+                if (typeof v === 'number' && isFinite(v)) {
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            });
         });
         const range = hi - lo;
         const toPct = function(v) { return range === 0 ? 50 : (v - lo) / range * 100; };
@@ -729,8 +747,13 @@ async function openChartModal(epic, overlay) {
         const annotations = [];
 
         // Horizontal reference line + right-anchored price label for one level.
+        // De-duplicated so trades sharing a level don't stack identical lines.
+        const _seenLevels = {};
         function addLevelLine(value, color, dash, label) {
             if (typeof value !== 'number' || !isFinite(value)) return;
+            const key = label + ':' + value.toFixed(4);
+            if (_seenLevels[key]) return;
+            _seenLevels[key] = true;
             const y = toPct(value);
             shapes.push({
                 type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: y, y1: y,
@@ -742,38 +765,47 @@ async function openChartModal(epic, overlay) {
                 font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
             });
         }
-        addLevelLine(ov.target, '#4ade80', 'solid', 'Target');
-        addLevelLine(ov.open,   '#cbd5e1', 'solid', 'Open');
-        // Break-even (0€, spread recovered) — dotted; skip if it coincides with open.
-        if (typeof ov.zero === 'number' && isFinite(ov.zero) &&
-            !(typeof ov.open === 'number' && Math.abs(ov.zero - ov.open) < 1e-6)) {
-            addLevelLine(ov.zero, '#94a3b8', 'dot', 'Break-even 0€');
-        }
-        addLevelLine(ov.stop, '#ef4444', 'solid', 'Stop');
 
-        // Vertical time marker + diamond point for an entry/exit event.
+        // Vertical time marker + diamond point + top time label for an event.
         function addEventMarker(timeStr, value, color, label) {
-            if (!xIsDate || !timeStr || typeof value !== 'number' || !isFinite(value)) return;
+            if (!timeStr || typeof value !== 'number' || !isFinite(value)) return;
             const xParis = _toParisNaive(timeStr);
+            const hhmm = xParis.slice(11, 16);  // "YYYY-MM-DDTHH:MM:SS" → "HH:MM"
             shapes.push({
                 type: 'line', xref: 'x', x0: xParis, x1: xParis, yref: 'paper', y0: 0, y1: 1,
                 line: { color: color, width: 1, dash: 'dash' }
+            });
+            annotations.push({
+                xref: 'x', x: xParis, yref: 'paper', y: 1, yanchor: 'bottom',
+                text: label + ' ' + hhmm, showarrow: false,
+                font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
             });
             traces.push({
                 x: [xParis], y: [toPct(value)], customdata: [value],
                 type: 'scatter', mode: 'markers', name: label,
                 marker: { color: color, size: 9, symbol: 'diamond', line: { color: '#1c1714', width: 1 } },
-                hovertemplate: label + ': %{customdata:.4f}<extra></extra>'
+                hovertemplate: label + ' ' + hhmm + ': %{customdata:.4f}<extra></extra>'
             });
         }
-        addEventMarker(ov.openTime, ov.open, '#E0B341', 'Entry');
-        addEventMarker(ov.closeTime, ov.close, '#60a5fa', 'Exit');
+
+        // Draw every trade's levels and entry/exit markers.
+        trades.forEach(function(t) {
+            addLevelLine(t.target, '#4ade80', 'solid', 'Target');
+            // Break-even line: the bid level at which the position turns positive
+            // (entry offer = bid + spread). Labelled "Zero".
+            const zero = (typeof t.zero === 'number') ? t.zero : t.open;
+            addLevelLine(zero, '#cbd5e1', 'solid', 'Zero');
+            addLevelLine(t.stop, '#ef4444', 'solid', 'Stop');
+            addEventMarker(t.openTime, t.open, '#E0B341', 'Entry');
+            addEventMarker(t.closeTime, t.close, '#60a5fa', 'Exit');
+        });
+        const xIsDate = true;
 
         Plotly.newPlot(container, traces, {
             paper_bgcolor: '#1c1714',
             plot_bgcolor: '#1c1714',
             font: { color: '#94a3b8', size: 11 },
-            margin: { l: 55, r: 20, t: 10, b: 50 },
+            margin: { l: 55, r: 20, t: 22, b: 50 },
             showlegend: false,
             shapes: shapes,
             annotations: annotations,

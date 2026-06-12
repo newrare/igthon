@@ -224,12 +224,9 @@ class TestBuildFragments:
         modal = _build_fragments(state)["positions_modal"]
         assert "DAX" in modal
         assert "No open positions" not in modal
-        # Row opens the chart modal with the position's overlay levels/markers.
-        assert "openChartModal('IX.D.DAX.IFMM.IP'" in modal
-        assert "open:18000.0" in modal
-        assert "stop:17950.0" in modal
-        assert "target:18050.0" in modal
-        assert "openTime:'2026-06-08T10:00:00+00:00'" in modal
+        # Row opens the chart modal for the epic; levels/markers are fetched from
+        # /api/chart/{epic} (all trades for the day), not embedded in the row.
+        assert "openChartModal('IX.D.DAX.IFMM.IP')" in modal
         # The Close button must not bubble up into the row's chart handler.
         assert "event.stopPropagation(); closePosition" in modal
 
@@ -269,15 +266,63 @@ class TestBuildFragments:
         assert "Manual" in modal  # open reason label
         assert "Target hit" in modal  # close reason label
         assert "No closed positions" not in modal
-        # Row opens the chart modal with entry + exit markers.
-        assert "openChartModal('IX.D.DAX.IFMM.IP'" in modal
-        assert "close:18050.0" in modal
-        assert "openTime:'2026-06-08T10:00:00+00:00'" in modal
-        assert "closeTime:'2026-06-08T11:30:00+00:00'" in modal
+        # Row opens the chart modal for the epic; entry/exit markers are fetched
+        # from /api/chart/{epic}, not embedded in the row.
+        assert "openChartModal('IX.D.DAX.IFMM.IP')" in modal
 
     def test_closed_positions_modal_empty_state(self):
         modal = _build_fragments(_base_state())["closed_positions_modal"]
         assert "No closed positions" in modal
+
+
+class TestTradeOverlay:
+    """`_trade_overlay` serialises a position's chart levels/markers for /api/chart."""
+
+    def test_open_trade_serialisation(self):
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=7,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=None,
+            level_open=18000.0,
+            level_zero=18002.0,
+            level_stop=17950.0,
+            level_win=18050.0,
+            level_close=None,
+            euro=5.0,
+        )
+        ov = _trade_overlay(pos)
+        assert ov["id"] == 7
+        assert ov["open"] == 18000.0
+        assert ov["zero"] == 18002.0
+        assert ov["stop"] == 17950.0
+        assert ov["target"] == 18050.0
+        assert ov["openTime"] == "2026-06-08T10:00:00+00:00"
+        # An open trade has no close level/time yet.
+        assert ov["close"] is None
+        assert ov["closeTime"] is None
+        assert ov["pnl"] == 5.0
+
+    def test_closed_trade_has_close_marker(self):
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=8,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=time(11, 30, 0),
+            level_open=18000.0,
+            level_zero=18002.0,
+            level_stop=17950.0,
+            level_win=18050.0,
+            level_close=18050.0,
+            euro=12.5,
+        )
+        ov = _trade_overlay(pos)
+        assert ov["close"] == 18050.0
+        assert ov["closeTime"] == "2026-06-08T11:30:00+00:00"
 
     def test_blocked_guard_renders_block_info(self):
         guard = SimpleNamespace(
@@ -430,6 +475,9 @@ class TestFragmentsEndpoint:
                 return []
 
             def pending_tasks(self):
+                return []
+
+            def errors(self):
                 return []
 
         buffer = PriceBuffer()

@@ -71,9 +71,11 @@ def create_app(
     from src.web.routes.charts import router as charts_router
     from src.web.routes.dashboard import router as dashboard_router
     from src.web.routes.positions import router as positions_router
+    from src.web.routes.simulator import router as simulator_router
 
     app.include_router(dashboard_router)
     app.include_router(positions_router, prefix="/positions")
     app.include_router(charts_router)
+    app.include_router(simulator_router)
 
     return app

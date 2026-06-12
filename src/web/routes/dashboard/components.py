@@ -87,10 +87,13 @@ def render_modal(
     max_width: str = "90vw",
     z_index: int = 8500,
     refresh_id: str = "",
+    header_actions: str = "",
 ) -> str:
     """Render a scrollable overlay modal with a standard header + close button.
 
     ``title`` is the inner HTML of the header ``<h2>`` (may carry a lucide icon).
+    ``header_actions`` is trusted HTML placed next to the title (e.g. a Buy
+    button), left of the close button.
     ``refresh_id`` adds the "Live · updated" row used by the live-data modals.
 
     The dialog box fills 90% of the viewport (width and height) so large data
@@ -108,11 +111,19 @@ def render_modal(
     header = ""
     if title:
         tid = f' id="{title_id}"' if title_id else ""
+        title_group = (
+            f'<h2{tid} style="margin:0;color:#E07B39;font-size:1.1rem;'
+            f'display:flex;align-items:center;gap:0.4rem;">{title}</h2>'
+        )
+        if header_actions:
+            title_group = (
+                '<div style="display:flex;align-items:center;gap:0.8rem;">'
+                f"{title_group}{header_actions}</div>"
+            )
         header = (
             '<div style="display:flex;justify-content:space-between;'
             'align-items:center;margin-bottom:1.2rem;">'
-            f'<h2{tid} style="margin:0;color:#E07B39;font-size:1.1rem;'
-            f'display:flex;align-items:center;gap:0.4rem;">{title}</h2>'
+            f"{title_group}"
             f'<button onclick="{close_fn}()" style="{_MODAL_CLOSE_BTN}">'
             '<i data-lucide="x" class="lc-icon"></i> Close</button>'
             "</div>"

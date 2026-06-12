@@ -7,7 +7,21 @@ import httpx
 import pytest
 
 from src.api.client import IGAPIError
-from src.services.market_scanner import MarketScanner
+from src.services.market_scanner import MarketInfo, MarketScanner
+
+
+def _market_info(epic: str, instrument_type: str, spread_ratio: float) -> MarketInfo:
+    """Build a minimal MarketInfo for subset-selection tests."""
+    return MarketInfo(
+        epic=epic,
+        name=epic,
+        bid=1.0,
+        offer=1.0,
+        spread_ratio=spread_ratio,
+        dealing_enabled=True,
+        status="TRADEABLE",
+        instrument_type=instrument_type,
+    )
 
 
 def _ig_error(epics_str: str, status_code: int, ig_error_code: str = "") -> IGAPIError:
@@ -527,3 +541,51 @@ async def test_batch_non_500_error_does_not_bisect() -> None:
 
     assert result == []
     assert call_count == 1  # no bisection on non-500 errors
+
+
+def test_diversified_subset_balances_classes_over_tightest_spread() -> None:
+    """The cap is filled round-robin per class, not by global spread.
+
+    FX pairs have far tighter spreads here, so a pure spread sort would take all
+    6 forex names and ignore indices/commodities. The diversified pick must keep
+    the best of every class instead.
+    """
+    markets = (
+        [_market_info(f"FX{i}", "CURRENCIES", 0.0001 * (i + 1)) for i in range(6)]
+        + [_market_info(f"IDX{i}", "INDICES", 0.01 * (i + 1)) for i in range(4)]
+        + [_market_info(f"COM{i}", "COMMODITIES", 0.05 * (i + 1)) for i in range(4)]
+    )
+
+    chosen = MarketScanner.select_diversified_subset(markets, cap=6)
+    classes = {m.instrument_type for m in chosen}
+
+    assert len(chosen) == 6
+    assert classes == {"CURRENCIES", "INDICES", "COMMODITIES"}
+    # Round-robin takes 2 of each (tightest first within the class).
+    fx = [m.epic for m in chosen if m.instrument_type == "CURRENCIES"]
+    idx = [m.epic for m in chosen if m.instrument_type == "INDICES"]
+    assert fx == ["FX0", "FX1"]
+    assert idx == ["IDX0", "IDX1"]
+
+
+def test_diversified_subset_reassigns_slots_when_a_class_runs_out() -> None:
+    """A class with few markets yields its unused slots to the others."""
+    markets = (
+        [_market_info(f"FX{i}", "CURRENCIES", 0.0001 * (i + 1)) for i in range(8)]
+        + [_market_info("IDX0", "INDICES", 0.01)]
+        + [_market_info("COM0", "COMMODITIES", 0.05)]
+    )
+
+    chosen = MarketScanner.select_diversified_subset(markets, cap=6)
+    epics = {m.epic for m in chosen}
+
+    assert len(chosen) == 6
+    # The single index and commodity are kept; the rest fills with tightest FX.
+    assert {"IDX0", "COM0"}.issubset(epics)
+    assert sum(1 for m in chosen if m.instrument_type == "CURRENCIES") == 4
+
+
+def test_diversified_subset_returns_input_when_it_already_fits() -> None:
+    """No selection happens when the market count is at or under the cap."""
+    markets = [_market_info("FX0", "CURRENCIES", 0.0001)]
+    assert MarketScanner.select_diversified_subset(markets, cap=40) == markets

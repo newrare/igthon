@@ -212,6 +212,88 @@ class MarketScanner:
         affordable = self._filter_affordable(open_tradeable)
         return self._dedupe_markets(affordable)
 
+    @staticmethod
+    def select_diversified_subset(
+        markets: list[MarketInfo], cap: int
+    ) -> list[MarketInfo]:
+        """Pick at most ``cap`` markets balanced across asset classes.
+
+        IG caps Lightstreamer at a fixed number of subscriptions, so when more
+        markets are tradable than fit, a subset must be chosen. Taking the
+        globally tightest spreads tends to fill every slot with one asset class
+        (FX pairs are far tighter than commodities), starving indices and
+        commodities. Instead this groups markets by ``instrument_type`` and picks
+        round-robin — the tightest-spread market of each class first, then the
+        second of each, and so on — so the result keeps the best market of every
+        class while still preferring tight spreads within each.
+
+        Classes that run out simply drop out of the rotation, their unused slots
+        going to the classes that still have markets. Markets with a blank type
+        are grouped under one bucket so they still participate. Returns the input
+        unchanged (as a list) when it already fits under ``cap``.
+        """
+        if cap <= 0 or len(markets) <= cap:
+            return list(markets)
+
+        buckets: dict[str, list[MarketInfo]] = {}
+        for m in markets:
+            key = m.instrument_type.upper() or "OTHER"
+            buckets.setdefault(key, []).append(m)
+        for bucket in buckets.values():
+            bucket.sort(key=lambda m: m.spread_ratio)
+
+        # Stable class order keeps the selection deterministic across refreshes.
+        order = sorted(buckets)
+        cursors = {key: 0 for key in order}
+        chosen: list[MarketInfo] = []
+        while len(chosen) < cap:
+            progressed = False
+            for key in order:
+                if len(chosen) >= cap:
+                    break
+                cursor = cursors[key]
+                if cursor < len(buckets[key]):
+                    chosen.append(buckets[key][cursor])
+                    cursors[key] += 1
+                    progressed = True
+            if not progressed:
+                break
+        return chosen
+
+    def get_non_tradable_reasons(
+        self,
+        all_infos: list[MarketInfo],
+        tradable: list[MarketInfo],
+    ) -> dict[str, str]:
+        """Return {epic: reason} for every epic in all_infos excluded from tradable.
+
+        Reasons (in priority order):
+        - The IG marketStatus value (e.g. "CLOSED", "OFFLINE") when not TRADEABLE
+        - "no_price" when bid or offer is missing
+        - "too_expensive" when funds_needed exceeds the configured cap
+        - "duplicate" when deduped as a product-type variant of a kept epic
+        """
+        tradable_set = {m.epic for m in tradable}
+        cap = self.settings.max_funds_per_position
+
+        reasons: dict[str, str] = {}
+        for info in all_infos:
+            if info.epic in tradable_set:
+                continue
+            if info.status != "TRADEABLE":
+                reasons[info.epic] = info.status or "CLOSED"
+            elif info.bid <= 0 or info.offer <= 0:
+                reasons[info.epic] = "no_price"
+            elif (
+                cap > 0
+                and info.funds_needed is not None
+                and info.funds_needed > cap
+            ):
+                reasons[info.epic] = "too_expensive"
+            else:
+                reasons[info.epic] = "duplicate"
+        return reasons
+
     # ------------------------------------------------------------------
     # Market-level deduplication
     # ------------------------------------------------------------------

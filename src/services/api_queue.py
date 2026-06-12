@@ -100,6 +100,31 @@ class QueueTaskView:
 
 
 @dataclass
+class QueueErrorView:
+    """Persistent record of an abandoned (failed) call, kept for debugging.
+
+    Unlike :class:`QueueTaskView` — a bounded *recent* buffer that any task,
+    success or failure, scrolls out of — errors live in their own larger ring
+    buffer so a failure stays inspectable even after a burst of successful calls
+    would have pushed it out of the recent list. It also carries the extra
+    context needed to diagnose a case later: the exact API route + version, the
+    HTTP status, the IG error code, and the full (untruncated) error message.
+    """
+
+    label: str
+    method: str
+    endpoint: str
+    version: int
+    http_status: int | None
+    ig_error_code: str
+    error: str
+    attempts: int
+    total_attempts: int
+    priority: int
+    failed_at: datetime
+
+
+@dataclass
 class APIQueueStats:
     """JSON-serialisable snapshot of the queue counters."""
 
@@ -129,6 +154,7 @@ class APIQueue:
         max_attempts: int = 3,
         retry_margin_seconds: int = 5,
         recent_size: int = 50,
+        errors_size: int = 100,
     ) -> None:
         self._client = client
         self._guard = guard
@@ -154,6 +180,11 @@ class APIQueue:
 
         # Pending calls waiting in the queue, keyed by seq for O(1) removal.
         self._pending_calls: dict[int, QueuedCall] = {}
+
+        # Abandoned-call errors (newest last); a separate, larger ring buffer so
+        # failures survive longer than the recent-task buffer for later debugging.
+        self._errors_size = errors_size
+        self._errors: list[QueueErrorView] = []
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -271,6 +302,14 @@ class APIQueue:
             )
             for c in calls
         ]
+
+    def errors(self) -> list[QueueErrorView]:
+        """Return abandoned-call errors, newest first (persistent debug log)."""
+        return list(reversed(self._errors))
+
+    def clear_errors(self) -> None:
+        """Drop all recorded queue errors (UI 'Clear' button)."""
+        self._errors.clear()
 
     # ------------------------------------------------------------------ internals
 
@@ -431,6 +470,10 @@ class APIQueue:
             call.attempts,
             exc,
         )
+        # Probes are expected bisection failures — keep them out of the debug
+        # error log so it only surfaces actionable, real failures.
+        if not call.suppress_error_logging:
+            self._record_error(call, exc, status, ig_code)
         if not call.future.done():
             call.future.set_exception(exc)
         self._record_recent(call)
@@ -464,3 +507,29 @@ class APIQueue:
         )
         if len(self._recent) > self._recent_size:
             del self._recent[0 : len(self._recent) - self._recent_size]
+
+    def _record_error(
+        self,
+        call: QueuedCall,
+        exc: Exception,
+        status: int | None,
+        ig_code: str,
+    ) -> None:
+        """Append a detailed snapshot of an abandoned call to the error buffer."""
+        self._errors.append(
+            QueueErrorView(
+                label=call.label,
+                method=call.method,
+                endpoint=call.endpoint,
+                version=call.version,
+                http_status=status,
+                ig_error_code=ig_code or "",
+                error=str(exc),
+                attempts=call.attempts,
+                total_attempts=call.total_attempts,
+                priority=call.priority,
+                failed_at=call.finished_at or datetime.now(UTC),
+            )
+        )
+        if len(self._errors) > self._errors_size:
+            del self._errors[0 : len(self._errors) - self._errors_size]
