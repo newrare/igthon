@@ -24,6 +24,11 @@ _BASE_DAY = datetime(2024, 1, 1)
 
 # Live-strategy defaults (mirrors src/config.py) for the baseline run.
 _LIVE_SETTINGS = SimpleNamespace(
+    strategy_name="trend_follower",
+    strategy_donchian_channel=20,
+    strategy_donchian_stop_atr_k=2.5,
+    strategy_efficiency_period=30,
+    strategy_min_efficiency=0.45,
     strategy_lookback_points=20,
     strategy_sma_fast=5,
     strategy_sma_slow=20,

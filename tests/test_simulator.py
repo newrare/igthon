@@ -21,6 +21,13 @@ def _settings() -> SimpleNamespace:
     return SimpleNamespace(
         ig_env=SimpleNamespace(value="demo"),
         web_port=8000,
+        # Default to the historical strategy so the engine tests below keep
+        # exercising the long-standing trend-follower expectations.
+        strategy_name="trend_follower",
+        strategy_donchian_channel=20,
+        strategy_donchian_stop_atr_k=2.5,
+        strategy_efficiency_period=30,
+        strategy_min_efficiency=0.45,
         strategy_lookback_points=20,
         strategy_sma_fast=5,
         strategy_sma_slow=20,

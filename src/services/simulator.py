@@ -1,9 +1,10 @@
 """Strategy simulator — replays the project's trading rules on synthetic curves.
 
 Feeds fictional candles (see :mod:`src.services.curve_generator`) through the
-exact same decision functions used live:
+exact same decision pipeline used live:
 
-- signal generation: :func:`src.services.compute.compute_signal`
+- signal generation: any pluggable :class:`src.strategies.base.BaseStrategy`,
+  selected by name (defaults to the ``STRATEGY_NAME`` setting)
 - pre-open gates: :func:`src.services.trading.evaluate_open_gates`
 - close rules: :func:`src.services.trading.decide_close_reason`
 - ATR trailing stop: :func:`src.services.trading.compute_trailing_stop`
@@ -26,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from src.services.compute import atr, compute_signal
+from src.services.compute import atr
 from src.services.price_buffer import Candle, EpicBuffer
 from src.services.trading import (
     TradeConfig,
@@ -35,6 +36,7 @@ from src.services.trading import (
     decide_close_reason,
     evaluate_open_gates,
 )
+from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -42,38 +44,6 @@ logger = logging.getLogger(__name__)
 _BASE_DAY = datetime(2024, 1, 1)
 
 CurveProvider = Callable[[int, int], list[Candle]]
-
-
-@dataclass(slots=True)
-class StrategyParams:
-    """Signal-generation parameters, mirroring the scheduler's kwargs mapping."""
-
-    regression_period: int = 20
-    sma_fast_period: int = 5
-    sma_slow_period: int = 20
-    roc_period: int = 10
-    min_r2: float = 0.70
-    min_score: float = 0.75
-    max_spread_ratio: float = 0.0015
-    stop_multiplier: float = 2.5
-    target_multiplier: float = 4.0
-    tactic: str = "spread"
-
-    @classmethod
-    def from_settings(cls, settings) -> "StrategyParams":
-        """Build from application Settings (same mapping as the scheduler)."""
-        return cls(
-            regression_period=settings.strategy_lookback_points,
-            sma_fast_period=settings.strategy_sma_fast,
-            sma_slow_period=settings.strategy_sma_slow,
-            roc_period=settings.strategy_roc_period,
-            min_r2=settings.strategy_min_r2,
-            min_score=settings.strategy_min_score,
-            max_spread_ratio=settings.strategy_max_spread_ratio,
-            stop_multiplier=settings.strategy_stop_multiplier,
-            target_multiplier=settings.strategy_target_multiplier,
-            tactic=settings.strategy_tactic,
-        )
 
 
 @dataclass(slots=True)
@@ -193,12 +163,12 @@ class StrategySimulator:
         self,
         curve_provider: CurveProvider,
         trade_config: TradeConfig,
-        params: StrategyParams,
+        strategy: BaseStrategy,
         sim_config: SimulationConfig,
     ) -> None:
         self._curves = curve_provider
         self._config = trade_config
-        self._params = params
+        self._strategy = strategy
         self._sim = sim_config
 
     def run(self) -> SimulationResult:
@@ -274,26 +244,10 @@ class StrategySimulator:
         result: SimulationResult,
     ) -> None:
         """Mirror of the scheduler's ``_evaluate_epic`` + pre-open gates."""
-        p = self._params
-        if len(buf) < p.sma_slow_period:
+        if len(buf) < self._strategy.warmup:
             return
 
-        signal = compute_signal(
-            buf.epic,
-            buf,
-            regression_period=p.regression_period,
-            sma_fast_period=p.sma_fast_period,
-            sma_slow_period=p.sma_slow_period,
-            roc_period=p.roc_period,
-            min_r2=p.min_r2,
-            min_score=p.min_score,
-            max_spread_ratio=p.max_spread_ratio,
-            follower_mult=p.stop_multiplier,
-            win_mult=p.target_multiplier,
-            loose_mult=p.stop_multiplier * 3,
-            security_mult=p.stop_multiplier * 2,
-            tactic=p.tactic,
-        )
+        signal = self._strategy.evaluate(buf.epic, buf)
         if signal is None or signal.direction != "BUY":
             return
         result.buy_signals += 1
@@ -431,13 +385,18 @@ class StrategySimulator:
 def run_simulation(
     settings,
     sim_config: SimulationConfig,
+    strategy_name: str | None = None,
 ) -> SimulationResult:
     """Wire the curve generator to the simulator and run it.
 
     The provider derives one deterministic seed per (day, epic) from the master
     seed, so a run is fully reproducible while every curve stays distinct.
+    The entry strategy is resolved by name through the registry; when
+    ``strategy_name`` is omitted the configured ``STRATEGY_NAME`` is used —
+    the simulator then replays exactly what the live bot would do.
     """
     from src.services.curve_generator import generate_curve
+    from src.strategies import get_strategy
 
     master = random.Random(sim_config.seed)
     curve_seeds: dict[tuple[int, int], int] = {}
@@ -457,7 +416,7 @@ def run_simulation(
     simulator = StrategySimulator(
         curve_provider=provider,
         trade_config=TradeConfig.from_settings(settings),
-        params=StrategyParams.from_settings(settings),
+        strategy=get_strategy(strategy_name or settings.strategy_name, settings),
         sim_config=sim_config,
     )
     return simulator.run()

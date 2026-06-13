@@ -168,6 +168,28 @@ def atr(candles: list[Candle], period: int = 14) -> float:
     return sum(true_ranges) / period
 
 
+def efficiency_ratio(values: list[float], period: int) -> float:
+    """Kaufman Efficiency Ratio over the last ``period`` values (0-1).
+
+    ER = |net move| / sum(|step move|): close to 1 when the path is a clean
+    directional trend, close to 0 when it is choppy/sideways noise. It is the
+    natural "is this market trending?" gate for a breakout strategy.
+
+    Args:
+        values: Ordered list of numeric values (oldest first).
+        period: Lookback window (needs ``period + 1`` values).
+
+    Returns:
+        ER in [0, 1], or 0.0 when there is insufficient data or no movement.
+    """
+    if len(values) < period + 1 or period < 1:
+        return 0.0
+    window = values[-period - 1 :]
+    net = abs(window[-1] - window[0])
+    path = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+    return net / path if path > 0 else 0.0
+
+
 def position_in_range(current: float, high: float, low: float) -> float:
     """Calculate where the current price sits in the day range (0-100%).
 

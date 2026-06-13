@@ -15,8 +15,13 @@ provides:
   breakout, momentum), deliberately different from the live trend follower.
 
 Everything is in-memory and synthetic — no IG API, no DB. Indicators reuse
-:mod:`src.services.compute` where possible (``sma``, ``atr``); RSI/EMA/z-score
-helpers are added here.
+:mod:`src.services.compute` where possible (``atr``, ``efficiency_ratio``);
+RSI/EMA/z-score helpers are added here.
+
+This module is the **research lab** only: candidates promoted to production are
+re-implemented against the pluggable live interface in :mod:`src.strategies`
+(e.g. ``DonchianBreakout`` here → ``src.strategies.donchian.DonchianER`` live)
+and selected via the ``STRATEGY_NAME`` setting.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 
-from src.services.compute import atr
+from src.services.compute import atr, efficiency_ratio
 from src.services.price_buffer import Candle, EpicBuffer
 
 LONG = "LONG"
@@ -65,21 +70,6 @@ def rsi(values: list[float], period: int = 14) -> float:
         return 100.0
     rs = (gains / period) / (losses / period)
     return 100 - 100 / (1 + rs)
-
-
-def efficiency_ratio(values: list[float], period: int) -> float:
-    """Kaufman Efficiency Ratio over the last ``period`` values (0-1).
-
-    ER = |net move| / sum(|step move|): close to 1 when the path is a clean
-    directional trend, close to 0 when it is choppy/sideways noise. It is the
-    natural "is this market trending?" gate for a breakout strategy.
-    """
-    if len(values) < period + 1 or period < 1:
-        return 0.0
-    window = values[-period - 1 :]
-    net = abs(window[-1] - window[0])
-    path = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
-    return net / path if path > 0 else 0.0
 
 
 def zscore(values: list[float], period: int) -> tuple[float, float, float]:
@@ -161,9 +151,13 @@ class MeanReversionZScore(Strategy):
             return None
         last = buf.last
         if z <= -self.entry_z:
-            return EntrySignal(LONG, stop=last.bid_close - self.stop_z * std, target=mean)
+            return EntrySignal(
+                LONG, stop=last.bid_close - self.stop_z * std, target=mean
+            )
         if z >= self.entry_z:
-            return EntrySignal(SHORT, stop=last.offer_close + self.stop_z * std, target=mean)
+            return EntrySignal(
+                SHORT, stop=last.offer_close + self.stop_z * std, target=mean
+            )
         return None
 
     def should_exit(self, direction: str, buf: EpicBuffer) -> bool:
@@ -433,8 +427,13 @@ class BacktestEngine:
         self._epp = euro_per_point * quantity
         self._no_entry_tail = no_entry_tail
 
-    def run_day(self, day: int, curves: list[list[Candle]], result: BacktestResult) -> None:
-        buffers = [EpicBuffer(epic=f"SIM.{day}.{e}", max_candles=600) for e in range(len(curves))]
+    def run_day(
+        self, day: int, curves: list[list[Candle]], result: BacktestResult
+    ) -> None:
+        buffers = [
+            EpicBuffer(epic=f"SIM.{day}.{e}", max_candles=600)
+            for e in range(len(curves))
+        ]
         positions: dict[int, _OpenPos] = {}
         n = min((len(c) for c in curves), default=0)
         cutoff = n - self._no_entry_tail
@@ -448,7 +447,11 @@ class BacktestEngine:
                 if pos is not None:
                     if self._manage(pos, candle, buf, result):
                         del positions[e]
-                elif tick >= self._s.warmup and tick < cutoff and len(buf) > self._s.warmup:
+                elif (
+                    tick >= self._s.warmup
+                    and tick < cutoff
+                    and len(buf) > self._s.warmup
+                ):
                     if self._regime_blocks(buf):
                         continue
                     sig = self._s.entry(buf)

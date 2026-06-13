@@ -128,12 +128,15 @@ def decide_close_reason(
     Returns the close reason ("end_of_day" | "win" | "loose") or None when the
     position should stay open (the follower/trailing update is handled
     separately by the caller).
+
+    ``level_win = 0`` means the strategy has no fixed take-profit (e.g. the
+    Donchian breakout rides its trailing stop) — the win check is skipped.
     """
     if is_close_hour:
         return "end_of_day"
-    if current_bid >= level_win:
+    if level_win > 0 and current_bid >= level_win:
         return "win"
-    if current_bid <= level_loose:
+    if level_loose > 0 and current_bid <= level_loose:
         return "loose"
     return None
 

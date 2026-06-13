@@ -123,7 +123,21 @@ class Settings(BaseSettings):
     streaming_rehydrate_window_minutes: int = 90
     streaming_reconnect_max_backoff_seconds: int = 60
 
-    # Strategy — Trend Volume Intraday
+    # Strategy selection — name of the pluggable strategy driving entries.
+    # Registered names live in src/strategies/__init__.py; each strategy is
+    # documented in docs/strategies/<name>.md. The rest of the pipeline
+    # (gates, orders, trailing stop, simulator, dashboard) is shared.
+    strategy_name: str = "donchian_er"
+
+    # Donchian breakout (strategy_name = "donchian_er")
+    strategy_donchian_channel: int = 20  # channel lookback (candles)
+    strategy_donchian_stop_atr_k: float = 2.5  # stop distance in ATR multiples
+    # Regime gate: only trade epics whose Kaufman Efficiency Ratio over the
+    # window reaches the threshold — i.e. skip sideways chop, keep clean trends.
+    strategy_efficiency_period: int = 30
+    strategy_min_efficiency: float = 0.45
+
+    # Trend follower (strategy_name = "trend_follower") — Trend Volume Intraday
     strategy_min_r2: float = 0.70
     strategy_min_score: float = 0.75
     strategy_lookback_points: int = 20

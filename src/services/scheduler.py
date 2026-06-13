@@ -28,12 +28,12 @@ from src.models.position import Position, PositionState
 from src.models.resume import Resume
 from src.services.api_queue import APIQueue
 from src.services.candle_store import CandleStore
-from src.services.compute import compute_signal
 from src.services.market_data import MarketDataService
 from src.services.market_scanner import MarketInfo, MarketScanner
 from src.services.price_buffer import DEFAULT_MAX_CANDLES, PriceBuffer
 from src.services.recorder import Recorder
 from src.services.trading import TradeConfig, TradingService
+from src.strategies import BaseStrategy, get_strategy
 
 if TYPE_CHECKING:
     from src.api.streaming import IGStreamingClient
@@ -196,6 +196,9 @@ class BotScheduler:
         self._scheduler = AsyncIOScheduler()
         self._running = False
         self._paused = False
+        # Entry strategy, selected by name via STRATEGY_NAME. Built lazily so a
+        # scheduler constructed with stub settings (tests) never resolves it.
+        self._strategy: BaseStrategy | None = None
 
         # Epic lists — start with the provided seed list
         self._all_epics: list[str] = list(epics)
@@ -938,6 +941,18 @@ class BotScheduler:
         """Create TradeConfig from current settings."""
         return TradeConfig.from_settings(self._settings)
 
+    @property
+    def strategy(self) -> BaseStrategy:
+        """The entry strategy selected by ``STRATEGY_NAME`` (built on first use)."""
+        if self._strategy is None:
+            self._strategy = get_strategy(self._settings.strategy_name, self._settings)
+            logger.info(
+                "Entry strategy plugged in: '%s' (warmup=%d candles)",
+                self._strategy.name,
+                self._strategy.warmup,
+            )
+        return self._strategy
+
     # ------------------------------------------------------------------
     # Epic list management
     # ------------------------------------------------------------------
@@ -1142,29 +1157,20 @@ class BotScheduler:
             await self._evaluate_epic(epic, config)
 
     async def _evaluate_epic(self, epic: str, config: TradeConfig) -> None:
-        """Compute the signal for one epic from its buffer and act on a BUY."""
+        """Run the plugged strategy on one epic's buffer and act on a BUY.
+
+        The strategy is the only per-strategy code path; gates, order
+        placement, and monitoring are shared whatever ``STRATEGY_NAME`` says.
+        """
+        strategy = self.strategy
         buf = self._buffer.get(epic)
-        if not buf or len(buf) < self._settings.strategy_sma_slow:
+        if not buf or len(buf) < strategy.warmup:
             return
-        signal = compute_signal(
-            epic,
-            buf,
-            regression_period=self._settings.strategy_lookback_points,
-            sma_fast_period=self._settings.strategy_sma_fast,
-            sma_slow_period=self._settings.strategy_sma_slow,
-            roc_period=self._settings.strategy_roc_period,
-            min_r2=self._settings.strategy_min_r2,
-            min_score=self._settings.strategy_min_score,
-            max_spread_ratio=self._settings.strategy_max_spread_ratio,
-            follower_mult=self._settings.strategy_stop_multiplier,
-            win_mult=self._settings.strategy_target_multiplier,
-            loose_mult=self._settings.strategy_stop_multiplier * 3,
-            security_mult=self._settings.strategy_stop_multiplier * 2,
-            tactic=self._settings.strategy_tactic,
-        )
+        signal = strategy.evaluate(epic, buf)
         if signal and signal.direction == "BUY":
             logger.info(
-                "BUY signal: %s (score=%.2f, R²=%.2f)",
+                "BUY signal [%s]: %s (score=%.2f, R²=%.2f)",
+                strategy.name,
                 epic,
                 signal.score,
                 signal.regression.r_squared,

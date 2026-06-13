@@ -1,5 +1,13 @@
 # Trading Strategy — Trend Volume Intraday
 
+> **Note (June 2026):** strategies are now **pluggable** and selected by name
+> via `STRATEGY_NAME` — see [strategies/README.md](strategies/README.md).
+> This document describes the *original* `trend_follower` strategy (kept
+> selectable, no longer the live default); the current live default is
+> [`donchian_er`](strategies/donchian-er.md). The risk management, daily
+> cycle, and circuit breakers described below are shared infrastructure and
+> still apply to every strategy.
+
 ## Philosophy
 
 The bot targets **volume-based intraday trading** built on three pillars:

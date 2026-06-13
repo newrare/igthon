@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from src.services.curve_generator import PROFILES, generate_curve
 from src.services.simulator import SimulationConfig, run_simulation
+from src.strategies import STRATEGIES
 
 router = APIRouter()
 
@@ -46,6 +47,7 @@ class SimulationRequest(BaseModel):
     """Validated parameters for a simulation run."""
 
     profile: str = Field("random", pattern="^[a-z_]+$")
+    strategy: str | None = Field(None, pattern="^[a-z_]+$")
     seed: int | None = Field(None, ge=0, lt=_MAX_SEED)
     target_trades: int = Field(100, ge=1, le=1000)
     epics_per_day: int = Field(3, ge=1, le=10)
@@ -95,6 +97,10 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         return JSONResponse(
             {"error": f"Unknown profile: {body.profile}"}, status_code=400
         )
+    if body.strategy is not None and body.strategy not in STRATEGIES:
+        return JSONResponse(
+            {"error": f"Unknown strategy: {body.strategy}"}, status_code=400
+        )
     seed = body.seed if body.seed is not None else random.randrange(_MAX_SEED)
 
     sim_config = SimulationConfig(
@@ -110,11 +116,15 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         breakeven_margin_mult=body.breakeven_margin_mult,
     )
     settings = request.app.state.settings
-    result = await asyncio.to_thread(run_simulation, settings, sim_config)
+    strategy_name = body.strategy or settings.strategy_name
+    result = await asyncio.to_thread(
+        run_simulation, settings, sim_config, strategy_name
+    )
 
     return JSONResponse(
         {
             "seed": seed,
+            "strategy": strategy_name,
             "summary": result.summary(),
             "trades": [
                 {
@@ -169,6 +179,14 @@ async def simulator_page(request: Request) -> HTMLResponse:
     profile_options = "".join(
         f'<option value="{p}"{" selected" if p == "random" else ""}>{p}</option>'
         for p in PROFILES
+    )
+    # Strategy dropdown defaults to the live STRATEGY_NAME so the simulation
+    # replays exactly what the bot would do; other entries allow comparison.
+    live_strategy = request.app.state.settings.strategy_name
+    strategy_options = "".join(
+        f'<option value="{name}"{" selected" if name == live_strategy else ""}>'
+        f"{name}{' (live)' if name == live_strategy else ''}</option>"
+        for name in sorted(STRATEGIES)
     )
     curve_candles = _stepper(
         "Candles", "curve-candles", value="600", minimum="50", maximum="2000", step="50"
@@ -249,6 +267,9 @@ async def simulator_page(request: Request) -> HTMLResponse:
             (signal score, pre-open gates, win/stop levels, ATR trailing stop)
             over generated days until the trade target is reached.</p>
             <div class="sim-controls">
+                <label>Strategy
+                    <select id="sim-strategy">{strategy_options}</select>
+                </label>
                 <label>Profile
                     <select id="sim-profile">{profile_options}</select>
                 </label>
@@ -439,6 +460,7 @@ async function runSimulation() {{
     const seedVal = document.getElementById("sim-seed").value;
     const body = {{
         profile: document.getElementById("sim-profile").value,
+        strategy: document.getElementById("sim-strategy").value,
         target_trades: parseInt(document.getElementById("sim-target").value) || 100,
         epics_per_day: parseInt(document.getElementById("sim-epics").value) || 3,
         euro_per_point: parseFloat(document.getElementById("sim-epp").value) || 1,
@@ -465,7 +487,8 @@ async function runSimulation() {{
     restoreButton();
 
     const s = data.summary;
-    status.innerHTML = `seed=<strong>${{data.seed}}</strong> — ` +
+    status.innerHTML = `strategy=<strong>${{data.strategy}}</strong> ` +
+        `seed=<strong>${{data.seed}}</strong> — ` +
         `${{s.days_simulated}} fictional days, ${{s.buy_signals}} BUY signals ` +
         `(reuse the seed to replay)`;
     document.getElementById("sim-results").style.display = "block";
