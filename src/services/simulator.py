@@ -23,7 +23,7 @@ for a real trading day.
 import logging
 import random
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -31,7 +31,6 @@ from src.services.compute import atr
 from src.services.price_buffer import Candle, EpicBuffer
 from src.services.trading import (
     TradeConfig,
-    compute_breakeven_stop,
     compute_trailing_stop,
     decide_close_reason,
     evaluate_open_gates,
@@ -59,13 +58,6 @@ class SimulationConfig:
     base_price: float = 8000.0
     euro_per_point: float = 1.0  # fictional contract value, € per point
     quantity: int = 1
-    # Break-even lock (A/B toggle, off by default so the baseline is unchanged):
-    # once price is a safe margin above level_zero, pull the stop just above zero
-    # so the trade can no longer lose — independent of the ATR trailing ratchet.
-    breakeven_lock: bool = False
-    breakeven_buffer_mult: float = 1.0  # lock at level_zero + buffer × spread
-    breakeven_margin_mult: float = 2.0  # min bid→stop gap to keep, in spreads
-    ig_min_stop_distance: float = 0.0  # IG min stop distance (price units)
 
 
 @dataclass(slots=True)
@@ -161,28 +153,33 @@ class StrategySimulator:
 
     def __init__(
         self,
-        curve_provider: CurveProvider,
         trade_config: TradeConfig,
         strategy: BaseStrategy,
         sim_config: SimulationConfig,
+        curve_provider: CurveProvider | None = None,
     ) -> None:
-        self._curves = curve_provider
         self._config = trade_config
         self._strategy = strategy
         self._sim = sim_config
+        # Only :meth:`run` (the synthetic path) needs a provider; the historical
+        # backtester feeds pre-built days straight to :meth:`run_days`.
+        self._curves = curve_provider
 
     def run(self) -> SimulationResult:
         """Simulate day after day until the trade target (or day cap) is hit."""
-        result = SimulationResult()
-        for day in range(self._sim.max_days):
-            if len(result.trades) >= self._sim.target_trades:
-                break
-            day_start = len(result.trades)
-            self._run_day(day, result)
-            result.days_simulated += 1
-            result.daily_pnl.append(
-                sum(t.euro or 0.0 for t in result.trades[day_start:])
+        if self._curves is None:
+            raise RuntimeError(
+                "run() needs a curve_provider; use run_days() for pre-built days"
             )
+
+        def synthetic_days() -> Iterable[list[tuple[str, list[Candle]]]]:
+            for day in range(self._sim.max_days):
+                yield [
+                    (f"SIM.{day}.{e}", self._curves(day, e))
+                    for e in range(self._sim.epics_per_day)
+                ]
+
+        result = self.run_days(synthetic_days())
         logger.info(
             "Simulation done: %d trades over %d days, P&L=%.2f€",
             len(result.trades),
@@ -191,37 +188,83 @@ class StrategySimulator:
         )
         return result
 
-    def _run_day(self, day: int, result: SimulationResult) -> None:
-        """Play one fictional day: feed candles tick by tick and apply rules."""
-        curves = [self._curves(day, e) for e in range(self._sim.epics_per_day)]
-        buffers = [
-            EpicBuffer(epic=f"SIM.{day}.{e}") for e in range(self._sim.epics_per_day)
-        ]
+    def run_days(
+        self, days: Iterable[Sequence[tuple[str, list[Candle]]]]
+    ) -> SimulationResult:
+        """Replay pre-built trading days through the shared open/close pipeline.
+
+        Each item is one trading day: a sequence of ``(epic, candles)`` pairs.
+        Days are consumed in order until the trade target is reached or the
+        input is exhausted. Daily gates (max trades, daily P&L, win rate) reset
+        per day, exactly like the synthetic :meth:`run`. This is the entry point
+        used by the historical backtester (see :mod:`src.services.backtester`).
+        """
+        result = SimulationResult()
+        for day_index, day in enumerate(days):
+            if len(result.trades) >= self._sim.target_trades:
+                break
+            curves = [(label, candles) for label, candles in day if candles]
+            if not curves:
+                continue
+            day_start = len(result.trades)
+            self._run_day(day_index, curves, result)
+            result.days_simulated += 1
+            result.daily_pnl.append(
+                sum(t.euro or 0.0 for t in result.trades[day_start:])
+            )
+        return result
+
+    def _run_day(
+        self,
+        day: int,
+        curves: Sequence[tuple[str, list[Candle]]],
+        result: SimulationResult,
+    ) -> None:
+        """Play one trading day: feed every epic's candles and apply the rules.
+
+        Candles across epics are merged into a single timestamp-ordered event
+        stream so misaligned real-market series (different start times and
+        lengths) interleave correctly. For the synthetic simulator — where all
+        curves share the same per-tick timestamps and lengths — sorting by
+        ``(timestamp, epic_index)`` reproduces the original lockstep tick order
+        exactly, so synthetic runs are unchanged.
+        """
+        buffers = [EpicBuffer(epic=label) for label, _ in curves]
         open_positions: dict[int, SimulatedTrade] = {}
         closed_today: list[SimulatedTrade] = []
-
-        num_ticks = min(len(c) for c in curves) if curves else 0
         last_candles: list[Candle | None] = [None] * len(curves)
 
-        for tick in range(num_ticks):
-            for e, curve in enumerate(curves):
-                candle = curve[tick]
-                buffers[e].add(candle)
-                last_candles[e] = candle
+        events = sorted(
+            (
+                (candle.timestamp, e, candle)
+                for e, (_, candles) in enumerate(curves)
+                for candle in candles
+            ),
+            key=lambda ev: (ev[0], ev[1]),
+        )
 
-                position = open_positions.get(e)
-                if position is not None:
-                    if self._monitor(position, candle, buffers[e]):
-                        del open_positions[e]
-                        closed_today.append(position)
-                        result.trades.append(position)
-                else:
-                    self._evaluate(
-                        e, candle, buffers[e], open_positions, closed_today, result
-                    )
+        prev_ts: datetime | None = None
+        for ts, e, candle in events:
+            # Re-check the early-stop boundary only between timestamps so a tick
+            # is never processed half-way across epics (matches the old loop).
+            if prev_ts is not None and ts != prev_ts:
+                if len(result.trades) >= self._sim.target_trades and not open_positions:
+                    break
+            prev_ts = ts
 
-            if len(result.trades) >= self._sim.target_trades and not open_positions:
-                break
+            buffers[e].add(candle)
+            last_candles[e] = candle
+
+            position = open_positions.get(e)
+            if position is not None:
+                if self._monitor(position, candle, buffers[e]):
+                    del open_positions[e]
+                    closed_today.append(position)
+                    result.trades.append(position)
+            else:
+                self._evaluate(
+                    day, e, candle, buffers[e], open_positions, closed_today, result
+                )
 
         # Force-close anything still open at the end of the day.
         for e, position in list(open_positions.items()):
@@ -236,6 +279,7 @@ class StrategySimulator:
 
     def _evaluate(
         self,
+        day: int,
         epic_index: int,
         candle: Candle,
         buf: EpicBuffer,
@@ -286,7 +330,7 @@ class StrategySimulator:
         # A market BUY fills at the offer (same as IG's confirmation level).
         open_positions[epic_index] = SimulatedTrade(
             epic=buf.epic,
-            day=int(buf.epic.split(".")[1]),
+            day=day,
             open_time=candle.timestamp.strftime("%H:%M"),
             level_open=round(candle.offer_close, 5),
             level_win=round(levels.level_win, 5),
@@ -333,23 +377,6 @@ class StrategySimulator:
             current_bid > position.level_open
             and self._config.close_strategy == "follower"
         ):
-            # Break-even lock first (ATR-independent): make the trade risk-free as
-            # soon as price is a safe margin above zero, even before the ATR trail
-            # would fire or while the ATR is not yet computable.
-            if self._sim.breakeven_lock:
-                be_stop = compute_breakeven_stop(
-                    current_bid,
-                    level_zero=position.level_zero,
-                    current_stop=max(position.level_stop, position.level_follower),
-                    spread=candle.spread,
-                    min_stop_distance=self._sim.ig_min_stop_distance,
-                    buffer_mult=self._sim.breakeven_buffer_mult,
-                    margin_mult=self._sim.breakeven_margin_mult,
-                )
-                if be_stop is not None and be_stop > position.level_follower:
-                    position.level_follower = round(be_stop, 5)
-                    position.stop_updates += 1
-
             new_stop = compute_trailing_stop(
                 current_bid,
                 atr_value=atr(list(buf.candles), self._config.atr_period),
@@ -414,9 +441,9 @@ def run_simulation(
         )
 
     simulator = StrategySimulator(
-        curve_provider=provider,
         trade_config=TradeConfig.from_settings(settings),
         strategy=get_strategy(strategy_name or settings.strategy_name, settings),
         sim_config=sim_config,
+        curve_provider=provider,
     )
     return simulator.run()

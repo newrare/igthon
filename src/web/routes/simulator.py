@@ -39,6 +39,7 @@ def _nav() -> str:
             <li><a href="/epics/tradable">Tradable</a></li>
             <li><a href="/charts">Charts</a></li>
             <li><a href="/simulator" class="active">Simulator</a></li>
+            <li><a href="/backtest">Backtest</a></li>
         </ul>
     </nav>"""
 
@@ -54,9 +55,6 @@ class SimulationRequest(BaseModel):
     candles_per_day: int = Field(600, ge=100, le=2000)
     base_price: float = Field(8000.0, gt=0)
     euro_per_point: float = Field(1.0, gt=0, le=1000)
-    breakeven_lock: bool = False
-    breakeven_buffer_mult: float = Field(1.0, ge=0, le=10)
-    breakeven_margin_mult: float = Field(2.0, ge=0.5, le=20)
 
 
 @router.get("/api/simulator/curve")
@@ -111,9 +109,6 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         seed=seed,
         base_price=body.base_price,
         euro_per_point=body.euro_per_point,
-        breakeven_lock=body.breakeven_lock,
-        breakeven_buffer_mult=body.breakeven_buffer_mult,
-        breakeven_margin_mult=body.breakeven_margin_mult,
     )
     settings = request.app.state.settings
     strategy_name = body.strategy or settings.strategy_name
@@ -206,14 +201,6 @@ async def simulator_page(request: Request) -> HTMLResponse:
         "Epics / day", "sim-epics", value="3", minimum="1", maximum="10", step="1"
     )
     sim_epp = _stepper("&euro; / point", "sim-epp", value="1", minimum="0.01", step="1")
-    sim_margin = _stepper(
-        "BE margin (spreads)",
-        "sim-margin",
-        value="2",
-        minimum="0.5",
-        maximum="20",
-        step="0.5",
-    )
     return HTMLResponse(f"""<!DOCTYPE html>
 <html>
 <head>
@@ -277,10 +264,6 @@ async def simulator_page(request: Request) -> HTMLResponse:
                 {sim_target}
                 {sim_epics}
                 {sim_epp}
-                <label class="sim-check">Break-even lock
-                    <input type="checkbox" id="sim-breakeven" checked>
-                </label>
-                {sim_margin}
                 <button class="nav-btn" id="sim-run-btn" onclick="runSimulation()">
                     <i data-lucide="play" class="lc-icon"></i> Run simulation
                 </button>
@@ -351,10 +334,6 @@ async def simulator_page(request: Request) -> HTMLResponse:
 .step-btn:last-child {{ border-radius:0 var(--radius-sm) var(--radius-sm) 0; }}
 .step-btn:hover {{ background:var(--primary); color:#120e0c; border-color:var(--primary); }}
 .step-btn:active {{ background:var(--primary-dark); }}
-/* Break-even toggle: keep the checkbox inline under its label. */
-.sim-check {{ justify-content:center; }}
-.sim-check input {{ width:auto !important; align-self:center; cursor:pointer;
-    accent-color:var(--primary); transform:scale(1.3); margin-top:0.3rem; }}
 .sim-controls .nav-btn {{ min-width:11rem; justify-content:center; }}
 .sim-controls .nav-btn:disabled {{ opacity:0.5; cursor:not-allowed; }}
 .sim-meta {{ font-size:0.75rem; color:var(--text-muted); padding:0.2rem 0 0.6rem;
@@ -464,9 +443,6 @@ async function runSimulation() {{
         target_trades: parseInt(document.getElementById("sim-target").value) || 100,
         epics_per_day: parseInt(document.getElementById("sim-epics").value) || 3,
         euro_per_point: parseFloat(document.getElementById("sim-epp").value) || 1,
-        breakeven_lock: document.getElementById("sim-breakeven").checked,
-        breakeven_margin_mult:
-            parseFloat(document.getElementById("sim-margin").value) || 2,
     }};
     if (seedVal !== "") body.seed = parseInt(seedVal);
 

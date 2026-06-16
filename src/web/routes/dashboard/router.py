@@ -211,6 +211,14 @@ def _trade_overlay(p: Position) -> dict:
         value = getattr(p, attr, None)
         return float(value) if value is not None else None
 
+    def _level(attr: str) -> float | None:
+        """Price level, or None when unset. A stored 0 means "no level" (e.g.
+        strategies without a fixed win target); it must not reach the chart, where
+        it would be folded into the normalisation bounds and flatten the bid curve
+        against the top of the view."""
+        value = _num(attr)
+        return value if value and value > 0 else None
+
     def _ts(t: time | None) -> str | None:
         if p.date is None or t is None:
             return None
@@ -218,11 +226,11 @@ def _trade_overlay(p: Position) -> dict:
 
     return {
         "id": p.id,
-        "open": _num("level_open"),
-        "zero": _num("level_zero"),
-        "stop": _num("level_stop"),
-        "target": _num("level_win"),
-        "close": _num("level_close"),
+        "open": _level("level_open"),
+        "zero": _level("level_zero"),
+        "stop": _level("level_stop"),
+        "target": _level("level_win"),
+        "close": _level("level_close"),
         "openTime": _ts(p.time_open),
         "closeTime": _ts(p.time_close),
         "pnl": _num("euro"),

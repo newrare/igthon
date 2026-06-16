@@ -134,8 +134,11 @@ class Settings(BaseSettings):
     strategy_donchian_stop_atr_k: float = 2.5  # stop distance in ATR multiples
     # Regime gate: only trade epics whose Kaufman Efficiency Ratio over the
     # window reaches the threshold — i.e. skip sideways chop, keep clean trends.
+    # Raised to 0.60 (from 0.45): on real 1-minute data the looser gate let too
+    # many marginal breakouts through, and each one bled the bid/offer spread
+    # ("spread churn"). A stricter regime gate trades less but cleaner.
     strategy_efficiency_period: int = 30
-    strategy_min_efficiency: float = 0.45
+    strategy_min_efficiency: float = 0.60
 
     # Trend follower (strategy_name = "trend_follower") — Trend Volume Intraday
     strategy_min_r2: float = 0.70
@@ -149,12 +152,27 @@ class Settings(BaseSettings):
     strategy_target_multiplier: float = 4.0
     strategy_tactic: str = "spread"
 
-    # Trailing stop (ATR-based adaptive follower)
-    # Distance = k x ATR(period). k widens before break-even to let the trade
-    # breathe, then tightens once price clears level_zero to lock in the gain.
+    # Momentum scalper (strategy_name = "momentum_scalper") — high-frequency,
+    # buy fresh up-ticks and grab a spread-multiple of profit immediately.
+    strategy_scalper_momentum_period: int = 5  # recent-trend ROC window (candles)
+    strategy_scalper_min_roc: float = 0.02  # min ROC over the window, in percent
+    strategy_scalper_confirm_period: int = 2  # very-recent rising-closes to confirm
+    strategy_scalper_win_ratio: float = 1.5  # take-profit in net spread multiples
+    strategy_scalper_stop_lookback: int = 60  # support window (≈ last hour, candles)
+    strategy_scalper_stop_buffer_atr_k: float = 0.5  # ATR buffer below the support
+    strategy_scalper_max_stop_atr_k: float = 3.0  # cap on stop distance (ATR mult)
+
+    # Trailing stop (ATR-based chandelier follower)
+    # Distance = k x ATR(period); the stop trails k×ATR below the running high
+    # and only ever ratchets up. pre/post are the multipliers before/after
+    # break-even. They are kept EQUAL (no post-break-even tightening) on purpose:
+    # the strategies are trend-followers, and tightening the stop once a trade
+    # turns green cut winners off at ~1.5 ATR while losers still ran the full
+    # 2.5 ATR — winners ended up smaller than losers. A single consistent width
+    # lets winners run, which is the whole point of a Donchian breakout.
     strategy_atr_period: int = 14
     strategy_atr_k_pre: float = 2.5  # multiplier before break-even
-    strategy_atr_k_post: float = 1.5  # tighter multiplier once past level_zero
+    strategy_atr_k_post: float = 2.5  # kept equal: do not tighten after break-even
     strategy_trailing_step_ratio: float = 0.3  # min gain (xATR) before a PUT
 
     # Position / Risk management

@@ -109,29 +109,6 @@ class TestSimulationRun:
         result = _run(target=1000, profile="sideways", max_days=3)
         assert result.days_simulated == 3
 
-    def test_breakeven_lock_does_not_worsen_outcomes(self):
-        # On the same curves, enabling the break-even lock must not deepen the
-        # worst loss and should not lower the win rate (it converts some losers
-        # to ~flat exits). P&L is allowed to move either way (it can cap winners).
-        off = _run(target=200, seed=42, profile="volatile", breakeven_lock=False)
-        on = _run(target=200, seed=42, profile="volatile", breakeven_lock=True)
-        s_off, s_on = off.summary(), on.summary()
-        assert s_on["worst"] >= s_off["worst"] - 1e-6
-        assert s_on["win_rate"] >= s_off["win_rate"]
-
-    def test_breakeven_lock_is_inert_with_a_huge_margin(self):
-        # A margin so wide the lock can never fire safely must leave the run
-        # identical to the baseline (proves the toggle is the only difference).
-        off = _run(target=120, seed=7, profile="random", breakeven_lock=False)
-        on = _run(
-            target=120,
-            seed=7,
-            profile="random",
-            breakeven_lock=True,
-            breakeven_margin_mult=20.0,
-        )
-        assert [t.euro for t in on.trades] == [t.euro for t in off.trades]
-
 
 class TestSimulatorRoutes:
     """The /simulator page and its JSON API."""

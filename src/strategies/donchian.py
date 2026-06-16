@@ -54,7 +54,7 @@ class DonchianER(BaseStrategy):
     stop_atr_k: float = 2.5  # protective stop distance, in ATR multiples
     atr_period: int = 14
     efficiency_period: int = 30  # ER lookback window
-    min_efficiency: float = 0.45  # regime gate threshold (0 disables)
+    min_efficiency: float = 0.60  # regime gate threshold (0 disables)
     max_spread_ratio: float = 0.0015
 
     @property

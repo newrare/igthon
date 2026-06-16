@@ -51,23 +51,30 @@ Hence: **trade breakouts only on markets that are trending efficiently.**
 
 ### Exit — no fixed take-profit
 
-`level_win = 0`: the trade rides the trend and exits via:
+`level_win = 0` **by design**. A Donchian breakout is a trend-following system:
+the edge is the occasional large trend that pays for many small losses, so a
+fixed take-profit (which caps exactly those large winners) is counter-productive.
+The trade rides the trend and exits via:
 
-- the **ATR trailing stop** (shared `compute_trailing_stop`, k_pre/k_post
-  regime) — the normal, profitable exit (`follower`);
+- the **ATR chandelier trailing stop** (shared `compute_trailing_stop`): the stop
+  trails `k × ATR` below the running high and only ratchets up — the normal exit
+  (`follower`). `atr_k_pre` and `atr_k_post` are kept **equal** (2.5): tightening
+  after break-even cut winners off at ~1.5 ATR while losers ran the full 2.5 ATR,
+  which made winners smaller than losers. A single consistent width lets winners
+  run, as a breakout system needs;
 - the **protective stop** at `STRATEGY_DONCHIAN_STOP_ATR_K × ATR(14)` below
   entry, pushed to IG as an absolute `stopLevel` (`stop`);
 - the **end-of-day force close** (strict intraday, unchanged).
 
 ### Levels mapping
 
-| Level            | Value (BUY) | Role                                 |
-| ---------------- | ----------- | ------------------------------------ |
-| `level_win`      | 0 (none)    | Skipped — trailing exit only         |
-| `level_zero`     | offer       | Break-even (trailing tightens after) |
-| `level_loose`    | bid − k×ATR | Software stop                        |
-| `level_security` | bid − k×ATR | Broker-side protective stop          |
-| `level_follower` | bid − k×ATR | Trailing stop start                  |
+| Level            | Value (BUY) | Role                                   |
+| ---------------- | ----------- | -------------------------------------- |
+| `level_win`      | 0 (none)    | Skipped — trailing exit only           |
+| `level_zero`     | offer       | Break-even (trail switches k_pre→post) |
+| `level_loose`    | bid − k×ATR | Software stop                          |
+| `level_security` | bid − k×ATR | Broker-side protective stop            |
+| `level_follower` | bid − k×ATR | Trailing stop start                    |
 
 ## Parameters
 
@@ -77,7 +84,7 @@ Hence: **trade breakouts only on markets that are trending efficiently.**
 | `STRATEGY_DONCHIAN_CHANNEL`    | 20            | Channel lookback (candles)            |
 | `STRATEGY_DONCHIAN_STOP_ATR_K` | 2.5           | Stop distance in ATR multiples        |
 | `STRATEGY_EFFICIENCY_PERIOD`   | 30            | ER lookback window                    |
-| `STRATEGY_MIN_EFFICIENCY`      | 0.45          | Regime gate threshold (0 disables)    |
+| `STRATEGY_MIN_EFFICIENCY`      | 0.60          | Regime gate threshold (0 disables)    |
 | `STRATEGY_ATR_PERIOD`          | 14            | ATR window (shared with the trailing) |
 | `STRATEGY_MAX_SPREAD_RATIO`    | 0.0015        | Spread gate (shared)                  |
 
@@ -140,12 +147,15 @@ python -m src.scripts.donchian_regime_filter --days 60 --epics 3 --seed 12345
    orders. Half the edge (down-trends) is unused. → Next step: short support
    in the trading service (order direction, mirrored levels, downward
    trailing).
-1. **Thresholds untuned on real data**: `ER ≥ 0.45` / window 30 come from the
-   synthetic sweep (0.30/0.45/0.60 tested); validate on recorded real candles
-   (the `candle` table / CSV dumps) before trusting them.
-1. **Trailing interplay**: the live trailing uses `atr_k_pre=2.5` /
-   `atr_k_post=1.5`; the lab used a flat 2.5. The tighter post-break-even
-   trail cuts winners earlier — worth a dedicated sweep.
+1. **Thresholds tuned on real data**: `ER ≥ 0.60` / window 30 — raised from 0.45
+   after the first real-candle backtests showed the looser gate let too many
+   marginal breakouts bleed the spread. Keep validating on recorded real candles
+   (the backtest reads the CSV archive) as more weeks accumulate.
+1. **Trailing width**: `atr_k_pre` and `atr_k_post` are kept **equal** (2.5) — a
+   single consistent chandelier width. The earlier two-speed setting
+   (`atr_k_post=1.5`) tightened the stop after break-even and cut winners short,
+   leaving winners smaller than losers; a breakout system needs to let winners
+   run.
 1. **One-shot churn**: in a strongly trending day the strategy may re-enter
    after each trailing exit (entry → trail out → new breakout). The daily
    circuit breakers (`STRATEGY_MAX_TRADES_DAY`, daily win/loss targets) bound

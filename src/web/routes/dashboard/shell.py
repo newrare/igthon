@@ -10,6 +10,19 @@ from src.web.routes.dashboard.fragments import (
     _render_config_grid,
 )
 
+#: Human-readable labels for the registered strategy names. Anything not listed
+#: falls back to a title-cased version of the raw ``STRATEGY_NAME`` value.
+_STRATEGY_LABELS: dict[str, str] = {
+    "donchian_er": "Donchian ER Breakout",
+    "momentum_scalper": "Momentum Scalper",
+    "trend_follower": "Trend Follower",
+}
+
+
+def _strategy_label(name: str) -> str:
+    """Return a display label for the active strategy name."""
+    return _STRATEGY_LABELS.get(name, name.replace("_", " ").title())
+
 
 def _render_modals(settings, frags: dict[str, str]) -> str:
     """Build every overlay modal from the shared component helpers."""
@@ -137,13 +150,23 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=3">
+    <link rel="stylesheet" href="/static/style.css?v=4">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
 <body>
 {modals}
 <div class="container">
+
+    <!-- Main title — active trading strategy -->
+    <div class="dashboard-title">
+        <i data-lucide="bot" class="lc-icon"></i>
+        <h1>IG Trading Bot</h1>
+        <span class="dashboard-title-sep">·</span>
+        <span class="dashboard-title-strategy">
+            <i data-lucide="cpu" class="lc-icon"></i> {_strategy_label(settings.strategy_name)}
+        </span>
+    </div>
 
     <!-- KPI Bar -->
     <div class="kpi-updated">Live data · updated <span id="refresh-kpi">—</span></div>
@@ -271,6 +294,7 @@ def _render_dashboard(settings, state: dict) -> str:
         <ul>
             <li><a href="/charts">Charts</a></li>
             <li><a href="/simulator">Simulator</a></li>
+            <li><a href="/backtest">Backtest</a></li>
             <li><a href="/positions" target="_blank">Positions<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
             <li><a href="/positions/summary" target="_blank">Daily Summary<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
             <li><a href="/api/status" target="_blank">API Status<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>

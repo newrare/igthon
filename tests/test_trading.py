@@ -12,7 +12,6 @@ from src.services.price_buffer import Candle, EpicBuffer
 from src.services.trading import (
     TradeConfig,
     TradingService,
-    compute_breakeven_stop,
 )
 
 
@@ -203,62 +202,6 @@ class TestClampTrailingDistance:
         assert svc._clamp_trailing_distance(5.0, pos, spread=0.0) == pytest.approx(5.0)
 
 
-class TestBreakevenStop:
-    """ATR-independent break-even lock: only fires with a safe margin, ratchets up."""
-
-    def test_locks_just_above_zero_when_safely_above(self):
-        # bid 110, level_zero 100, spread 1: target 101, gap 9 >= margin 2 -> lock.
-        stop = compute_breakeven_stop(
-            110.0, level_zero=100.0, current_stop=95.0, spread=1.0
-        )
-        assert stop == pytest.approx(101.0)  # level_zero + 1 x spread
-
-    def test_none_when_bid_too_close_to_target(self):
-        # bid 102, target 101: gap 1 < margin (2 x spread = 2) -> wait, do not push.
-        assert (
-            compute_breakeven_stop(
-                102.0, level_zero=100.0, current_stop=95.0, spread=1.0
-            )
-            is None
-        )
-
-    def test_respects_ig_min_stop_distance_over_spread_margin(self):
-        # margin from spread is 2, but IG min distance is 6: bid 105 (gap 4) waits.
-        assert (
-            compute_breakeven_stop(
-                105.0,
-                level_zero=100.0,
-                current_stop=95.0,
-                spread=1.0,
-                min_stop_distance=6.0,
-            )
-            is None
-        )
-        # bid 108 -> gap 7 >= 6 -> lock.
-        assert compute_breakeven_stop(
-            108.0,
-            level_zero=100.0,
-            current_stop=95.0,
-            spread=1.0,
-            min_stop_distance=6.0,
-        ) == pytest.approx(101.0)
-
-    def test_ratchets_up_never_down(self):
-        # Current stop already above the break-even target -> no move.
-        assert (
-            compute_breakeven_stop(
-                110.0, level_zero=100.0, current_stop=103.0, spread=1.0
-            )
-            is None
-        )
-
-    def test_none_without_level_zero(self):
-        assert (
-            compute_breakeven_stop(110.0, level_zero=0.0, current_stop=0.0, spread=1.0)
-            is None
-        )
-
-
 class TestTrailingStop:
     """ATR-based trailing stop: ratchet, two-speed regime, IG push."""
 
@@ -299,20 +242,24 @@ class TestTrailingStop:
         assert float(pos.level_follower) == pytest.approx(102.0)  # 105 - 3
         client.put.assert_awaited_once()
 
-    async def test_never_falls_below_level_zero_once_secured(self):
+    async def test_trails_naturally_without_breakeven_pin(self):
+        # The stop is NOT pinned up to level_zero on the first tick of profit
+        # (that pin strangled trades flat). It trails a full ATR distance below
+        # price; the upward-only ratchet then locks break-even organically as
+        # the trade keeps running.
         svc, _, _ = _trailing_service()
         buf = _buffer_with_atr2()
         pos = Position(
             epic="X",
             deal_id="DEAL1",
             level_open=Decimal("100"),
-            level_zero=Decimal("104"),  # 105 - 3 = 102 < 104 -> floored to 104
+            level_zero=Decimal("104"),  # past zero at bid 105 -> k_post 1.5 -> dist 3
             level_follower=Decimal("100"),
         )
 
         await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
 
-        assert float(pos.level_follower) == pytest.approx(104.0)
+        assert float(pos.level_follower) == pytest.approx(102.0)  # 105 - 3, not 104
 
     async def test_does_not_move_down_or_below_step(self):
         svc, client, db = _trailing_service()

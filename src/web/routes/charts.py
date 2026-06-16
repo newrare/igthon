@@ -43,6 +43,7 @@ def _nav(active: str) -> str:
             <li><a href="/epics/tradable"{cls("tradable")}>Tradable</a></li>
             <li><a href="/charts"{cls("charts")}>Charts</a></li>
             <li><a href="/simulator"{cls("simulator")}>Simulator</a></li>
+            <li><a href="/backtest"{cls("backtest")}>Backtest</a></li>
             <li><a href="/positions" target="_blank">Positions</a></li>
         </ul>
     </nav>"""
@@ -351,14 +352,17 @@ def _add_position_markers(fig: go.Figure, p: Position, day: date) -> None:
             )
         )
 
-    # Win target / stop level as faint horizontal references.
-    if p.level_win is not None:
+    # Win target / stop level as faint horizontal references. A level of 0 means
+    # "no target set" (e.g. strategies without a fixed win level); drawing a line
+    # at y=0 would blow up the y-axis range and flatten the price curves into an
+    # invisible sliver, so treat 0 the same as None.
+    if p.level_win:
         fig.add_hline(
             y=float(p.level_win),
             line={"color": "#22c55e", "width": 1, "dash": "dash"},
             opacity=0.35,
         )
-    if p.level_stop is not None:
+    if p.level_stop:
         fig.add_hline(
             y=float(p.level_stop),
             line={"color": "#ef4444", "width": 1, "dash": "dash"},

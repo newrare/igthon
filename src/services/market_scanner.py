@@ -284,11 +284,7 @@ class MarketScanner:
                 reasons[info.epic] = info.status or "CLOSED"
             elif info.bid <= 0 or info.offer <= 0:
                 reasons[info.epic] = "no_price"
-            elif (
-                cap > 0
-                and info.funds_needed is not None
-                and info.funds_needed > cap
-            ):
+            elif cap > 0 and info.funds_needed is not None and info.funds_needed > cap:
                 reasons[info.epic] = "too_expensive"
             else:
                 reasons[info.epic] = "duplicate"

@@ -68,6 +68,7 @@ def create_app(
     app.state.log_buffer = log_buffer
 
     # Include routes
+    from src.web.routes.backtest import router as backtest_router
     from src.web.routes.charts import router as charts_router
     from src.web.routes.dashboard import router as dashboard_router
     from src.web.routes.positions import router as positions_router
@@ -77,5 +78,6 @@ def create_app(
     app.include_router(positions_router, prefix="/positions")
     app.include_router(charts_router)
     app.include_router(simulator_router)
+    app.include_router(backtest_router)
 
     return app

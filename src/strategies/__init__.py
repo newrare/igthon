@@ -20,12 +20,14 @@ from __future__ import annotations
 
 from src.strategies.base import BaseStrategy
 from src.strategies.donchian import DonchianER
+from src.strategies.momentum_scalper import MomentumScalper
 from src.strategies.trend_follower import TrendFollower
 
 #: Name → class map. Keys are the valid ``STRATEGY_NAME`` values.
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     TrendFollower.name: TrendFollower,
     DonchianER.name: DonchianER,
+    MomentumScalper.name: MomentumScalper,
 }
 
 
@@ -47,6 +49,7 @@ __all__ = [
     "STRATEGIES",
     "BaseStrategy",
     "DonchianER",
+    "MomentumScalper",
     "TrendFollower",
     "get_strategy",
 ]

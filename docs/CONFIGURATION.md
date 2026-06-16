@@ -74,10 +74,10 @@ ______________________________________________________________________
 
 ## Candle persistence
 
-| Variable                | Default   | Description                                           |
-| ----------------------- | --------- | ----------------------------------------------------- |
-| `CANDLE_RETENTION_DAYS` | `7`       | Days of candles kept in DB before CSV dump + deletion |
-| `CANDLE_DUMP_DIR`       | `./dumps` | Directory for CSV dumps                               |
+| Variable                | Default   | Description                                                                                                     |
+| ----------------------- | --------- | --------------------------------------------------------------------------------------------------------------- |
+| `CANDLE_RETENTION_DAYS` | `7`       | Days of candles kept in DB before per-week CSV archive + deletion                                               |
+| `CANDLE_DUMP_DIR`       | `./dumps` | Directory for per-week candle archives (`candles_<year>-W<week>.csv`), read by the [backtester](BACKTESTING.md) |
 
 ______________________________________________________________________
 

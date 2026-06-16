@@ -22,11 +22,12 @@ STRATEGY_NAME=donchian_er
 
 ## Available strategies
 
-| Name             | File                               | Doc                                    | Style                              | Status            |
-| ---------------- | ---------------------------------- | -------------------------------------- | ---------------------------------- | ----------------- |
-| `donchian_er`    | `src/strategies/donchian.py`       | [donchian-er.md](donchian-er.md)       | Breakout gated by trend efficiency | **Live default**  |
-| `trend_follower` | `src/strategies/trend_follower.py` | [trend-follower.md](trend-follower.md) | Composite-score trend confirmation | Legacy (original) |
-| —                | `src/services/strategies.py` (lab) | [research-lab.md](research-lab.md)     | 5-candidate research backtests     | Research only     |
+| Name               | File                                 | Doc                                        | Style                                | Status            |
+| ------------------ | ------------------------------------ | ------------------------------------------ | ------------------------------------ | ----------------- |
+| `donchian_er`      | `src/strategies/donchian.py`         | [donchian-er.md](donchian-er.md)           | Breakout gated by trend efficiency   | **Live default**  |
+| `trend_follower`   | `src/strategies/trend_follower.py`   | [trend-follower.md](trend-follower.md)     | Composite-score trend confirmation   | Legacy (original) |
+| `momentum_scalper` | `src/strategies/momentum_scalper.py` | [momentum-scalper.md](momentum-scalper.md) | High-frequency spread-multiple scalp | Experimental      |
+| —                  | `src/services/strategies.py` (lab)   | [research-lab.md](research-lab.md)         | 5-candidate research backtests       | Research only     |
 
 ## How it works
 

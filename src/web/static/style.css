@@ -48,6 +48,42 @@ body {
   padding: 1.5rem;
 }
 
+/* ── Main title (active strategy) ───────────────────────────── */
+.dashboard-title {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--primary);
+  border-radius: var(--radius);
+  padding: 0.85rem 1.25rem;
+  margin-bottom: 1.5rem;
+}
+.dashboard-title h1 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.5px;
+}
+.dashboard-title .lc-icon { color: var(--primary); }
+.dashboard-title-sep { color: var(--text-dim); font-size: 1.1rem; }
+.dashboard-title-strategy {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--primary);
+  background: var(--primary-glow);
+  border: 1px solid var(--primary-border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.7rem;
+}
+
 /* ── Navigation ─────────────────────────────────────────────── */
 nav {
   background: var(--surface);

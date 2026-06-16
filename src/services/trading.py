@@ -173,10 +173,13 @@ def compute_trailing_stop(
     euro_stop: float,
     config: TradeConfig,
 ) -> float | None:
-    """Pure ATR trailing-stop computation shared by live trading and the simulator.
+    """Pure ATR chandelier trailing-stop shared by live trading and the simulator.
 
-    Implements the two-speed regime (looser before break-even, tighter once
-    past ``level_zero``) and the upward-only ratchet with a minimum step.
+    The stop trails ``k × ATR`` below price and only ever ratchets up, so it sits
+    ``k × ATR`` below the running high. ``k`` can differ before/after break-even
+    (``atr_k_pre`` / ``atr_k_post``), but the application keeps them EQUAL: for a
+    trend-following breakout, tightening after break-even cuts winners short. The
+    capability is retained so the two-speed regime can still be configured.
 
     Returns:
         The new stop level, or None when no update is warranted.
@@ -193,63 +196,19 @@ def compute_trailing_stop(
         euro_stop=euro_stop,
     )
 
+    # Trail a full ATR distance below price. The ratchet below ensures the stop
+    # only ever moves up, so once the trail has climbed past break-even it stays
+    # there — break-even is locked organically as the trade runs. The stop is
+    # deliberately NOT pinned to ``level_zero`` on the first tick of profit:
+    # doing so parked it on the entry price and a single spread of pullback
+    # closed the trade flat (the "everything exits at 0 €" pathology).
     new_stop = current_bid - distance
-    # Once break-even is cleared, never let the stop fall back into a loss.
-    if past_zero:
-        new_stop = max(new_stop, level_zero)
 
     # Ratchet: only move up, and only when the gain is worth an API write.
     step = config.trailing_step_ratio * atr_value
     if new_stop <= level_follower + step:
         return None
     return new_stop
-
-
-def compute_breakeven_stop(
-    current_bid: float,
-    *,
-    level_zero: float,
-    current_stop: float,
-    spread: float,
-    min_stop_distance: float = 0.0,
-    buffer_mult: float = 1.0,
-    margin_mult: float = 2.0,
-) -> float | None:
-    """Lock the stop just above break-even once price has moved safely past it.
-
-    This is deliberately *independent* of the ATR ratchet in
-    :func:`compute_trailing_stop`: its sole purpose is to make a trade that has
-    gone positive risk-free. As soon as the bid sits a safe distance above
-    ``level_zero`` the stop is pulled up to ``level_zero + buffer_mult * spread``
-    — a hair above break-even — so a later reversal closes the trade flat (or
-    marginally green) instead of at the opening loss-stop. Because it does not
-    need an ATR value, it still protects early in a session or after a restart,
-    when the candle buffer is too short for ``atr()`` to return a value.
-
-    The move is only proposed when the broker would accept it: the locked stop
-    is kept at least ``safe_distance`` below the current bid, where
-    ``safe_distance`` is the larger of IG's minimum stop distance
-    (``min_stop_distance``, a price distance) and ``margin_mult * spread``. While
-    the bid is not yet that far above break-even, None is returned (wait for more
-    room) rather than pushing a stop IG would refuse for being too tight — the
-    margin the caller must keep between the new stop and the live market.
-
-    Returns:
-        The break-even stop level, or None when locking is not yet safe or would
-        not improve on ``current_stop`` (ratchet: the stop never moves down).
-    """
-    if level_zero <= 0:
-        return None
-    target = level_zero + buffer_mult * spread
-    # Ratchet: never move the stop down — only lock in once it beats the live one.
-    if target <= current_stop:
-        return None
-    # Keep a safety margin so IG neither rejects the update (too tight) nor
-    # triggers it on the spread alone.
-    safe_distance = max(min_stop_distance, margin_mult * spread)
-    if current_bid - target < safe_distance:
-        return None
-    return target
 
 
 class TradingService:

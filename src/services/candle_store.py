@@ -47,7 +47,19 @@ def record_to_candle(record: CandleRecord) -> Candle:
     )
 
 
-# Column order used for both CSV dump and (potential) reload during simulation.
+def iso_week_label(moment: datetime) -> str:
+    """Return the ISO-week archive label for a timestamp, e.g. ``2026-W24``.
+
+    Archive files are grouped by ISO week so the backtester can list and select
+    a week's worth of candles independently of how many purge runs produced it.
+    """
+    year, week, _ = moment.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+# Column order used for both CSV dump and reload during backtesting. The
+# backtest archive loader (:mod:`src.services.backtest_archive`) reads any CSV
+# carrying this exact header, so old ``candles_before_*`` dumps stay usable.
 _DUMP_FIELDS = [
     "epic",
     "timestamp",
@@ -190,12 +202,15 @@ class CandleStore:
                 for row in result.all()
             ]
 
-    async def dump_and_purge(self) -> tuple[int, Path | None]:
+    async def dump_and_purge(self) -> tuple[int, list[Path]]:
         """Export candles older than the retention window, then delete them.
 
-        Old candles are written to a timestamped CSV under ``dump_dir`` so they
-        can later seed offline simulations, after which they are removed from the
-        live table to keep it small. Returns ``(rows_dumped, dump_path)``.
+        Old candles are archived to per-ISO-week CSV files under ``dump_dir``
+        (``candles_<year>-W<week>.csv``) so the backtester can later replay a
+        whole week offline, after which they are deleted from the live table to
+        keep it small. A given candle is archived exactly once (it is removed
+        right after), so repeated daily runs simply append the newly-aged
+        candles to the matching week file. Returns ``(rows_dumped, paths)``.
         """
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
 
@@ -212,9 +227,11 @@ class CandleStore:
 
             if not old:
                 logger.info("Candle purge: nothing older than %s", cutoff.date())
-                return 0, None
+                return 0, []
 
-            dump_path = self._write_dump(old, cutoff)
+            # Purged candles are deleted right after, so each is archived once:
+            # plain append is correct and there is no need to dedup against files.
+            _, paths = self._archive_rows(old, dedup=False)
 
             await session.execute(
                 delete(CandleRecord)
@@ -224,35 +241,110 @@ class CandleStore:
             await session.commit()
 
         logger.info(
-            "Candle purge: dumped %d rows to %s and deleted them from the table",
+            "Candle purge: archived %d rows to %s and deleted them from the table",
             len(old),
-            dump_path,
+            ", ".join(p.name for p in paths),
         )
-        return len(old), dump_path
+        return len(old), paths
 
-    def _write_dump(self, rows: list[CandleRecord], cutoff: datetime) -> Path:
-        """Write candle rows to a CSV dump file and return its path."""
+    async def export_to_archive(self) -> tuple[int, list[Path]]:
+        """Snapshot **all** currently-stored candles to the archive, no deletion.
+
+        Unlike :meth:`dump_and_purge` — which only archives candles past the
+        retention window and then removes them — this copies the live table as-is
+        so a backtest can use recent data that has not yet aged out of the
+        database. Rows already present in a week file (matched by epic +
+        timestamp) are skipped, so it is safe to run repeatedly and it merges
+        cleanly with what the retention purge has already written. Returns
+        ``(rows_written, paths)`` where ``rows_written`` counts only new rows.
+        """
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(CandleRecord).order_by(
+                            CandleRecord.epic, CandleRecord.timestamp
+                        )
+                    )
+                ).all()
+            )
+
+        if not rows:
+            logger.info("Candle export: the table is empty, nothing to archive")
+            return 0, []
+
+        written, paths = self._archive_rows(rows, dedup=True)
+        logger.info(
+            "Candle export: wrote %d new rows to %s",
+            written,
+            ", ".join(p.name for p in paths),
+        )
+        return written, paths
+
+    @staticmethod
+    def _row_values(r: CandleRecord) -> list:
+        """Serialise a candle record to a dump CSV row (matches ``_DUMP_FIELDS``)."""
+        return [
+            r.epic,
+            r.timestamp.isoformat(),
+            r.bid_open,
+            r.bid_close,
+            r.bid_high,
+            r.bid_low,
+            r.offer_open,
+            r.offer_close,
+            r.offer_high,
+            r.offer_low,
+            r.volume,
+        ]
+
+    @staticmethod
+    def _existing_keys(path: Path) -> set[tuple[str, str]]:
+        """Return the ``(epic, timestamp)`` pairs already present in a week file."""
+        keys: set[tuple[str, str]] = set()
+        with path.open("r", newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                keys.add((row["epic"], row["timestamp"]))
+        return keys
+
+    def _archive_rows(
+        self, rows: list[CandleRecord], *, dedup: bool
+    ) -> tuple[int, list[Path]]:
+        """Write candle rows to their per-ISO-week CSV files; return (written, paths).
+
+        Rows are bucketed by the ISO week of their timestamp; a week file gets a
+        header only when first created, so successive writes append seamlessly.
+        When ``dedup`` is set, rows already in a week file (matched by epic +
+        timestamp) are skipped — used by :meth:`export_to_archive` so re-runs and
+        overlap with the retention purge never duplicate data.
+        """
         self._dump_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        dump_path = self._dump_dir / f"candles_before_{cutoff.date()}_{stamp}.csv"
 
-        with dump_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(_DUMP_FIELDS)
-            for r in rows:
-                writer.writerow(
-                    [
-                        r.epic,
-                        r.timestamp.isoformat(),
-                        r.bid_open,
-                        r.bid_close,
-                        r.bid_high,
-                        r.bid_low,
-                        r.offer_open,
-                        r.offer_close,
-                        r.offer_high,
-                        r.offer_low,
-                        r.volume,
-                    ]
-                )
-        return dump_path
+        buckets: dict[str, list[CandleRecord]] = {}
+        for r in rows:
+            buckets.setdefault(iso_week_label(r.timestamp), []).append(r)
+
+        written = 0
+        paths: list[Path] = []
+        for week, week_rows in sorted(buckets.items()):
+            path = self._dump_dir / f"candles_{week}.csv"
+            new_file = not path.exists()
+            existing = self._existing_keys(path) if dedup and not new_file else set()
+
+            to_write = [
+                r
+                for r in week_rows
+                if not existing or (r.epic, r.timestamp.isoformat()) not in existing
+            ]
+            paths.append(path)
+            if not to_write and not new_file:
+                continue
+
+            with path.open("a", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                if new_file:
+                    writer.writerow(_DUMP_FIELDS)
+                for r in to_write:
+                    writer.writerow(self._row_values(r))
+            written += len(to_write)
+        return written, paths

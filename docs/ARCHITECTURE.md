@@ -35,7 +35,9 @@ igthon/
 │   │   ├── api_error_log.py  # Ring buffer of recent API errors
 │   │   ├── api_guard.py      # Rate-limit tracker (per-second + per-minute)
 │   │   ├── api_queue.py      # Single-worker queue — serialises all IG calls
-│   │   ├── candle_store.py   # Persist + prune candles; CSV dump for backtesting
+│   │   ├── backtest_archive.py # Read candle dump files (no DB) for backtesting
+│   │   ├── backtester.py     # Replay a strategy on archived real candles
+│   │   ├── candle_store.py   # Persist + prune candles; per-week CSV archive
 │   │   ├── compute.py        # Technical indicators (regression, SMA, ROC, score)
 │   │   ├── market_data.py    # Fetches /prices → feeds PriceBuffer
 │   │   ├── market_scanner.py # Discovers tradeable epics via search terms
@@ -117,13 +119,13 @@ ______________________________________________________________________
 
 ## Database tables
 
-| Table      | Contents                              | Storage rationale                                    |
-| ---------- | ------------------------------------- | ---------------------------------------------------- |
-| `position` | Every opened/closed trade             | Cannot be reconstructed — permanent record           |
-| `epic`     | Instrument metadata (deposit, type)   | Rarely changes, avoids redundant API calls           |
-| `day`      | Daily P&L summary                     | One row per day — aggregated                         |
-| `resume`   | Per-epic direction summary (day/week) | Direction analysis                                   |
-| `candle`   | 1-minute OHLC + volume                | Rehydrates buffer on restart; CSV-dumped then pruned |
+| Table      | Contents                              | Storage rationale                                                                                         |
+| ---------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `position` | Every opened/closed trade             | Cannot be reconstructed — permanent record                                                                |
+| `epic`     | Instrument metadata (deposit, type)   | Rarely changes, avoids redundant API calls                                                                |
+| `day`      | Daily P&L summary                     | One row per day — aggregated                                                                              |
+| `resume`   | Per-epic direction summary (day/week) | Direction analysis                                                                                        |
+| `candle`   | 1-minute OHLC + volume                | Rehydrates buffer on restart; archived per-week to CSV then pruned (see [BACKTESTING.md](BACKTESTING.md)) |
 
 **Not stored:** intraday tick-by-tick data — fetched on demand from `/prices` when needed.
 

@@ -58,6 +58,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 "src/web/routes/dashboard/pages.py" = ["E501"]
 "src/web/routes/charts.py" = ["E501"]
 "src/web/routes/simulator.py" = ["E501"]
+"src/web/routes/backtest.py" = ["E501"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

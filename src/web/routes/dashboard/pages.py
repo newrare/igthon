@@ -62,6 +62,7 @@ def _render_tradable_list_page(
             <li><a href="/epics/tradable" class="active">Tradable</a></li>
             <li><a href="/charts">Charts</a></li>
             <li><a href="/simulator">Simulator</a></li>
+            <li><a href="/backtest">Backtest</a></li>
             <li><a href="/positions" target="_blank">Positions<svg class="ext-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M4.5 3H3a1 1 0 0 0-1 1v5a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1V7.5M7.5 1.5H10.5M10.5 1.5V4.5M10.5 1.5L5.5 6.5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
         </ul>
     </nav>

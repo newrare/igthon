@@ -1395,10 +1395,11 @@ class BotScheduler:
         if self._candle_store is None:
             return
         try:
-            count, path = await self._candle_store.dump_and_purge()
+            count, paths = await self._candle_store.dump_and_purge()
         except Exception as exc:
             logger.error("Candle dump/purge failed: %s", exc)
             return
         if count:
-            self._recorder.info(f"Candle retention: dumped {count} rows to {path}")
+            names = ", ".join(p.name for p in paths)
+            self._recorder.info(f"Candle retention: archived {count} rows to {names}")
         await self._record_job_run("dump_and_purge_candles")
