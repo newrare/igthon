@@ -18,15 +18,15 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from src.services.backtest_archive import BacktestArchive
-from src.services.backtester import (
+from src.backtest.backtest_archive import BacktestArchive
+from src.backtest.backtester import (
     BacktestConfig,
     dedupe_correlated_epics,
     percentage_summary,
     run_backtest,
     trade_return_pct,
 )
-from src.strategies import STRATEGIES
+from src.entry import ENTRY_STRATEGIES
 
 router = APIRouter()
 
@@ -114,13 +114,13 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
     The load + replay is pure CPU/IO work pushed to a worker thread so the event
     loop (and the 1 s dashboard poll) stays responsive.
     """
-    if body.strategy is not None and body.strategy not in STRATEGIES:
+    if body.strategy is not None and body.strategy not in ENTRY_STRATEGIES:
         return JSONResponse(
             {"error": f"Unknown strategy: {body.strategy}"}, status_code=400
         )
 
     settings = request.app.state.settings
-    strategy_name = body.strategy or settings.strategy_name
+    strategy_name = body.strategy or settings.entry_strategy_name
     archive = _archive(request)
     config = BacktestConfig(target_trades=body.target_trades)
 
@@ -216,11 +216,11 @@ def _stepper(
 @router.get("/backtest", response_class=HTMLResponse)
 async def backtest_page(request: Request) -> HTMLResponse:
     """Render the backtest page (archive picker + strategy replay)."""
-    live_strategy = request.app.state.settings.strategy_name
+    live_strategy = request.app.state.settings.entry_strategy_name
     strategy_options = "".join(
         f'<option value="{name}"{" selected" if name == live_strategy else ""}>'
         f"{name}{' (live)' if name == live_strategy else ''}</option>"
-        for name in sorted(STRATEGIES)
+        for name in sorted(ENTRY_STRATEGIES)
     )
     bt_target = _stepper(
         "Trades target",

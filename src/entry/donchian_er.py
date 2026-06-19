@@ -27,9 +27,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from src.core.indicators import atr, efficiency_ratio
 from src.entry.base import EntryIntent, EntryStrategy
-from src.services.compute import atr, efficiency_ratio
-from src.services.price_buffer import EpicBuffer
+from src.feed.price_buffer import EpicBuffer
 
 logger = logging.getLogger(__name__)
 

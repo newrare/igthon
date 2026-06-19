@@ -16,9 +16,9 @@ import random
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from src.services.curve_generator import PROFILES, generate_curve
-from src.services.simulator import SimulationConfig, run_simulation
-from src.services.strategies import BacktestEngine, BacktestResult, all_strategies
+from src.backtest.curve_generator import PROFILES, generate_curve
+from src.backtest.simulator import SimulationConfig, run_simulation
+from src.backtest.strategies import BacktestEngine, BacktestResult, all_strategies
 
 _BASE_DAY = datetime(2024, 1, 1)
 

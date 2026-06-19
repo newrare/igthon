@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.core.indicators import atr
 from src.exit import AtrTrailingExit, get_close_profile
 from src.exit.base import (
     ACTION_CLOSE,
@@ -18,8 +19,7 @@ from src.exit.base import (
     ACTION_UPDATE_STOP,
     CloseProfile,
 )
-from src.services.compute import atr
-from src.services.price_buffer import Candle, EpicBuffer
+from src.feed.price_buffer import Candle, EpicBuffer
 
 
 def _settings(**overrides) -> SimpleNamespace:

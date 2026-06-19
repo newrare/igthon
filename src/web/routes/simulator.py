@@ -3,7 +3,7 @@
 Two tools on one page:
 
 - a curve generator preview: draw a synthetic market curve (the generation
-  internals live in :mod:`src.services.curve_generator` and stay opaque here);
+  internals live in :mod:`src.backtest.curve_generator` and stay opaque here);
 - a strategy simulation: replay the project's real open/close rules over many
   generated days until ~100 positions have closed, then report the win/loss
   count and a euro P&L estimate.
@@ -20,9 +20,9 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from src.services.curve_generator import PROFILES, generate_curve
-from src.services.simulator import SimulationConfig, run_simulation
-from src.strategies import STRATEGIES
+from src.backtest.curve_generator import PROFILES, generate_curve
+from src.backtest.simulator import SimulationConfig, run_simulation
+from src.entry import ENTRY_STRATEGIES
 
 router = APIRouter()
 
@@ -95,7 +95,7 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         return JSONResponse(
             {"error": f"Unknown profile: {body.profile}"}, status_code=400
         )
-    if body.strategy is not None and body.strategy not in STRATEGIES:
+    if body.strategy is not None and body.strategy not in ENTRY_STRATEGIES:
         return JSONResponse(
             {"error": f"Unknown strategy: {body.strategy}"}, status_code=400
         )
@@ -111,7 +111,7 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         euro_per_point=body.euro_per_point,
     )
     settings = request.app.state.settings
-    strategy_name = body.strategy or settings.strategy_name
+    strategy_name = body.strategy or settings.entry_strategy_name
     result = await asyncio.to_thread(
         run_simulation, settings, sim_config, strategy_name
     )
@@ -175,13 +175,13 @@ async def simulator_page(request: Request) -> HTMLResponse:
         f'<option value="{p}"{" selected" if p == "random" else ""}>{p}</option>'
         for p in PROFILES
     )
-    # Strategy dropdown defaults to the live STRATEGY_NAME so the simulation
-    # replays exactly what the bot would do; other entries allow comparison.
-    live_strategy = request.app.state.settings.strategy_name
+    # Entry-strategy dropdown defaults to the live ENTRY_STRATEGY_NAME so the
+    # simulation replays exactly what the bot would do; other entries compare.
+    live_strategy = request.app.state.settings.entry_strategy_name
     strategy_options = "".join(
         f'<option value="{name}"{" selected" if name == live_strategy else ""}>'
         f"{name}{' (live)' if name == live_strategy else ''}</option>"
-        for name in sorted(STRATEGIES)
+        for name in sorted(ENTRY_STRATEGIES)
     )
     curve_candles = _stepper(
         "Candles", "curve-candles", value="600", minimum="50", maximum="2000", step="50"

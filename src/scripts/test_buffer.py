@@ -9,10 +9,10 @@ import asyncio
 import logging
 import sys
 
-from src.api.client import IGClient
-from src.config import get_settings
-from src.services.market_data import MarketDataService
-from src.services.price_buffer import PriceBuffer
+from src.core.api.client import IGClient
+from src.core.config import get_settings
+from src.feed.market_data import MarketDataService
+from src.feed.price_buffer import PriceBuffer
 
 logging.basicConfig(
     level=logging.INFO,

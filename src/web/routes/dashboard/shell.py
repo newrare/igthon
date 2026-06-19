@@ -1,5 +1,6 @@
 """Full-page dashboard shell (skeleton embedding the dynamic fragments)."""
 
+from src.entry import ENTRY_STRATEGIES
 from src.web.routes.dashboard.components import (
     render_button,
     render_confirm_modal,
@@ -16,12 +17,36 @@ _STRATEGY_LABELS: dict[str, str] = {
     "donchian_er": "Donchian ER Breakout",
     "momentum_scalper": "Momentum Scalper",
     "trend_follower": "Trend Follower",
+    "trend_template": "Trend Template (hourly)",
+    "dip_rebound": "Dip Rebound",
 }
 
 
 def _strategy_label(name: str) -> str:
     """Return a display label for the active strategy name."""
     return _STRATEGY_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _render_strategy_select(current: str) -> str:
+    """Build the title-bar dropdown that switches the active entry strategy.
+
+    Mirrors the job-toggle pattern: an ``onchange`` posts to the backend, which
+    swaps the live entry strategy without a restart (the close profile is chosen
+    independently). The current name is preselected; every registered entry
+    strategy is offered.
+    """
+    options = "".join(
+        f'<option value="{name}"{" selected" if name == current else ""}>'
+        f"{_strategy_label(name)}</option>"
+        for name in sorted(ENTRY_STRATEGIES)
+    )
+    return (
+        '<span class="dashboard-title-strategy">'
+        '<i data-lucide="cpu" class="lc-icon"></i>'
+        '<select class="strategy-select" title="Active trading strategy" '
+        f'onchange="switchStrategy(this.value, this)">{options}</select>'
+        "</span>"
+    )
 
 
 def _render_modals(settings, frags: dict[str, str]) -> str:
@@ -133,6 +158,35 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
     )
 
 
+def _render_connection_banner(state: dict) -> str:
+    """Banner shown when the bot is not connected to IG.
+
+    The web server starts before (and independently of) the IG login, so the
+    dashboard is reachable even when the broker connection fails. This explains
+    the degraded state instead of leaving the user with a blank or broken page.
+    """
+    error = state.get("startup_error")
+    connecting = state.get("connecting")
+    if error:
+        return (
+            '<div class="conn-banner conn-banner-error" role="alert">'
+            '<i data-lucide="alert-triangle" class="lc-icon"></i>'
+            "<span><strong>Not connected to IG.</strong> "
+            f"The dashboard is running in read-only mode. Reason: {error}. "
+            "Check <code>IG_API_KEY</code> and credentials in <code>.env</code> — "
+            "the bot retries automatically and goes live once it connects.</span>"
+            "</div>"
+        )
+    if connecting:
+        return (
+            '<div class="conn-banner conn-banner-info" role="status">'
+            '<i data-lucide="loader" class="lc-icon"></i>'
+            "<span>Connecting to IG… the dashboard will go live automatically."
+            "</span></div>"
+        )
+    return ""
+
+
 def _render_dashboard(settings, state: dict) -> str:
     """Render the full dashboard shell with nav, config, commands and the
     dynamically refreshed fragments (KPI bar, market data, modals).
@@ -158,14 +212,14 @@ def _render_dashboard(settings, state: dict) -> str:
 {modals}
 <div class="container">
 
+    {_render_connection_banner(state)}
+
     <!-- Main title — active trading strategy -->
     <div class="dashboard-title">
         <i data-lucide="bot" class="lc-icon"></i>
         <h1>IG Trading Bot</h1>
         <span class="dashboard-title-sep">·</span>
-        <span class="dashboard-title-strategy">
-            <i data-lucide="cpu" class="lc-icon"></i> {_strategy_label(settings.strategy_name)}
-        </span>
+        {_render_strategy_select(settings.entry_strategy_name)}
     </div>
 
     <!-- KPI Bar -->

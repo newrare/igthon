@@ -1,6 +1,6 @@
 # Research lab — candidate strategy backtests
 
-The lab ([src/services/strategies.py](../../src/services/strategies.py)) is a
+The lab ([src/backtest/strategies.py](../../src/backtest/strategies.py)) is a
 **long + short** backtest engine with honest spread costs (longs fill at the
 offer and exit at the bid; shorts the reverse) plus five candidate strategies.
 It exists to compare ideas quickly on synthetic curves before promoting one to

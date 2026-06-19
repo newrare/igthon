@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from src.entry import DonchianEntry, EntryIntent, get_entry_strategy
 from src.entry.base import EntryStrategy
-from src.services.price_buffer import Candle, EpicBuffer
+from src.feed.price_buffer import Candle, EpicBuffer
 
 
 def _settings(**overrides) -> SimpleNamespace:

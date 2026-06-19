@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.services.price_buffer import PriceBuffer
-from src.services.simulator import SimulationConfig, run_simulation
+from src.backtest.simulator import SimulationConfig, run_simulation
+from src.feed.price_buffer import PriceBuffer
 from src.web.app import create_app
 
 
@@ -21,9 +21,10 @@ def _settings() -> SimpleNamespace:
     return SimpleNamespace(
         ig_env=SimpleNamespace(value="demo"),
         web_port=8000,
-        # Default to the historical strategy so the engine tests below keep
-        # exercising the long-standing trend-follower expectations.
-        strategy_name="trend_follower",
+        # Decoupled open/close: the reference entry + close profile.
+        entry_strategy_name="donchian_er",
+        close_profile_name="atr_trailing",
+        strategy_name="donchian_er",
         strategy_donchian_channel=20,
         strategy_donchian_stop_atr_k=2.5,
         strategy_efficiency_period=30,

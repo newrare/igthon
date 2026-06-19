@@ -10,7 +10,7 @@
 
 The live bot records one-minute candles (bid + offer OHLC) for every tracked
 epic. They feed the in-memory buffer and are persisted to the `candle` table
-(see [candle_store.py](../src/services/candle_store.py)). To keep that table
+(see [candle_store.py](../src/feed/candle_store.py)). To keep that table
 small, a retention job archives aged candles to CSV files and deletes them from
 the database.
 
@@ -30,7 +30,7 @@ recorder owns the DB; the backtester owns the files.
 ## The weekly archive (retention dump)
 
 The job `dump_and_purge_candles` (registered in
-[scheduler.py](../src/services/scheduler.py), runs daily at 02:00 UTC, also
+[scheduler.py](../src/core/scheduler.py), runs daily at 02:00 UTC, also
 triggerable from the dashboard) does two things:
 
 1. Selects every candle older than `CANDLE_RETENTION_DAYS` (default **7**).
@@ -76,9 +76,9 @@ offer_open, offer_close, offer_high, offer_low, volume
 
 | Layer       | File                                                       | Responsibility                                                                            |
 | ----------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Archive     | [backtest_archive.py](../src/services/backtest_archive.py) | Read dump CSVs (no DB). `datasets()` lists weeks/epics; `load()` returns candles per epic |
-| Engine      | [backtester.py](../src/services/backtester.py)             | `build_days()` groups candles into trading days; `run_backtest()` replays the strategy    |
-| Replay core | [simulator.py](../src/services/simulator.py)               | Shared `StrategySimulator.run_days()` — the same engine the synthetic simulator uses      |
+| Archive     | [backtest_archive.py](../src/backtest/backtest_archive.py) | Read dump CSVs (no DB). `datasets()` lists weeks/epics; `load()` returns candles per epic |
+| Engine      | [backtester.py](../src/backtest/backtester.py)             | `build_days()` groups candles into trading days; `run_backtest()` replays the strategy    |
+| Replay core | [simulator.py](../src/backtest/simulator.py)               | Shared `StrategySimulator.run_days()` — the same engine the synthetic simulator uses      |
 | Web         | [backtest.py](../src/web/routes/backtest.py)               | `/backtest` page + `/api/backtest/datasets` + `/api/backtest/run`                         |
 
 ### Pipeline
@@ -104,7 +104,7 @@ lengths) interleave correctly.
 
 The replay applies the **same** rules as production: the pluggable entry
 strategy (`evaluate`), the pre-open gates
-([trading.py](../src/services/trading.py)), the win/stop levels, and the ATR
+([trading.py](../src/execution/trading.py)), the win/stop levels, and the ATR
 trailing stop. A BUY fills at the offer, the protective stop fills intra-candle
 when the bid low crosses it, and anything still open at end of day is
 force-closed.
@@ -140,8 +140,8 @@ equity curve are all in percent.
 ## Programmatic use
 
 ```python
-from src.services.backtest_archive import BacktestArchive
-from src.services.backtester import BacktestConfig, percentage_summary, run_backtest
+from src.backtest.backtest_archive import BacktestArchive
+from src.backtest.backtester import BacktestConfig, percentage_summary, run_backtest
 
 archive = BacktestArchive(settings.candle_dump_dir)
 candles = archive.load(weeks=["2026-W24"])           # files only — no DB

@@ -59,6 +59,11 @@ class Position(Base):
     pip_spread: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     reason_open: Mapped[str | None] = mapped_column(String(30))
     reason_close: Mapped[str | None] = mapped_column(String(30))
+    # Name of the close profile that manages this position's exit for its whole
+    # life (e.g. "atr_trailing"). Set at open by the execution layer from the
+    # selected CloseProfile; decoupled from the entry strategy. Adopted/legacy
+    # rows default to "atr_trailing". See src/exit/ and migration d5e6f7a8b9c0.
+    close_profile: Mapped[str | None] = mapped_column(String(30))
     size: Mapped[int | None] = mapped_column(Integer)
     negative: Mapped[int | None] = mapped_column(Integer)
     quantity: Mapped[int | None] = mapped_column(Integer)

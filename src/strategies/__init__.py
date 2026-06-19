@@ -19,15 +19,19 @@ Each entry is documented in ``docs/strategies/`` (one file per strategy).
 from __future__ import annotations
 
 from src.strategies.base import BaseStrategy
+from src.strategies.dip_rebound import DipRebound
 from src.strategies.donchian import DonchianER
 from src.strategies.momentum_scalper import MomentumScalper
 from src.strategies.trend_follower import TrendFollower
+from src.strategies.trend_template import TrendTemplate
 
 #: Name → class map. Keys are the valid ``STRATEGY_NAME`` values.
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     TrendFollower.name: TrendFollower,
     DonchianER.name: DonchianER,
     MomentumScalper.name: MomentumScalper,
+    TrendTemplate.name: TrendTemplate,
+    DipRebound.name: DipRebound,
 }
 
 
@@ -48,8 +52,10 @@ def get_strategy(name: str, settings) -> BaseStrategy:
 __all__ = [
     "STRATEGIES",
     "BaseStrategy",
+    "DipRebound",
     "DonchianER",
     "MomentumScalper",
     "TrendFollower",
+    "TrendTemplate",
     "get_strategy",
 ]

@@ -2,7 +2,7 @@
 
 import logging
 
-from src.services.recorder import LogBuffer
+from src.core.recorder import LogBuffer
 
 
 def _make_logger(buf: LogBuffer) -> logging.Logger:

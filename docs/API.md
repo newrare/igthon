@@ -36,7 +36,7 @@ Response:
 - Refresh endpoint: `POST /session/refresh-token` with `{"refresh_token": "..."}`
 - Tokens are stored **in memory only** — never written to disk or DB
 
-Implementation: [src/api/session.py](../src/api/session.py)
+Implementation: [src/core/api/session.py](../src/core/api/session.py)
 
 ### Legacy CST / X-SECURITY-TOKEN (not used)
 
@@ -138,7 +138,7 @@ IG enforces per-account rate limits. All calls are routed through `APIQueue` + `
 - **25 requests/second**
 - Quota blocks trigger automatic wait + resume
 
-See [src/services/api_guard.py](../src/services/api_guard.py).
+See [src/core/api_guard.py](../src/core/api_guard.py).
 
 ______________________________________________________________________
 
@@ -153,7 +153,7 @@ IG provides a real-time data feed via [Lightstreamer](https://lightstreamer.com)
 The streaming endpoint and credentials are obtained from the OAuth login response.
 Hard limit: **40 subscriptions per connection** (`STREAMING_MAX_EPICS`).
 
-Implementation: [src/api/streaming.py](../src/api/streaming.py)
+Implementation: [src/feed/streaming.py](../src/feed/streaming.py)
 
 ______________________________________________________________________
 

@@ -11,11 +11,11 @@ import asyncio
 import logging
 import sys
 
-from src.api.client import IGClient
-from src.api.endpoints.accounts import get_accounts
-from src.api.endpoints.markets import get_market, search_markets
-from src.api.endpoints.positions import get_positions
-from src.config import get_settings
+from src.core.api.client import IGClient
+from src.core.api.endpoints.accounts import get_accounts
+from src.core.api.endpoints.markets import get_market, search_markets
+from src.core.api.endpoints.positions import get_positions
+from src.core.config import get_settings
 
 logging.basicConfig(
     level=logging.INFO,

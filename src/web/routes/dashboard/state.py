@@ -8,11 +8,11 @@ from zoneinfo import ZoneInfo
 from fastapi import Request
 from sqlalchemy import select
 
+from src.core.api_queue import Priority
 from src.models.day import Day
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
 from src.models.resume import Resume
-from src.services.api_queue import Priority
 from src.utils.tools import euro_per_point
 
 logger = logging.getLogger(__name__)
@@ -328,11 +328,13 @@ async def _gather_dashboard_state(request: Request) -> dict:
                 )
                 epic_db_map = {e.name: e for e in epic_rows}
 
-            # Today's positions
+            # Open positions — ALL of them, regardless of date. A position that
+            # stays open past midnight (or one adopted from IG) keeps tying up
+            # margin, so it must remain visible; scoping this to ``today`` is what
+            # let live positions vanish from the dashboard while "in use" stayed
+            # non-zero. Closed positions below stay scoped to today.
             open_pos = await session.scalars(
-                select(Position).where(
-                    Position.date == today, Position.state == PositionState.OPEN
-                )
+                select(Position).where(Position.state == PositionState.OPEN)
             )
             open_positions = list(open_pos)
 
@@ -511,6 +513,11 @@ async def _gather_dashboard_state(request: Request) -> dict:
         "scheduler_available": scheduler is not None,
         "jobs": scheduler.jobs_status() if scheduler else [],
         "log_entries": log_entries,
+        # IG connection state for the degraded-mode banner: the web server runs
+        # even when login fails, so the dashboard explains the situation rather
+        # than crashing. Set by run_bot's connection loop on app.state.
+        "startup_error": getattr(request.app.state, "startup_error", None),
+        "connecting": getattr(request.app.state, "connecting", False),
     }
 
 

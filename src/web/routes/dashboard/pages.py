@@ -3,7 +3,7 @@
 import html
 from datetime import date, datetime
 
-from src.services.market_scanner import MarketInfo
+from src.markets.market_scanner import MarketInfo
 from src.web.routes.dashboard.state import _PARIS
 
 

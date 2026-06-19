@@ -9,8 +9,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
 
+from src.core.api_queue import Priority
+from src.entry import ENTRY_STRATEGIES
 from src.models.position import Position, PositionState, PositionStrategy
-from src.services.api_queue import Priority
 from src.utils.tools import _to_float, euro_per_point, margin_factor_pct
 from src.web.routes.dashboard.fragments import _build_fragments
 from src.web.routes.dashboard.pages import _render_tradable_list_page
@@ -104,6 +105,7 @@ _ACTIONS = {
     "refresh_epic_list",
     "refresh_tradable_epics",
     "collect_and_analyze",
+    "trend_select",
     "monitor_positions",
     "sync_positions",
     "end_of_day",
@@ -160,6 +162,19 @@ async def set_job_mode(request: Request, action: str, mode: str) -> JSONResponse
     if not ok:
         return JSONResponse({"error": "Could not change job mode"}, status_code=400)
     return JSONResponse({"status": "ok", "action": action, "auto": mode == "auto"})
+
+
+@router.post("/api/strategy/{name}")
+async def set_strategy(request: Request, name: str) -> JSONResponse:
+    """Switch the active entry strategy at runtime (in-memory until restart)."""
+    scheduler = request.app.state.scheduler
+    if not scheduler:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    if name not in ENTRY_STRATEGIES:
+        return JSONResponse({"error": f"Unknown strategy: {name}"}, status_code=400)
+    if not scheduler.set_strategy(name):
+        return JSONResponse({"error": "Could not switch strategy"}, status_code=400)
+    return JSONResponse({"status": "ok", "strategy": name})
 
 
 @router.get("/api/prices/{epic}")

@@ -6,8 +6,8 @@ from urllib.parse import unquote
 import httpx
 import pytest
 
-from src.api.client import IGAPIError
-from src.services.market_scanner import MarketInfo, MarketScanner
+from src.core.api.client import IGAPIError
+from src.markets.market_scanner import MarketInfo, MarketScanner
 
 
 def _market_info(epic: str, instrument_type: str, spread_ratio: float) -> MarketInfo:

@@ -37,7 +37,7 @@ All of the following must be true simultaneously:
 
 ### Computed indicators
 
-All computed in [src/services/compute.py](../src/services/compute.py):
+All computed in [src/core/indicators.py](../src/core/indicators.py):
 
 **Linear regression** — over the last `STRATEGY_LOOKBACK_POINTS` bid values:
 

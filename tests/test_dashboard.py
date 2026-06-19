@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.services.price_buffer import PriceBuffer
+from src.feed.price_buffer import PriceBuffer
 from src.web.app import create_app
 from src.web.routes.dashboard import _build_fragments, _render_dashboard
 
@@ -117,6 +117,9 @@ def _settings() -> SimpleNamespace:
         strategy_target_multiplier=3,
         strategy_max_spread_ratio=0.1,
         strategy_close_target=0.8,
+        strategy_name="donchian_er",
+        entry_strategy_name="donchian_er",
+        close_profile_name="atr_trailing",
         web_port=8000,
     )
 
@@ -366,6 +369,28 @@ class TestRenderDashboard:
         assert "location.reload()" not in html
         assert "Live — updating every 1 s" in html
 
+    def test_title_renders_strategy_switcher(self):
+        html = _render_dashboard(_settings(), _base_state())
+        # A dropdown in the title posts to /api/strategy on change, with the
+        # active entry strategy preselected and every registered entry strategy
+        # offered (only donchian_er is ported so far).
+        assert 'class="strategy-select"' in html
+        assert "switchStrategy(this.value" in html
+        assert '<option value="donchian_er" selected>' in html
+
+    def test_degraded_mode_shows_connection_error_banner(self):
+        # When IG login fails the web server still serves the dashboard; it must
+        # explain the degraded state instead of crashing or rendering blank.
+        state = {**_base_state(), "startup_error": "403 error.security.api-key-invalid"}
+        html = _render_dashboard(_settings(), state)
+        assert "conn-banner-error" in html
+        assert "Not connected to IG" in html
+        assert "api-key-invalid" in html
+
+    def test_healthy_state_has_no_connection_banner(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert "conn-banner" not in html
+
     def test_engine_script_polls_fragments_endpoint(self):
         # The extracted JS engine still drives the live fragment polling.
         js = (
@@ -447,6 +472,31 @@ class TestFragmentsEndpoint:
         assert resp.status_code == 200
         assert 'id="frag-kpi_bar"' in resp.text
 
+    async def test_strategy_switch_no_scheduler_returns_503(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/strategy/donchian_er")
+        assert resp.status_code == 503
+
+    async def test_strategy_switch_unknown_name_rejected(self, app):
+        app.state.scheduler = SimpleNamespace(set_strategy=lambda name: True)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/strategy/not_a_strategy")
+        assert resp.status_code == 400
+
+    async def test_strategy_switch_valid_calls_scheduler(self, app):
+        calls: list[str] = []
+        app.state.scheduler = SimpleNamespace(
+            set_strategy=lambda name: bool(calls.append(name)) or True
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/strategy/donchian_er")
+        assert resp.status_code == 200
+        assert resp.json()["strategy"] == "donchian_er"
+        assert calls == ["donchian_er"]
+
     async def test_poll_never_blocks_on_a_busy_queue(self):
         """The fragments poll must not await external IG calls.
 
@@ -505,7 +555,7 @@ class TestFragmentsEndpoint:
 
 def _candle(bid: float) -> "object":
     """Build a minimal candle whose close prices are ``bid`` (offer = bid + 1)."""
-    from src.services.price_buffer import Candle
+    from src.feed.price_buffer import Candle
 
     return Candle(
         timestamp=datetime(2026, 6, 9, 10, 0, tzinfo=UTC),

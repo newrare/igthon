@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from src.services.compute import (
+from src.core.indicators import (
     TradingLevels,
     TradingSignal,
     atr,
@@ -38,7 +38,7 @@ from src.services.compute import (
     linear_regression,
     position_in_range,
 )
-from src.services.price_buffer import EpicBuffer
+from src.feed.price_buffer import EpicBuffer
 from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)

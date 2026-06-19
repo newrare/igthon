@@ -83,6 +83,29 @@ body {
   border-radius: var(--radius-sm);
   padding: 0.3rem 0.7rem;
 }
+/* Strategy switcher dropdown, styled to read as part of the title pill. */
+.strategy-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--primary);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  cursor: pointer;
+  padding: 0;
+  outline: none;
+}
+.strategy-select:disabled { opacity: 0.5; cursor: default; }
+.strategy-select option {
+  background: var(--surface);
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: normal;
+}
 
 /* ── Navigation ─────────────────────────────────────────────── */
 nav {
@@ -912,3 +935,33 @@ footer {
 #funds-tooltip .ft-ok   { color: #4ade80; }
 #funds-tooltip .ft-low  { color: #ef4444; }
 #funds-tooltip .ft-muted { color: #94a3b8; }
+
+/* Connection banner — shown when the bot is not connected to IG (degraded mode).
+   The web server runs independently of the IG login, so the dashboard stays
+   reachable and explains the situation instead of crashing. */
+.conn-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+  margin: 0 0 1rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+.conn-banner .lc-icon { flex: 0 0 auto; width: 20px; height: 20px; }
+.conn-banner code {
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+}
+.conn-banner-error {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #fca5a5;
+}
+.conn-banner-info {
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  color: #93c5fd;
+}

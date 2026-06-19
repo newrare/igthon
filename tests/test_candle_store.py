@@ -5,9 +5,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.feed.candle_store import CandleStore
+from src.feed.price_buffer import Candle
 from src.models.database import Base
-from src.services.candle_store import CandleStore
-from src.services.price_buffer import Candle
 
 
 def _candle(ts: datetime, bid: float = 100.0) -> Candle:

@@ -19,7 +19,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from src.services.price_buffer import EpicBuffer
+from src.feed.price_buffer import EpicBuffer
 
 
 @dataclass(slots=True)
@@ -56,7 +56,7 @@ class EntryStrategy(ABC):
     @classmethod
     @abstractmethod
     def from_settings(cls, settings) -> EntryStrategy:
-        """Build the strategy from application :class:`~src.config.Settings`."""
+        """Build the strategy from application :class:`~src.core.config.Settings`."""
 
     @abstractmethod
     def evaluate(self, epic: str, buf: EpicBuffer) -> EntryIntent | None:

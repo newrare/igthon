@@ -9,7 +9,7 @@ from datetime import timedelta
 
 import pytest
 
-from src.services.curve_generator import PROFILES, generate_curve
+from src.backtest.curve_generator import PROFILES, generate_curve
 
 
 class TestContract:

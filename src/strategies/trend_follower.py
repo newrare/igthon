@@ -1,6 +1,6 @@
 """Trend-follower strategy — the project's original live strategy.
 
-Thin adapter exposing :func:`src.services.compute.compute_signal` (composite
+Thin adapter exposing :func:`src.core.indicators.compute_signal` (composite
 score: linear regression + R² + SMA crossover + ROC, long-only) through the
 pluggable :class:`~src.strategies.base.BaseStrategy` interface. The signal
 mathematics are unchanged and stay in ``compute.py``; this class only carries
@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.services.compute import TradingSignal, compute_signal
-from src.services.price_buffer import EpicBuffer
+from src.core.indicators import TradingSignal, compute_signal
+from src.feed.price_buffer import EpicBuffer
 from src.strategies.base import BaseStrategy
 
 

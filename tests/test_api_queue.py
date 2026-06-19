@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from src.api.client import IGAPIError
-from src.services.api_guard import APIGuard
-from src.services.api_queue import APIQueue, Priority, QueueStatus
+from src.core.api.client import IGAPIError
+from src.core.api_guard import APIGuard
+from src.core.api_queue import APIQueue, Priority, QueueStatus
 
 
 def _ig_error(status_code: int, ig_error_code: str = "") -> IGAPIError:

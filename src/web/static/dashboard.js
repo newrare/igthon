@@ -115,6 +115,27 @@ async function toggleJobMode(action, cb) {
     }
 }
 
+// Switch the active trading strategy from the title-bar dropdown.
+async function switchStrategy(name, sel) {
+    const previous = sel.dataset.current || sel.value;
+    sel.disabled = true;
+    try {
+        const res = await fetch('/api/strategy/' + encodeURIComponent(name), { method: 'POST' });
+        if (res.ok) {
+            sel.dataset.current = name;
+            showToast('Strategy', 'Now running ' + name.replace(/_/g, ' '), 'success');
+        } else {
+            sel.value = previous;  // revert on failure
+            showToast('Strategy', 'Failed to switch strategy', 'error');
+        }
+    } catch (e) {
+        sel.value = previous;
+        showToast('Strategy', 'Network error', 'error');
+    } finally {
+        sel.disabled = false;
+    }
+}
+
 // General pause-all / resume-all — flips every job at once.
 async function setAllJobs(auto, btn) {
     btn.disabled = true;

@@ -40,64 +40,50 @@ ______________________________________________________________________
 
 ## Project architecture
 
+The codebase is organised **by domain**. The two trading decisions —
+**opening** and **closing** — are fully decoupled and live in separate domains
+that never import each other (see "Open/close decoupling" below). Everything
+else is shared, purely-functional infrastructure.
+
 ```
-python/
-├── README.md
-├── pyproject.toml
-├── .env.example
-├── alembic/                    # DB migrations
-├── src/
-│   ├── __init__.py
-│   ├── config.py               # Settings via pydantic-settings
-│   ├── main.py                 # Entry point
-│   ├── api/
-│   │   ├── __init__.py
-│   │   ├── client.py           # IG HTTP client (auth, refresh, requests)
-│   │   ├── session.py          # OAuth token management (access + refresh)
-│   │   ├── endpoints/
-│   │   │   ├── accounts.py
-│   │   │   ├── positions.py
-│   │   │   ├── markets.py
-│   │   │   ├── prices.py
-│   │   │   ├── watchlists.py
-│   │   │   └── history.py
-│   │   └── streaming.py        # Lightstreamer client
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── database.py         # SQLAlchemy engine + Base
-│   │   ├── position.py
-│   │   ├── epic.py
-│   │   ├── day.py
-│   │   └── resume.py
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── price_buffer.py     # In-memory rolling candle buffer (replaces DB history)
-│   │   ├── market_data.py      # Fetches prices from IG → feeds PriceBuffer
-│   │   ├── trading.py          # Open/close positions (ported from Action.php)
-│   │   ├── compute.py          # Technical analysis (ported from Compute.php)
-│   │   ├── recorder.py         # Logging + alerts (ported from Record.php)
-│   │   └── scheduler.py        # Scheduled tasks (replaces CRON)
-│   ├── web/
-│   │   ├── __init__.py
-│   │   ├── app.py              # FastAPI application
-│   │   ├── routes/
-│   │   │   ├── dashboard.py
-│   │   │   ├── positions.py
-│   │   │   └── history.py
-│   │   └── templates/
-│   ├── scripts/
-│   │   ├── fetch_markets.py    # One-shot market discovery script
-│   │   ├── test_buffer.py      # Manual buffer inspection script
-│   │   └── verify_connection.py # Smoke-test IG API connectivity
-│   └── utils/
-│       ├── __init__.py
-│       └── tools.py            # Utilities (ported from Tools.php)
-└── tests/
-    ├── test_client.py
-    ├── test_trading.py
-    ├── test_compute.py
-    └── test_price_buffer.py
+src/
+├── main.py                 # CLI entry point
+├── core/                   # INFRA — shared plumbing (no trading decisions)
+│   ├── config.py           # Settings via pydantic-settings
+│   ├── scheduler.py        # APScheduler jobs (thin: orchestration only)
+│   ├── indicators.py       # Technical analysis (regression, SMA, ROC, ATR, ER)
+│   ├── recorder.py         # Logging + alerts
+│   ├── api_queue.py / api_guard.py / api_error_log.py
+│   └── api/                # IG HTTP client (client.py, session.py, endpoints/)
+├── feed/                   # FLUX — streaming, market_data, price_buffer, candle_store
+├── markets/                # MARCHÉS — market_scanner (build the epic list)
+├── entry/                  # OUVERTURE — EntryStrategy → EntryIntent (direction only)
+│   ├── base.py
+│   └── donchian_er.py
+├── exit/                   # FERMETURE — CloseProfile (owns stop/target/trailing)
+│   ├── base.py · trailing.py · atr_trailing.py
+├── execution/              # MAINS — risk.py (gates+sizing), trading.py (TradingService)
+├── backtest/               # OUTILS — simulator, backtester, archive, curve_generator
+├── models/                 # DATA — SQLAlchemy ORM (database.py + tables)
+├── web/                    # VUES — FastAPI app + dashboard/routes
+├── utils/                  # tools.py
+└── strategies/             # LEGACY — pre-decoupling strategies, to be ported to entry/+exit/
+tests/                      # one test file per module + isolated entry/exit/risk tests
 ```
+
+### Open/close decoupling (core rule)
+
+- **Opening** code lives only in `src/entry/`. An `EntryStrategy.evaluate()`
+  returns an `EntryIntent` (direction + optional size hint) and **never any exit
+  level**. New opening ideas are new modules here.
+- **Closing** code lives only in `src/exit/`. A `CloseProfile` owns the entire
+  exit: `initial_plan()` chooses the protective stop at open (which drives
+  sizing) and `evaluate()` makes every per-tick decision (hold / close / ratchet
+  stop). New closing scenarios are new modules here.
+- They are **composed at runtime** by `core/scheduler.py` + `execution/` and are
+  linked only through the persisted `Position.close_profile`. Each can be
+  swapped or unit-tested in isolation. Selection: `ENTRY_STRATEGY_NAME` /
+  `CLOSE_PROFILE_NAME`.
 
 ______________________________________________________________________
 
@@ -132,7 +118,7 @@ ______________________________________________________________________
 ### Architecture
 
 - Follow **separation of concerns**: API layer, service layer, model layer, web layer.
-- No business logic in routes or models — put it in `services/`.
+- No business logic in routes or models — put it in the domain packages (entry/exit/execution/feed/markets/core).
 - Use **dependency injection** (FastAPI `Depends`) rather than global state.
 - Configuration is loaded once via `pydantic-settings` from `.env`; never hardcode credentials.
 - Never store secrets in source files — use the `.env` file (excluded from git).
@@ -162,11 +148,11 @@ ______________________________________________________________________
 - Every module in `src/` must have a corresponding test file in `tests/`.
 - Use `pytest` fixtures for DB sessions and HTTP mocks.
 - Mock external API calls — never hit the real IG API in tests.
-- Aim for meaningful coverage on `services/` and `api/` layers.
+- Aim for meaningful coverage on the `entry/`, `exit/`, `execution/` and `core/api/` layers.
 
 ### Logging
 
-- Use Python's standard `logging` module (configured in `src/services/recorder.py`).
+- Use Python's standard `logging` module (configured in `src/core/recorder.py`).
 - Log levels: `DEBUG` for detailed traces, `INFO` for normal operations, `WARNING` for recoverable issues, `ERROR` for failures.
 - Never use `print()` in production code.
 
@@ -183,14 +169,3 @@ ______________________________________________________________________
 - **Before running tests:** run `mdformat docs/ README.md CLAUDE.md` to keep docs consistent.
 - Commit messages in English, imperative mood: `Add OAuth token refresh`, `Fix position close logic`.
 - One logical change per commit.
-
-______________________________________________________________________
-
-## Development phases
-
-1. **Phase 1 — API connection**: `config.py`, `session.py`, `client.py` (OAuth v3, auto refresh)
-1. **Phase 2 — DB models**: SQLAlchemy models + Alembic migrations
-1. **Phase 3 — Data reading**: fetch markets, prices, history → store in DB
-1. **Phase 4 — Trading**: open/close positions, strategy logic
-1. **Phase 5 — Interface**: web dashboard with visualisation
-1. **Phase 6 — Automation**: scheduler, notifications, production mode

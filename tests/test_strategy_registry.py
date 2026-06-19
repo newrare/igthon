@@ -11,9 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.compute import compute_signal, efficiency_ratio
-from src.services.price_buffer import Candle, EpicBuffer
-from src.services.trading import decide_close_reason
+from src.core.indicators import compute_signal, efficiency_ratio
+from src.execution.trading import decide_close_reason
+from src.feed.price_buffer import Candle, EpicBuffer
 from src.strategies import STRATEGIES, DonchianER, TrendFollower, get_strategy
 
 
@@ -21,6 +21,8 @@ def _settings(**overrides) -> SimpleNamespace:
     """Settings stand-in with every attribute the strategies read."""
     base = {
         "strategy_name": "donchian_er",
+        "entry_strategy_name": "donchian_er",
+        "close_profile_name": "atr_trailing",
         "strategy_donchian_channel": 20,
         "strategy_donchian_stop_atr_k": 2.5,
         "strategy_efficiency_period": 30,
@@ -212,7 +214,7 @@ class TestNoTargetCloseConvention:
 class TestSimulatorIntegration:
     def test_donchian_runs_through_the_full_pipeline(self):
         """End-to-end: the registry strategy drives a deterministic simulation."""
-        from src.services.simulator import SimulationConfig, run_simulation
+        from src.backtest.simulator import SimulationConfig, run_simulation
 
         settings = SimpleNamespace(
             **vars(_settings()),

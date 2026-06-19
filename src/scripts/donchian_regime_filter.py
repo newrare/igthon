@@ -15,8 +15,8 @@ import argparse
 import random
 from datetime import datetime, timedelta
 
-from src.services.curve_generator import PROFILES, generate_curve
-from src.services.strategies import BacktestEngine, BacktestResult, DonchianBreakout
+from src.backtest.curve_generator import PROFILES, generate_curve
+from src.backtest.strategies import BacktestEngine, BacktestResult, DonchianBreakout
 
 _BASE_DAY = datetime(2024, 1, 1)
 

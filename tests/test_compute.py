@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.services.compute import (
+from src.core.indicators import (
     atr,
     compute_levels,
     linear_regression,
@@ -12,7 +12,7 @@ from src.services.compute import (
     rate_of_change,
     sma,
 )
-from src.services.price_buffer import Candle
+from src.feed.price_buffer import Candle
 
 
 def _candle(high: float, low: float, close: float) -> Candle:

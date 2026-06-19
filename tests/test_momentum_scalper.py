@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.compute import atr
-from src.services.price_buffer import Candle, EpicBuffer
+from src.core.indicators import atr
+from src.feed.price_buffer import Candle, EpicBuffer
 from src.strategies import MomentumScalper, get_strategy
 
 
@@ -153,36 +153,8 @@ class TestSmartStop:
         assert signal.levels.level_security == pytest.approx(support - 0.5 * atr_value)
 
 
-class TestSimulatorIntegration:
-    def test_scalper_runs_through_the_full_pipeline(self):
-        """End-to-end: the registry strategy drives a deterministic simulation."""
-        from src.services.simulator import SimulationConfig, run_simulation
-
-        settings = SimpleNamespace(
-            **vars(_settings()),
-            strategy_name="momentum_scalper",
-            strategy_max_positions=6,
-            strategy_max_trades_day=50,
-            strategy_daily_loss_limit=-500.0,
-            strategy_daily_win_target=300.0,
-            strategy_min_win_rate=0.40,
-            strategy_hour_start=9,
-            strategy_hour_end=16,
-            strategy_hour_close=17,
-            strategy_close_target="follower",
-            strategy_compensate_loose=False,
-            strategy_euro_loss=4000.0,
-            strategy_atr_k_pre=2.5,
-            strategy_atr_k_post=2.5,
-            strategy_trailing_step_ratio=0.3,
-        )
-        config = SimulationConfig(target_trades=10, profile="trend_up", seed=42)
-        a = run_simulation(settings, config, "momentum_scalper")
-        b = run_simulation(settings, config, "momentum_scalper")
-        # Deterministic for a fixed seed.
-        assert [t.euro for t in a.trades] == [t.euro for t in b.trades]
-        # A scalper has a fixed target, so "win" closes are reachable.
-        assert all(
-            t.reason_close in {"win", "stop", "follower", "loose", "end_of_day"}
-            for t in a.trades
-        )
+# NOTE: the end-to-end simulator integration for this strategy was removed when
+# the simulator moved to the decoupled entry/exit model. The momentum scalper is
+# not yet ported to src/entry/, so it cannot drive run_simulation; its unit tests
+# above still cover the signal logic. Restore an integration test once it is
+# ported to an EntryStrategy (+ a matching close profile if it needs a target).

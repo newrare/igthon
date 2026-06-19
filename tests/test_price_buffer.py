@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.services.price_buffer import Candle, EpicBuffer, PriceBuffer
+from src.feed.price_buffer import Candle, EpicBuffer, PriceBuffer
 
 
 def _make_candle(

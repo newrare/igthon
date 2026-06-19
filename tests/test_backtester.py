@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.services.backtester import (
+from src.backtest.backtester import (
     BacktestConfig,
     build_days,
     dedupe_correlated_epics,
@@ -21,9 +21,9 @@ from src.services.backtester import (
     run_backtest,
     trade_return_pct,
 )
-from src.services.candle_store import _DUMP_FIELDS
-from src.services.curve_generator import generate_curve
-from src.services.price_buffer import Candle, PriceBuffer
+from src.backtest.curve_generator import generate_curve
+from src.feed.candle_store import _DUMP_FIELDS
+from src.feed.price_buffer import Candle, PriceBuffer
 from src.web.app import create_app
 
 
@@ -33,7 +33,9 @@ def _settings(dump_dir="./dumps") -> SimpleNamespace:
         ig_env=SimpleNamespace(value="demo"),
         web_port=8000,
         candle_dump_dir=str(dump_dir),
-        strategy_name="trend_follower",
+        entry_strategy_name="donchian_er",
+        close_profile_name="atr_trailing",
+        strategy_name="donchian_er",
         strategy_donchian_channel=20,
         strategy_donchian_stop_atr_k=2.5,
         strategy_efficiency_period=30,
@@ -115,7 +117,7 @@ class TestDedupeEpics:
     """Correlated duplicate contracts collapse to one epic per underlying."""
 
     def test_underlying_key(self):
-        from src.services.backtester import _underlying
+        from src.backtest.backtester import _underlying
 
         assert _underlying("IX.D.DAX.IDF.IP") == "DAX"
         assert _underlying("IX.D.DAX.IMF.IP") == "DAX"
@@ -364,8 +366,8 @@ class TestExportEndpoint:
     async def store_and_dir(self, tmp_path):
         from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+        from src.feed.candle_store import CandleStore
         from src.models.database import Base
-        from src.services.candle_store import CandleStore
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with engine.begin() as conn:

@@ -143,8 +143,8 @@ ______________________________________________________________________
 
 ## Adding a new endpoint
 
-1. Create `src/api/endpoints/my_endpoint.py` with an async function that takes `IGClient`.
-1. Add it to the relevant service in `src/services/`.
+1. Create `src/core/api/endpoints/my_endpoint.py` with an async function that takes `IGClient`.
+1. Call it from the relevant domain (`feed/`, `markets/`, `execution/`, …).
 1. Write tests in `tests/test_my_endpoint.py` using `respx`.
 1. No direct calls from routes — always via a service.
 
@@ -165,8 +165,11 @@ ______________________________________________________________________
 
 ## Project structure rules
 
-- Business logic lives in `src/services/` — not in routes, not in models.
-- Routes are thin: validate input, call a service, return the response.
+- Business logic lives in the domain packages (`entry/`, `exit/`, `execution/`,
+  `feed/`, `markets/`, `core/`) — not in routes, not in models. Opening and
+  closing logic stay in `entry/` and `exit/` respectively and never import each
+  other.
+- Routes are thin: validate input, call a domain service, return the response.
 - Models are pure data structures (SQLAlchemy ORM) — no logic.
 - Configuration is loaded once via `get_settings()` — no direct `os.getenv()` calls.
 - Use `asyncio.Lock` for any shared mutable state (e.g. token refresh in `IGSession`).

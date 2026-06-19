@@ -9,7 +9,7 @@ strategy.
 The contract is intentionally tiny:
 
 - :attr:`BaseStrategy.warmup` — minimum candles needed before evaluating;
-- :meth:`BaseStrategy.evaluate` — return a :class:`~src.services.compute.TradingSignal`
+- :meth:`BaseStrategy.evaluate` — return a :class:`~src.core.indicators.TradingSignal`
   (direction + all position levels) or ``None`` to stay flat.
 
 The signal reuses the existing :class:`TradingSignal` / ``TradingLevels``
@@ -28,8 +28,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from src.services.compute import TradingSignal
-from src.services.price_buffer import EpicBuffer
+from src.core.indicators import TradingSignal
+from src.feed.price_buffer import EpicBuffer
 
 
 class BaseStrategy(ABC):
@@ -37,6 +37,13 @@ class BaseStrategy(ABC):
 
     #: Registry key and ``STRATEGY_NAME`` value (kebab/snake, stable).
     name: str = "base"
+
+    #: Whether opens are driven by an hourly cross-epic selection job rather than
+    #: the per-epic 30s ``collect_analyze`` loop. The default (per-epic) keeps
+    #: every existing strategy on the immediate-open path; a strategy that ranks
+    #: all epics and opens only the single best one each hour sets this True so
+    #: the scheduler skips the per-epic auto-open and runs ``trend_select`` instead.
+    hourly_selection: bool = False
 
     @property
     @abstractmethod
@@ -46,7 +53,7 @@ class BaseStrategy(ABC):
     @classmethod
     @abstractmethod
     def from_settings(cls, settings) -> BaseStrategy:
-        """Build the strategy from application :class:`~src.config.Settings`."""
+        """Build the strategy from application :class:`~src.core.config.Settings`."""
 
     @abstractmethod
     def evaluate(self, epic: str, buf: EpicBuffer) -> TradingSignal | None:

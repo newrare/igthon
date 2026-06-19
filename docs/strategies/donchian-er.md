@@ -86,14 +86,14 @@ The trade rides the trend and exits via:
 | `STRATEGY_EFFICIENCY_PERIOD`   | 30            | ER lookback window                    |
 | `STRATEGY_MIN_EFFICIENCY`      | 0.60          | Regime gate threshold (0 disables)    |
 | `STRATEGY_ATR_PERIOD`          | 14            | ATR window (shared with the trailing) |
-| `STRATEGY_MAX_SPREAD_RATIO`    | 0.0015        | Spread gate (shared)                  |
+| `STRATEGY_MAX_SPREAD_RATIO`    | 0.0010        | Spread gate (shared)                  |
 
 ## Backtest evidence
 
 > **Two engines — do not confuse them.** The **live simulator**
 > (`/simulator`, `run_simulation`) is **long-only** and gated exactly like the
 > bot — *this is what the bot does, trust it*. The **research lab**
-> (`src/services/strategies.py`, the `compare_strategies` /
+> (`src/backtest/strategies.py`, the `compare_strategies` /
 > `donchian_regime_filter` scripts) is **long + short** with no daily gates —
 > useful for exploring ideas, but it overstates what the live bot achieves.
 

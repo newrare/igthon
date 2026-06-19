@@ -1,18 +1,18 @@
 """Tests for the trading service."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.models.position import Position
-from src.services.compute import RegressionResult, TradingLevels, TradingSignal
-from src.services.price_buffer import Candle, EpicBuffer
-from src.services.trading import (
+from src.core.indicators import RegressionResult, TradingLevels, TradingSignal
+from src.execution.trading import (
     TradeConfig,
     TradingService,
 )
+from src.feed.price_buffer import Candle, EpicBuffer
+from src.models.position import Position, PositionState
 
 
 def _service() -> TradingService:
@@ -395,3 +395,184 @@ class TestOpenPosition:
         # Clamped to the 8-point minimum: 1.21000 - 0.0008.
         assert payload["stopLevel"] == pytest.approx(1.20920)
         assert float(pos.level_stop) == pytest.approx(1.20920)
+
+
+class TestOpenPositionPersistence:
+    """The position is recorded the instant IG accepts the order — before the
+    /confirms round-trip — so a failed confirm can never leave a live position
+    untracked (the "margin in use with no open position" bug)."""
+
+    async def test_persists_before_confirm_and_keeps_row_when_confirm_fails(self):
+        svc, client, db = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        # market OK, then the confirm raises (timeout / rate-limit / 5xx).
+        client.get.side_effect = [_open_market(), RuntimeError("confirm timeout")]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        # Row was written (add + commit happened before the confirm) and kept.
+        assert pos is not None
+        db.add.assert_called_once_with(pos)
+        assert pos.deal_reference == "REF1"
+        assert pos.deal_id is None  # unresolved — sync will bind it
+        assert pos.state == PositionState.OPEN
+        db.delete.assert_not_called()
+
+    async def test_rejected_deal_removes_the_draft_row(self):
+        svc, client, db = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "REJECTED", "reason": "INSUFFICIENT_FUNDS"},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        # Draft was added then removed; caller sees a clean failure.
+        assert pos is None
+        db.add.assert_called_once()
+        draft = db.add.call_args.args[0]
+        db.delete.assert_awaited_once_with(draft)
+
+
+def _ig_entry(
+    *,
+    deal_id: str,
+    epic: str,
+    direction: str = "BUY",
+    level: float = 288.52,
+    stop: float | None = 287.49,
+    bid: float = 288.49,
+) -> dict:
+    """A GET /positions entry shaped like IG's real payload."""
+    return {
+        "position": {
+            "dealId": deal_id,
+            "dealReference": f"REF-{deal_id}",
+            "direction": direction,
+            "level": level,
+            "stopLevel": stop,
+            "limitLevel": None,
+            "size": 1.0,
+            "currency": "EUR",
+            "contractSize": 50.0,
+            "createdDateUTC": "2026-06-16T10:47:30",
+        },
+        "market": {
+            "epic": epic,
+            "bid": bid,
+            "offer": bid + 0.1,
+            "scalingFactor": 1,
+            "instrumentName": "EU Stocks Banks",
+        },
+    }
+
+
+def _sync_service(db_open: list[Position]):
+    """Service whose DB returns ``db_open`` for the OPEN-positions query."""
+    client = AsyncMock()
+    db = AsyncMock()
+    db.add = MagicMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = db_open
+    db.execute = AsyncMock(return_value=result)
+    svc = TradingService(client=client, db_session=db, config=TradeConfig())
+    return svc, client, db
+
+
+class TestSyncAdoption:
+    """sync_open_positions reconciles BOTH directions: it adopts live IG
+    positions the DB doesn't track and binds provisional rows to their dealId."""
+
+    async def test_adopts_untracked_ig_position(self):
+        svc, client, db = _sync_service(db_open=[])
+        entry = _ig_entry(deal_id="D1", epic="IX.D.StoxxBank.FNI3.IP")
+        market = {
+            "instrument": {
+                "contractSize": "50",
+                "currencies": [{"code": "EUR", "exchangeRate": 1.0, "isDefault": True}],
+            }
+        }
+        client.get = AsyncMock(side_effect=[{"positions": [entry]}, market])
+
+        live = await svc.sync_open_positions()
+
+        db.add.assert_called_once()
+        added = db.add.call_args.args[0]
+        assert added.epic == "IX.D.StoxxBank.FNI3.IP"
+        assert added.deal_id == "D1"
+        assert added.reason_open == "adopted"
+        assert added.state == PositionState.OPEN
+        assert float(added.level_open) == pytest.approx(288.52)
+        assert float(added.level_loose) == pytest.approx(287.49)
+        # epp = size(1) * contractSize(50) * rate(1.0)
+        assert float(added.euro_per_point) == pytest.approx(50.0)
+        db.commit.assert_awaited()
+        assert "IX.D.StoxxBank.FNI3.IP" in live
+
+    async def test_does_not_adopt_non_buy(self):
+        svc, client, db = _sync_service(db_open=[])
+        entry = _ig_entry(deal_id="D2", epic="CS.D.EURUSD.CEF.IP", direction="SELL")
+        client.get = AsyncMock(return_value={"positions": [entry]})
+
+        await svc.sync_open_positions()
+
+        db.add.assert_not_called()
+
+    async def test_binds_provisional_row_by_epic_instead_of_adopting(self):
+        prov = Position(
+            epic="E1",
+            epic_name="E1",
+            deal_id=None,  # provisional: confirm never landed
+            date=date(2026, 6, 16),
+            state=PositionState.OPEN,
+            level_open=Decimal("100.00000"),
+            euro_per_point=Decimal("10.000000"),
+        )
+        svc, client, db = _sync_service(db_open=[prov])
+        entry = _ig_entry(deal_id="D9", epic="E1", level=100.0, stop=99.0, bid=101.0)
+        client.get = AsyncMock(return_value={"positions": [entry]})
+
+        await svc.sync_open_positions()
+
+        # Bound to the live dealId, NOT adopted as a duplicate row.
+        assert prov.deal_id == "D9"
+        db.add.assert_not_called()
+        # Unrealized euro refreshed from the live bid: (101 - 100) * 10.
+        assert float(prov.euro) == pytest.approx(10.0)
+
+    async def test_heals_rows_sharing_one_deal_id_without_duplicating(self):
+        # Legacy corruption: three same-epic rows all stamped with the LAST
+        # dealId by the old epic-keyed sync. The reconcile must spread the three
+        # live dealIds across them — never grab one entry thrice and adopt the
+        # other two as duplicates.
+        def _row(level: float) -> Position:
+            return Position(
+                epic="E1",
+                epic_name="E1",
+                deal_id="C",  # all three share the last dealId
+                date=date(2026, 6, 16),
+                state=PositionState.OPEN,
+                level_open=Decimal(str(level)),
+                euro_per_point=Decimal("10.000000"),
+            )
+
+        rows = [_row(288.52), _row(288.62), _row(288.67)]
+        svc, client, db = _sync_service(db_open=rows)
+        client.get = AsyncMock(
+            return_value={
+                "positions": [
+                    _ig_entry(deal_id="A", epic="E1", level=288.52, bid=288.52),
+                    _ig_entry(deal_id="B", epic="E1", level=288.62, bid=288.62),
+                    _ig_entry(deal_id="C", epic="E1", level=288.67, bid=288.67),
+                ]
+            }
+        )
+
+        await svc.sync_open_positions()
+
+        # No new rows created, and every live dealId is now bound exactly once.
+        db.add.assert_not_called()
+        assert sorted(r.deal_id for r in rows) == ["A", "B", "C"]

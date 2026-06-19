@@ -10,15 +10,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.config import Settings
-from src.services.price_buffer import PriceBuffer
+from src.core.config import Settings
+from src.feed.price_buffer import PriceBuffer
 
 if TYPE_CHECKING:
-    from src.services.api_error_log import APIErrorLog
-    from src.services.api_guard import APIGuard
-    from src.services.api_queue import APIQueue
-    from src.services.candle_store import CandleStore
-    from src.services.recorder import LogBuffer
+    from src.core.api_error_log import APIErrorLog
+    from src.core.api_guard import APIGuard
+    from src.core.api_queue import APIQueue
+    from src.core.recorder import LogBuffer
+    from src.feed.candle_store import CandleStore
 
 templates = Jinja2Templates(directory="src/web/templates")
 

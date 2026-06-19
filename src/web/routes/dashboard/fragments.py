@@ -3,7 +3,7 @@
 import html
 from datetime import date
 
-from src.services.api_error_log import APIErrorEntry
+from src.core.api_error_log import APIErrorEntry
 from src.web.routes.dashboard.components import (
     render_button,
     render_card,

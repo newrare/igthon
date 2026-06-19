@@ -77,14 +77,14 @@ end-of-day force close are the fallbacks.
 
 | Setting (`.env`)                     | Field               | Default  | Meaning                                         |
 | ------------------------------------ | ------------------- | -------- | ----------------------------------------------- |
-| `STRATEGY_SCALPER_MOMENTUM_PERIOD`   | `momentum_period`   | `5`      | Recent-trend ROC window (candles)               |
-| `STRATEGY_SCALPER_MIN_ROC`           | `min_roc`           | `0.02`   | Minimum ROC over that window (percent)          |
-| `STRATEGY_SCALPER_CONFIRM_PERIOD`    | `confirm_period`    | `2`      | Number of last closes that must each rise       |
-| `STRATEGY_SCALPER_WIN_RATIO`         | `win_ratio`         | `1.5`    | Take-profit as a multiple of the spread (net)   |
+| `STRATEGY_SCALPER_MOMENTUM_PERIOD`   | `momentum_period`   | `8`      | Recent-trend ROC window (candles)               |
+| `STRATEGY_SCALPER_MIN_ROC`           | `min_roc`           | `0.20`   | Minimum ROC over that window (percent)          |
+| `STRATEGY_SCALPER_CONFIRM_PERIOD`    | `confirm_period`    | `1`      | Number of last closes that must each rise       |
+| `STRATEGY_SCALPER_WIN_RATIO`         | `win_ratio`         | `4.0`    | Take-profit as a multiple of the spread (net)   |
 | `STRATEGY_SCALPER_STOP_LOOKBACK`     | `stop_lookback`     | `60`     | Support-detection window (candles, ≈ last hour) |
 | `STRATEGY_SCALPER_STOP_BUFFER_ATR_K` | `stop_buffer_atr_k` | `0.5`    | ATR buffer placed below the detected support    |
 | `STRATEGY_SCALPER_MAX_STOP_ATR_K`    | `max_stop_atr_k`    | `3.0`    | Cap on the stop distance, in ATR multiples      |
-| `STRATEGY_MAX_SPREAD_RATIO` (shared) | `max_spread_ratio`  | `0.0015` | Maximum `spread / bid` to consider an entry     |
+| `STRATEGY_MAX_SPREAD_RATIO` (shared) | `max_spread_ratio`  | `0.0010` | Maximum `spread / bid` to consider an entry     |
 | `STRATEGY_ATR_PERIOD` (shared)       | `atr_period`        | `14`     | ATR window for the stop buffer and cap          |
 
 ## Limitations
@@ -99,6 +99,31 @@ end-of-day force close are the fallbacks.
   volume and does not filter sideways markets — chop with frequent up-ticks is
   exactly where it churns the most. Watch the simulator's `stop` count.
 - **BUY-only**, like the rest of the live pipeline.
+
+## Backtest tuning (2026 session, real candles)
+
+The original defaults (`win_ratio=1.5`, `min_roc=0.02`, `momentum_period=5`,
+`confirm_period=2`) carried the exact failure mode in the second limitation: a
+high win rate (≈70 %) but an average loss roughly 3× the average win, leaving
+the profit factor below 1 on every recorded week. A parameter sweep over the
+archived weeks `2021-W41`, `2026-W24` and `2026-W25` (percentage-return basis,
+contract-agnostic) isolated the levers that fix the asymmetry **and** generalise
+across weeks:
+
+- **`win_ratio` 1.5 → 4** lifts the average win from ≈0.08 % to ≈0.20-0.29 %,
+  close to the average loss — the single biggest improvement.
+- **`min_roc` 0.02 → 0.20** and **`momentum_period` 5 → 8** make entries more
+  selective; **`confirm_period` 2 → 1** and the tighter shared
+  **`max_spread_ratio` 0.0015 → 0.0010** each add a smaller, robust gain.
+- **Do not tighten `max_stop_atr_k`.** Lowering the stop cap (3 → 1) collapsed
+  the win rate (the support stop needs room) and made things strictly worse.
+
+This config raised the profit factor on the two harder weeks (W24 0.58 → 0.96,
+W25 0.65 → 0.87) and stayed near break-even on W41 (0.89 → 0.57). **Caveat:** no
+single config was net positive (PF > 1) on all three weeks — three weeks is a
+thin sample and `2026-W24` is a regime hostile to both live strategies. Treat
+these defaults as the most robust starting point found, not a proven edge;
+re-validate as more weeks accumulate.
 
 ## Testing
 

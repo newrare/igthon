@@ -10,7 +10,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
-from src.config import get_settings
+from src.core.config import get_settings
 from src.models import Base
 from src.models.database import _to_async_url
 

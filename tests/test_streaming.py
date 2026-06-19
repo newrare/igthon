@@ -9,15 +9,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.api import streaming as streaming_module
-from src.api.streaming import (
+from src.core.config import Settings
+from src.feed import streaming as streaming_module
+from src.feed.price_buffer import PriceBuffer
+from src.feed.streaming import (
     IGStreamingClient,
     _CandleListener,
     _parse_stream_candle,
     _utm_to_datetime,
 )
-from src.config import Settings
-from src.services.price_buffer import PriceBuffer
 
 # --------------------------------------------------------------------------- fakes
 

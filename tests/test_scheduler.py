@@ -12,9 +12,9 @@ import pytest
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.core.scheduler import BotScheduler
 from src.models.database import Base
 from src.models.job_preference import JobPreference
-from src.services.scheduler import BotScheduler
 
 
 @pytest.fixture
@@ -43,6 +43,34 @@ def _make_scheduler(session_factory) -> BotScheduler:
         candle_store=MagicMock(),
         streaming=None,
     )
+
+
+class TestSetStrategy:
+    """Runtime entry-strategy switching via the dashboard title dropdown.
+
+    Switching swaps the *entry* (open) strategy only; the close profile is
+    chosen independently (open/close decoupling). The entry registry currently
+    holds ``donchian_er`` (others are ported later).
+    """
+
+    def test_switch_to_registered_strategy(self):
+        sched = _make_scheduler(MagicMock())
+        sched._settings.entry_strategy_name = "something_else"
+        assert sched.set_strategy("donchian_er") is True
+        assert sched.active_strategy_name == "donchian_er"
+
+    def test_unknown_strategy_is_rejected(self):
+        sched = _make_scheduler(MagicMock())
+        sched._settings.entry_strategy_name = "donchian_er"
+        assert sched.set_strategy("not_a_strategy") is False
+        assert sched.active_strategy_name == "donchian_er"
+
+    def test_switch_clears_cached_instance(self):
+        sched = _make_scheduler(MagicMock())
+        sched._strategy = object()  # pretend a strategy was already built
+        sched.set_strategy("donchian_er")
+        # Cleared so the ``strategy`` property rebuilds from the new name.
+        assert sched._strategy is None
 
 
 class TestLastScheduledFire:

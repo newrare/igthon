@@ -11,8 +11,8 @@ import asyncio
 import logging
 import sys
 
-from src.api.client import IGClient
-from src.config import get_settings
+from src.core.api.client import IGClient
+from src.core.config import get_settings
 
 logging.basicConfig(
     level=logging.INFO,

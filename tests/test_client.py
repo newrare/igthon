@@ -6,9 +6,9 @@ import pytest
 import respx
 from httpx import Response
 
-from src.api.client import IGAPIError, IGClient
-from src.api.session import IGSession, OAuthToken
-from src.config import Settings
+from src.core.api.client import IGAPIError, IGClient
+from src.core.api.session import IGSession, OAuthToken
+from src.core.config import Settings
 
 
 @pytest.fixture

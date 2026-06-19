@@ -28,7 +28,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from src.services.price_buffer import EpicBuffer
+from src.feed.price_buffer import EpicBuffer
 
 #: A position should stay open; nothing to do this tick.
 ACTION_HOLD = "HOLD"
@@ -85,7 +85,7 @@ class CloseProfile(ABC):
     @classmethod
     @abstractmethod
     def from_settings(cls, settings) -> CloseProfile:
-        """Build the profile from application :class:`~src.config.Settings`."""
+        """Build the profile from application :class:`~src.core.config.Settings`."""
 
     @abstractmethod
     def initial_plan(

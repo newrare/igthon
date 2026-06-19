@@ -14,16 +14,15 @@ strategy:
   after break-even (``atr_k_pre`` / ``atr_k_post``).
 
 The actual maths lives in the shared pure helpers ``decide_close_reason`` and
-``compute_trailing_stop``. They are imported transitionally from
-``src.services.trading``; the execution-layer extraction (plan phase 3) will
-relocate them into this domain and flip the dependency so ``trading`` imports
-from here.
+``compute_trailing_stop`` in :mod:`src.exit.trailing`; the live trading service
+imports those same helpers from there, so the exit domain owns the close maths.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.core.indicators import atr
 from src.exit.base import (
     ACTION_CLOSE,
     ACTION_HOLD,
@@ -32,12 +31,8 @@ from src.exit.base import (
     CloseProfile,
     OpenPlan,
 )
-from src.services.compute import atr
-from src.services.price_buffer import EpicBuffer
-
-# Transitional import (see module docstring): these pure functions move into
-# the exit domain in the execution-layer phase.
-from src.services.trading import compute_trailing_stop, decide_close_reason
+from src.exit.trailing import compute_trailing_stop, decide_close_reason
+from src.feed.price_buffer import EpicBuffer
 
 
 @dataclass

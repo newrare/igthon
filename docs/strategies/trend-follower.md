@@ -4,7 +4,7 @@
 comparison. Superseded as live default by [`donchian_er`](donchian-er.md).
 
 - Code: [src/strategies/trend_follower.py](../../src/strategies/trend_follower.py)
-  (thin adapter over [src/services/compute.py](../../src/services/compute.py)
+  (thin adapter over [src/core/indicators.py](../../src/core/indicators.py)
   `compute_signal`, where all the mathematics live)
 - Philosophy & full background: [docs/STRATEGY.md](../STRATEGY.md)
 

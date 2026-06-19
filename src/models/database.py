@@ -10,7 +10,7 @@ The driver is auto-detected from DATABASE_URL:
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-from src.config import Settings
+from src.core.config import Settings
 
 
 class Base(DeclarativeBase):
