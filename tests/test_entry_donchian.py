@@ -72,13 +72,16 @@ class TestRegistry:
         else:  # pragma: no cover
             raise AssertionError("expected ValueError")
 
-    def test_from_settings_maps_parameters(self):
+    def test_parameters_are_class_constants(self):
+        # from_settings ignores settings — parameters are class constants. The
+        # override below is NOT picked up; the constructor still tunes them.
         strat = get_entry_strategy(
             "donchian_er",
             _settings(strategy_donchian_channel=33, strategy_min_efficiency=0.6),
         )
-        assert strat.channel == 33
-        assert strat.min_efficiency == 0.6
+        assert strat.channel == 20  # class constant, not the ignored setting
+        assert strat.min_efficiency == 0.60
+        assert DonchianEntry(channel=33).channel == 33
 
 
 class TestEntryIntentIsExitAgnostic:

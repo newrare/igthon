@@ -58,6 +58,7 @@ def _settings(dump_dir="./dumps") -> SimpleNamespace:
         strategy_hour_start=9,
         strategy_hour_end=16,
         strategy_hour_close=17,
+        strategy_close_margin_minutes=5,
         strategy_close_target="follower",
         strategy_compensate_loose=False,
         strategy_euro_loss=4000.0,

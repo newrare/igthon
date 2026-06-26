@@ -17,10 +17,14 @@ from __future__ import annotations
 
 from src.entry.base import EntryIntent, EntryStrategy
 from src.entry.donchian_er import DonchianEntry
+from src.entry.donchian_projection import DonchianProjectionEntry
+from src.entry.projection_ranking import ProjectionRankingEntry
 
 #: Name → class map. Keys are the valid ``ENTRY_STRATEGY_NAME`` values.
 ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     DonchianEntry.name: DonchianEntry,
+    DonchianProjectionEntry.name: DonchianProjectionEntry,
+    ProjectionRankingEntry.name: ProjectionRankingEntry,
 }
 
 
@@ -42,6 +46,8 @@ def get_entry_strategy(name: str, settings) -> EntryStrategy:
 __all__ = [
     "ENTRY_STRATEGIES",
     "DonchianEntry",
+    "DonchianProjectionEntry",
+    "ProjectionRankingEntry",
     "EntryIntent",
     "EntryStrategy",
     "get_entry_strategy",

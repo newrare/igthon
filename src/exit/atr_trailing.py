@@ -44,18 +44,18 @@ class AtrTrailingExit(CloseProfile):
     atr_period: int = 14
     stop_atr_k: float = 2.5  # initial protective stop distance, in ATR multiples
     atr_k_pre: float = 2.5  # trailing distance (ATR multiples) before break-even
-    atr_k_post: float = 1.5  # trailing distance after break-even
+    # Kept EQUAL to atr_k_pre on purpose: tightening after break-even cut winners
+    # off while losers ran the full pre-distance, so winners ended up smaller than
+    # losers. A single consistent width lets a breakout winner run.
+    atr_k_post: float = 2.5  # trailing distance after break-even (no tightening)
     trailing_step_ratio: float = 0.3  # min advance (× ATR) before re-pushing stop
 
     @classmethod
     def from_settings(cls, settings) -> AtrTrailingExit:
-        return cls(
-            atr_period=settings.strategy_atr_period,
-            stop_atr_k=settings.strategy_donchian_stop_atr_k,
-            atr_k_pre=settings.strategy_atr_k_pre,
-            atr_k_post=settings.strategy_atr_k_post,
-            trailing_step_ratio=settings.strategy_trailing_step_ratio,
-        )
+        # Parameters are constants of this class (the field defaults above), so
+        # the profile builds from those and ignores ``settings``. Tune by editing
+        # the constants; select the profile at runtime from the dashboard.
+        return cls()
 
     def initial_plan(
         self, *, entry_level: float, direction: str, buf: EpicBuffer

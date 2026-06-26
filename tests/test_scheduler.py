@@ -1,11 +1,13 @@
-"""Tests for the scheduler's missed-run catch-up mechanism.
+"""Tests for the scheduler's catch-up and streaming-subscription behaviour.
 
-Covers the helper that finds the last scheduled fire time, the persistence of a
-job's last successful run, and the startup replay of fixed-time jobs whose slot
-was missed while the server was down.
+Covers the missed-run catch-up (last-scheduled-fire helper, run persistence,
+startup replay) and that epics holding an open position stay subscribed to the
+live feed through the hourly tradable refresh, so a trade's price history keeps
+recording until it closes.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,8 +15,10 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.scheduler import BotScheduler
+from src.feed.price_buffer import Candle, PriceBuffer
 from src.models.database import Base
 from src.models.job_preference import JobPreference
+from src.models.position import Position, PositionState
 
 
 @pytest.fixture
@@ -71,6 +75,53 @@ class TestSetStrategy:
         sched.set_strategy("donchian_er")
         # Cleared so the ``strategy`` property rebuilds from the new name.
         assert sched._strategy is None
+
+
+class TestSelectionPersistence:
+    """Dashboard selection is saved to the DB and restored on startup."""
+
+    async def test_select_strategy_persists_and_restores(self, session_factory):
+        sched = _make_scheduler(session_factory)
+        sched._settings.entry_strategy_name = "donchian_er"
+        assert await sched.select_strategy("projection_ranking") is True
+
+        # A fresh scheduler (simulating a restart) restores the saved choice,
+        # overriding its initial .env fallback.
+        restarted = _make_scheduler(session_factory)
+        restarted._settings.entry_strategy_name = "donchian_er"
+        await restarted.load_selection_preferences()
+        assert restarted.active_strategy_name == "projection_ranking"
+
+    async def test_select_close_profile_persists_and_restores(self, session_factory):
+        sched = _make_scheduler(session_factory)
+        sched._settings.close_profile_name = "atr_trailing"
+        assert await sched.select_close_profile("atr_trailing_profit") is True
+
+        restarted = _make_scheduler(session_factory)
+        restarted._settings.close_profile_name = "atr_trailing"
+        await restarted.load_selection_preferences()
+        assert restarted.active_close_profile_name == "atr_trailing_profit"
+
+    async def test_rejected_selection_is_not_persisted(self, session_factory):
+        sched = _make_scheduler(session_factory)
+        sched._settings.entry_strategy_name = "donchian_er"
+        assert await sched.select_strategy("not_a_strategy") is False
+
+        restarted = _make_scheduler(session_factory)
+        restarted._settings.entry_strategy_name = "donchian_er"
+        await restarted.load_selection_preferences()
+        # Nothing persisted → stays on the fallback.
+        assert restarted.active_strategy_name == "donchian_er"
+
+    async def test_load_with_no_persisted_selection_keeps_fallback(
+        self, session_factory
+    ):
+        sched = _make_scheduler(session_factory)
+        sched._settings.entry_strategy_name = "donchian_projection"
+        sched._settings.close_profile_name = "atr_trailing"
+        await sched.load_selection_preferences()
+        assert sched.active_strategy_name == "donchian_projection"
+        assert sched.active_close_profile_name == "atr_trailing"
 
 
 class TestLastScheduledFire:
@@ -210,3 +261,266 @@ class TestRunCatchUp:
             stub.assert_not_awaited()
         finally:
             scheduler.stop()
+
+
+def _candle(ts: datetime) -> Candle:
+    """A minimal candle stamped at ``ts`` for buffer freshness tests."""
+    return Candle(
+        timestamp=ts,
+        bid_open=1.0,
+        bid_close=1.0,
+        bid_high=1.0,
+        bid_low=1.0,
+        offer_open=1.0,
+        offer_close=1.0,
+        offer_high=1.0,
+        offer_low=1.0,
+    )
+
+
+class TestTradedTodayEpics:
+    """The rolling ranker's one-opening-per-epic-per-day diversity rule."""
+
+    async def test_returns_epics_opened_today_any_state(self, session_factory):
+        async with session_factory() as session:
+            session.add_all(
+                [
+                    Position(
+                        epic="A",
+                        epic_name="A",
+                        date=date.today(),
+                        state=PositionState.CLOSE,
+                    ),
+                    Position(
+                        epic="B",
+                        epic_name="B",
+                        date=date.today(),
+                        state=PositionState.OPEN,
+                    ),
+                    Position(
+                        epic="C",
+                        epic_name="C",
+                        date=date.today() - timedelta(days=1),
+                        state=PositionState.CLOSE,
+                    ),
+                ]
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            traded = await BotScheduler._traded_today_epics(session)
+
+        # A closed today and B open today are "used"; C (yesterday) is free again.
+        assert traded == {"A", "B"}
+
+
+def _streaming_scheduler(session_factory, streaming):
+    """Scheduler wired with a real PriceBuffer and the given streaming stub."""
+    settings = MagicMock()
+    settings.strategy_hour_close = 17
+    settings.streaming_stale_seconds = 180
+    return BotScheduler(
+        settings=settings,
+        client=MagicMock(),
+        buffer=PriceBuffer(),
+        market_data=MagicMock(),
+        recorder=MagicMock(),
+        epics=[],
+        session_factory=session_factory,
+        candle_store=MagicMock(),
+        streaming=streaming,
+    )
+
+
+async def _add_open(session_factory, epic: str) -> None:
+    async with session_factory() as session:
+        session.add(
+            Position(
+                epic=epic, epic_name=epic, date=date.today(), state=PositionState.OPEN
+            )
+        )
+        await session.commit()
+
+
+class TestOpenEpicFeedWatchdog:
+    """An open position's epic must always keep a live feed."""
+
+    async def test_fresh_feed_is_left_alone(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = True
+        streaming.subscribed_epics = ["A"]
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        await _add_open(session_factory, "A")
+        scheduler._buffer.add_candle("A", _candle(datetime.now(UTC)))
+
+        await scheduler._ensure_open_epics_streamed()
+
+        streaming.resubscribe.assert_not_awaited()
+
+    async def test_stale_feed_is_resubscribed(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = True
+        streaming.subscribed_epics = ["A"]
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        await _add_open(session_factory, "A")
+        stale = datetime.now(UTC) - timedelta(seconds=600)
+        scheduler._buffer.add_candle("A", _candle(stale))
+
+        await scheduler._ensure_open_epics_streamed()
+
+        streaming.resubscribe.assert_awaited_once_with("A")
+
+    async def test_missing_from_feed_is_resubscribed(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = True
+        streaming.subscribed_epics = []  # open epic dropped off the feed entirely
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        await _add_open(session_factory, "A")
+
+        await scheduler._ensure_open_epics_streamed()
+
+        streaming.resubscribe.assert_awaited_once_with("A")
+
+    async def test_just_opened_without_candle_is_left_alone(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = True
+        streaming.subscribed_epics = ["A"]  # subscribed, no candle printed yet
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        await _add_open(session_factory, "A")
+
+        await scheduler._ensure_open_epics_streamed()
+
+        streaming.resubscribe.assert_not_awaited()
+
+    async def test_noop_when_disconnected(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = False
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        await _add_open(session_factory, "A")
+
+        await scheduler._ensure_open_epics_streamed()
+
+        streaming.resubscribe.assert_not_awaited()
+
+
+def _market(epic: str, status: str = "TRADEABLE") -> SimpleNamespace:
+    """A minimal MarketInfo stand-in for the scanner mocks."""
+    return SimpleNamespace(
+        epic=epic,
+        instrument_type="CURRENCIES",
+        spread_ratio=1.0,
+        status=status,
+    )
+
+
+class TestStreamingKeepsOpenPositions:
+    async def test_open_position_epic_stays_subscribed_when_capped(
+        self, session_factory
+    ):
+        settings = MagicMock()
+        settings.strategy_hour_close = 17
+        settings.streaming_max_epics = 2  # force the cap with 3 candidates
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = BotScheduler(
+            settings=settings,
+            client=MagicMock(),
+            buffer=MagicMock(),
+            market_data=MagicMock(),
+            recorder=MagicMock(),
+            epics=["A", "B", "C"],
+            session_factory=session_factory,
+            candle_store=MagicMock(),
+            streaming=streaming,
+        )
+
+        # Epic A holds an open position but would be dropped by the cap below.
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="A",
+                    epic_name="A",
+                    date=date(2026, 6, 24),
+                    state=PositionState.OPEN,
+                )
+            )
+            await session.commit()
+
+        ma, mb, mc = _market("A"), _market("B"), _market("C")
+        scheduler._scanner.get_all_market_infos = AsyncMock(return_value=[ma, mb, mc])
+        scheduler._scanner.select_tradable = MagicMock(return_value=[ma, mb, mc])
+        scheduler._scanner.select_diversified_subset = MagicMock(return_value=[mb, mc])
+        scheduler._scanner.get_non_tradable_reasons = MagicMock(return_value={})
+        scheduler._persist_epic_enrichment = AsyncMock()
+        scheduler._persist_tradable_flags = AsyncMock()
+
+        await scheduler._refresh_tradable_epics()
+
+        # The analysis set is the capped subset — A is dropped for *new* trades.
+        assert scheduler._tradable_epics == ["B", "C"]
+        # But A (open position) is still streamed, and listed first so it survives
+        # set_epics' truncation to the IG subscription cap.
+        streaming.set_epics.assert_awaited_once()
+        streamed = streaming.set_epics.await_args.args[0]
+        assert streamed[0] == "A"
+        assert set(streamed) == {"A", "B", "C"}
+
+    async def test_open_epic_no_longer_tradeable_is_force_closed(
+        self, session_factory, monkeypatch
+    ):
+        """Safety net: an open position whose market is no longer TRADEABLE is
+        force-closed during the hourly refresh."""
+        import src.core.scheduler as scheduler_mod
+
+        settings = MagicMock()
+        settings.strategy_hour_close = 17
+        settings.streaming_max_epics = 40
+        scheduler = BotScheduler(
+            settings=settings,
+            client=MagicMock(),
+            buffer=MagicMock(),
+            market_data=MagicMock(),
+            recorder=MagicMock(),
+            epics=["A", "B"],
+            session_factory=session_factory,
+            candle_store=MagicMock(),
+            streaming=None,
+        )
+
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="A",
+                    epic_name="A",
+                    date=date(2026, 6, 26),
+                    state=PositionState.OPEN,
+                )
+            )
+            await session.commit()
+
+        # A is open but now CLOSED on IG; B is fine.
+        ma, mb = _market("A", status="CLOSED"), _market("B")
+        scheduler._scanner.get_all_market_infos = AsyncMock(return_value=[ma, mb])
+        scheduler._scanner.select_tradable = MagicMock(return_value=[mb])
+        scheduler._scanner.get_non_tradable_reasons = MagicMock(return_value={})
+        scheduler._persist_epic_enrichment = AsyncMock()
+        scheduler._persist_tradable_flags = AsyncMock()
+
+        # Capture the close_epics call on the TradingService built inside.
+        trading = MagicMock()
+        trading.close_epics = AsyncMock(return_value=1)
+        monkeypatch.setattr(
+            scheduler_mod, "TradingService", MagicMock(return_value=trading)
+        )
+
+        await scheduler._refresh_tradable_epics()
+
+        trading.close_epics.assert_awaited_once()
+        epics_arg, reason_arg = trading.close_epics.await_args.args
+        assert epics_arg == {"A"}
+        assert reason_arg == "market_closed"

@@ -167,5 +167,4 @@ ______________________________________________________________________
 
 - **Before committing:** run `mdformat docs/ README.md CLAUDE.md` to align all Markdown tables.
 - **Before running tests:** run `mdformat docs/ README.md CLAUDE.md` to keep docs consistent.
-- Commit messages in English, imperative mood: `Add OAuth token refresh`, `Fix position close logic`.
-- One logical change per commit.
+- no commit files, no change branch without user ask

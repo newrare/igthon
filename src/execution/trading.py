@@ -9,7 +9,7 @@ Implements the full trading workflow:
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -27,8 +27,14 @@ from src.exit.trailing import (
     decide_close_reason,
 )
 from src.feed.price_buffer import EpicBuffer
+from src.models.epic import Epic
 from src.models.position import Position, PositionState, PositionStrategy
-from src.utils.tools import _to_float, euro_per_point, parse_ig_pnl
+from src.utils.tools import (
+    _parse_ig_utc_time,
+    _to_float,
+    euro_per_point,
+    parse_ig_pnl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,10 @@ class TradeConfig:
     hour_start: int = 9
     hour_end: int = 16
     hour_close: int = 17
+    # Minutes before a market's own close at which an open position on it is
+    # force-closed (per-epic close rule). Applied to Epic.market_close_utc when
+    # known; otherwise the global hour_close is the fallback.
+    close_margin_minutes: int = 5
     euro_loss_max: float = 4000.0
     day_euro_finish_win: float = 300.0
     day_euro_finish_loose: float = -500.0
@@ -75,6 +85,7 @@ class TradeConfig:
             hour_start=settings.strategy_hour_start,
             hour_end=settings.strategy_hour_end,
             hour_close=settings.strategy_hour_close,
+            close_margin_minutes=settings.strategy_close_margin_minutes,
             euro_loss_max=settings.strategy_euro_loss,
             day_euro_finish_win=settings.strategy_daily_win_target,
             day_euro_finish_loose=settings.strategy_daily_loss_limit,
@@ -159,32 +170,53 @@ class TradingService:
         wins = sum(1 for p in positions if (p.win or 0) > 0)
         return count, wins / count
 
-    def _is_trading_hours(self) -> bool:
-        """Check if we're within allowed trading hours."""
-        now = datetime.now(UTC)
-        return self._config.hour_start <= now.hour < self._config.hour_end
+    async def _epic_close_utc(self, epic: str) -> time | None:
+        """The epic's own market close (UTC) from the Epic table, or None."""
+        try:
+            result = await self._db.scalar(
+                select(Epic.market_close_utc).where(Epic.name == epic)
+            )
+        except Exception:  # pragma: no cover - defensive (fall back to global)
+            return None
+        return result if isinstance(result, time) else None
 
-    def _is_close_hours(self) -> bool:
-        """Check if we've passed the forced-close hour."""
+    async def _is_epic_close_hour(self, epic: str) -> bool:
+        """True when a position on ``epic`` should be force-closed for the day.
+
+        Uses the epic's own market close (``Epic.market_close_utc``) minus the
+        configured margin when known, so the position is closed just before that
+        market actually closes. Falls back to the global ``hour_close`` (UTC) when
+        the per-epic close time is unknown (e.g. IG exposes no openingHours).
+        """
         now = datetime.now(UTC)
+        close_t = await self._epic_close_utc(epic)
+        if close_t is not None:
+            close_dt = datetime.combine(now.date(), close_t, tzinfo=UTC)
+            margin = timedelta(minutes=self._config.close_margin_minutes)
+            return now >= close_dt - margin
         return now.hour >= self._config.hour_close
 
     async def can_open_position(self, signal: TradingSignal) -> tuple[bool, str]:
         """Run all pre-open checks. Returns (allowed, reason).
 
         Checks:
-        1. Trading hours
-        2. Signal direction is BUY
-        3. No duplicate epic open
-        4. Max simultaneous positions
-        5. Daily P&L circuit breaker
-        6. Market is TRADEABLE (checked during open_position)
+        1. Signal direction is BUY
+        2. No duplicate epic open
+        3. Max simultaneous positions
+        4. Daily P&L circuit breaker
+        5. Market is TRADEABLE (checked during open_position)
+
+        Note: there is no wall-clock trading-hours gate live — the real
+        "is the market open?" signal is the per-epic ``marketStatus ==
+        TRADEABLE`` check (hourly tradable filter + re-check in
+        :meth:`open_position`), so ``in_trading_hours`` is always satisfied
+        here. The simulator keeps its own hour gate (no live status to read).
         """
         trade_count, win_rate = await self._get_daily_stats()
         return evaluate_open_gates(
             epic=signal.epic,
             direction=signal.direction,
-            in_trading_hours=self._is_trading_hours(),
+            in_trading_hours=True,
             epic_already_open=await self._is_epic_open(signal.epic),
             open_count=await self._count_open_positions(),
             daily_pnl=await self._get_daily_pnl(),
@@ -197,13 +229,15 @@ class TradingService:
         """Pre-open gates for a decoupled :class:`EntryIntent`.
 
         Same portfolio/risk rules as :meth:`can_open_position`, but driven by an
-        exit-agnostic entry intent rather than a signal carrying levels.
+        exit-agnostic entry intent rather than a signal carrying levels. As there,
+        the live market-open gate is the per-epic ``marketStatus == TRADEABLE``
+        check, not a wall-clock window, so ``in_trading_hours`` is always True.
         """
         trade_count, win_rate = await self._get_daily_stats()
         return evaluate_open_gates(
             epic=intent.epic,
             direction=intent.direction,
-            in_trading_hours=self._is_trading_hours(),
+            in_trading_hours=True,
             epic_already_open=await self._is_epic_open(intent.epic),
             open_count=await self._count_open_positions(),
             daily_pnl=await self._get_daily_pnl(),
@@ -266,6 +300,7 @@ class TradingService:
             level_loose=plan.stop_level,
             level_security=plan.stop_level,
             stop_distance=abs(last.bid_close - plan.stop_level),
+            level_margin=plan.level_margin,
         )
         signal = TradingSignal(
             epic=intent.epic,
@@ -476,6 +511,7 @@ class TradingService:
             level_loose=Decimal(str(round(levels.level_loose, 5))),
             level_security=Decimal(str(round(levels.level_security, 5))),
             level_stop=Decimal(str(round(stop_level, 5))),
+            level_margin=Decimal(str(round(levels.level_margin, 5))),
             pip_spread=Decimal(str(round(levels.spread, 5))),
             quantity=quantity,
             size=int(round(stop_price_distance * scaling_factor)),
@@ -672,7 +708,17 @@ class TradingService:
         return updated
 
     def _apply_transaction(self, position: Position, txn: dict) -> bool:
-        """Write a transaction's authoritative P&L and levels onto a position."""
+        """Write a transaction's authoritative P&L, levels and times onto a position.
+
+        ``/history/transactions`` is IG's source of truth for a closed deal: it
+        carries the real ``openLevel``/``closeLevel``, the realized
+        ``profitAndLoss`` and the exact UTC execution timestamps
+        (``openDateUtc``/``dateUtc``). We persist the broker times into the
+        dedicated ``time_open_broker``/``time_close_broker`` columns so the chart
+        can mark entry/exit at the moment the broker actually filled — not at the
+        bot's loop/detection clock (``time_open``/``time_close``), which lags and,
+        for externally-closed positions, can be minutes off.
+        """
         pnl = parse_ig_pnl(txn.get("profitAndLoss"))
         if pnl is None:
             return False
@@ -684,6 +730,20 @@ class TradingService:
             position.level_open = Decimal(str(round(open_level, 5)))
         if close_level:
             position.level_close = Decimal(str(round(close_level, 5)))
+        else:
+            # IG omitted the close level: keep it consistent with the
+            # authoritative P&L instead of leaving a stale value, since
+            # close = open + pnl / euro_per_point.
+            base_open = float(position.level_open or 0)
+            epp = float(position.euro_per_point or 0)
+            if base_open and epp:
+                position.level_close = Decimal(str(round(base_open + pnl / epp, 5)))
+        open_time = _parse_ig_utc_time(txn.get("openDateUtc"))
+        close_time = _parse_ig_utc_time(txn.get("dateUtc"))
+        if open_time is not None:
+            position.time_open_broker = open_time
+        if close_time is not None:
+            position.time_close_broker = close_time
         return True
 
     @staticmethod
@@ -990,17 +1050,29 @@ class TradingService:
         level to record; the best estimate is the last live unrealized P&L
         computed by the most recent sync (stored in ``euro``). This estimate is
         later overwritten by ``reconcile_realized_pnl`` with IG's true figure.
+
+        ``level_close`` must stay consistent with that ``euro``: since
+        ``P&L = (close - open) * euro_per_point``, we back the close level out of
+        the P&L (``close = open + euro / epp``) rather than defaulting it to the
+        open level — that default left ``level_close == level_open`` while ``euro``
+        showed a real loss, which read as "closed at break-even for −89€" on the
+        chart. Only derived when no genuine close fill was ever captured.
         """
         now = datetime.now(UTC)
-        close_level = float(position.level_close or position.level_open or 0)
+        open_level = float(position.level_open or 0)
+        epp = float(position.euro_per_point or 0)
         euro_pnl = (
             float(position.euro)
             if position.euro is not None
-            else self._euro_pnl(position, close_level)
+            else self._euro_pnl(position, float(position.level_close or open_level))
         )
         position.state = PositionState.CLOSE
         position.time_close = now.time()
         if position.level_close is None:
+            if position.euro is not None and epp:
+                close_level = open_level + euro_pnl / epp
+            else:
+                close_level = open_level
             position.level_close = Decimal(str(round(close_level, 5)))
         position.reason_close = "closed_externally"
         position.euro = Decimal(str(round(euro_pnl, 3)))
@@ -1033,7 +1105,10 @@ class TradingService:
             return await self.check_and_close(position, current_bid, buf)
 
         decision = self._close_profile.evaluate(
-            position, current_bid, buf, is_close_hour=self._is_close_hours()
+            position,
+            current_bid,
+            buf,
+            is_close_hour=await self._is_epic_close_hour(position.epic),
         )
         if decision.action == ACTION_CLOSE:
             return await self._close_position(position, current_bid, decision.reason)
@@ -1081,7 +1156,7 @@ class TradingService:
             current_bid,
             level_win=float(position.level_win or 0),
             level_loose=float(position.level_loose or 0),
-            is_close_hour=self._is_close_hours(),
+            is_close_hour=await self._is_epic_close_hour(position.epic),
         )
 
         if reason is None:
@@ -1398,10 +1473,31 @@ class TradingService:
             select(Position).where(Position.state == PositionState.OPEN)
         )
         positions = result.scalars().all()
-        closed = 0
+        return await self._force_close(positions, "end_of_day")
 
+    async def close_epics(self, epics: set[str], reason: str) -> int:
+        """Force-close every open position whose epic is in ``epics``.
+
+        Safety net for the per-epic close rule: when an open epic's market is no
+        longer TRADEABLE, close it so a position can't be stranded past its
+        market's close. Best-effort — IG may reject a deal on a market that has
+        already closed, which is logged and counted as a failure.
+        """
+        if not epics:
+            return 0
+        result = await self._db.execute(
+            select(Position).where(
+                Position.state == PositionState.OPEN,
+                Position.epic.in_(epics),
+            )
+        )
+        positions = result.scalars().all()
+        return await self._force_close(positions, reason)
+
+    async def _force_close(self, positions, reason: str) -> int:
+        """Close each given position at its current IG bid, with ``reason``."""
+        closed = 0
         for position in positions:
-            # Get current bid
             try:
                 market = await self._client.get(
                     f"/markets/{position.epic}",
@@ -1410,10 +1506,16 @@ class TradingService:
                     label=f"close {position.epic}: market",
                 )
                 bid = float(market.get("snapshot", {}).get("bid", 0))
-                if await self._close_position(position, bid, "end_of_day"):
+                if await self._close_position(position, bid, reason):
                     closed += 1
             except Exception as exc:
                 logger.error("Failed to close position %s: %s", position.epic, exc)
 
-        logger.info("Forced close: %d/%d positions closed", closed, len(positions))
+        if positions:
+            logger.info(
+                "Forced close (%s): %d/%d positions closed",
+                reason,
+                closed,
+                len(positions),
+            )
         return closed

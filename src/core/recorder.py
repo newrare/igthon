@@ -8,8 +8,14 @@ import logging
 import smtplib
 from datetime import datetime
 from email.message import EmailMessage
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from src.core.config import Settings
+
+# Default rotating-log location — a predictable temp path so the file can be
+# tailed/read while debugging (e.g. why the rolling ranker isn't opening).
+DEFAULT_LOG_FILE = Path("/tmp/ig_bot/ig_bot.log")
 
 logger = logging.getLogger("ig_bot")
 
@@ -72,22 +78,85 @@ class LogBuffer(logging.Handler):
         return [{k: v for k, v in e.items() if k != "seq"} for e in merged]
 
 
-def setup_logging(level: str = "INFO") -> LogBuffer:
+def setup_logging(
+    level: str = "INFO",
+    *,
+    log_file: str | Path | None = DEFAULT_LOG_FILE,
+    file_level: str = "DEBUG",
+    max_bytes: int = 5_000_000,
+    backup_count: int = 5,
+) -> LogBuffer:
     """Configure application-wide logging and return the in-memory log buffer.
 
+    Two sinks are wired onto the root logger:
+
+    * a **console** handler at ``level`` (the operator-facing stream);
+    * a **rotating file** handler at ``file_level`` (default ``DEBUG``) so the
+      full detailed trace — including the ``Rolling select …`` decisions that are
+      DEBUG-only — is always persisted to ``log_file`` for post-mortem reading,
+      independently of how noisy the console is set to be.
+
+    The root level is lowered to the most verbose of the two so DEBUG records
+    reach the file even when the console stays at INFO. The file rotates at
+    ``max_bytes`` keeping ``backup_count`` backups (``ig_bot.log.1`` …). Pass
+    ``log_file=None`` to disable the file sink (e.g. in tests).
+
     Args:
-        level: Log level (DEBUG, INFO, WARNING, ERROR).
+        level: Console log level (DEBUG, INFO, WARNING, ERROR).
+        log_file: Destination path for the rotating file sink, or None.
+        file_level: Minimum level written to the file sink.
+        max_bytes: Rotate the file once it reaches this size.
+        backup_count: Number of rotated backups to keep.
 
     Returns:
         LogBuffer handler attached to the root logger.
     """
-    log_level = getattr(logging, level.upper(), logging.INFO)
+    console_level = getattr(logging, level.upper(), logging.INFO)
+    file_lvl = getattr(logging, file_level.upper(), logging.DEBUG)
 
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    root = logging.getLogger()
+    # Drop our own previously-attached handlers so repeated calls don't stack
+    # duplicates; foreign handlers (e.g. pytest's caplog) are left untouched.
+    for handler in list(root.handlers):
+        if isinstance(handler, RotatingFileHandler | LogBuffer) or (
+            type(handler) is logging.StreamHandler
+        ):
+            root.removeHandler(handler)
+
+    root.setLevel(min(console_level, file_lvl) if log_file else console_level)
+
+    console = logging.StreamHandler()
+    console.setLevel(console_level)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    if log_file is not None:
+        path = Path(log_file)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                path,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(file_lvl)
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+            logger.info(
+                "Logging to %s (file level=%s, rotate %d×%dB)",
+                path,
+                logging.getLevelName(file_lvl),
+                backup_count,
+                max_bytes,
+            )
+        except OSError as exc:  # pragma: no cover - defensive (perms/full disk)
+            logger.warning("Could not open log file %s: %s", log_file, exc)
 
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -95,7 +164,7 @@ def setup_logging(level: str = "INFO") -> LogBuffer:
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
     buf = LogBuffer(max_per_level=30)
-    logging.getLogger().addHandler(buf)
+    root.addHandler(buf)
     return buf
 
 

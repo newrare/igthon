@@ -124,14 +124,20 @@ class Settings(BaseSettings):
     # on startup — wide enough to hold >= strategy_sma_slow one-minute candles.
     streaming_rehydrate_window_minutes: int = 90
     streaming_reconnect_max_backoff_seconds: int = 60
+    # Watchdog: an open position's epic must always have a live feed. If its most
+    # recent streamed candle is older than this (or it has none), the scheduler
+    # force re-subscribes it — covers an individual Lightstreamer subscription that
+    # silently stalls/expires without a full disconnect. Keep comfortably above
+    # the candle resolution (3x a 1-minute bar) to avoid churn on slow markets.
+    streaming_stale_seconds: int = 180
 
     # Open/close selection — entry strategy and close profile are decoupled and
     # chosen independently. The entry strategy (src/entry/) decides only the
     # direction; the close profile (src/exit/) owns the stop/target/trailing.
     # The rest of the pipeline (gates, orders, sizing, simulator, dashboard) is
     # shared. Registered names: src/entry/__init__.py and src/exit/__init__.py.
-    entry_strategy_name: str = "donchian_er"
-    close_profile_name: str = "atr_trailing"
+    entry_strategy_name: str = "donchian_projection"
+    close_profile_name: str = "atr_trailing_profit"
 
     # Deprecated alias kept for the legacy strategies/ registry still used by
     # not-yet-ported entries; new code reads entry_strategy_name.
@@ -147,6 +153,18 @@ class Settings(BaseSettings):
     # ("spread churn"). A stricter regime gate trades less but cleaner.
     strategy_efficiency_period: int = 30
     strategy_min_efficiency: float = 0.60
+
+    # Donchian + multi-model projection consensus
+    # (entry_strategy_name = "donchian_projection") — same breakout + ER gate as
+    # donchian_er plus a projection-consensus gate. Its parameters are constants
+    # in src/entry/donchian_projection.py (not .env): tune them there and select
+    # the strategy at runtime from the dashboard.
+
+    # Projection ranking (entry_strategy_name = "projection_ranking") — cross-epic
+    # ranker that keeps a rolling position open all day. Its parameters (scoring
+    # windows/weights and the rolling-selection knobs) are constants in
+    # ``src/entry/projection_ranking.py``, not settings: tune them there, and
+    # select the strategy at runtime from the dashboard.
 
     # Trend follower (strategy_name = "trend_follower") — Trend Volume Intraday
     strategy_min_r2: float = 0.70
@@ -211,6 +229,11 @@ class Settings(BaseSettings):
     strategy_atr_k_post: float = 2.5  # kept equal: do not tighten after break-even
     strategy_trailing_step_ratio: float = 0.3  # min gain (xATR) before a PUT
 
+    # Close profiles "atr_trailing_positive" and "atr_trailing_profit" — their
+    # shaping parameters are constants in src/exit/atr_trailing_positive.py and
+    # src/exit/atr_trailing_profit.py (not .env): tune them there and select the
+    # profile at runtime from the dashboard.
+
     # Position / Risk management
     strategy_max_positions: int = 6
     strategy_max_trades_day: int = 50
@@ -219,7 +242,11 @@ class Settings(BaseSettings):
     strategy_min_win_rate: float = 0.40
     strategy_hour_start: int = 9
     strategy_hour_end: int = 16
-    strategy_hour_close: int = 17
+    strategy_hour_close: int = 17  # global fallback close hour (UTC)
+    # Minutes before an epic's own market close to force-close a position on it.
+    # Applied to the per-epic Epic.market_close_utc when known (IG openingHours);
+    # falls back to strategy_hour_close otherwise.
+    strategy_close_margin_minutes: int = 5
     strategy_close_target: str = "follower"
     strategy_compensate_loose: bool = False
     strategy_euro_loss: float = 4000.0

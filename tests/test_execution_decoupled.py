@@ -177,3 +177,37 @@ class TestManagePosition:
 
         closed = await svc.manage_position(pos, current_bid=95.0, buf=buf)
         assert closed is False
+
+
+class TestPerEpicCloseHour:
+    """The per-epic close gate: epic-specific close time, else global fallback."""
+
+    async def test_falls_back_to_global_hour_close_when_unknown(self):
+        # No per-epic close time -> global hour_close governs.
+        svc, _, db = _service(hour_close=0)
+        db.scalar = AsyncMock(return_value=None)  # unknown -> None
+        assert await svc._is_epic_close_hour("X") is True  # now.hour >= 0 always
+
+        svc2, _, db2 = _service(hour_close=99)
+        db2.scalar = AsyncMock(return_value=None)
+        assert await svc2._is_epic_close_hour("X") is False  # now.hour >= 99 never
+
+    async def test_uses_per_epic_close_minus_margin(self, monkeypatch):
+        from datetime import time
+
+        import src.execution.trading as trading_mod
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 6, 26, 15, 28, tzinfo=tz)
+
+        monkeypatch.setattr(trading_mod, "datetime", _FrozenDT)
+
+        svc, _, db = _service(close_margin_minutes=5)
+        # now 15:28 >= 15:30 - 5min (15:25) -> close
+        db.scalar = AsyncMock(return_value=time(15, 30))
+        assert await svc._is_epic_close_hour("X") is True
+        # now 15:28 < 16:00 - 5min (15:55) -> hold
+        db.scalar = AsyncMock(return_value=time(16, 0))
+        assert await svc._is_epic_close_hour("X") is False

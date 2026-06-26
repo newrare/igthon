@@ -73,6 +73,7 @@ class SimulatedTrade:
     level_loose: float
     level_stop: float  # broker-side protective stop (trails upward)
     euro_stop: float
+    level_margin: float = 0.0  # margin level frozen at open (read by the profile)
     euro_per_point: float = 0.0  # € per point of movement (read by the profile)
     close_time: str | None = None
     level_close: float | None = None
@@ -82,6 +83,7 @@ class SimulatedTrade:
     stop_updates: int = 0
     # internal monitoring state (not part of the report)
     level_follower: float = 0.0
+    opened_at: datetime | None = None  # open timestamp (read by trend-aware exits)
 
 
 @dataclass
@@ -369,8 +371,10 @@ class StrategySimulator:
             level_loose=round(plan.stop_level, 5),
             level_stop=round(plan.stop_level, 5),
             level_follower=round(plan.stop_level, 5),
+            level_margin=round(plan.level_margin, 5),
             euro_stop=round(euro_risk, 2),
             euro_per_point=euro_per_point,
+            opened_at=candle.timestamp,
         )
         return True
 
@@ -390,9 +394,12 @@ class StrategySimulator:
         """
         current_bid = candle.bid_close
 
-        # Broker-side protective stop: fills intra-candle when the low touches
-        # it (this is what IG does with the pushed stopLevel).
-        broker_stop = max(position.level_stop, position.level_follower)
+        # Broker-side protective stop: the close profile owns the stop level
+        # (``level_follower``), so this models IG filling the *pushed* stop when
+        # the low touches it. The profile may move the stop down as well as up
+        # (e.g. atr_trailing_positive giving a soft dip room), hence the level is
+        # taken as-is rather than ratcheted here.
+        broker_stop = position.level_follower
         if candle.bid_low <= broker_stop:
             reason = "follower" if position.stop_updates else "stop"
             self._close(position, candle, broker_stop, reason)
@@ -410,8 +417,9 @@ class StrategySimulator:
         if (
             decision.action == ACTION_UPDATE_STOP
             and decision.new_stop_level is not None
-            and decision.new_stop_level > position.level_follower
         ):
+            # Apply the profile's stop verbatim (up or down) — mirrors live
+            # manage_position, which pushes whatever level the profile returns.
             position.level_follower = round(decision.new_stop_level, 5)
             position.stop_updates += 1
         return False
@@ -478,3 +486,259 @@ def run_simulation(
         curve_provider=provider,
     )
     return simulator.run()
+
+
+def run_close_visual(
+    settings,
+    *,
+    curve_profile: str = "random",
+    close_profile_name: str | None = None,
+    seed: int | None = None,
+    num_candles: int = 600,
+    base_price: float = 8000.0,
+    euro_per_point: float = 1.0,
+    open_index: int | None = None,
+) -> dict:
+    """Replay a single open→close cycle on one curve to visualise the exit.
+
+    Unlike :func:`run_simulation` (which aggregates hundreds of trades), this
+    opens **one** BUY at a (random or chosen) moment on a single synthetic curve
+    and walks the chosen close profile forward tick by tick, recording the
+    protective stop level at every step. The result is everything the front-end
+    needs to draw: the price curve, the entry marker, the trailing-stop line as
+    it ratchets up, and the exit marker.
+
+    The entry direction is fixed to BUY and the open is unconditional (no entry
+    strategy, no gates): the point is to inspect the *close* behaviour in
+    isolation — does the stop follow the curve with a safety gap and climb when
+    price climbs, without closing on noise?
+    """
+    from src.backtest.curve_generator import generate_curve
+    from src.exit import get_close_profile
+
+    if seed is None:
+        seed = random.randrange(2**31)
+
+    candles = generate_curve(
+        curve_profile,
+        seed=seed,
+        num_candles=num_candles,
+        base_price=base_price,
+        day=_BASE_DAY,
+    )
+
+    profile = get_close_profile(
+        close_profile_name or settings.close_profile_name, settings
+    )
+    config = TradeConfig.from_settings(settings)
+
+    # The open must sit far enough in to have a warmup window for the ATR, and
+    # leave room afterwards for the curve to evolve and the stop to trail.
+    warmup = max(settings.strategy_atr_period + 5, 30)
+    last_open = max(warmup + 1, num_candles - 100)
+    if open_index is None:
+        open_index = random.Random(seed ^ 0x5EED).randrange(warmup, last_open)
+    open_index = max(warmup, min(open_index, num_candles - 2))
+
+    # Feed the warmup window into the buffer up to (and including) the open tick.
+    buf = EpicBuffer(epic="SIM", max_candles=num_candles + 1)
+    for candle in candles[: open_index + 1]:
+        buf.add(candle)
+
+    open_candle = candles[open_index]
+    plan = profile.initial_plan(
+        entry_level=open_candle.bid_close, direction="BUY", buf=buf
+    )
+    stop_distance = open_candle.bid_close - plan.stop_level
+    euro_risk = stop_distance * euro_per_point
+
+    # Reference levels for the chart, all expressed on the bid scale (the curve
+    # plotted): break-even is the offer paid for a BUY (≈ one spread above the
+    # opening bid), and the margin level (frozen on the plan at open) adds the
+    # profile's noise margin on top — the threshold above which a position counts
+    # as "positive beyond noise". Sourcing it from the plan keeps the drawn line
+    # identical to the level the profile actually enforces.
+    level_zero = round(plan.level_zero, 5)
+    level_margin = round(plan.level_margin, 5) if plan.level_margin else level_zero
+    noise_margin = round(level_margin - level_zero, 5)
+
+    position = SimulatedTrade(
+        epic="SIM",
+        day=0,
+        open_time=open_candle.timestamp.strftime("%H:%M"),
+        level_open=round(open_candle.offer_close, 5),  # market BUY fills at offer
+        level_win=round(plan.target_level, 5),
+        level_zero=round(plan.level_zero, 5),
+        level_loose=round(plan.stop_level, 5),
+        level_stop=round(plan.stop_level, 5),
+        level_follower=round(plan.stop_level, 5),
+        level_margin=round(plan.level_margin, 5),
+        euro_stop=round(euro_risk, 2),
+        euro_per_point=euro_per_point,
+        opened_at=open_candle.timestamp,
+    )
+
+    # The broker-side stop is the level the close profile owns (level_follower):
+    # it may move up or down, and the broker fills it intra-candle on the low.
+    stop_track: list[dict] = [{"index": open_index, "level": round(plan.stop_level, 5)}]
+    close_index = num_candles - 1
+    close_level = candles[-1].bid_close
+    close_reason = "end_of_day"
+
+    for idx in range(open_index + 1, num_candles):
+        candle = candles[idx]
+        buf.add(candle)
+        current_bid = candle.bid_close
+
+        broker_stop = position.level_follower
+        if candle.bid_low <= broker_stop:
+            close_index = idx
+            close_level = broker_stop
+            close_reason = "follower" if position.stop_updates else "stop"
+            stop_track.append({"index": idx, "level": round(broker_stop, 5)})
+            break
+
+        decision = profile.evaluate(
+            position,
+            current_bid,
+            buf,
+            is_close_hour=candle.timestamp.hour >= config.hour_close,
+        )
+        if decision.action == ACTION_CLOSE:
+            close_index = idx
+            close_level = current_bid
+            close_reason = decision.reason or "close"
+            stop_track.append({"index": idx, "level": round(broker_stop, 5)})
+            break
+        if (
+            decision.action == ACTION_UPDATE_STOP
+            and decision.new_stop_level is not None
+        ):
+            # Apply the profile's stop verbatim (up or down), like live trading.
+            position.level_follower = round(decision.new_stop_level, 5)
+            position.stop_updates += 1
+
+        stop_track.append({"index": idx, "level": round(position.level_follower, 5)})
+
+    euro = round((close_level - position.level_open) * euro_per_point, 2)
+
+    return {
+        "curve_profile": curve_profile,
+        "close_profile": profile.name,
+        "seed": seed,
+        "timestamps": [c.timestamp.strftime("%H:%M") for c in candles],
+        "bids": [round(c.bid_close, 5) for c in candles],
+        # Intra-candle bid range: a long's protective stop is filled on the low,
+        # so the low must be plotted for a stop hit to be visible (the close line
+        # alone can stay above a stop the wick already pierced).
+        "bid_lows": [round(c.bid_low, 5) for c in candles],
+        "bid_highs": [round(c.bid_high, 5) for c in candles],
+        "offers": [round(c.offer_close, 5) for c in candles],
+        "open": {
+            "index": open_index,
+            "time": position.open_time,
+            "level": position.level_open,  # fill price (offer paid)
+            "bid": round(open_candle.bid_close, 5),  # bid at open (on the curve)
+            "initial_stop": round(plan.stop_level, 5),
+        },
+        "level_zero": level_zero,  # break-even on the bid scale
+        "level_margin": level_margin,  # break-even + noise margin
+        "noise_margin": round(noise_margin, 5),
+        "stops": stop_track,
+        "close": {
+            "index": close_index,
+            "time": candles[close_index].timestamp.strftime("%H:%M"),
+            "level": round(close_level, 5),
+            "reason": close_reason,
+        },
+        "stop_updates": position.stop_updates,
+        "euro": euro,
+        "win": euro > 0,
+    }
+
+
+def run_open_visual(
+    settings,
+    *,
+    curve_profile: str = "random",
+    strategy_name: str | None = None,
+    seed: int | None = None,
+    num_candles: int = 600,
+    base_price: float = 8000.0,
+) -> dict:
+    """Replay one synthetic day until the entry strategy first decides to open.
+
+    Counterpart to :func:`run_close_visual` for the *open* side: it walks the
+    chosen :class:`~src.entry.base.EntryStrategy` forward tick by tick over a
+    single synthetic curve (no gates, no exit) and stops at the **first BUY**
+    :class:`~src.entry.base.EntryIntent` — the moment the live bot would open.
+
+    To keep the assessment of *whether the trigger fires correctly* free of
+    hindsight bias, the returned curve is **truncated at the open tick**: the
+    future price action (which would reveal the outcome) is never sent to the
+    front-end. When the strategy never opens over the whole day, the full curve
+    is returned with ``opened`` false so the absence of a signal is itself
+    visible.
+
+    SELL intents are ignored, mirroring the live pipeline (the risk gate opens
+    BUY only) and the aggregate simulator's open path.
+    """
+    from src.backtest.curve_generator import generate_curve
+    from src.entry import get_entry_strategy
+
+    if seed is None:
+        seed = random.randrange(2**31)
+
+    candles = generate_curve(
+        curve_profile,
+        seed=seed,
+        num_candles=num_candles,
+        base_price=base_price,
+        day=_BASE_DAY,
+    )
+
+    entry = get_entry_strategy(strategy_name or settings.entry_strategy_name, settings)
+
+    # Feed candles one at a time and evaluate exactly as the scheduler does:
+    # only once the warmup window is filled, and stop on the first BUY.
+    buf = EpicBuffer(epic="SIM", max_candles=num_candles + 1)
+    open_index: int | None = None
+    score = 0.0
+    for idx, candle in enumerate(candles):
+        buf.add(candle)
+        if len(buf) < entry.warmup:
+            continue
+        intent = entry.evaluate(buf.epic, buf)
+        if intent is not None and intent.direction == "BUY":
+            open_index = idx
+            score = round(intent.score, 4)
+            break
+
+    opened = open_index is not None
+    # Truncate the future once an open is found; otherwise show the whole day so
+    # the absence of any trigger is itself visible.
+    last = (open_index + 1) if opened else num_candles
+
+    return {
+        "curve_profile": curve_profile,
+        "strategy": entry.name,
+        "seed": seed,
+        "opened": opened,
+        "warmup": entry.warmup,
+        "candles_total": num_candles,
+        "timestamps": [c.timestamp.strftime("%H:%M") for c in candles[:last]],
+        "bids": [round(c.bid_close, 5) for c in candles[:last]],
+        "offers": [round(c.offer_close, 5) for c in candles[:last]],
+        "open": (
+            {
+                "index": open_index,
+                "time": candles[open_index].timestamp.strftime("%H:%M"),
+                "bid": round(candles[open_index].bid_close, 5),
+                "offer": round(candles[open_index].offer_close, 5),
+                "score": score,
+                "direction": "BUY",
+            }
+            if opened
+            else None
+        ),
+    }

@@ -44,7 +44,7 @@ class DonchianEntry(EntryStrategy):
     atr_period: int = 14  # only used to confirm there is measurable volatility
     efficiency_period: int = 30  # ER lookback window
     min_efficiency: float = 0.60  # regime gate threshold (0 disables)
-    max_spread_ratio: float = 0.0015
+    max_spread_ratio: float = 0.0010  # tightened: a breakout edge dies on spread
 
     @property
     def warmup(self) -> int:
@@ -52,13 +52,10 @@ class DonchianEntry(EntryStrategy):
 
     @classmethod
     def from_settings(cls, settings) -> DonchianEntry:
-        return cls(
-            channel=settings.strategy_donchian_channel,
-            atr_period=settings.strategy_atr_period,
-            efficiency_period=settings.strategy_efficiency_period,
-            min_efficiency=settings.strategy_min_efficiency,
-            max_spread_ratio=settings.strategy_max_spread_ratio,
-        )
+        # Parameters are constants of this class (the field defaults above), so
+        # the strategy builds from those and ignores ``settings``. Tune by
+        # editing the constants; select the strategy at runtime from the dashboard.
+        return cls()
 
     def evaluate(self, epic: str, buf: EpicBuffer) -> EntryIntent | None:
         candles = list(buf.candles)

@@ -589,3 +589,93 @@ def test_diversified_subset_returns_input_when_it_already_fits() -> None:
     """No selection happens when the market count is at or under the cap."""
     markets = [_market_info("FX0", "CURRENCIES", 0.0001)]
     assert MarketScanner.select_diversified_subset(markets, cap=40) == markets
+
+
+class TestParseMarketCloseUtc:
+    """Defensive parsing of IG instrument.openingHours -> UTC close time."""
+
+    def test_resolves_close_to_utc_with_offset(self):
+        from datetime import time
+
+        from src.markets.market_scanner import parse_market_close_utc
+
+        instrument = {
+            "timeZoneOffset": 1,  # market is UTC+1
+            "openingHours": {
+                "marketTimes": [{"openTime": "08:00", "closeTime": "16:30"}]
+            },
+        }
+        # 16:30 local (UTC+1) -> 15:30 UTC
+        assert parse_market_close_utc(instrument) == time(15, 30)
+
+    def test_picks_latest_close_across_sessions(self):
+        from datetime import time
+
+        from src.markets.market_scanner import parse_market_close_utc
+
+        instrument = {
+            "timeZoneOffset": 0,
+            "openingHours": {
+                "marketTimes": [
+                    {"openTime": "08:00", "closeTime": "12:00"},
+                    {"openTime": "13:00", "closeTime": "17:00"},
+                ]
+            },
+        }
+        assert parse_market_close_utc(instrument) == time(17, 0)
+
+    def test_accepts_plain_list_form(self):
+        from datetime import time
+
+        from src.markets.market_scanner import parse_market_close_utc
+
+        instrument = {
+            "timeZoneOffset": 2,
+            "openingHours": [{"openTime": "09:00", "closeTime": "22:00"}],
+        }
+        # 22:00 local (UTC+2) -> 20:00 UTC
+        assert parse_market_close_utc(instrument) == time(20, 0)
+
+    def test_none_without_offset(self):
+        from src.markets.market_scanner import parse_market_close_utc
+
+        instrument = {
+            "openingHours": {
+                "marketTimes": [{"openTime": "08:00", "closeTime": "16:30"}]
+            }
+        }
+        # No timezone offset -> cannot resolve to UTC -> None (fall back to global)
+        assert parse_market_close_utc(instrument) is None
+
+    def test_none_for_24h_market(self):
+        from src.markets.market_scanner import parse_market_close_utc
+
+        instrument = {
+            "timeZoneOffset": 0,
+            "openingHours": {
+                "marketTimes": [{"openTime": "00:00", "closeTime": "00:00"}]
+            },
+        }
+        # open == close -> 24h market, no meaningful daily close -> None
+        assert parse_market_close_utc(instrument) is None
+
+    def test_none_when_absent_or_malformed(self):
+        from src.markets.market_scanner import parse_market_close_utc
+
+        assert parse_market_close_utc({}) is None
+        assert parse_market_close_utc({"openingHours": None}) is None
+        assert (
+            parse_market_close_utc(
+                {"timeZoneOffset": 1, "openingHours": {"marketTimes": []}}
+            )
+            is None
+        )
+        assert (
+            parse_market_close_utc(
+                {
+                    "timeZoneOffset": 1,
+                    "openingHours": {"marketTimes": [{"openTime": "x"}]},
+                }
+            )
+            is None
+        )

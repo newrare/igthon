@@ -87,11 +87,14 @@ class TestRegistry:
         with pytest.raises(ValueError, match="Unknown close profile"):
             get_close_profile("nope", _settings())
 
-    def test_from_settings_maps_parameters(self):
+    def test_parameters_are_class_constants(self):
+        # from_settings ignores settings — parameters are class constants. The
+        # override below is NOT picked up; the constructor still tunes them.
         prof = get_close_profile(
             "atr_trailing", _settings(strategy_donchian_stop_atr_k=3.0)
         )
-        assert prof.stop_atr_k == 3.0
+        assert prof.stop_atr_k == 2.5  # class constant, not the ignored setting
+        assert AtrTrailingExit(stop_atr_k=3.0).stop_atr_k == 3.0
 
     def test_is_close_profile_instance(self):
         assert isinstance(AtrTrailingExit(), CloseProfile)

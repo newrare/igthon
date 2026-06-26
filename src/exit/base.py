@@ -49,6 +49,11 @@ class OpenPlan:
             past which the stop tightens). Typically the entry offer for a BUY.
         target_level: Absolute fixed take-profit, or ``0.0`` for none (the
             position then exits via the trailing stop / end-of-day only).
+        level_margin: Absolute "margin" level frozen at open — break-even plus
+            the profile's noise margin (``0.0`` when the profile has no such
+            band). Persisted so the band the stop must clear never drifts with
+            later volatility. Used by ``atr_trailing_profit`` to forbid parking
+            the stop between break-even and this level.
         profile: Name of the close profile that produced this plan; persisted on
             the position so the same profile manages it for its whole life.
     """
@@ -56,6 +61,7 @@ class OpenPlan:
     stop_level: float
     level_zero: float
     target_level: float = 0.0
+    level_margin: float = 0.0
     profile: str = "base"
 
 

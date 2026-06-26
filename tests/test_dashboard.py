@@ -6,6 +6,7 @@ which the client swaps in place every two seconds instead of reloading the page.
 """
 
 import asyncio
+import sys
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +14,15 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import src.web.routes.dashboard.router  # noqa: F401  (ensure submodule imported)
 from src.feed.price_buffer import PriceBuffer
 from src.web.app import create_app
 from src.web.routes.dashboard import _build_fragments, _render_dashboard
+
+# The dashboard package re-exports the ``router`` APIRouter, shadowing the
+# submodule attribute, so reach the real module object via sys.modules to patch
+# its globals (e.g. TradingService) in the manual-open tests.
+_ROUTER_MOD = sys.modules["src.web.routes.dashboard.router"]
 
 # ── Fixtures / builders ─────────────────────────────────────────────────────
 
@@ -121,6 +128,15 @@ def _settings() -> SimpleNamespace:
         entry_strategy_name="donchian_er",
         close_profile_name="atr_trailing",
         web_port=8000,
+        # Extra knobs read by TradeConfig.from_settings (manual-open path).
+        strategy_close_margin_minutes=5,
+        strategy_euro_loss=4000.0,
+        strategy_compensate_loose=False,
+        strategy_min_win_rate=0.4,
+        strategy_atr_period=14,
+        strategy_atr_k_pre=2.5,
+        strategy_atr_k_post=1.5,
+        strategy_trailing_step_ratio=0.3,
     )
 
 
@@ -479,7 +495,8 @@ class TestFragmentsEndpoint:
         assert resp.status_code == 503
 
     async def test_strategy_switch_unknown_name_rejected(self, app):
-        app.state.scheduler = SimpleNamespace(set_strategy=lambda name: True)
+        # Rejected on the registry check before the scheduler is ever called.
+        app.state.scheduler = SimpleNamespace()
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post("/api/strategy/not_a_strategy")
@@ -487,9 +504,12 @@ class TestFragmentsEndpoint:
 
     async def test_strategy_switch_valid_calls_scheduler(self, app):
         calls: list[str] = []
-        app.state.scheduler = SimpleNamespace(
-            set_strategy=lambda name: bool(calls.append(name)) or True
-        )
+
+        async def _select(name: str) -> bool:
+            calls.append(name)
+            return True
+
+        app.state.scheduler = SimpleNamespace(select_strategy=_select)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post("/api/strategy/donchian_er")
@@ -653,4 +673,133 @@ class TestPositionFundsEndpoint:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/api/positions/funds/UNKNOWN.EPIC")
+        assert resp.status_code == 400
+
+
+# ── POST /api/positions/open/{epic} (manual force-open) ──────────────────────
+
+
+class _NoopSession:
+    """Async-context-manager session stub: only ``commit`` is exercised."""
+
+    async def __aenter__(self) -> "_NoopSession":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def commit(self) -> None:
+        return None
+
+
+def _manual_app() -> object:
+    """App wired for the manual-open path: queue, session, scheduler, one candle."""
+    epic = "IX.D.DAX.IFMM.IP"
+    buffer = PriceBuffer()
+    buffer.add_candle(epic, _candle(1000.0))
+    app = create_app(settings=_settings(), buffer=buffer, api_queue=_FakeQueue({}))
+    app.state.session_factory = lambda: _NoopSession()
+    # The active close profile is opaque here — the route only forwards it.
+    app.state.scheduler = SimpleNamespace(close_profile=object())
+    return app, epic
+
+
+class TestManualOpenEndpoint:
+    async def test_no_scheduler_returns_503(self):
+        # Minimal app: no scheduler / session_factory injected.
+        app = create_app(settings=_settings(), buffer=PriceBuffer())
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/positions/open/IX.D.DAX.IFMM.IP")
+        assert resp.status_code == 503
+
+    async def test_no_price_data_returns_400(self):
+        app, _epic = _manual_app()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/positions/open/UNKNOWN.EPIC")
+        assert resp.status_code == 400
+
+    async def test_portfolio_gate_refusal_returns_400(self, monkeypatch):
+        app, epic = _manual_app()
+
+        class _GatedTrading:
+            def __init__(self, *a, **k) -> None:
+                pass
+
+            async def can_open_intent(self, intent):
+                return False, "Max positions reached"
+
+            async def open_from_intent(self, intent, buf):  # pragma: no cover
+                raise AssertionError("must not open when the gate refuses")
+
+        monkeypatch.setattr(
+            _ROUTER_MOD, "TradingService", _GatedTrading
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/positions/open/{epic}")
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "Max positions reached"
+
+    async def test_happy_path_forces_buy_through_close_profile(self, monkeypatch):
+        app, epic = _manual_app()
+        seen = {}
+        position = SimpleNamespace(
+            level_open=1000.0, quantity=1, deal_id="DEAL1", reason_open="auto"
+        )
+
+        class _OkTrading:
+            def __init__(self, client, session, config, close_profile=None) -> None:
+                seen["close_profile"] = close_profile
+
+            async def can_open_intent(self, intent):
+                seen["direction"] = intent.direction
+                seen["epic"] = intent.epic
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return position
+
+        monkeypatch.setattr(
+            _ROUTER_MOD, "TradingService", _OkTrading
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/positions/open/{epic}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data == {
+            "status": "opened",
+            "deal_id": "DEAL1",
+            "level": 1000.0,
+            "quantity": 1,
+        }
+        # Forced BUY on the requested epic, driven by the scheduler's close profile.
+        assert seen["direction"] == "BUY"
+        assert seen["epic"] == epic
+        assert seen["close_profile"] is app.state.scheduler.close_profile
+        # The manual origin is tagged on the persisted position.
+        assert position.reason_open == "manual"
+
+    async def test_open_rejected_returns_400(self, monkeypatch):
+        app, epic = _manual_app()
+
+        class _RejectTrading:
+            def __init__(self, *a, **k) -> None:
+                pass
+
+            async def can_open_intent(self, intent):
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return None  # market closed / risk cap / IG rejection
+
+        monkeypatch.setattr(
+            _ROUTER_MOD, "TradingService", _RejectTrading
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/positions/open/{epic}")
         assert resp.status_code == 400

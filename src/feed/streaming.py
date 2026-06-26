@@ -248,6 +248,28 @@ class IGStreamingClient:
             "Streaming: now subscribed to %d epics", len(self._subscribed_epics)
         )
 
+    async def resubscribe(self, epic: str) -> bool:
+        """Force a fresh subscription for ``epic`` (drop the old one, re-add).
+
+        Used by the open-position feed watchdog to recover a Lightstreamer
+        subscription that silently stalled (no candle updates) without a global
+        disconnect — :meth:`set_epics` alone cannot, as it skips epics already in
+        ``_subscribed_epics``. No-op (returns ``False``) when offline; the next
+        reconnect re-subscribes everything anyway.
+        """
+        if self._ls is None or not self._connected:
+            return False
+        sub = self._subscriptions.pop(epic, None)
+        if sub is not None:
+            try:
+                self._ls.unsubscribe(sub)
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("Streaming: error unsubscribing %s", epic, exc_info=True)
+        self._subscribed_epics.discard(epic)
+        self._subscribe_epic(epic)
+        logger.warning("Streaming: force-resubscribed stalled epic %s", epic)
+        return True
+
     # ------------------------------------------------------------------ internals
 
     async def _connect(self) -> None:

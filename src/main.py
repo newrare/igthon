@@ -20,7 +20,7 @@ from src.core.api_guard import APIGuard
 from src.core.api_queue import APIQueue
 from src.core.config import get_settings
 from src.core.indicators import compute_signal
-from src.core.recorder import LogBuffer, Recorder, setup_logging
+from src.core.recorder import DEFAULT_LOG_FILE, LogBuffer, Recorder, setup_logging
 from src.core.scheduler import BotScheduler
 from src.feed.candle_store import CandleStore
 from src.feed.market_data import MarketDataService
@@ -180,6 +180,12 @@ async def _run_connected(
 
     # Start scheduler (all jobs start in manual mode by default).
     scheduler.start()
+
+    # Restore the dashboard-chosen entry strategy / close profile so the bot
+    # resumes with the user's last selection (the .env names are only the
+    # initial fallback). Done before jobs are resumed below so the first
+    # analysis tick already uses the right strategy.
+    await scheduler.load_selection_preferences()
 
     # Restore the last-saved auto/manual mode for each job so the bot
     # resumes exactly as the user left it before the server was stopped.
@@ -354,9 +360,24 @@ def main() -> None:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--log-file",
+        default=str(DEFAULT_LOG_FILE),
+        help="Rotating log file path (empty string disables the file sink)",
+    )
+    parser.add_argument(
+        "--log-file-level",
+        default="DEBUG",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Minimum level written to the rotating log file",
+    )
     args = parser.parse_args()
 
-    log_buffer = setup_logging(args.log_level)
+    log_buffer = setup_logging(
+        args.log_level,
+        log_file=args.log_file or None,
+        file_level=args.log_file_level,
+    )
 
     if args.analyze_only:
         asyncio.run(analyze_once(args.epics))

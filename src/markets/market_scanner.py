@@ -23,6 +23,7 @@ IG API endpoints used:
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import time
 from urllib.parse import quote
 
 from src.core.api.client import IGAPIError, IGClient
@@ -65,6 +66,78 @@ class MarketInfo:
     # Estimated EUR loss if that minimum-size BUY is stopped out at IG's minimum
     # stop distance, or None when the contract/price/stop-rule data is missing.
     stop_loss_eur: float | None = None
+    # Today's market close, in UTC, parsed from IG's ``instrument.openingHours``
+    # when it is present AND the timezone offset is known (so it can be resolved
+    # to UTC with confidence). None otherwise — callers then fall back to the
+    # global ``hour_close``. Drives the per-epic "close before the market closes"
+    # rule; never guessed (an unknown/ambiguous schedule stays None).
+    market_close_utc: time | None = None
+
+
+def _parse_hhmm(value: object) -> int | None:
+    """Parse an IG ``HH:MM`` (or ``HH:MM:SS``) clock string to minutes-of-day."""
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def parse_market_close_utc(instrument: dict) -> time | None:
+    """Today's market close as a UTC ``time`` from IG ``instrument.openingHours``.
+
+    Defensive by design: returns None whenever the schedule is absent, malformed,
+    a 24h market (open == close), or the timezone offset is unknown — i.e. unless
+    a real daily close can be resolved to UTC with confidence. The caller falls
+    back to the global ``hour_close`` on None, so a wrong/ambiguous schedule can
+    never cause a mistimed close.
+
+    IG returns ``openingHours`` as ``{"marketTimes": [{"openTime": "08:00",
+    "closeTime": "16:30"}, ...]}`` (or, in some payloads, the list directly), with
+    ``instrument.timeZoneOffset`` giving the market's offset from UTC in hours.
+    The latest close across sessions is used.
+    """
+    hours = instrument.get("openingHours")
+    if isinstance(hours, dict):
+        times = hours.get("marketTimes")
+    elif isinstance(hours, list):
+        times = hours
+    else:
+        times = None
+    if not times:
+        return None
+
+    offset = instrument.get("timeZoneOffset")
+    if offset is None:
+        return None  # cannot convert local -> UTC safely
+    try:
+        offset_minutes = round(float(offset) * 60)
+    except (TypeError, ValueError):
+        return None
+
+    closes: list[int] = []
+    for entry in times:
+        if not isinstance(entry, dict):
+            continue
+        open_m = _parse_hhmm(entry.get("openTime"))
+        close_m = _parse_hhmm(entry.get("closeTime"))
+        if close_m is None:
+            continue
+        if open_m is not None and open_m == close_m:
+            continue  # 24h market (e.g. forex) — no meaningful daily close
+        closes.append(close_m)
+    if not closes:
+        return None
+
+    utc_minutes = (max(closes) - offset_minutes) % (24 * 60)
+    return time(hour=utc_minutes // 60, minute=utc_minutes % 60)
 
 
 @dataclass
@@ -732,6 +805,7 @@ class MarketScanner:
                 instrument_type=str(instrument.get("type") or ""),
                 funds_needed=funds_needed_for_one_buy(detail),
                 stop_loss_eur=stop_loss_eur_for_one_buy(detail),
+                market_close_utc=parse_market_close_utc(instrument),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("MarketScanner: failed to parse market detail: %s", exc)

@@ -1,0 +1,9 @@
+- [IG transaction P&L quirks](ig-transaction-pnl-quirks.md) — authoritative P&L source + position-matching traps (reference unusable, "converted at" suffix)
+- [Queue vs internal calls](queue-vs-internal-calls.md) — external IG calls via APIQueue; the 2s dashboard poll must never await the queue (cache + background refresh)
+- [IG stop units: points vs price](ig-stop-units-points-vs-price.md) — stopDistance is in points (1/scalingFactor); never subtract a point-distance from a price; prefer absolute stopLevel
+- [Trailing stop: no break-even pin](trailing-stop-no-breakeven-pin.md) — the max(new_stop, level_zero) pin strangled every trade to 0€; removed along with the break-even lock; forex 0.00€ is a €/point display artifact
+- [IG position reconciliation gap](ig-position-reconciliation-gap.md) — "in use" with no open position = orphan IG positions; sync must be two-way + dealId-keyed; record open before /confirms
+- [User does own commits](user-does-own-commits.md) — don't run git commit; leave changes in the working tree for the user
+- [Chart marker semantics](chart-marker-semantics.md) — long chart: entry diamond on the bid (level_zero−spread), break-even = level_zero (bid+spread above), exit on bid; times from broker
+- [Broker exec times from transactions](broker-exec-times-from-transactions.md) — /history/transactions gives real open/close levels + UTC times; capture into time_*_broker; keep level_close consistent with euro
+- [Trading-hours rework: status+candles open, per-epic close](trading-hours-rework.md) — opening dropped global UTC window for live marketStatus+warmup; closing uses per-epic IG openingHours with fallback+safety net

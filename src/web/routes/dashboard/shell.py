@@ -1,6 +1,7 @@
 """Full-page dashboard shell (skeleton embedding the dynamic fragments)."""
 
 from src.entry import ENTRY_STRATEGIES
+from src.exit import CLOSE_PROFILES
 from src.web.routes.dashboard.components import (
     render_button,
     render_confirm_modal,
@@ -22,9 +23,45 @@ _STRATEGY_LABELS: dict[str, str] = {
 }
 
 
+#: Human-readable labels for the registered close-profile names.
+_CLOSE_PROFILE_LABELS: dict[str, str] = {
+    "atr_trailing": "ATR Trailing Stop",
+    "atr_trailing_positive": "ATR Trailing (Positive)",
+    "atr_trailing_profit": "ATR Trailing (Profit-gated)",
+}
+
+
 def _strategy_label(name: str) -> str:
     """Return a display label for the active strategy name."""
     return _STRATEGY_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _close_profile_label(name: str) -> str:
+    """Return a display label for the active close-profile name."""
+    return _CLOSE_PROFILE_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _render_close_profile_select(current: str) -> str:
+    """Build the title-bar dropdown that switches the active close profile.
+
+    Mirrors :func:`_render_strategy_select`: an ``onchange`` posts to the backend,
+    which swaps the live close profile without a restart (the entry strategy is
+    chosen independently). The current name is preselected; every registered close
+    profile is offered. Positions already open keep the profile persisted on them
+    — only positions opened after the switch use the new exit.
+    """
+    options = "".join(
+        f'<option value="{name}"{" selected" if name == current else ""}>'
+        f"{_close_profile_label(name)}</option>"
+        for name in sorted(CLOSE_PROFILES)
+    )
+    return (
+        '<span class="dashboard-title-exit">'
+        '<i data-lucide="shield" class="lc-icon"></i>'
+        '<select class="strategy-select" title="Active close profile (exit)" '
+        f'onchange="switchCloseProfile(this.value, this)">{options}</select>'
+        "</span>"
+    )
 
 
 def _render_strategy_select(current: str) -> str:
@@ -214,12 +251,14 @@ def _render_dashboard(settings, state: dict) -> str:
 
     {_render_connection_banner(state)}
 
-    <!-- Main title — active trading strategy -->
+    <!-- Main title — active entry strategy (open) + close profile (exit) -->
     <div class="dashboard-title">
         <i data-lucide="bot" class="lc-icon"></i>
         <h1>IG Trading Bot</h1>
         <span class="dashboard-title-sep">·</span>
         {_render_strategy_select(settings.entry_strategy_name)}
+        <i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>
+        {_render_close_profile_select(settings.close_profile_name)}
     </div>
 
     <!-- KPI Bar -->
@@ -360,6 +399,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=3"></script>
+<script src="/static/dashboard.js?v=10"></script>
 </body>
 </html>"""

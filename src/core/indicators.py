@@ -44,6 +44,7 @@ class TradingLevels:
     level_loose: float
     level_security: float
     stop_distance: float
+    level_margin: float = 0.0
 
 
 @dataclass(slots=True)

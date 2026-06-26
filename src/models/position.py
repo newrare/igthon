@@ -56,6 +56,10 @@ class Position(Base):
     level_security: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     level_close: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     level_stop: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    # Margin level frozen at open (break-even + noise margin). The trailing stop
+    # is never parked between break-even and this level. See migration
+    # b3c4d5e6f7a8.
+    level_margin: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     pip_spread: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     reason_open: Mapped[str | None] = mapped_column(String(30))
     reason_close: Mapped[str | None] = mapped_column(String(30))

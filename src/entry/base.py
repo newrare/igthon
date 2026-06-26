@@ -48,6 +48,29 @@ class EntryStrategy(ABC):
     #: Registry key and ``ENTRY_STRATEGY_NAME`` value (kebab/snake, stable).
     name: str = "base"
 
+    #: How the orchestration layer drives this strategy. The default per-epic
+    #: entries are evaluated by the 30-second analysis loop, which opens on every
+    #: BUY intent. A ``cross_epic_selection`` entry is a *ranker* instead:
+    #: :meth:`evaluate` always returns a comparable ``score`` for ranking, the
+    #: per-epic auto-open loop leaves it alone, and the scheduler scores all
+    #: tradable epics, ranks them and opens the best one(s) to maintain a target
+    #: number of open positions. See
+    #: :class:`~src.entry.projection_ranking.ProjectionRankingEntry`.
+    cross_epic_selection: bool = False
+
+    #: Rolling cross-epic selection knobs — consulted by the scheduler only when
+    #: ``cross_epic_selection`` is True. These defaults define the contract; a
+    #: ranker sets its own values as constants in its own class. They are
+    #: deliberately *not* loaded from settings/``.env``: strategy parameters live
+    #: as constants in the strategy class, and the strategy is chosen at runtime
+    #: from the dashboard.
+    concurrent_positions: int = 1  # target number of open positions to hold
+    # Legacy warm-up delay: no longer enforced live (the per-epic ``warmup``
+    # candle count is the warm-up, and live opens are gated by ``marketStatus``
+    # rather than a wall clock). Kept for reference / the simulator's own gating.
+    open_after_minutes: int = 60
+    wallet_reserve: float = 0.10  # fraction of available funds kept free
+
     @property
     @abstractmethod
     def warmup(self) -> int:
@@ -56,7 +79,13 @@ class EntryStrategy(ABC):
     @classmethod
     @abstractmethod
     def from_settings(cls, settings) -> EntryStrategy:
-        """Build the strategy from application :class:`~src.core.config.Settings`."""
+        """Build the strategy.
+
+        Parameters are constants in each strategy class, so most strategies build
+        from their own defaults and ignore ``settings``; the argument is kept for
+        the few entries that still read shared infra knobs and for interface
+        stability with the registry.
+        """
 
     @abstractmethod
     def evaluate(self, epic: str, buf: EpicBuffer) -> EntryIntent | None:

@@ -17,11 +17,15 @@ Adding a close profile:
 from __future__ import annotations
 
 from src.exit.atr_trailing import AtrTrailingExit
+from src.exit.atr_trailing_positive import AtrTrailingPositiveExit
+from src.exit.atr_trailing_profit import AtrTrailingProfitExit
 from src.exit.base import CloseDecision, CloseProfile, OpenPlan
 
 #: Name → class map. Keys are the valid ``CLOSE_PROFILE_NAME`` values.
 CLOSE_PROFILES: dict[str, type[CloseProfile]] = {
     AtrTrailingExit.name: AtrTrailingExit,
+    AtrTrailingPositiveExit.name: AtrTrailingPositiveExit,
+    AtrTrailingProfitExit.name: AtrTrailingProfitExit,
 }
 
 
@@ -42,6 +46,8 @@ def get_close_profile(name: str, settings) -> CloseProfile:
 __all__ = [
     "CLOSE_PROFILES",
     "AtrTrailingExit",
+    "AtrTrailingPositiveExit",
+    "AtrTrailingProfitExit",
     "CloseDecision",
     "CloseProfile",
     "OpenPlan",

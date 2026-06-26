@@ -21,8 +21,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from src.backtest.curve_generator import PROFILES, generate_curve
-from src.backtest.simulator import SimulationConfig, run_simulation
+from src.backtest.simulator import (
+    SimulationConfig,
+    run_close_visual,
+    run_open_visual,
+    run_simulation,
+)
 from src.entry import ENTRY_STRATEGIES
+from src.exit import CLOSE_PROFILES
 
 router = APIRouter()
 
@@ -82,6 +88,82 @@ async def api_simulator_curve(
             "offer_closes": [c.offer_close for c in series],
         }
     )
+
+
+@router.get("/api/simulator/close-profile")
+async def api_simulator_close_profile(
+    request: Request,
+    curve_profile: str = Query("random"),
+    close_profile: str | None = Query(None),
+    seed: int | None = Query(None, ge=0, lt=_MAX_SEED),
+    candles: int = Query(600, ge=100, le=2000),
+    base_price: float = Query(8000.0, gt=0),
+    euro_per_point: float = Query(1.0, gt=0, le=1000),
+    open_index: int | None = Query(None, ge=0),
+) -> JSONResponse:
+    """JSON API: one open→close cycle so the close profile can be eyeballed.
+
+    Opens a single BUY at a random (or pinned) moment on a synthetic curve and
+    walks the chosen close profile forward tick by tick, returning the price
+    curve, the entry, the trailing-stop track and the exit.
+    """
+    if curve_profile not in PROFILES:
+        return JSONResponse(
+            {"error": f"Unknown profile: {curve_profile}"}, status_code=400
+        )
+    if close_profile is not None and close_profile not in CLOSE_PROFILES:
+        return JSONResponse(
+            {"error": f"Unknown close profile: {close_profile}"}, status_code=400
+        )
+    settings = request.app.state.settings
+    result = await asyncio.to_thread(
+        run_close_visual,
+        settings,
+        curve_profile=curve_profile,
+        close_profile_name=close_profile,
+        seed=seed,
+        num_candles=candles,
+        base_price=base_price,
+        euro_per_point=euro_per_point,
+        open_index=open_index,
+    )
+    return JSONResponse(result)
+
+
+@router.get("/api/simulator/open-strategy")
+async def api_simulator_open_strategy(
+    request: Request,
+    curve_profile: str = Query("random"),
+    strategy: str | None = Query(None),
+    seed: int | None = Query(None, ge=0, lt=_MAX_SEED),
+    candles: int = Query(600, ge=100, le=2000),
+    base_price: float = Query(8000.0, gt=0),
+) -> JSONResponse:
+    """JSON API: walk the entry strategy until its first BUY so the open can be
+    eyeballed.
+
+    Replays the chosen entry strategy tick by tick on a synthetic curve and
+    stops at the first BUY signal. The returned curve is truncated at the open
+    tick — the future is withheld so judging *whether the trigger fires
+    correctly* stays free of hindsight bias.
+    """
+    if curve_profile not in PROFILES:
+        return JSONResponse(
+            {"error": f"Unknown profile: {curve_profile}"}, status_code=400
+        )
+    if strategy is not None and strategy not in ENTRY_STRATEGIES:
+        return JSONResponse({"error": f"Unknown strategy: {strategy}"}, status_code=400)
+    settings = request.app.state.settings
+    result = await asyncio.to_thread(
+        run_open_visual,
+        settings,
+        curve_profile=curve_profile,
+        strategy_name=strategy,
+        seed=seed,
+        num_candles=candles,
+        base_price=base_price,
+    )
+    return JSONResponse(result)
 
 
 @router.post("/api/simulator/run")
@@ -183,6 +265,13 @@ async def simulator_page(request: Request) -> HTMLResponse:
         f"{name}{' (live)' if name == live_strategy else ''}</option>"
         for name in sorted(ENTRY_STRATEGIES)
     )
+    # Close-profile dropdown defaults to the live CLOSE_PROFILE_NAME.
+    live_close = request.app.state.settings.close_profile_name
+    close_options = "".join(
+        f'<option value="{name}"{" selected" if name == live_close else ""}>'
+        f"{name}{' (live)' if name == live_close else ''}</option>"
+        for name in sorted(CLOSE_PROFILES)
+    )
     curve_candles = _stepper(
         "Candles", "curve-candles", value="600", minimum="50", maximum="2000", step="50"
     )
@@ -201,6 +290,9 @@ async def simulator_page(request: Request) -> HTMLResponse:
         "Epics / day", "sim-epics", value="3", minimum="1", maximum="10", step="1"
     )
     sim_epp = _stepper("&euro; / point", "sim-epp", value="1", minimum="0.01", step="1")
+    op_base = _stepper("Base price", "op-base", value="8000", minimum="1", step="100")
+    cp_base = _stepper("Base price", "cp-base", value="8000", minimum="1", step="100")
+    cp_epp = _stepper("&euro; / point", "cp-epp", value="1", minimum="0.01", step="1")
     return HTMLResponse(f"""<!DOCTYPE html>
 <html>
 <head>
@@ -241,6 +333,67 @@ async def simulator_page(request: Request) -> HTMLResponse:
             </div>
             <div id="curve-meta" class="sim-meta"></div>
             <div id="curve-chart" style="min-height:360px;"></div>
+        </div>
+    </div>
+
+    <!-- Entry-strategy visual simulation -->
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title"><i data-lucide="target" class="lc-icon"></i> Entry Strategy — Open Trigger Test</span>
+        </div>
+        <div class="section-body">
+            <p class="sim-hint">Walks the chosen entry strategy forward tick by
+            tick on a synthetic curve and stops at the <strong>first BUY
+            signal</strong> — the moment the bot would open. To keep your read on
+            <em>whether the trigger fires at the right spot</em> honest, the curve
+            is cut at the open: the future is hidden, so the outcome can't bias
+            your judgement.</p>
+            <div class="sim-controls">
+                <label>Strategy
+                    <select id="op-strategy">{strategy_options}</select>
+                </label>
+                <label>Curve profile
+                    <select id="op-profile">{profile_options}</select>
+                </label>
+                <label>Seed <input type="number" id="op-seed" min="0" placeholder="random"></label>
+                {op_base}
+                <button class="nav-btn" id="op-run-btn" onclick="runOpenStrategy()">
+                    <i data-lucide="dice-5" class="lc-icon"></i> New curve
+                </button>
+            </div>
+            <div id="op-meta" class="sim-meta"></div>
+            <div class="kpi-bar" id="op-kpis"></div>
+            <div id="op-chart" style="min-height:420px;"></div>
+        </div>
+    </div>
+
+    <!-- Close-profile visual simulation -->
+    <div class="section">
+        <div class="section-header">
+            <span class="section-title"><i data-lucide="shield" class="lc-icon"></i> Close Profile — Visual Test</span>
+        </div>
+        <div class="section-body">
+            <p class="sim-hint">Opens one BUY at a random moment on a synthetic
+            curve and walks the chosen close profile forward tick by tick. Watch
+            the protective stop (orange) trail the price with a safety gap and
+            ratchet up as the curve climbs — and where it finally closes.</p>
+            <div class="sim-controls">
+                <label>Curve profile
+                    <select id="cp-profile">{profile_options}</select>
+                </label>
+                <label>Close profile
+                    <select id="cp-close">{close_options}</select>
+                </label>
+                <label>Seed <input type="number" id="cp-seed" min="0" placeholder="random"></label>
+                {cp_base}
+                {cp_epp}
+                <button class="nav-btn" id="cp-run-btn" onclick="runCloseProfile()">
+                    <i data-lucide="dice-5" class="lc-icon"></i> New trade
+                </button>
+            </div>
+            <div id="cp-meta" class="sim-meta"></div>
+            <div class="kpi-bar" id="cp-kpis"></div>
+            <div id="cp-chart" style="min-height:420px;"></div>
         </div>
     </div>
 
@@ -510,8 +663,169 @@ async function runSimulation() {{
     lucide.createIcons();
 }}
 
+// Entry-strategy open trigger test: walk forward to the first BUY, then cut the
+// curve at the open so the post-open price action stays hidden.
+async function runOpenStrategy() {{
+    const btn = document.getElementById("op-run-btn");
+    const meta = document.getElementById("op-meta");
+    const strategy = document.getElementById("op-strategy").value;
+    const profile = document.getElementById("op-profile").value;
+    const seed = document.getElementById("op-seed").value;
+    const base = document.getElementById("op-base").value;
+
+    const params = new URLSearchParams({{
+        curve_profile: profile, strategy, base_price: base,
+    }});
+    if (seed !== "") params.set("seed", seed);
+
+    btn.disabled = true;
+    meta.innerHTML = '<span class="spinner"></span> Looking for an open…';
+
+    let data;
+    try {{
+        const resp = await fetch(`/api/simulator/open-strategy?${{params}}`);
+        data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || "request failed");
+    }} catch (err) {{
+        meta.textContent = `Failed: ${{err.message}}`;
+        btn.disabled = false;
+        return;
+    }}
+    btn.disabled = false;
+
+    const ts = data.timestamps;
+    const traces = [
+        {{x: ts, y: data.bids, name: "Bid", mode: "lines",
+          line: {{color: "#60a5fa", width: 1.6}}}},
+        {{x: ts, y: data.offers, name: "Offer", mode: "lines",
+          line: {{color: "#475569", width: 1, dash: "dot"}}}},
+    ];
+
+    if (data.opened) {{
+        const o = data.open;
+        meta.innerHTML =
+            `strategy=<strong>${{data.strategy}}</strong> · curve=${{data.curve_profile}} · ` +
+            `seed=<strong>${{data.seed}}</strong> · ` +
+            `<span style="color:#4ade80;">BUY</span> at ${{o.time}} ` +
+            `(candle ${{o.index + 1}}/${{data.candles_total}}) @ bid ${{o.bid}} · ` +
+            `future hidden`;
+        document.getElementById("op-kpis").innerHTML =
+            kpi("Signal", "BUY", "#4ade80") +
+            kpi("Open time", o.time, "#e2e8f0") +
+            kpi("Open bid", o.bid, "#60a5fa") +
+            kpi("Score", o.score, "#a78bfa") +
+            kpi("Candle", (o.index + 1) + " / " + data.candles_total, "#94a3b8");
+        // Mark the open with a triangle on the bid at the truncation point.
+        traces.push({{x: [ts[o.index]], y: [o.bid], name: "Open (BUY)",
+            mode: "markers",
+            marker: {{color: "#4ade80", size: 14, symbol: "triangle-up"}}}});
+    }} else {{
+        meta.innerHTML =
+            `strategy=<strong>${{data.strategy}}</strong> · curve=${{data.curve_profile}} · ` +
+            `seed=<strong>${{data.seed}}</strong> · ` +
+            `<span style="color:#fbbf24;">no open triggered</span> over ` +
+            `${{data.candles_total}} candles`;
+        document.getElementById("op-kpis").innerHTML =
+            kpi("Signal", "none", "#fbbf24") +
+            kpi("Candles", data.candles_total, "#94a3b8") +
+            kpi("Warmup", data.warmup, "#94a3b8");
+    }}
+
+    Plotly.newPlot("op-chart", traces, {{...PLOTLY_LAYOUT, height: 420,
+        xaxis: {{title: "Time", nticks: 12}}, yaxis: {{title: "Price"}},
+        legend: {{orientation: "h", y: 1.08}}}},
+        {{displayModeBar: false, responsive: true}});
+}}
+
+// Close-profile visual test: one open→close cycle, stop trailing the curve.
+async function runCloseProfile() {{
+    const btn = document.getElementById("cp-run-btn");
+    const meta = document.getElementById("cp-meta");
+    const profile = document.getElementById("cp-profile").value;
+    const close = document.getElementById("cp-close").value;
+    const seed = document.getElementById("cp-seed").value;
+    const base = document.getElementById("cp-base").value;
+    const epp = document.getElementById("cp-epp").value;
+
+    const params = new URLSearchParams({{
+        curve_profile: profile, close_profile: close,
+        base_price: base, euro_per_point: epp,
+    }});
+    if (seed !== "") params.set("seed", seed);
+
+    btn.disabled = true;
+    meta.innerHTML = '<span class="spinner"></span> Simulating one trade…';
+
+    let data;
+    try {{
+        const resp = await fetch(`/api/simulator/close-profile?${{params}}`);
+        data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || "request failed");
+    }} catch (err) {{
+        meta.textContent = `Failed: ${{err.message}}`;
+        btn.disabled = false;
+        return;
+    }}
+    btn.disabled = false;
+
+    // Map the stop track (sparse indices) onto x = timestamps for plotting.
+    const ts = data.timestamps;
+    const stopX = data.stops.map(s => ts[s.index]);
+    const stopY = data.stops.map(s => s.level);
+
+    const reasonColor = data.win ? "#4ade80" : "#f87171";
+    meta.innerHTML =
+        `curve=${{data.curve_profile}} · profile=<strong>${{data.close_profile}}</strong> · ` +
+        `seed=<strong>${{data.seed}}</strong> · ` +
+        `open ${{data.open.time}} @ ${{data.open.level}} → ` +
+        `close ${{data.close.time}} @ ${{data.close.level}} ` +
+        `(<span style="color:${{reasonColor}};">${{data.close.reason}}</span>) · ` +
+        `${{data.stop_updates}} stop moves`;
+
+    document.getElementById("cp-kpis").innerHTML =
+        kpi("Result", eur(data.euro, true), reasonColor) +
+        kpi("Close reason", data.close.reason, "#e2e8f0") +
+        kpi("Stop moves", data.stop_updates, "#60a5fa") +
+        kpi("Level zero", data.level_zero, "#a78bfa") +
+        kpi("Level margin", data.level_margin, "#22d3ee") +
+        kpi("Close", data.close.time + " @ " + data.close.level, "#94a3b8");
+
+    // Horizontal reference spanning open → end of curve, drawn at a constant y.
+    const span = [ts[data.open.index], ts[ts.length - 1]];
+    const hline = (y, name, color) => ({{
+        x: span, y: [y, y], name, mode: "lines",
+        line: {{color, width: 1.2, dash: "dash"}},
+    }});
+
+    Plotly.newPlot("cp-chart", [
+        // Intra-candle bid range (low–high) as a faint band behind the lines, so
+        // a stop filled on a wick is visible even when the close stays above it.
+        {{x: ts, y: data.bid_highs, mode: "lines", line: {{width: 0}},
+          hoverinfo: "skip", showlegend: false}},
+        {{x: ts, y: data.bid_lows, name: "Bid range (low–high)", mode: "lines",
+          line: {{width: 0}}, fill: "tonexty",
+          fillcolor: "rgba(96,165,250,0.18)", hoverinfo: "skip"}},
+        {{x: ts, y: data.bids, name: "Bid", mode: "lines",
+          line: {{color: "#60a5fa", width: 1.6}}}},
+        {{x: stopX, y: stopY, name: "Protective stop", mode: "lines",
+          line: {{color: "#fb923c", width: 1.8, shape: "hv"}}}},
+        // Break-even (offer paid) and the margin above it (positive beyond noise).
+        hline(data.level_zero, "Level zero (break-even)", "#a78bfa"),
+        hline(data.level_margin, "Level margin (zero + noise)", "#22d3ee"),
+        {{x: [ts[data.open.index]], y: [data.open.bid], name: "Open",
+          mode: "markers", marker: {{color: "#4ade80", size: 12, symbol: "triangle-up"}}}},
+        {{x: [ts[data.close.index]], y: [data.close.level], name: "Close",
+          mode: "markers", marker: {{color: "#f87171", size: 12, symbol: "x"}}}},
+    ], {{...PLOTLY_LAYOUT, height: 420,
+        xaxis: {{title: "Time", nticks: 12}}, yaxis: {{title: "Price"}},
+        legend: {{orientation: "h", y: 1.08}}}},
+        {{displayModeBar: false, responsive: true}});
+}}
+
 lucide.createIcons();
 generateCurve();
+runOpenStrategy();
+runCloseProfile();
 </script>
 </body>
 </html>""")

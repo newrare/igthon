@@ -20,24 +20,25 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.core.api.client import IGAPIError, IGClient
-from src.core.api_queue import APIQueue
+from src.core.api_queue import APIQueue, Priority
 from src.core.config import Settings
 from src.core.recorder import Recorder
-from src.entry import ENTRY_STRATEGIES, EntryStrategy, get_entry_strategy
+from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
 from src.execution.trading import (
     TradeConfig,
     TradingService,
 )
-from src.exit import CloseProfile, get_close_profile
+from src.exit import CLOSE_PROFILES, CloseProfile, get_close_profile
 from src.feed.candle_store import CandleStore
 from src.feed.market_data import MarketDataService
-from src.feed.price_buffer import DEFAULT_MAX_CANDLES, PriceBuffer
+from src.feed.price_buffer import DEFAULT_MAX_CANDLES, EpicBuffer, PriceBuffer
 from src.markets.market_scanner import MarketInfo, MarketScanner
 from src.models.day import Day, DayState
 from src.models.epic import Epic
 from src.models.job_preference import JobPreference
 from src.models.position import Position, PositionState
 from src.models.resume import Resume
+from src.models.selection_preference import SelectionPreference
 
 if TYPE_CHECKING:
     from src.feed.streaming import IGStreamingClient
@@ -88,10 +89,12 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
     {
         "action": "trend_select",
         "job_id": "trend_select",
-        "name": "Trend Select (hourly)",
+        "name": "Trend Select (backstop)",
         "description": (
-            "Hourly cross-epic selection — currently inactive (the reference "
-            "entry opens per-epic). Reserved for a future cross-epic entry."
+            "Backstop for the rolling cross-epic selection (also runs every "
+            "analysis tick): re-ranks tradable epics and tops the portfolio up "
+            "to its target open-position count. Active only with a cross-epic "
+            "ranker entry (e.g. projection_ranking); a no-op for per-epic entries."
         ),
         "schedule": "Hourly · 09–16 · Mon–Fri",
         "danger": "safe",
@@ -217,6 +220,11 @@ class BotScheduler:
         # resolves them.
         self._strategy: EntryStrategy | None = None
         self._close_profile_obj: CloseProfile | None = None
+        # Serialises the rolling cross-epic selection: it is invoked both by the
+        # 30-second analysis loop and the hourly backstop job, which could
+        # otherwise both see "0 open" and double-open. The lock + an in-band
+        # open-count re-check keep the target position count exact.
+        self._select_lock = asyncio.Lock()
 
         # Epic lists — start with the provided seed list
         self._all_epics: list[str] = list(epics)
@@ -870,10 +878,11 @@ class BotScheduler:
 
         Reuses the existing ``Epic.description`` (instrument name) and
         ``Epic.deposit`` (margin in EUR to open one minimum-size BUY) columns,
-        plus ``Epic.stop_loss`` (EUR loss if that BUY is stopped out), so the
-        Epic List modal can show real data. Only updates rows that already exist
-        (created by ``_persist_epic_list``); a missing figure is stored as NULL
-        so the UI renders it as unknown.
+        plus ``Epic.stop_loss`` (EUR loss if that BUY is stopped out) and
+        ``Epic.market_close_utc`` (today's UTC close from IG's openingHours, used
+        by the per-epic close rule), so the Epic List modal can show real data.
+        Only updates rows that already exist (created by ``_persist_epic_list``);
+        a missing figure is stored as NULL so the UI renders it as unknown.
         """
         if not infos:
             return
@@ -897,6 +906,7 @@ class BotScheduler:
                             description=info.name or None,
                             deposit=funds,
                             stop_loss=stop_loss,
+                            market_close_utc=getattr(info, "market_close_utc", None),
                         )
                     )
                 await session.commit()
@@ -1012,13 +1022,13 @@ class BotScheduler:
         return self._settings.entry_strategy_name
 
     def set_strategy(self, name: str) -> bool:
-        """Switch the active entry strategy at runtime.
+        """Switch the active entry strategy at runtime (in-memory only).
 
         Validates ``name`` against the entry registry, updates the in-memory
         setting and clears the cached instance so the ``strategy`` property
         rebuilds it on next use. The close profile is unaffected (open/close are
-        decoupled). The choice is in-memory only — it reverts to
-        ``ENTRY_STRATEGY_NAME`` from the environment when the process restarts.
+        decoupled). This does **not** persist; use :meth:`select_strategy` (the
+        dashboard path) to also save the choice across restarts.
 
         Returns:
             True on success, False for an unknown entry strategy name.
@@ -1030,6 +1040,104 @@ class BotScheduler:
         self._strategy = None  # force rebuild via the ``strategy`` property
         logger.info("Active entry strategy switched to '%s'", name)
         return True
+
+    async def select_strategy(self, name: str) -> bool:
+        """Switch the active entry strategy and persist the choice.
+
+        The dashboard path: applies :meth:`set_strategy` and, on success, saves
+        the selection to the database so it is restored on the next startup
+        (``ENTRY_STRATEGY_NAME`` in ``.env`` is only the initial fallback).
+        """
+        if not self.set_strategy(name):
+            return False
+        await self._save_selection("entry", name)
+        return True
+
+    @property
+    def active_close_profile_name(self) -> str:
+        """Name of the currently selected close profile."""
+        return self._settings.close_profile_name
+
+    def set_close_profile(self, name: str) -> bool:
+        """Switch the active close profile at runtime (in-memory only).
+
+        Validates ``name`` against the exit registry, updates the in-memory
+        setting and clears the cached instance so the ``close_profile`` property
+        rebuilds it on next use. The entry strategy is unaffected (open/close are
+        decoupled), and positions already open keep the profile persisted on them
+        — only positions opened after the switch use the new one. This does
+        **not** persist; use :meth:`select_close_profile` (the dashboard path) to
+        also save the choice across restarts.
+
+        Returns:
+            True on success, False for an unknown close-profile name.
+        """
+        if name not in CLOSE_PROFILES:
+            logger.warning("Rejected switch to unknown close profile: %r", name)
+            return False
+        self._settings.close_profile_name = name
+        self._close_profile_obj = None  # rebuild via the ``close_profile`` property
+        logger.info("Active close profile switched to '%s'", name)
+        return True
+
+    async def select_close_profile(self, name: str) -> bool:
+        """Switch the active close profile and persist the choice.
+
+        The dashboard path: applies :meth:`set_close_profile` and, on success,
+        saves the selection to the database so it is restored on the next startup
+        (``CLOSE_PROFILE_NAME`` in ``.env`` is only the initial fallback).
+        """
+        if not self.set_close_profile(name):
+            return False
+        await self._save_selection("close", name)
+        return True
+
+    async def load_selection_preferences(self) -> None:
+        """Restore the dashboard-chosen entry strategy and close profile.
+
+        Called once on startup. Reads the persisted selections and applies them
+        in-memory via :meth:`set_strategy` / :meth:`set_close_profile`, so a
+        restart resumes with the same choice the user made on the dashboard.
+        Falls back silently to the ``.env`` defaults when nothing is persisted
+        (or the table does not exist yet — before the migration is applied).
+        """
+        try:
+            async with self._session_factory() as session:
+                rows = await session.scalars(select(SelectionPreference))
+                selection = {row.kind: row.name for row in rows}
+        except Exception as exc:
+            logger.warning("Could not load selection preferences: %s", exc)
+            return
+
+        entry = selection.get("entry")
+        if entry and entry in ENTRY_STRATEGIES:
+            self.set_strategy(entry)
+        close = selection.get("close")
+        if close and close in CLOSE_PROFILES:
+            self.set_close_profile(close)
+        if entry or close:
+            logger.info(
+                "Selection restored: entry=%s close=%s",
+                entry or "(default)",
+                close or "(default)",
+            )
+
+    async def _save_selection(self, kind: str, name: str) -> None:
+        """Upsert the persisted entry/close selection for one ``kind``."""
+        now = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session:
+                existing = await session.get(SelectionPreference, kind)
+                if existing:
+                    existing.name = name
+                    existing.updated_at = now
+                else:
+                    session.add(
+                        SelectionPreference(kind=kind, name=name, updated_at=now)
+                    )
+                await session.commit()
+        except Exception as exc:
+            logger.error("Failed to persist %s selection '%s': %s", kind, name, exc)
 
     # ------------------------------------------------------------------
     # Epic list management
@@ -1063,6 +1171,41 @@ class BotScheduler:
         logger.info("Epic list refreshed: %d epics discovered", len(epics))
         self._recorder.info(f"Daily epic refresh: {len(epics)} epics")
         await self._record_job_run("refresh_epic_list")
+
+    async def _open_position_epics(self) -> set[str]:
+        """Return the epics that currently hold an OPEN position.
+
+        These are pinned onto the streaming feed in ``_refresh_tradable_epics`` so
+        a trade's price history (and the bid the position monitor reads) keeps
+        recording until it closes — even when the subscription cap would otherwise
+        drop the epic. Returns an empty set on any DB error, in which case the feed
+        simply falls back to the tradable set.
+        """
+        try:
+            async with self._session_factory() as session:
+                rows = await session.scalars(
+                    select(Position.epic).where(Position.state == PositionState.OPEN)
+                )
+                return set(rows.all())
+        except Exception as exc:
+            logger.warning("Could not load open-position epics for streaming: %s", exc)
+            return set()
+
+    @staticmethod
+    async def _traded_today_epics(session: AsyncSession) -> set[str]:
+        """Epics that already had an opening today (any state, open or closed).
+
+        Used by the rolling cross-epic ranker (:meth:`_select_and_open`) to enforce
+        one opening per epic per day: once a market has been *used*, it is excluded
+        from re-ranking so the rolling position keeps rotating across epics
+        (diversity) instead of re-opening the same rising curve the moment it
+        closes. Keyed on ``Position.date`` to match the daily P&L / trade-count
+        gates in the execution domain.
+        """
+        rows = await session.scalars(
+            select(Position.epic).where(Position.date == date.today())
+        )
+        return set(rows.all())
 
     async def _refresh_tradable_epics(self) -> None:
         """Filter ``_all_epics`` to those currently open and TRADEABLE.
@@ -1137,20 +1280,98 @@ class BotScheduler:
             len(self._all_epics),
         )
 
+        # Epics holding an open position must keep their live feed until the trade
+        # closes, so the position's candle history (and the bid the monitor reads)
+        # never stops mid-trade — even if the spread/diversity cap would otherwise
+        # drop them. They are streamed regardless of the cap below.
+        open_epics = await self._open_position_epics()
+
+        # Safety net for the per-epic close rule: if an open position's market is
+        # no longer TRADEABLE (it closed, or went to auction/edits-only), force it
+        # shut so a trade can't be stranded past its market's close. Only act on a
+        # status we actually observed this refresh (unknown epics are left alone).
+        status_by_epic = {m.epic: m.status for m in infos}
+        not_tradeable_open = {
+            e for e in open_epics if status_by_epic.get(e, "TRADEABLE") != "TRADEABLE"
+        }
+        if not_tradeable_open:
+            logger.warning(
+                "Open positions on non-TRADEABLE markets, force-closing: %s",
+                ", ".join(sorted(not_tradeable_open)),
+            )
+            async with self._session_factory() as session:
+                trading = TradingService(
+                    self._client, session, self._build_trade_config()
+                )
+                await trading.close_epics(not_tradeable_open, "market_closed")
+            open_epics = await self._open_position_epics()
+
         # Reasons against the pre-cap set, then overlay the streaming-cap reason
         # for markets that were tradable but cut to fit the 40-subscription limit
         # — so the Epic List doesn't mislabel them as "duplicate".
         reasons = self._scanner.get_non_tradable_reasons(infos, selected)
         for epic in capped_out:
-            reasons[epic] = "streaming_cap"
+            # A capped epic that still holds an open position stays on the feed
+            # below, so don't mislabel it as dropped by the cap.
+            if epic not in open_epics:
+                reasons[epic] = "streaming_cap"
         await self._persist_tradable_flags(self._tradable_epics, reasons)
 
         if self._streaming is not None:
-            await self._streaming.set_epics(self._tradable_epics)
+            # Open-position epics first so they survive ``set_epics``' truncation
+            # to the IG subscription cap; the tradable set fills the rest.
+            stream_epics = [
+                *sorted(open_epics),
+                *(e for e in self._tradable_epics if e not in open_epics),
+            ]
+            await self._streaming.set_epics(stream_epics)
 
     # ------------------------------------------------------------------
     # Scheduled tasks
     # ------------------------------------------------------------------
+
+    async def _ensure_open_epics_streamed(self) -> None:
+        """Watchdog: keep a guaranteed live feed on every open-position epic.
+
+        An open position's chart (and the bid the monitor reads) must never go
+        dark mid-trade. Two failure modes are recovered here:
+
+        * the epic dropped off the subscription set entirely — re-subscribe it;
+        * the subscription is still registered but has gone silent (no candle for
+          longer than ``streaming_stale_seconds``, e.g. an expired/stalled
+          Lightstreamer subscription) — force a fresh subscription.
+
+        Runs every analysis tick. A just-opened epic with no candle yet is left
+        alone (it is subscribed and simply hasn't printed its first bar); age
+        tracking takes over once the first candle arrives.
+        """
+        streaming = self._streaming
+        if streaming is None or not streaming.is_connected:
+            return
+        open_epics = await self._open_position_epics()
+        if not open_epics:
+            return
+        subscribed = set(streaming.subscribed_epics)
+        threshold = float(self._settings.streaming_stale_seconds)
+        now = datetime.now(UTC)
+        for epic in open_epics:
+            if epic not in subscribed:
+                logger.warning("Streaming: open epic %s missing from feed", epic)
+                await streaming.resubscribe(epic)
+                continue
+            buf = self._buffer.get(epic)
+            last = buf.last if buf else None
+            if last is None:
+                continue  # subscribed but no candle yet — give it time
+            age = (now - last.timestamp).total_seconds()
+            if age > threshold:
+                logger.warning(
+                    "Streaming: open epic %s feed stale (%.0fs > %.0fs)",
+                    epic,
+                    age,
+                    threshold,
+                )
+                await streaming.resubscribe(epic)
 
     async def _collect_and_analyze(self) -> None:
         """Compute signals for all active epics and open positions on BUY.
@@ -1164,10 +1385,20 @@ class BotScheduler:
             await self._collect_and_analyze_polling()
             return
 
+        # Guarantee every open position keeps a live feed before anything else —
+        # a stalled subscription must be recovered even if the tradable set is
+        # empty this tick.
+        await self._ensure_open_epics_streamed()
+
         config = self._build_trade_config()
         epics = [e for e in self._tradable_epics if e not in self._pricing_blacklist]
         if not epics:
             logger.debug("No tradable epics to analyze")
+            return
+        # Cross-epic rankers don't open per-epic: the buffer is already live, so
+        # just top the rolling portfolio back up to its target position count.
+        if self.strategy.cross_epic_selection:
+            await self._select_and_open()
             return
         for epic in epics:
             await self._evaluate_epic(epic, config)
@@ -1209,6 +1440,15 @@ class BotScheduler:
             *(_fetch(e) for e in epics)
         )
 
+        # Cross-epic rankers don't open per-epic: prices are now in the buffer, so
+        # top the rolling portfolio back up to its target position count instead.
+        if self.strategy.cross_epic_selection:
+            for epic, error in results:
+                if isinstance(error, IGAPIError) and error.response.status_code == 403:
+                    self._pricing_blacklist.add(epic)
+            await self._select_and_open()
+            return
+
         # Phase 2 — compute signals and act; all I/O is already done.
         for epic, error in results:
             if error is not None:
@@ -1243,6 +1483,11 @@ class BotScheduler:
         whatever the entry/close choice.
         """
         strategy = self.strategy
+        # Cross-epic rankers open through the rolling selection routine, not the
+        # per-epic loop — otherwise every BUY-scored epic would be opened at once.
+        # The buffer is still fed (streaming / polling save) regardless.
+        if strategy.cross_epic_selection:
+            return
         buf = self._buffer.get(epic)
         if not buf or len(buf) < strategy.warmup:
             return
@@ -1270,16 +1515,178 @@ class BotScheduler:
                     logger.debug("Cannot open %s: %s", epic, reason)
 
     async def _hourly_trend_select(self) -> None:
-        """Hourly cross-epic selection — currently a no-op.
+        """Backstop / manual trigger for the rolling cross-epic selection.
 
-        This job ranked all epics and opened the single best one for the old
-        cross-epic ``trend_template`` strategy. That strategy is not yet ported
-        to the decoupled ``entry/`` model, and the reference entry
-        (``donchian_er``) opens per-epic via ``_collect_and_analyze``. The
-        scheduled job is kept registered so the hourly selection can be restored
-        without touching the schedule once a cross-epic entry strategy lands.
+        The selection runs continuously in the 30-second analysis loop
+        (``_collect_and_analyze``) — that is what re-opens a fresh position the
+        moment the previous one closes. This hourly job (and its dashboard *Run*
+        button) simply invokes the same guarded routine, so a missed tick or a
+        manual trigger still tops the portfolio back up to its target. A no-op
+        for per-epic entries.
         """
-        return
+        await self._select_and_open()
+
+    async def _select_and_open(self) -> None:
+        """Maintain the rolling cross-epic portfolio at its target size.
+
+        Active only for a cross-epic ranker entry (``cross_epic_selection``, e.g.
+        ``projection_ranking``); a no-op otherwise. The selection knobs are
+        constants on the strategy class (``concurrent_positions``,
+        ``wallet_reserve``), not settings. The goal is to
+        stay in the market all day: hold ``concurrent_positions`` open positions
+        (default 1, a single rolling position) and re-fill a slot as soon as one
+        closes — win or loss.
+
+        Each invocation:
+
+        1. returns early when the target position count is already met (the cheap
+           steady state while a position is running);
+        2. otherwise scores every tradable epic, ranks the BUY candidates by score
+           and opens the best ones that pass the shared open gates **and** the
+           wallet check (available balance minus ``wallet_reserve`` must cover the
+           epic's margin) until the target is reached.
+
+        There is no wall-clock warm-up: an epic may be opened as soon as its
+        market is open (it is in ``_tradable_epics``, filtered to ``TRADEABLE``)
+        and it has enough buffered candles (``len(buf) >= strategy.warmup``). The
+        candle count is the warm-up — the bid curve must be long enough to score.
+
+        The lock serialises concurrent callers (analysis loop + hourly backstop)
+        and the open-count is re-checked inside it, so the target is never
+        overshot.
+        """
+        strategy = self.strategy
+        if not strategy.cross_epic_selection:
+            return  # per-epic entry strategy drives opens via _collect_and_analyze
+
+        config = self._build_trade_config()
+
+        epics = [e for e in self._tradable_epics if e not in self._pricing_blacklist]
+        if not epics:
+            logger.debug("Rolling select: no tradable epics (after pricing blacklist)")
+            return
+
+        async with self._select_lock:
+            async with self._session_factory() as session:
+                open_count = (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(Position)
+                        .where(Position.state == PositionState.OPEN)
+                    )
+                ) or 0
+                target = max(int(strategy.concurrent_positions), 1)
+                slots = target - int(open_count)
+                if slots <= 0:
+                    logger.debug(
+                        "Rolling select: target met (%d/%d open) — holding",
+                        open_count,
+                        target,
+                    )
+                    return  # target met — a position is already running
+
+                # Diversity rule: an epic already *used* today (it had an opening,
+                # now open or closed) is dropped from the candidate set so the
+                # rolling position rotates across markets instead of re-opening the
+                # same epic the moment it closes. The shared ``epic_already_open``
+                # gate only blocks *concurrent* duplicates, not a same-day re-open.
+                traded_today = await self._traded_today_epics(session)
+                candidates = [e for e in epics if e not in traded_today]
+                if not candidates:
+                    logger.debug("Rolling select: every epic already used today")
+                    return
+
+                # Score every epic with enough buffered history; keep BUY
+                # candidates, then rank by score (highest first).
+                ranked: list[tuple[EntryIntent, EpicBuffer]] = []
+                for epic in candidates:
+                    buf = self._buffer.get(epic)
+                    if not buf or len(buf) < strategy.warmup:
+                        continue
+                    intent = strategy.evaluate(epic, buf)
+                    if intent and intent.direction == "BUY":
+                        ranked.append((intent, buf))
+                if not ranked:
+                    logger.debug("Rolling select: no scorable epic yet")
+                    return
+                ranked.sort(key=lambda item: item[0].score, reverse=True)
+
+                available = await self._account_available_funds()
+                reserve = max(0.0, min(1.0, strategy.wallet_reserve))
+                spendable = (
+                    available * (1.0 - reserve) if available is not None else None
+                )
+                funds_map = {
+                    m.epic: m.funds_needed
+                    for m in self._tradable_markets
+                    if m.funds_needed is not None
+                }
+
+                trading = TradingService(
+                    self._client, session, config, close_profile=self.close_profile
+                )
+                opened = 0
+                for intent, buf in ranked:
+                    if opened >= slots:
+                        break
+                    allowed, reason = await trading.can_open_intent(intent)
+                    if not allowed:
+                        logger.debug("Rolling select skip %s: %s", intent.epic, reason)
+                        continue
+                    # Wallet gate: only open while the available balance (minus the
+                    # reserve) covers this epic's margin. Unknown margin -> allow
+                    # (the euro_loss_max gate in open_position bounds the downside).
+                    need = funds_map.get(intent.epic)
+                    if spendable is not None and need is not None and need > spendable:
+                        logger.info(
+                            "Rolling select skip %s: wallet %.0f€ < margin %.0f€",
+                            intent.epic,
+                            spendable,
+                            need,
+                        )
+                        continue
+                    logger.info(
+                        "Rolling select [%s]: opening %s (score=%.3f)",
+                        strategy.name,
+                        intent.epic,
+                        intent.score,
+                    )
+                    position = await trading.open_from_intent(intent, buf)
+                    if position:
+                        opened += 1
+                        if spendable is not None and need is not None:
+                            spendable -= need
+                        self._recorder.info(
+                            f"Rolling open: {intent.epic} @ {position.level_open} "
+                            f"(score={intent.score:.3f})"
+                        )
+
+                if opened:
+                    logger.info("Rolling select: opened %d position(s)", opened)
+
+    async def _account_available_funds(self) -> float | None:
+        """Live available balance (EUR) on the trading account, or None.
+
+        The wallet gate for the rolling selector: a new position is opened only
+        while the available funds (minus the configured reserve) cover the epic's
+        margin. Returns ``None`` when the balance cannot be read, in which case
+        the selector falls back to the shared risk gates only.
+        """
+        try:
+            data = await self._client.get(
+                "/accounts",
+                version=1,
+                priority=Priority.HIGH,
+                label="rolling select: balance",
+            )
+        except Exception as exc:
+            logger.warning("Rolling select: could not read account balance: %s", exc)
+            return None
+        for account in data.get("accounts", []):
+            if account.get("accountId") == self._settings.ig_account_id:
+                available = account.get("balance", {}).get("available")
+                return float(available) if available is not None else None
+        return None
 
     async def _monitor_positions(self) -> None:
         """Check open positions and apply close strategy.

@@ -4,6 +4,28 @@ General-purpose helpers for number formatting, data conversion, etc.
 """
 
 import re
+from datetime import datetime, time
+
+
+def _parse_ig_utc_time(value: object) -> time | None:
+    """Parse an IG UTC datetime string into a naive UTC :class:`~datetime.time`.
+
+    IG's ``/history/transactions`` exposes execution timestamps in UTC
+    (``openDateUtc`` / ``dateUtc``) as ISO 8601 strings, with or without
+    milliseconds and using either ``T`` or a space as the date/time separator
+    (e.g. ``"2026-06-23T09:23:30"`` or ``"2026-06-23 09:23:30.123"``). Returns
+    the time-of-day component, or ``None`` when the value is missing or cannot
+    be parsed (so callers leave the field untouched rather than crash).
+    """
+    if not value:
+        return None
+    text = str(value).strip().replace(" ", "T")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+    return None
 
 
 def _to_float(value: object, default: float = 0.0) -> float:

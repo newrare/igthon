@@ -265,6 +265,43 @@ async def test_reconnect_refetches_tokens_and_resubscribes(
     assert streamer.subscribed_epics == ["EPIC.A", "EPIC.B"]
 
 
+async def test_resubscribe_replaces_stalled_subscription(
+    settings, fake_client, patch_lib
+):
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+    await streamer.start()
+    streamer._connected = True
+    await streamer.set_epics(["EPIC.A", "EPIC.B"])
+    old_sub = streamer._subscriptions["EPIC.A"]
+
+    result = await streamer.resubscribe("EPIC.A")
+
+    assert result is True
+    # Still tracked, but a *fresh* subscription replaced the stalled one.
+    assert "EPIC.A" in streamer.subscribed_epics
+    assert streamer._subscriptions["EPIC.A"] is not old_sub
+    assert old_sub in streamer._ls.unsubscribed
+
+
+async def test_resubscribe_subscribes_missing_epic(settings, fake_client, patch_lib):
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+    await streamer.start()
+    streamer._connected = True
+
+    result = await streamer.resubscribe("EPIC.A")
+
+    assert result is True
+    assert "EPIC.A" in streamer.subscribed_epics
+
+
+async def test_resubscribe_noop_when_offline(settings, fake_client, patch_lib):
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+    await streamer.start()  # _connected stays False (no CONNECTED status)
+    await streamer.set_epics(["EPIC.A"])
+
+    assert await streamer.resubscribe("EPIC.A") is False
+
+
 def test_handle_status_tracks_connected(settings, fake_client):
     streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
 

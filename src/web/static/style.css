@@ -83,6 +83,23 @@ body {
   border-radius: var(--radius-sm);
   padding: 0.3rem 0.7rem;
 }
+/* Pill wrapping the active close-profile switcher (the exit scenario). */
+.dashboard-title-arrow { color: var(--text-dim); width: 1rem; height: 1rem; }
+.dashboard-title-exit {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.3rem 0.7rem;
+}
+.dashboard-title-exit .lc-icon { color: var(--text-muted); }
 /* Strategy switcher dropdown, styled to read as part of the title pill. */
 .strategy-select {
   appearance: none;

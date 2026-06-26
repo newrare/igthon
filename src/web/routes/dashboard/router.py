@@ -11,7 +11,10 @@ from sqlalchemy import select
 
 from src.core.api_queue import Priority
 from src.entry import ENTRY_STRATEGIES
-from src.models.position import Position, PositionState, PositionStrategy
+from src.entry.base import EntryIntent
+from src.execution.trading import TradeConfig, TradingService
+from src.exit import CLOSE_PROFILES
+from src.models.position import Position, PositionState
 from src.utils.tools import _to_float, euro_per_point, margin_factor_pct
 from src.web.routes.dashboard.fragments import _build_fragments
 from src.web.routes.dashboard.pages import _render_tradable_list_page
@@ -166,15 +169,32 @@ async def set_job_mode(request: Request, action: str, mode: str) -> JSONResponse
 
 @router.post("/api/strategy/{name}")
 async def set_strategy(request: Request, name: str) -> JSONResponse:
-    """Switch the active entry strategy at runtime (in-memory until restart)."""
+    """Switch the active entry strategy at runtime and persist the choice."""
     scheduler = request.app.state.scheduler
     if not scheduler:
         return JSONResponse({"error": "Scheduler not available"}, status_code=503)
     if name not in ENTRY_STRATEGIES:
         return JSONResponse({"error": f"Unknown strategy: {name}"}, status_code=400)
-    if not scheduler.set_strategy(name):
+    if not await scheduler.select_strategy(name):
         return JSONResponse({"error": "Could not switch strategy"}, status_code=400)
     return JSONResponse({"status": "ok", "strategy": name})
+
+
+@router.post("/api/close-profile/{name}")
+async def set_close_profile(request: Request, name: str) -> JSONResponse:
+    """Switch the active close profile at runtime and persist the choice."""
+    scheduler = request.app.state.scheduler
+    if not scheduler:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    if name not in CLOSE_PROFILES:
+        return JSONResponse(
+            {"error": f"Unknown close profile: {name}"}, status_code=400
+        )
+    if not await scheduler.select_close_profile(name):
+        return JSONResponse(
+            {"error": "Could not switch close profile"}, status_code=400
+        )
+    return JSONResponse({"status": "ok", "close_profile": name})
 
 
 @router.get("/api/prices/{epic}")
@@ -239,15 +259,36 @@ def _trade_overlay(p: Position) -> dict:
             return None
         return datetime.combine(p.date, t, tzinfo=UTC).isoformat()
 
+    # Entry marker sits on the BID at open. A long is filled on the offer, so the
+    # bid at that instant is the offer minus the spread; ``level_zero`` is exactly
+    # that open offer and ``pip_spread`` the spread, so ``level_zero - pip_spread``
+    # reconstructs the open bid (falls back to the recorded fill). The break-even
+    # is then ``level_zero`` itself — one spread above the bid, as it must be for a
+    # long (the bid has to climb back through the spread to reach flat).
+    zero = _level("level_zero")
+    spread = _num("pip_spread")
+    if zero is not None and spread is not None:
+        open_bid: float | None = zero - spread
+    else:
+        open_bid = _level("level_open")
+
     return {
         "id": p.id,
         "open": _level("level_open"),
-        "zero": _level("level_zero"),
+        "openBid": open_bid,
+        "zero": zero,
         "stop": _level("level_stop"),
         "target": _level("level_win"),
         "close": _level("level_close"),
-        "openTime": _ts(p.time_open),
-        "closeTime": _ts(p.time_close),
+        # Close reason — lets the chart flag an *estimated* exit (the position
+        # vanished from IG and the close level/time were derived, not a captured
+        # fill) so it is not read as a real stop/limit execution.
+        "closeReason": getattr(p, "reason_close", None),
+        # Prefer the broker's exact UTC execution time (captured from IG's
+        # transaction history) over the bot's loop/detection clock; fall back to
+        # the latter when reconciliation has not stamped the broker time yet.
+        "openTime": _ts(getattr(p, "time_open_broker", None) or p.time_open),
+        "closeTime": _ts(getattr(p, "time_close_broker", None) or p.time_close),
         "pnl": _num("euro"),
     }
 
@@ -270,14 +311,18 @@ async def api_chart(request: Request, epic: str) -> JSONResponse:
         start = datetime.combine(today, time.min, tzinfo=_PARIS).astimezone(UTC)
         end = datetime.combine(today, time.max, tzinfo=_PARIS).astimezone(UTC)
         records = await store.fetch(epic, since=start, until=end)
-        candles = [{"t": _iso_utc(c.timestamp), "bid": c.bid_close} for c in records]
+        candles = [
+            {"t": _iso_utc(c.timestamp), "bid": c.bid_close, "offer": c.offer_close}
+            for c in records
+        ]
 
     # Fall back to the live buffer when the store has no rows for today yet.
     if not candles:
         buf = request.app.state.buffer.get(epic)
         if buf:
             candles = [
-                {"t": _iso_utc(c.timestamp), "bid": c.bid_close} for c in buf.candles
+                {"t": _iso_utc(c.timestamp), "bid": c.bid_close, "offer": c.offer_close}
+                for c in buf.candles
             ]
 
     # Every trade on this epic today (all open/close cycles, oldest first).
@@ -468,160 +513,71 @@ async def position_funds_required(request: Request, epic: str) -> JSONResponse:
 
 @router.post("/api/positions/open/{epic}")
 async def open_position_manual(request: Request, epic: str) -> JSONResponse:
-    """Open a BUY position at minimum deal size for the given epic.
+    """Open a BUY position for the given epic, manually from the dashboard.
 
-    Triggered manually from the dashboard.
+    This forces the *open decision only*: the entry strategy is bypassed
+    (direction is hard-coded BUY), but everything else goes through the bot's
+    normal open path. The active close profile chooses the protective stop via
+    :meth:`CloseProfile.initial_plan`, and
+    :meth:`TradingService.open_from_intent` reuses the same sizing, risk caps,
+    dealing-rule validation, confirmation and DB record as an automatic open —
+    so the stop is the strategy's stop, not IG's bare minimum (which sat
+    inside the spread and closed the trade on the first monitor tick).
+
+    The portfolio risk gates (max positions, duplicate epic, daily P&L limits,
+    win-rate) still apply: a manual open that violates them is refused.
     """
     api_queue = getattr(request.app.state, "api_queue", None)
-    session_factory = request.app.state.session_factory
+    session_factory = getattr(request.app.state, "session_factory", None)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    settings = request.app.state.settings
     buffer = request.app.state.buffer
 
-    if not api_queue or not session_factory:
+    if not api_queue or not session_factory or scheduler is None:
         return JSONResponse({"error": "Trading not available"}, status_code=503)
 
     buf = buffer.get(epic)
     if not buf or not buf.last:
         return JSONResponse({"error": "No price data for this epic"}, status_code=400)
 
-    current_bid = buf.last.bid_close
-    current_spread = buf.last.spread
-
     try:
-        market_data = await api_queue.get(
-            f"/markets/{epic}",
-            version=3,
-            priority=Priority.URGENT,
-            label=f"manual open {epic}: market",
-        )
-        instrument = market_data.get("instrument", {})
-        snapshot = market_data.get("snapshot", {})
-        dealing_rules = market_data.get("dealingRules", {})
-
-        if snapshot.get("marketStatus") != "TRADEABLE":
-            return JSONResponse(
-                {"error": f"Market not TRADEABLE: {snapshot.get('marketStatus')}"},
-                status_code=400,
+        config = TradeConfig.from_settings(settings)
+        intent = EntryIntent(epic=epic, direction="BUY")
+        async with session_factory() as session:
+            trading = TradingService(
+                api_queue, session, config, close_profile=scheduler.close_profile
             )
 
-        min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
-        min_deal_size = float(dealing_rules.get("minDealSize", {}).get("value", 1))
-        scaling_factor = (
-            float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
-        )
+            allowed, reason = await trading.can_open_intent(intent)
+            if not allowed:
+                return JSONResponse({"error": reason}, status_code=400)
 
-        # A manual open uses IG's minimum allowed stop. Express it as a price
-        # *distance* (not points): IG quotes the rule in points where
-        # 1 point = 1 / scalingFactor in price terms, so everything below — the
-        # stop level and the derived levels — stays consistently in price units.
-        min_stop_raw = float(min_stop_rule.get("value", 5))
-        if min_stop_rule.get("unit") == "PERCENTAGE":
-            stop_distance = min_stop_raw * current_bid / 100
-        else:
-            stop_distance = min_stop_raw / scaling_factor
-        stop_distance = max(stop_distance, 1.0 / scaling_factor)
-
-        quantity = max(int(min_deal_size), 1)
-        currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
-        # Currency-converted euro value of one point of movement (basis for P&L).
-        epp = euro_per_point(market_data, quantity, currency)
-        euro_risk = stop_distance * epp if epp else quantity * stop_distance
-        expiry = instrument.get("expiry", "-")
-
-        # Absolute stop level, based on the expected entry (current bid). IG
-        # validates it against the actual fill; sending a level avoids any
-        # point/price unit ambiguity.
-        stop_level = round(current_bid - stop_distance, 5)
-
-        order_payload = {
-            "epic": epic,
-            "expiry": expiry,
-            "direction": "BUY",
-            "size": str(quantity),
-            "orderType": "MARKET",
-            "currencyCode": currency,
-            "guaranteedStop": False,
-            "stopLevel": stop_level,
-            "forceOpen": True,
-        }
-
-        result = await api_queue.post(
-            "/positions/otc",
-            order_payload,
-            version=2,
-            priority=Priority.URGENT,
-            label=f"manual open {epic}: order",
-        )
-
-        deal_reference = result.get("dealReference")
-        if not deal_reference:
-            return JSONResponse({"error": "No dealReference returned"}, status_code=500)
-
-        # IG processes deals asynchronously — poll up to 4 times with 1 s delays
-        confirmation = None
-        for _attempt in range(4):
-            try:
-                confirmation = await api_queue.get(
-                    f"/confirms/{deal_reference}",
-                    version=1,
-                    priority=Priority.URGENT,
-                    label=f"manual open {epic}: confirm",
+            position = await trading.open_from_intent(intent, buf)
+            if position is None:
+                # open_position returned None: market not TRADEABLE, euro risk
+                # above euro_loss_max, or IG rejected the deal.
+                return JSONResponse(
+                    {"error": "Open rejected (market closed or risk cap reached)"},
+                    status_code=400,
                 )
-                break
-            except Exception:
-                if _attempt < 3:
-                    await asyncio.sleep(1)
-                else:
-                    raise
 
-        if confirmation.get("dealStatus") != "ACCEPTED":
-            reason = confirmation.get("reason", "UNKNOWN")
-            return JSONResponse({"error": f"Deal rejected: {reason}"}, status_code=400)
-
-        deal_id = confirmation.get("dealId", "")
-        open_level = float(confirmation.get("level", current_bid))
-
-        now = datetime.now(UTC)
-        position = Position(
-            epic=epic,
-            epic_name=instrument.get("name", epic)[:10],
-            deal_reference=deal_reference,
-            deal_id=deal_id or None,
-            date=now.date(),
-            time_open=now.time(),
-            state=PositionState.OPEN,
-            strategy=PositionStrategy.TARGET,
-            reason_open="manual",
-            level_open=Decimal(str(round(open_level, 5))),
-            level_win=Decimal(str(round(open_level + stop_distance * 2, 5))),
-            level_zero=Decimal(str(round(open_level, 5))),
-            level_follower=Decimal(str(round(open_level - stop_distance * 0.5, 5))),
-            level_loose=Decimal(str(round(open_level - stop_distance, 5))),
-            level_security=Decimal(str(round(open_level - stop_distance * 0.8, 5))),
-            level_stop=Decimal(str(round(open_level - stop_distance, 5))),
-            pip_spread=Decimal(str(round(current_spread, 5))),
-            quantity=quantity,
-            size=int(round(stop_distance * scaling_factor)),
-            euro_stop=Decimal(str(round(euro_risk, 3))),
-            euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
-        )
-        async with session_factory() as session:
-            session.add(position)
+            # Tag the manual origin (open_from_intent records reason_open="auto").
+            position.reason_open = "manual"
             await session.commit()
 
+            level = float(position.level_open)
+            quantity = int(position.quantity)
+            deal_id = position.deal_id or ""
+
         logger.info(
-            "Manual position opened: %s qty=%d level=%.5f stop_level=%.5f",
-            epic,
-            quantity,
-            open_level,
-            round(open_level - stop_distance, 5),
+            "Manual position opened: %s qty=%d level=%.5f", epic, quantity, level
         )
         return JSONResponse(
             {
                 "status": "opened",
                 "deal_id": deal_id,
-                "level": open_level,
+                "level": level,
                 "quantity": quantity,
-                "stop_distance": stop_distance,
             }
         )
 

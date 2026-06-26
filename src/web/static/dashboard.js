@@ -136,6 +136,27 @@ async function switchStrategy(name, sel) {
     }
 }
 
+// Switch the active close profile from the title-bar dropdown.
+async function switchCloseProfile(name, sel) {
+    const previous = sel.dataset.current || sel.value;
+    sel.disabled = true;
+    try {
+        const res = await fetch('/api/close-profile/' + encodeURIComponent(name), { method: 'POST' });
+        if (res.ok) {
+            sel.dataset.current = name;
+            showToast('Close profile', 'Now exiting with ' + name.replace(/_/g, ' '), 'success');
+        } else {
+            sel.value = previous;  // revert on failure
+            showToast('Close profile', 'Failed to switch close profile', 'error');
+        }
+    } catch (e) {
+        sel.value = previous;
+        showToast('Close profile', 'Network error', 'error');
+    } finally {
+        sel.disabled = false;
+    }
+}
+
 // General pause-all / resume-all — flips every job at once.
 async function setAllJobs(auto, btn) {
     btn.disabled = true;
@@ -733,16 +754,22 @@ async function openChartModal(epic) {
         }
         const trades = data.trades || [];
         const rawBids = candles.map(function(c) { return c.bid; });
+        // Offer (ask) curve. A long is filled on the offer, so level_open/zero sit
+        // on this curve, not the bid one; without it the entry marker floats a
+        // spread above the only visible line. Fall back to bid when absent.
+        const rawOffers = candles.map(function(c) {
+            return (typeof c.offer === 'number') ? c.offer : c.bid;
+        });
         // Convert UTC → Paris naive strings so Plotly displays the correct local hour.
         const timestamps = candles.map(function(c) { return _toParisNaive(c.t); });
 
-        // Normalisation bounds: include every trade's price levels so their lines
-        // stay inside the [0, 100]% view even when stop/target sit outside the
-        // recent bid range.
-        let lo = Math.min.apply(null, rawBids);
-        let hi = Math.max.apply(null, rawBids);
+        // Normalisation bounds: include both curves and every trade's price levels
+        // so their lines stay inside the [0, 100]% view even when stop/target sit
+        // outside the recent bid range.
+        let lo = Math.min(Math.min.apply(null, rawBids), Math.min.apply(null, rawOffers));
+        let hi = Math.max(Math.max.apply(null, rawBids), Math.max.apply(null, rawOffers));
         trades.forEach(function(t) {
-            ['open', 'zero', 'stop', 'target', 'close'].forEach(function(k) {
+            ['open', 'openBid', 'zero', 'stop', 'target', 'close'].forEach(function(k) {
                 const v = t[k];
                 if (typeof v === 'number' && isFinite(v)) {
                     if (v < lo) lo = v;
@@ -753,6 +780,7 @@ async function openChartModal(epic) {
         const range = hi - lo;
         const toPct = function(v) { return range === 0 ? 50 : (v - lo) / range * 100; };
         const pctY = rawBids.map(toPct);
+        const pctYOffer = rawOffers.map(toPct);
 
         const traces = [{
             x: timestamps,
@@ -763,6 +791,17 @@ async function openChartModal(epic) {
             line: { color: '#E07B39', width: 1.5 },
             name: 'Bid close',
             hovertemplate: 'Bid: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
+        }, {
+            // Offer (ask): a faint dotted line one spread above the bid, so the
+            // bid/offer band (and the cost the long paid into it) is visible.
+            x: timestamps,
+            y: pctYOffer,
+            customdata: rawOffers,
+            type: 'scatter',
+            mode: 'lines',
+            line: { color: '#475569', width: 1, dash: 'dot' },
+            name: 'Offer close',
+            hovertemplate: 'Offer: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
         }];
         const shapes = [];
         const annotations = [];
@@ -787,38 +826,92 @@ async function openChartModal(epic) {
             });
         }
 
+        // Candle timestamps as epoch ms (parsed in the browser's local tz; all
+        // values use the same convention so differences and round-trips are
+        // consistent regardless of which tz that is).
+        const _candleMs = timestamps.map(function(t) { return new Date(t).getTime(); });
+        const _pad2 = function(n) { return String(n).padStart(2, '0'); };
+        const _msToParisNaive = function(ms) {
+            const d = new Date(ms);
+            return d.getFullYear() + '-' + _pad2(d.getMonth() + 1) + '-' + _pad2(d.getDate()) +
+                'T' + _pad2(d.getHours()) + ':' + _pad2(d.getMinutes()) + ':' + _pad2(d.getSeconds());
+        };
+        // Time at which the bid curve crosses ``target``, nearest to ``refMs``.
+        // Markers carry a real price (the open bid / the close fill), but the
+        // recorded execution time can sit a candle off during a fast move, leaving
+        // the diamond hanging above/below the bid line. We keep the price and slide
+        // the marker along X to where the bid actually equals it, dropping the
+        // diamond onto the curve (the vertical line shifts with it). Capped to a
+        // few minutes so a price that only recurs far away never yanks the marker
+        // across the chart. Returns null when no nearby crossing exists.
+        const _SNAP_CAP_MS = 6 * 60 * 1000;
+        function _snapMsToBid(target, refMs) {
+            if (typeof target !== 'number' || !isFinite(target) || _candleMs.length < 2) return null;
+            let best = null, bestDist = Infinity;
+            for (let i = 1; i < rawBids.length; i++) {
+                const a = rawBids[i - 1], b = rawBids[i];
+                if (target < Math.min(a, b) || target > Math.max(a, b)) continue;
+                const f = (b === a) ? 0 : (target - a) / (b - a);
+                const tCross = _candleMs[i - 1] + f * (_candleMs[i] - _candleMs[i - 1]);
+                const dist = Math.abs(tCross - refMs);
+                if (dist < bestDist) { bestDist = dist; best = tCross; }
+            }
+            return (best !== null && bestDist <= _SNAP_CAP_MS) ? best : null;
+        }
+
         // Vertical time marker + diamond point + top time label for an event.
-        function addEventMarker(timeStr, value, color, label) {
+        // ``value`` is the real bid-side price (openBid = bid at open, one spread
+        // below Break-even; level_close = the sell fill at exit). We snap the
+        // marker's X to where the bid curve equals that price so the diamond lands
+        // on the curve; the visible label keeps the broker's true execution time.
+        // ``estimated`` = the level/time were derived (position closed outside the
+        // bot, not a captured fill): drawn as a hollow diamond with an "(est.)"
+        // tag so it is not mistaken for a real stop/limit execution.
+        function addEventMarker(timeStr, value, color, label, estimated) {
             if (!timeStr || typeof value !== 'number' || !isFinite(value)) return;
-            const xParis = _toParisNaive(timeStr);
-            const hhmm = xParis.slice(11, 16);  // "YYYY-MM-DDTHH:MM:SS" → "HH:MM"
+            const realHhmm = _toParisNaive(timeStr).slice(11, 16);
+            const refMs = new Date(_toParisNaive(timeStr)).getTime();
+            const snapped = _snapMsToBid(value, refMs);
+            const xParis = snapped !== null ? _msToParisNaive(snapped) : _toParisNaive(timeStr);
+            const tag = estimated ? ' (est.)' : '';
             shapes.push({
                 type: 'line', xref: 'x', x0: xParis, x1: xParis, yref: 'paper', y0: 0, y1: 1,
                 line: { color: color, width: 1, dash: 'dash' }
             });
             annotations.push({
                 xref: 'x', x: xParis, yref: 'paper', y: 1, yanchor: 'bottom',
-                text: label + ' ' + hhmm, showarrow: false,
+                text: label + ' ' + realHhmm + tag, showarrow: false,
                 font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
             });
             traces.push({
                 x: [xParis], y: [toPct(value)], customdata: [value],
                 type: 'scatter', mode: 'markers', name: label,
-                marker: { color: color, size: 9, symbol: 'diamond', line: { color: '#1c1714', width: 1 } },
-                hovertemplate: label + ' ' + hhmm + ': %{customdata:.4f}<extra></extra>'
+                marker: estimated
+                    ? { color: 'rgba(0,0,0,0)', size: 10, symbol: 'diamond-open',
+                        line: { color: color, width: 2 } }
+                    : { color: color, size: 9, symbol: 'diamond', line: { color: '#1c1714', width: 1 } },
+                hovertemplate: label + ' ' + realHhmm + tag + ': %{customdata:.4f}<extra></extra>'
             });
         }
+
+        // Close reasons whose exit level/time were derived (the position vanished
+        // from IG), not captured from a real fill — flagged as estimated.
+        const _ESTIMATED_CLOSE = { closed_externally: 1, not_found_in_ig: 1 };
 
         // Draw every trade's levels and entry/exit markers.
         trades.forEach(function(t) {
             addLevelLine(t.target, '#4ade80', 'solid', 'Target');
-            // Break-even line: the bid level at which the position turns positive
-            // (entry offer = bid + spread). Labelled "Zero".
-            const zero = (typeof t.zero === 'number') ? t.zero : t.open;
-            addLevelLine(zero, '#cbd5e1', 'solid', 'Zero');
+            // Break-even line = the open offer (level_zero) = the bid at open
+            // plus the spread. For a long this MUST sit one spread above the
+            // entry: you buy on the offer, so the bid has to climb back through
+            // the spread before the trade is flat. The Entry diamond is drawn on
+            // the bid (openBid = level_zero - spread), so the gap up to this line
+            // is exactly the spread; the bid curve reaching it = break-even.
+            addLevelLine(t.zero, '#cbd5e1', 'solid', 'Break-even');
             addLevelLine(t.stop, '#ef4444', 'solid', 'Stop');
-            addEventMarker(t.openTime, t.open, '#E0B341', 'Entry');
-            addEventMarker(t.closeTime, t.close, '#60a5fa', 'Exit');
+            addEventMarker(t.openTime, t.openBid, '#E0B341', 'Entry', false);
+            addEventMarker(t.closeTime, t.close, '#60a5fa', 'Exit',
+                !!_ESTIMATED_CLOSE[t.closeReason]);
         });
         const xIsDate = true;
 

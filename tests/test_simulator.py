@@ -11,7 +11,12 @@ from types import SimpleNamespace
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src.backtest.simulator import SimulationConfig, run_simulation
+from src.backtest.simulator import (
+    SimulationConfig,
+    run_close_visual,
+    run_open_visual,
+    run_simulation,
+)
 from src.feed.price_buffer import PriceBuffer
 from src.web.app import create_app
 
@@ -47,6 +52,7 @@ def _settings() -> SimpleNamespace:
         strategy_hour_start=9,
         strategy_hour_end=16,
         strategy_hour_close=17,
+        strategy_close_margin_minutes=5,
         strategy_close_target="follower",
         strategy_compensate_loose=False,
         strategy_euro_loss=4000.0,
@@ -111,6 +117,76 @@ class TestSimulationRun:
         assert result.days_simulated == 3
 
 
+class TestCloseVisual:
+    """Single open→close cycle used by the close-profile visual test."""
+
+    def _visual(self, **kw):
+        return run_close_visual(_settings(), seed=42, **kw)
+
+    def test_shape_and_ordering(self):
+        r = self._visual(curve_profile="random")
+        assert len(r["bids"]) == len(r["timestamps"]) == 600
+        # The first stop sits at the open; the close never precedes the open.
+        assert r["stops"][0]["index"] == r["open"]["index"]
+        assert r["close"]["index"] >= r["open"]["index"]
+        assert r["close"]["reason"] in {
+            "win",
+            "loose",
+            "stop",
+            "follower",
+            "end_of_day",
+        }
+
+    def test_deterministic_with_seed(self):
+        a = self._visual(curve_profile="volatile")
+        b = self._visual(curve_profile="volatile")
+        assert a["open"] == b["open"]
+        assert a["close"] == b["close"]
+        assert a["euro"] == b["euro"]
+
+    def test_stop_only_ratchets_up(self):
+        # On a clean uptrend the protective stop must never step down.
+        r = self._visual(curve_profile="trend_up")
+        levels = [s["level"] for s in r["stops"]]
+        assert all(b >= a for a, b in zip(levels, levels[1:]))
+        assert r["stop_updates"] > 0
+
+    def test_pinned_open_index(self):
+        r = self._visual(curve_profile="random", open_index=120)
+        assert r["open"]["index"] == 120
+
+
+class TestOpenVisual:
+    """Walk-to-first-open cycle used by the entry-strategy open-trigger test."""
+
+    def _visual(self, **kw):
+        return run_open_visual(_settings(), seed=42, **kw)
+
+    def test_truncates_curve_at_open(self):
+        # When the strategy opens, the curve must stop exactly at the open tick
+        # so the future stays hidden.
+        r = self._visual(curve_profile="trend_up")
+        assert r["opened"] is True
+        assert r["open"]["direction"] == "BUY"
+        idx = r["open"]["index"]
+        assert len(r["bids"]) == len(r["timestamps"]) == idx + 1
+        assert len(r["offers"]) == idx + 1
+        assert idx + 1 <= r["candles_total"]
+
+    def test_full_curve_when_no_open(self):
+        # A flat market never triggers: the whole day is returned, open is null.
+        r = self._visual(curve_profile="sideways", num_candles=600)
+        assert r["opened"] is False
+        assert r["open"] is None
+        assert len(r["bids"]) == r["candles_total"] == 600
+
+    def test_deterministic_with_seed(self):
+        a = self._visual(curve_profile="trend_up")
+        b = self._visual(curve_profile="trend_up")
+        assert a["open"] == b["open"]
+        assert a["bids"] == b["bids"]
+
+
 class TestSimulatorRoutes:
     """The /simulator page and its JSON API."""
 
@@ -165,3 +241,52 @@ class TestSimulatorRoutes:
     async def test_run_endpoint_validates_body(self, client):
         resp = await client.post("/api/simulator/run", json={"target_trades": 100000})
         assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_close_profile_endpoint(self, client):
+        resp = await client.get(
+            "/api/simulator/close-profile",
+            params={
+                "curve_profile": "trend_up",
+                "close_profile": "atr_trailing",
+                "seed": 7,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["seed"] == 7
+        assert data["close_profile"] == "atr_trailing"
+        assert len(data["bids"]) == 600
+        assert data["stops"][0]["index"] == data["open"]["index"]
+
+    @pytest.mark.asyncio
+    async def test_close_profile_rejects_unknown_profile(self, client):
+        resp = await client.get(
+            "/api/simulator/close-profile", params={"close_profile": "nope"}
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_open_strategy_endpoint(self, client):
+        resp = await client.get(
+            "/api/simulator/open-strategy",
+            params={
+                "curve_profile": "trend_up",
+                "strategy": "donchian_er",
+                "seed": 7,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["seed"] == 7
+        assert data["strategy"] == "donchian_er"
+        # Truncated at the open: the curve ends at the open tick.
+        if data["opened"]:
+            assert len(data["bids"]) == data["open"]["index"] + 1
+
+    @pytest.mark.asyncio
+    async def test_open_strategy_rejects_unknown_strategy(self, client):
+        resp = await client.get(
+            "/api/simulator/open-strategy", params={"strategy": "nope"}
+        )
+        assert resp.status_code == 400

@@ -1,9 +1,9 @@
 """Epic model — ported from Epic.php."""
 
-from datetime import datetime
+from datetime import datetime, time
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Integer, Numeric, String
+from sqlalchemy import Boolean, DateTime, Integer, Numeric, String, Time
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.database import Base
@@ -35,3 +35,7 @@ class Epic(Base):
     # hourly refresh. NULL when is_tradable=True. Examples: "CLOSED", "OFFLINE",
     # "no_price", "too_expensive".
     not_tradable_reason: Mapped[str | None] = mapped_column(String(50))
+    # Today's market close in UTC, parsed from IG's instrument.openingHours when
+    # resolvable to UTC (else NULL). Drives the per-epic "close before the market
+    # closes" rule; NULL falls back to the global strategy_hour_close.
+    market_close_utc: Mapped[time | None] = mapped_column(Time)
