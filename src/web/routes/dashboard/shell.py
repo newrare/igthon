@@ -59,6 +59,7 @@ def _render_close_profile_select(current: str) -> str:
         '<span class="dashboard-title-exit">'
         '<i data-lucide="shield" class="lc-icon"></i>'
         '<select class="strategy-select" title="Active close profile (exit)" '
+        f'data-current="{current}" '
         f'onchange="switchCloseProfile(this.value, this)">{options}</select>'
         "</span>"
     )
@@ -81,6 +82,7 @@ def _render_strategy_select(current: str) -> str:
         '<span class="dashboard-title-strategy">'
         '<i data-lucide="cpu" class="lc-icon"></i>'
         '<select class="strategy-select" title="Active trading strategy" '
+        f'data-current="{current}" '
         f'onchange="switchStrategy(this.value, this)">{options}</select>'
         "</span>"
     )
@@ -165,6 +167,33 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     "padding:0.4rem 1rem;border-radius:4px;"
                 ),
             ),
+            # Shared confirm dialog for switching the live entry strategy or
+            # close profile. Both dropdowns route through it (the JS fills in the
+            # kind/target text) so a mis-click never swaps the live trading logic
+            # without an explicit confirmation.
+            render_confirm_modal(
+                modal_id="strategy-confirm-modal",
+                close_fn="closeStrategyConfirmModal",
+                title="Confirm Strategy Change",
+                title_color="#E07B39",
+                lead_html=(
+                    '<p style="color:#cbd5e1;margin:0 0 0.4rem;">Switch the active '
+                    '<span id="strategy-confirm-kind">strategy</span> to '
+                    '<strong id="strategy-confirm-target" style="color:#f0fdf4;">'
+                    "</strong>?</p>"
+                ),
+                note=(
+                    "This changes the live trading logic immediately. Open "
+                    "positions keep their current plan; only positions opened "
+                    "after the switch use the new one."
+                ),
+                confirm_label="Confirm Change",
+                confirm_style=(
+                    "background:#b45309;border:1px solid #b45309;color:#fff7ed;"
+                    "cursor:pointer;font-size:0.85rem;font-weight:600;"
+                    "padding:0.4rem 1rem;border-radius:4px;"
+                ),
+            ),
             render_modal(
                 modal_id="positions-modal",
                 close_fn="closePositionsModal",
@@ -190,6 +219,15 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 close_fn="closeWinRateModal",
                 title='<i data-lucide="settings" class="lc-icon"></i> Configuration',
                 body=_render_config_grid(settings),
+            ),
+            render_modal(
+                modal_id="risk-modal",
+                close_fn="closeRiskModal",
+                title=(
+                    '<i data-lucide="shield-alert" class="lc-icon"></i> '
+                    "Daily Risk Safety"
+                ),
+                body=f'<div id="frag-risk_modal">{frags["risk_modal"]}</div>',
             ),
         ]
     )
@@ -399,6 +437,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=10"></script>
+<script src="/static/dashboard.js?v=14"></script>
 </body>
 </html>"""

@@ -1,7 +1,7 @@
 """Dashboard HTML fragment builders (dynamically refreshed regions)."""
 
 import html
-from datetime import date
+from datetime import UTC, date, datetime, time
 
 from src.core.api_error_log import APIErrorEntry
 from src.web.routes.dashboard.components import (
@@ -17,6 +17,103 @@ from src.web.routes.dashboard.state import (
     _open_reason_label,
     _pnl_color,
 )
+
+
+def _fmt_paris_time(d: date | None, t: time | None) -> str:
+    """Format a stored (UTC date, UTC time) pair as Paris-local ``HH:MM:SS``.
+
+    Position times are persisted timezone-naive in UTC (``datetime.now(UTC)`` at
+    open, IG's ``createdDateUTC`` for adopted rows). The dashboard must show them
+    on the French (Europe/Paris) wall clock, so combine the date+time as UTC and
+    convert — mirroring what the chart modal already does client-side. Falls back
+    to a naive format when the date is missing (cannot localise without it).
+    """
+    if t is None:
+        return "—"
+    if d is None:
+        return t.strftime("%H:%M:%S")
+    return datetime.combine(d, t, tzinfo=UTC).astimezone(_PARIS).strftime("%H:%M:%S")
+
+
+def _render_risk_modal(kpis: dict) -> str:
+    """Body of the daily-risk modal: a row per circuit-breaker + the arm switch.
+
+    Lives in a fragment refreshed by the 2s poll, so the figures and the
+    tripped/OK status stay live. The toggle posts to ``/api/risk/{on|off}``;
+    disarming lets the bot keep opening (dev/test) — the per-epic gates are
+    untouched, which the note spells out.
+    """
+    enabled = kpis.get("daily_risk_enabled", True)
+    pnl = float(kpis.get("risk_daily_pnl", 0.0))
+    trades = int(kpis.get("risk_trade_count", 0))
+    win_rate = float(kpis.get("risk_win_rate", 1.0))
+    loss_limit = float(kpis.get("risk_loss_limit", 0.0))
+    win_target = float(kpis.get("risk_win_target", 0.0))
+    max_trades = int(kpis.get("risk_max_trades", 0))
+    min_win_rate = float(kpis.get("risk_min_win_rate", 0.0))
+
+    def _row(rule: str, current: str, threshold: str, tripped: bool) -> str:
+        if not enabled:
+            color, status = "#64748b", "ignored"
+        else:
+            color = "#ef4444" if tripped else "#4ade80"
+            status = "TRIPPED" if tripped else "OK"
+        return (
+            f"<tr><td>{rule}</td><td class='number'>{current}</td>"
+            f"<td class='number'>{threshold}</td>"
+            f"<td style='color:{color};font-weight:600;'>{status}</td></tr>"
+        )
+
+    rows = "".join(
+        [
+            _row(
+                "Daily loss limit",
+                f"{pnl:+.2f}€",
+                f"≤ {loss_limit:+.2f}€",
+                pnl <= loss_limit,
+            ),
+            _row(
+                "Daily target",
+                f"{pnl:+.2f}€",
+                f"≥ {win_target:+.2f}€",
+                pnl >= win_target,
+            ),
+            _row(
+                "Max daily trades",
+                f"{trades}",
+                f"≥ {max_trades}",
+                trades >= max_trades,
+            ),
+            _row(
+                "Win-rate floor (after ≥10 trades)",
+                f"{win_rate:.0%} over {trades}",
+                f"< {min_win_rate:.0%}",
+                trades >= 10 and win_rate < min_win_rate,
+            ),
+        ]
+    )
+
+    checked = "checked" if enabled else ""
+    state_label = "ARMED" if enabled else "DISABLED (dev)"
+    state_color = "#4ade80" if enabled else "#f59e0b"
+    table = render_table(
+        ["Rule", "Current", "Threshold", "Status"], rows, tbody_id="risk-tbody"
+    )
+    return f"""
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;margin:0 0 0.8rem;">
+            <span style="font-size:0.95rem;color:#cbd5e1;">Daily risk safety:
+                <strong style="color:{state_color};">{state_label}</strong></span>
+            <label class="switch" title="Arm / disarm the daily-risk circuit-breakers">
+                <input type="checkbox" {checked} onchange="toggleRiskGuard(this.checked, this)">
+                <span class="switch-slider"></span>
+            </label>
+        </div>
+        <p style="color:#94a3b8;font-size:0.83rem;margin:0 0 1rem;">
+            When disarmed, the bot keeps opening regardless of the day's P&amp;L and
+            trade record — meant for dev/test to observe behaviour. The per-epic
+            limits (duplicate epic, max positions) still apply. Keep it
+            <strong>armed in production</strong>.</p>
+        {table}"""
 
 
 def _render_logs_section(entries: list[dict]) -> str:
@@ -347,7 +444,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
     if open_positions:
         pos_rows_html = ""
         for p in open_positions:
-            t_open = p.time_open.strftime("%H:%M:%S") if p.time_open else "—"
+            t_open = _fmt_paris_time(p.date, p.time_open)
             lvl_open = f"{p.level_open:.3f}" if p.level_open else "—"
             lvl_win = f"{p.level_win:.3f}" if p.level_win else "—"
             lvl_stop = f"{p.level_stop:.3f}" if p.level_stop else "—"
@@ -386,8 +483,8 @@ def _build_fragments(state: dict) -> dict[str, str]:
         closed_rows_html = ""
         for p in closed_positions:
             d_str = p.date.strftime("%d/%m/%Y") if p.date else "—"
-            t_open = p.time_open.strftime("%H:%M:%S") if p.time_open else "—"
-            t_close = p.time_close.strftime("%H:%M:%S") if p.time_close else "—"
+            t_open = _fmt_paris_time(p.date, p.time_open)
+            t_close = _fmt_paris_time(p.date, p.time_close)
             lvl_open = f"{p.level_open:.3f}" if p.level_open else "—"
             lvl_close = f"{p.level_close:.3f}" if p.level_close else "—"
             qty = p.quantity or "—"
@@ -473,6 +570,31 @@ def _build_fragments(state: dict) -> dict[str, str]:
             <div class="kpi-label"><i data-lucide="wallet" class="lc-icon"></i> Wallet</div>
             <div class="kpi-value" style="color:{wallet_color};">{wallet_value}</div>
             <div class="kpi-sub">{wallet_sub}</div>
+        </div>"""
+
+    # Opening status tile (click → risk modal). Amber when the daily-risk gates
+    # are disarmed (dev/test), red when a breaker (daily loss, daily target, max
+    # trades, win-rate floor) has stopped ALL new openings for the day, green
+    # otherwise. The reason mirrors the live open gate (``daily_risk_block``).
+    risk_enabled = kpis.get("daily_risk_enabled", True)
+    block_reason = kpis.get("open_block_reason")
+    if not risk_enabled:
+        open_color = "#f59e0b"
+        open_status = "Risk OFF"
+        open_sub = "Daily risk disabled (dev)"
+    elif block_reason:
+        open_color = "#ef4444"
+        open_status = "BLOCKED"
+        open_sub = html.escape(block_reason)
+    else:
+        open_color = "#4ade80"
+        open_status = "Active"
+        open_sub = "No daily risk block"
+    opening_tile = f"""
+        <div class="kpi-tile clickable" style="border-left-color:{open_color};" title="{open_sub}" onclick="openRiskModal()">
+            <div class="kpi-label"><i data-lucide="shield-alert" class="lc-icon"></i> Opening</div>
+            <div class="kpi-value" style="color:{open_color};">{open_status}</div>
+            <div class="kpi-sub">{open_sub}</div>
         </div>"""
 
     # API Guard status (rendered inside the Queue modal, no longer its own tile).
@@ -721,7 +843,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
         <div class="kpi-tile clickable" style="border-left-color:{open_pnl_color};" onclick="openPositionsModal()">
             <div class="kpi-label">OPEN</div>
             <div class="kpi-value" style="color:{open_pnl_color};">{f"{kpis['open_pnl']:+.2f}€" if kpis['open_trades'] else "—"}</div>
-            <div class="kpi-sub"><span style="color:#4ade80;">{kpis['open_trades']} position{'s' if kpis['open_trades'] != 1 else ''}</span></div>
+            <div class="kpi-sub"><span style="color:#4ade80;">{kpis['open_trades']} position{'s' if kpis['open_trades'] != 1 else ''}</span>{f"<span style='color:#64748b;'> · IG {kpis['open_pnl_as_of']}</span>" if kpis['open_trades'] and kpis.get('open_pnl_as_of') else ""}</div>
         </div>
         <div class="kpi-tile clickable" style="border-left-color:{pnl_color};" onclick="openClosedModal()">
             <div class="kpi-label">CLOSED</div>
@@ -733,6 +855,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
             <div class="kpi-value" style="color:{'#4ade80' if kpis['win_rate'] >= 0.5 else '#ef4444'};">{kpis['win_rate']:.1%}</div>
             <div class="kpi-sub"><span style="color:#4ade80;">{kpis['total_wins']} win</span>&nbsp;/&nbsp;<span style="color:#ef4444;">{kpis['total_losses']} Loose</span></div>
         </div>
+        {opening_tile}
         {wallet_tile}"""
 
     # ── IG API guard detail (availability + error log) ──────────────────────────
@@ -880,6 +1003,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
         ),
         "positions_modal": positions_modal,
         "closed_positions_modal": closed_positions_modal,
+        "risk_modal": _render_risk_modal(kpis),
         "actions": _render_action_cards(state.get("jobs", [])),
         "logs_section": _render_logs_section(state.get("log_entries") or []),
     }

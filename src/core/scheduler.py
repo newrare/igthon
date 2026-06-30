@@ -225,6 +225,15 @@ class BotScheduler:
         # otherwise both see "0 open" and double-open. The lock + an in-band
         # open-count re-check keep the target position count exact.
         self._select_lock = asyncio.Lock()
+        # Per-epic open lock: serialises the "is this epic already open?" gate
+        # and the order placement so two concurrent callers (the analysis tick,
+        # a manual dashboard open, the rolling selector — or the same dashboard
+        # open fired from two browser tabs / a double-click) can never both pass
+        # the gate before either has committed its provisional row and so place
+        # two orders on the same epic. Opens on different epics still run in
+        # parallel (one lock each). Bounded by the tradable universe, so the dict
+        # never grows without limit.
+        self._open_locks: dict[str, asyncio.Lock] = {}
 
         # Epic lists — start with the provided seed list
         self._all_epics: list[str] = list(epics)
@@ -232,6 +241,10 @@ class BotScheduler:
         self._tradable_markets: list[MarketInfo] = []
         self._tradable_last_refresh: datetime | None = None
         self._epic_last_refresh: datetime | None = None
+        # UTC timestamp of the last successful open-position sync (the moment the
+        # stored ``euro`` figures were last refreshed from IG). Surfaced on the
+        # dashboard so the displayed P&L carries its "as of" time.
+        self._positions_synced_at: datetime | None = None
         # Epics that returned 403 on /prices — skipped until next hourly refresh
         self._pricing_blacklist: set[str] = set()
 
@@ -765,6 +778,11 @@ class BotScheduler:
         """UTC timestamp of the last successful epic-list discovery."""
         return self._epic_last_refresh
 
+    @property
+    def positions_synced_at(self) -> datetime | None:
+        """UTC timestamp of the last successful open-position sync from IG."""
+        return self._positions_synced_at
+
     # ------------------------------------------------------------------
     # Epic list persistence (survives restarts)
     # ------------------------------------------------------------------
@@ -1092,6 +1110,34 @@ class BotScheduler:
         await self._save_selection("close", name)
         return True
 
+    @property
+    def daily_risk_enabled(self) -> bool:
+        """Whether the daily-risk circuit-breakers are currently armed."""
+        return bool(getattr(self._settings, "strategy_daily_risk_enabled", True))
+
+    def set_daily_risk_enabled(self, enabled: bool) -> None:
+        """Arm/disarm the daily-risk gates at runtime (in-memory only).
+
+        Flips the setting the next ``_build_trade_config`` reads, so the change
+        takes effect on the following open evaluation. Disarming lets the bot keep
+        opening regardless of the day's P&L / trade record (dev/test); the
+        per-epic gates (duplicate epic, max positions) are unaffected.
+        """
+        self._settings.strategy_daily_risk_enabled = bool(enabled)
+        logger.info(
+            "Daily-risk circuit-breakers %s", "armed" if enabled else "DISABLED"
+        )
+
+    async def select_daily_risk(self, enabled: bool) -> bool:
+        """Arm/disarm the daily-risk gates and persist across restarts (dashboard).
+
+        Mirrors :meth:`select_strategy`: applies the in-memory change and saves it
+        so the choice survives a restart (the ``.env`` default is the fallback).
+        """
+        self.set_daily_risk_enabled(enabled)
+        await self._save_selection("risk", "on" if enabled else "off")
+        return True
+
     async def load_selection_preferences(self) -> None:
         """Restore the dashboard-chosen entry strategy and close profile.
 
@@ -1115,11 +1161,15 @@ class BotScheduler:
         close = selection.get("close")
         if close and close in CLOSE_PROFILES:
             self.set_close_profile(close)
-        if entry or close:
+        risk = selection.get("risk")
+        if risk in {"on", "off"}:
+            self.set_daily_risk_enabled(risk == "on")
+        if entry or close or risk:
             logger.info(
-                "Selection restored: entry=%s close=%s",
+                "Selection restored: entry=%s close=%s risk=%s",
                 entry or "(default)",
                 close or "(default)",
+                risk or "(default)",
             )
 
     async def _save_selection(self, kind: str, name: str) -> None:
@@ -1474,6 +1524,42 @@ class BotScheduler:
 
             await self._evaluate_epic(epic, config)
 
+    def _open_lock(self, epic: str) -> asyncio.Lock:
+        """Return (creating on first use) the per-epic open lock.
+
+        Safe to build lazily: lock creation is synchronous and the whole stack
+        runs on a single event loop, so there is no thread race on the dict.
+        """
+        lock = self._open_locks.get(epic)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._open_locks[epic] = lock
+        return lock
+
+    async def open_epic_guarded(
+        self,
+        trading: "TradingService",
+        intent: EntryIntent,
+        buf: EpicBuffer,
+    ) -> tuple[Position | None, str | None]:
+        """Open ``intent.epic`` under its per-epic lock (single-flight per epic).
+
+        Holds the lock across the duplicate-epic gate **and** the order placement
+        so a second concurrent caller (analysis tick, manual dashboard open,
+        rolling selector, or the same open fired twice from two tabs) re-runs the
+        gate only after the first has committed its provisional row — and is then
+        correctly refused instead of placing a second order on the same epic.
+
+        Returns ``(position, None)`` on success, ``(None, reason)`` when the gate
+        refuses the open, and ``(None, None)`` when IG rejected the order.
+        """
+        async with self._open_lock(intent.epic):
+            allowed, reason = await trading.can_open_intent(intent)
+            if not allowed:
+                return None, reason
+            position = await trading.open_from_intent(intent, buf)
+            return position, None
+
     async def _evaluate_epic(self, epic: str, config: TradeConfig) -> None:
         """Run the entry strategy on one epic's buffer and open on an intent.
 
@@ -1504,14 +1590,12 @@ class BotScheduler:
                 trading = TradingService(
                     self._client, session, config, close_profile=self.close_profile
                 )
-                allowed, reason = await trading.can_open_intent(intent)
-                if allowed:
-                    position = await trading.open_from_intent(intent, buf)
-                    if position:
-                        self._recorder.info(
-                            f"Position opened: {epic} @ {position.level_open}"
-                        )
-                else:
+                position, reason = await self.open_epic_guarded(trading, intent, buf)
+                if position:
+                    self._recorder.info(
+                        f"Position opened: {epic} @ {position.level_open}"
+                    )
+                elif reason:
                     logger.debug("Cannot open %s: %s", epic, reason)
 
     async def _hourly_trend_select(self) -> None:
@@ -1651,7 +1735,10 @@ class BotScheduler:
                         intent.epic,
                         intent.score,
                     )
-                    position = await trading.open_from_intent(intent, buf)
+                    # Single-flight per epic: re-checks the duplicate gate under
+                    # the per-epic lock so a manual dashboard open on the same
+                    # epic cannot slip a second order through the race window.
+                    position, _ = await self.open_epic_guarded(trading, intent, buf)
                     if position:
                         opened += 1
                         if spendable is not None and need is not None:
@@ -1753,6 +1840,9 @@ class BotScheduler:
             except Exception as exc:
                 logger.error("Position sync failed: %s", exc)
                 return
+        # Stamp the "as of" time only on a successful sync so the dashboard can
+        # show when the displayed P&L figures were last refreshed from IG.
+        self._positions_synced_at = datetime.now(UTC)
         if live:
             logger.debug("Position sync: %d position(s) live at IG", len(live))
 
@@ -1800,7 +1890,12 @@ class BotScheduler:
                     Position.state == PositionState.CLOSE,
                 )
             )
-            positions = result.scalars().all()
+            # Exclude "never_opened" phantoms (provisional rows whose order never
+            # confirmed at IG): they are not real trades and must not inflate the
+            # day's trade count or P&L. Mirrors the live dashboard aggregation.
+            positions = [
+                p for p in result.scalars().all() if p.reason_close != "never_opened"
+            ]
 
             euro_total = sum(float(p.euro or 0) for p in positions)
             euro_list = (

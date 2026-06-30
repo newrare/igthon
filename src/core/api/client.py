@@ -248,7 +248,10 @@ class IGClient:
         url = f"{self._settings.ig_base_url}{endpoint}"
         headers = self._build_headers(version)
         async with self._request_context():
-            logger.debug("POST %s", url)
+            # Log the payload too: POST is a mutating action (open a position,
+            # etc.) and the body is the audit record of *what* we asked for. No
+            # secrets pass here — login/refresh use the raw http client, not this.
+            logger.debug("POST %s payload=%s", url, payload)
             response = await self.http.post(url, json=payload, headers=headers)
         self._raise_for_status(response, "POST", url)
         return response.json()
@@ -267,7 +270,7 @@ class IGClient:
         url = f"{self._settings.ig_base_url}{endpoint}"
         headers = self._build_headers(version)
         async with self._request_context():
-            logger.debug("PUT %s", url)
+            logger.debug("PUT %s payload=%s", url, payload)
             response = await self.http.put(url, json=payload, headers=headers)
         self._raise_for_status(response, "PUT", url)
         return response.json()
@@ -292,7 +295,7 @@ class IGClient:
         headers = self._build_headers(version)
         headers["_method"] = "DELETE"
         async with self._request_context():
-            logger.debug("DELETE (via POST+_method) %s", url)
+            logger.debug("DELETE (via POST+_method) %s payload=%s", url, payload)
             response = await self.http.post(url, json=payload, headers=headers)
         self._raise_for_status(response, "DELETE", url)
         return response.json()

@@ -197,6 +197,31 @@ async def set_close_profile(request: Request, name: str) -> JSONResponse:
     return JSONResponse({"status": "ok", "close_profile": name})
 
 
+@router.post("/api/risk/{value}")
+async def set_daily_risk(request: Request, value: str) -> JSONResponse:
+    """Arm/disarm the daily-risk circuit-breakers at runtime and persist it.
+
+    ``value`` is ``on``/``off`` (also accepts ``enable``/``disable``,
+    ``true``/``false``, ``1``/``0``). Off lets the bot keep opening regardless of
+    the day's P&L / trade record — meant for dev/test, with the dashboard badge
+    flagging the disarmed state in production.
+    """
+    scheduler = request.app.state.scheduler
+    if not scheduler:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    truthy = {"on", "enable", "enabled", "true", "1"}
+    falsy = {"off", "disable", "disabled", "false", "0"}
+    key = value.strip().lower()
+    if key in truthy:
+        enabled = True
+    elif key in falsy:
+        enabled = False
+    else:
+        return JSONResponse({"error": f"Invalid risk value: {value}"}, status_code=400)
+    await scheduler.select_daily_risk(enabled)
+    return JSONResponse({"status": "ok", "daily_risk_enabled": enabled})
+
+
 @router.get("/api/prices/{epic}")
 async def api_prices(request: Request, epic: str) -> JSONResponse:
     """JSON API: price data for a specific epic."""
@@ -259,6 +284,26 @@ def _trade_overlay(p: Position) -> dict:
             return None
         return datetime.combine(p.date, t, tzinfo=UTC).isoformat()
 
+    def _stops() -> list[dict] | None:
+        """Sanitised stop trajectory points, or None when unavailable.
+
+        Drops malformed/zero entries so a stored 0 level (treated as "unset"
+        elsewhere) cannot flatten the chart's normalisation bounds.
+        """
+        raw = getattr(p, "stop_history", None)
+        if not raw:
+            return None
+        points: list[dict] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            when = entry.get("t")
+            level = entry.get("level")
+            if when is None or not level:
+                continue
+            points.append({"t": when, "level": float(level)})
+        return points or None
+
     # Entry marker sits on the BID at open. A long is filled on the offer, so the
     # bid at that instant is the offer minus the spread; ``level_zero`` is exactly
     # that open offer and ``pip_spread`` the spread, so ``level_zero - pip_spread``
@@ -272,12 +317,49 @@ def _trade_overlay(p: Position) -> dict:
     else:
         open_bid = _level("level_open")
 
+    # Two distinct protective-stop lines for the chart:
+    #   - the FOLLOWER stop (``level_follower`` + its ratchet history): the
+    #     application-side trailing stop that ratchets up with the market once
+    #     break-even + margin is cleared. It is the level a close is decided on
+    #     app-side, between two bid polls.
+    #   - the LOOSE stop (``level_stop`` + its pushed updates): the protective
+    #     stop actually resting at the broker, the safety net that secures a close
+    #     if price gaps between two bid readings.
+    # They diverge at open whenever IG's minimum-stop-distance rule widens the
+    # broker (loose) stop past the (tighter) follower — so a close triggered on
+    # the follower looks, on the broker line alone, as if the stop was never
+    # touched. ``stop_history`` is seeded with the follower and every ratchet is
+    # also pushed to IG, so the loose trajectory is reconstructed as the broker's
+    # initial level followed by those same ratchet points.
+    follower_stops = _stops()
+    loose_initial = _level("level_stop")
+    if not follower_stops:
+        loose_stops = None
+    elif loose_initial is None:
+        loose_stops = follower_stops
+    else:
+        loose_stops = [
+            {"t": follower_stops[0]["t"], "level": loose_initial},
+            *follower_stops[1:],
+        ]
+
     return {
         "id": p.id,
         "open": _level("level_open"),
         "openBid": open_bid,
         "zero": zero,
-        "stop": _level("level_stop"),
+        # Loose stop (resting at the broker): the initial clamped level (never
+        # lowered) and, when a ratchet history exists, the stepped path of every
+        # level later pushed to IG.
+        "stopLoose": loose_initial,
+        "stopsLoose": loose_stops,
+        # Follower stop (application-side trail): the ``level_follower`` the close
+        # profile enforces, plus its stepped ratchet path. It can sit tighter than
+        # the loose stop above. Empty/absent for positions opened before the
+        # history was captured — the chart then falls back to the flat
+        # ``stopFollower`` / ``stopLoose`` scalars.
+        "stopFollower": _level("level_follower"),
+        "stopsFollower": follower_stops,
         "target": _level("level_win"),
         "close": _level("level_close"),
         # Close reason — lets the chart flag an *estimated* exit (the position
@@ -548,11 +630,14 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
                 api_queue, session, config, close_profile=scheduler.close_profile
             )
 
-            allowed, reason = await trading.can_open_intent(intent)
-            if not allowed:
+            # Open under the scheduler's per-epic lock (single-flight): a
+            # double-click or a second browser tab firing the same manual open —
+            # or the analysis tick opening this epic at the same instant — can no
+            # longer slip two orders through the duplicate-epic gate before the
+            # first commits its row. The lock spans the gate re-check + order.
+            position, reason = await scheduler.open_epic_guarded(trading, intent, buf)
+            if reason:
                 return JSONResponse({"error": reason}, status_code=400)
-
-            position = await trading.open_from_intent(intent, buf)
             if position is None:
                 # open_position returned None: market not TRADEABLE, euro risk
                 # above euro_loss_max, or IG rejected the deal.

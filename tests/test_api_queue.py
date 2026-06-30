@@ -210,6 +210,36 @@ async def test_abandoned_call_recorded_in_error_log_with_full_details():
 
 
 @pytest.mark.asyncio
+async def test_abandoned_call_mirrored_to_durable_error_log(monkeypatch):
+    """Besides the in-memory buffer, an abandoned call is written to the durable
+    file-backed error log via recorder.log_api_error."""
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        "src.core.api_queue.log_api_error",
+        lambda **kw: recorded.append(kw),
+    )
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=_ig_error(400, "validation.failed"))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with pytest.raises(IGAPIError):
+            await queue.post("/positions/otc", {"epic": "X"}, version=2, label="open X")
+    finally:
+        await queue.stop()
+
+    assert len(recorded) == 1
+    e = recorded[0]
+    assert e["method"] == "POST"
+    assert e["endpoint"] == "/positions/otc"
+    assert e["version"] == 2
+    assert e["http_status"] == 400
+    assert e["ig_error_code"] == "validation.failed"
+    assert e["label"] == "open X"
+    assert "boom" in e["error"]
+
+
+@pytest.mark.asyncio
 async def test_probe_failure_excluded_from_error_log():
     """Probe (bisection) failures are expected — they stay out of the error log."""
     client = AsyncMock()

@@ -7,6 +7,7 @@ Implements the full trading workflow:
 - Stop level updates (trailing stop)
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -37,6 +38,26 @@ from src.utils.tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Grace window (seconds) granted to a freshly-opened position whose ``deal_id``
+# never bound before the sync job reconciles it. The open path writes a
+# provisional row (``deal_id=None``) before ``/confirms`` lands; if that confirm
+# fails the row stays unbound and ``GET /positions`` may not list the new
+# position yet (IG eventual consistency). Reconciling it immediately would close
+# it as a phantom ``closed_externally`` trade at €0. Within this window the sync
+# leaves it alone so the epic-level fallback can bind it on a later tick; past
+# it, an unbound-and-absent row was never genuinely opened (see
+# ``_mark_never_opened``). Comfortably covers a few 20s sync cycles.
+RECONCILE_GRACE_SECONDS = 60.0
+
+# Deal-confirmation polling. IG resolves a dealReference asynchronously, so
+# ``GET /confirms/{ref}`` can 404 for a short window right after the order POST.
+# The APIQueue does not retry 4xx, so ``open_position`` polls the confirm itself:
+# ``CONFIRM_MAX_ATTEMPTS`` tries spaced by a linear backoff of
+# ``CONFIRM_RETRY_DELAY_SECONDS * attempt``. Kept short — a deal is normally
+# resolvable within ~1 s, and the sync job is the backstop for anything slower.
+CONFIRM_MAX_ATTEMPTS = 4
+CONFIRM_RETRY_DELAY_SECONDS = 0.4
 
 # Re-exported for backward compatibility: these pure close helpers now live in
 # the exit domain (src/exit/trailing.py). Existing importers
@@ -71,6 +92,14 @@ class TradeConfig:
     close_strategy: str = "follower"  # win | follower | now | zero
     max_trades_day: int = 50
     min_win_rate: float = 0.40
+    # Master switch for the daily-risk circuit-breakers (see Settings). When
+    # False, evaluate_open_gates skips daily_risk_block entirely — used in dev to
+    # keep opening regardless of the day's P&L / trade record.
+    daily_risk_enabled: bool = True
+    # Fraction added on top of IG's minimum stop distance when clamping an order's
+    # protective stop, so a fast-moving market can't push the stop back under
+    # IG's floor between the market snapshot and the order ("Stop trop près").
+    stop_min_distance_margin: float = 0.15
     # Trailing stop (ATR-based adaptive follower)
     atr_period: int = 14
     atr_k_pre: float = 2.5
@@ -93,6 +122,10 @@ class TradeConfig:
             close_strategy=settings.strategy_close_target,
             max_trades_day=settings.strategy_max_trades_day,
             min_win_rate=settings.strategy_min_win_rate,
+            daily_risk_enabled=getattr(settings, "strategy_daily_risk_enabled", True),
+            stop_min_distance_margin=getattr(
+                settings, "strategy_stop_min_distance_margin", 0.15
+            ),
             atr_period=settings.strategy_atr_period,
             atr_k_pre=settings.strategy_atr_k_pre,
             atr_k_post=settings.strategy_atr_k_post,
@@ -397,12 +430,20 @@ class TradingService:
         min_stop_price = _rule_to_price_distance(min_stop_rule, 0.0)
         max_stop_price = _rule_to_price_distance(max_stop_rule, float("inf"))
 
+        # Pad IG's minimum-distance floor by a safety margin. IG rejects a stop
+        # at/inside its minimum, and the price drifts between this snapshot and
+        # the order landing — a stop clamped exactly to the minimum is routinely
+        # bounced ("Stop trop près"). The margin gives the market room to move
+        # without pushing us back under the floor.
+        min_stop_price *= 1 + self._config.stop_min_distance_margin
+
         # Absolute stop level chosen by the strategy, and its distance below the
         # entry in price terms.
         stop_level = levels.level_security
         stop_price_distance = levels.bid - stop_level
 
-        # Never place the stop tighter than IG allows: clamp out to the minimum.
+        # Never place the stop tighter than IG allows (margin included): clamp out
+        # to the padded minimum.
         if stop_price_distance < min_stop_price:
             stop_price_distance = min_stop_price
             stop_level = levels.bid - stop_price_distance
@@ -415,6 +456,24 @@ class TradingService:
                 max_stop_price,
             )
             return None
+
+        # IG may have widened the order stop to satisfy its minimum-distance rule,
+        # leaving ``stop_level`` further from entry than the strategy asked. In the
+        # decoupled open path the close profile sets a SINGLE protective stop
+        # (``level_follower == level_loose == level_security``), so when the clamp
+        # moves it the software backstop must move with it. Otherwise the bot
+        # enforces a stop TIGHTER than the one actually resting at the broker and
+        # closes the position in the noise at a level IG would never have hit (the
+        # euro risk is already sized from the clamped, wider distance). Shift only
+        # the levels that equalled the pre-clamp security; a legacy strategy that
+        # deliberately set a tighter follower/loose is left untouched.
+        clamp_delta = stop_level - levels.level_security
+        follower_level = levels.level_follower
+        loose_level = levels.level_loose
+        if clamp_delta and levels.level_follower == levels.level_security:
+            follower_level += clamp_delta
+        if clamp_delta and levels.level_loose == levels.level_security:
+            loose_level += clamp_delta
 
         # 3. Quantity — minimum deal size scaled by the (martingale) multiplier.
         quantity = max(int(min_deal_size), 1) * max(int(quantity_multiplier), 1)
@@ -507,9 +566,10 @@ class TradingService:
             level_open=Decimal(str(round(levels.bid, 5))),
             level_win=Decimal(str(round(levels.level_win, 5))),
             level_zero=Decimal(str(round(levels.level_zero, 5))),
-            level_follower=Decimal(str(round(levels.level_follower, 5))),
-            level_loose=Decimal(str(round(levels.level_loose, 5))),
-            level_security=Decimal(str(round(levels.level_security, 5))),
+            level_follower=Decimal(str(round(follower_level, 5))),
+            level_loose=Decimal(str(round(loose_level, 5))),
+            # The hard software stop tracks the level actually posted at the broker.
+            level_security=Decimal(str(round(stop_level, 5))),
             level_stop=Decimal(str(round(stop_level, 5))),
             level_margin=Decimal(str(round(levels.level_margin, 5))),
             pip_spread=Decimal(str(round(levels.spread, 5))),
@@ -517,29 +577,49 @@ class TradingService:
             size=int(round(stop_price_distance * scaling_factor)),
             euro_stop=Decimal(str(round(euro_risk, 3))),
             euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
+            # Seed the stop trajectory with the bot's SOFTWARE stop (the
+            # ``level_follower`` the close profile enforces), not the clamped
+            # ``stop_level`` sent to IG. The two diverge at open when IG's
+            # minimum-stop-distance rule widens the broker stop past the tighter
+            # software stop, and the chart must trace the level the bot actually
+            # closes on; the IG broker line is rebuilt from ``level_stop``
+            # separately. Each later ratchet appends here and is pushed to IG, so
+            # the two lines converge from the first ratchet onward.
+            stop_history=(
+                [
+                    {
+                        "t": now.isoformat(),
+                        "level": round(float(follower_level), 5),
+                    }
+                ]
+                if follower_level
+                else None
+            ),
         )
         self._db.add(position)
         await self._db.commit()
         await self._db.refresh(position)
 
         # 7. Confirm the deal to capture the authoritative dealId and fill level.
-        try:
-            confirmation = await self._client.get(
-                f"/confirms/{deal_reference}",
-                version=1,
-                priority=Priority.URGENT,
-                label=f"open {epic}: confirm",
-            )
-        except Exception as exc:
-            # Order is live at IG but unconfirmed. Keep the provisional row; the
-            # sync job resolves the dealId from GET /positions within ~20 s (and
-            # reconciles it away if it turns out the order never executed).
+        # IG processes the order asynchronously: GET /confirms/{ref} returns 404
+        # for a brief window right after the POST (the deal reference is not yet
+        # resolvable). The APIQueue treats 404 as a permanent client error and
+        # does NOT retry it, so a single confirm call loses that race and leaves
+        # the row unbound -> phantom never_opened. ``_confirm_with_retry`` polls
+        # through that window (and logs IG's error code so a genuine failure is
+        # diagnosable from ig_bot.log next time).
+        confirmation = await self._confirm_with_retry(deal_reference, epic)
+        if confirmation is None:
+            # Could not retrieve the confirmation at all. The order may or may not
+            # have executed at IG; keep the provisional row so sync_open_positions
+            # binds it from GET /positions when it appears (or marks it
+            # never_opened past the grace window if it never does). Never delete
+            # here — that would orphan a real fill, tying up margin invisibly.
             logger.error(
-                "Could not confirm deal %s for %s — position kept, sync will "
-                "reconcile: %s",
+                "Could not confirm deal %s for %s after retries — position kept, "
+                "sync will reconcile",
                 deal_reference,
                 epic,
-                exc,
             )
             return position
 
@@ -568,6 +648,79 @@ class TradingService:
         )
 
         return position
+
+    async def _confirm_with_retry(self, deal_reference: str, epic: str) -> dict | None:
+        """Poll ``GET /confirms/{ref}`` until IG can resolve the deal reference.
+
+        IG processes the order asynchronously: the confirmation is briefly
+        unavailable right after the POST and the endpoint answers ``404``. The
+        APIQueue classifies ``404`` as a permanent client error and does not
+        retry it, so a single call loses that race and the position is left
+        unbound. This polls up to :data:`CONFIRM_MAX_ATTEMPTS` times with a
+        linear backoff, retrying only the transient cases:
+
+        - ``404`` — deal not resolvable yet (poll again);
+        - network error / ``5xx`` (no/elevated HTTP status) — transient;
+
+        Any other ``4xx`` is permanent (bad request, auth, etc.) and stops the
+        loop immediately. The IG ``errorCode`` and HTTP status are logged on
+        every failed attempt so a genuine failure is diagnosable afterwards
+        (the previous single-line ``except`` swallowed the cause). Returns the
+        confirmation dict, or ``None`` if it could never be retrieved.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, CONFIRM_MAX_ATTEMPTS + 1):
+            try:
+                return await self._client.get(
+                    f"/confirms/{deal_reference}",
+                    version=1,
+                    priority=Priority.URGENT,
+                    label=f"open {epic}: confirm ({attempt}/{CONFIRM_MAX_ATTEMPTS})",
+                )
+            except IGAPIError as exc:
+                last_exc = exc
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
+                ig_code = getattr(exc, "ig_error_code", "") or "—"
+                transient = status == 404 or status is None or status >= 500
+                if not transient:
+                    logger.error(
+                        "Confirm for %s failed permanently (HTTP %s, IG=%s): %s",
+                        epic,
+                        status,
+                        ig_code,
+                        exc,
+                    )
+                    return None
+                logger.warning(
+                    "Confirm for %s not ready (attempt %d/%d, HTTP %s, IG=%s) "
+                    "— retrying",
+                    epic,
+                    attempt,
+                    CONFIRM_MAX_ATTEMPTS,
+                    status,
+                    ig_code,
+                )
+            except Exception as exc:  # noqa: BLE001 — network/timeouts are transient
+                last_exc = exc
+                logger.warning(
+                    "Confirm for %s errored (attempt %d/%d) — retrying: %s",
+                    epic,
+                    attempt,
+                    CONFIRM_MAX_ATTEMPTS,
+                    exc,
+                )
+            if attempt < CONFIRM_MAX_ATTEMPTS:
+                await asyncio.sleep(CONFIRM_RETRY_DELAY_SECONDS * attempt)
+
+        logger.error(
+            "Confirm for %s (dealRef=%s) never retrieved after %d attempts: %s",
+            epic,
+            deal_reference,
+            CONFIRM_MAX_ATTEMPTS,
+            last_exc,
+        )
+        return None
 
     def _euro_pnl(self, position: Position, level: float) -> float:
         """Compute the euro P&L of a position at a given market level.
@@ -814,6 +967,18 @@ class TradingService:
         )
         db_positions = list(result.scalars().all())
 
+        # Every dealId the DB has *ever* recorded, in any state. Adoption is gated
+        # on this so a live IG position is never adopted twice: once a row exists
+        # for a dealId (OPEN, or already CLOSEd by reconciliation) it must never
+        # spawn a second "adopted" row. Without this guard a position whose
+        # provisional row failed to bind — or whose adopted row was reconciled to
+        # CLOSE — was re-adopted on the next 20s sync, piling up duplicate rows
+        # for one dealId (observed: 6 rows for a single DAX position).
+        known = await self._db.execute(
+            select(Position.deal_id).where(Position.deal_id.isnot(None))
+        )
+        known_deal_ids: set[str] = {row[0] for row in known.all()}
+
         # Always query IG — it is the source of truth for tied-up margin. We must
         # call even when the DB has no OPEN row, otherwise an untracked position
         # at the broker stays invisible forever (it can never be adopted).
@@ -832,16 +997,22 @@ class TradingService:
 
         entries = data.get("positions", [])
         # An epic may carry several live positions (one per dealId), so index by
-        # dealId for exact matching and keep an epic->entries list for resolving
-        # provisional rows whose dealId is not known yet.
+        # dealId for exact matching, by dealReference for binding provisional
+        # rows whose dealId is not known yet (the order executed but /confirms
+        # never landed — the dealReference is the only stable handle we already
+        # hold), and keep an epic->entries list as the last-resort fallback.
         live_by_deal: dict[str, dict] = {}
+        live_by_ref: dict[str, dict] = {}
         live_by_epic: dict[str, list[dict]] = {}
         for entry in entries:
             ig_position = entry.get("position", {})
             epic = entry.get("market", {}).get("epic")
             deal_id = ig_position.get("dealId")
+            deal_ref = ig_position.get("dealReference")
             if deal_id:
                 live_by_deal[deal_id] = entry
+            if deal_ref:
+                live_by_ref[deal_ref] = entry
             if epic:
                 live_by_epic.setdefault(epic, []).append(entry)
 
@@ -857,12 +1028,21 @@ class TradingService:
                 cand_deal = live_by_deal[position.deal_id]["position"].get("dealId")
                 if cand_deal not in claimed:
                     entry = live_by_deal[position.deal_id]
+            if entry is None and position.deal_reference:
+                # Deterministic binding for a provisional row (deal_id None) whose
+                # order DID execute: IG echoes our dealReference on the live
+                # position, so match on it directly rather than guessing by level.
+                ref_entry = live_by_ref.get(position.deal_reference)
+                if ref_entry is not None:
+                    cand_deal = ref_entry["position"].get("dealId")
+                    if cand_deal and cand_deal not in claimed:
+                        entry = ref_entry
             if entry is None:
-                # No / stale / already-claimed dealId — bind to the unclaimed live
-                # entry for this epic whose open level is closest (keeps the
-                # level<->deal pairing sane when an epic has several positions).
-                # This is also how a provisional open row (written before its
-                # /confirms landed) acquires its real dealId.
+                # No / stale / already-claimed dealId and no dealReference match —
+                # bind to the unclaimed live entry for this epic whose open level
+                # is closest (keeps the level<->deal pairing sane when an epic has
+                # several positions). Last-resort fallback for rows that never
+                # recorded a usable dealReference.
                 best_dist: float | None = None
                 for candidate in live_by_epic.get(position.epic, []):
                     cand_deal = candidate.get("position", {}).get("dealId")
@@ -874,8 +1054,24 @@ class TradingService:
                         entry, best_dist = candidate, dist
 
             if entry is None:
-                # Position is gone at IG — closed or expired outside the bot.
-                self._reconcile_vanished(position)
+                # No live IG position matched this DB row. Split by whether the
+                # row ever bound a dealId:
+                #   * deal_id set  -> a real position that has now closed or
+                #     expired outside the bot: reconcile it as closed_externally.
+                #   * deal_id None -> the open never confirmed (the /confirms
+                #     round-trip failed, or the order never executed). Such a row
+                #     must not be logged as a real closed_externally trade at €0.
+                #     Grant it a grace window first: a just-opened position may
+                #     simply not be in /positions yet (IG eventual consistency)
+                #     and the epic-level fallback above binds it on a later tick.
+                #     Past the window with still no match, it was never genuinely
+                #     opened -> mark never_opened (excluded from stats).
+                if position.deal_id is None:
+                    if self._opened_within(position, RECONCILE_GRACE_SECONDS):
+                        continue  # too fresh — let a later sync bind it
+                    self._mark_never_opened(position)
+                else:
+                    self._reconcile_vanished(position)
                 dirty = True
                 continue
 
@@ -909,14 +1105,17 @@ class TradingService:
                 )
                 dirty = True
 
-        # Adopt every live IG position no DB row claimed.
+        # Adopt every live IG position no DB row claimed — but never one already
+        # tracked (claimed this run) or ever recorded (known_deal_ids), so a
+        # position is adopted at most once across syncs.
         for entry in entries:
             deal_id = entry.get("position", {}).get("dealId")
-            if not deal_id or deal_id in claimed:
+            if not deal_id or deal_id in claimed or deal_id in known_deal_ids:
                 continue
             adopted = await self._adopt_ig_position(entry)
             if adopted is not None:
                 claimed.add(deal_id)
+                known_deal_ids.add(deal_id)
                 dirty = True
 
         if dirty:
@@ -1023,6 +1222,13 @@ class TradingService:
             level_loose=stop_dec,
             level_security=stop_dec,
             level_stop=stop_dec,
+            # Seed the stop trajectory at the IG-reported open time (later
+            # ratchets append) so adopted positions also get a stepped line.
+            stop_history=(
+                [{"t": opened_at.isoformat(), "level": round(stop_level, 5)}]
+                if stop_level
+                else None
+            ),
             pip_spread=Decimal(str(round(spread, 5))),
             quantity=int(size),
             size=int(round(stop_distance * scaling)),
@@ -1084,6 +1290,50 @@ class TradingService:
             euro_pnl,
         )
 
+    def _opened_within(self, position: Position, seconds: float) -> bool:
+        """Whether ``position`` was opened less than ``seconds`` ago (UTC).
+
+        ``time_open`` is stored naive-UTC (``datetime.now(UTC).time()`` at open),
+        so it is recombined with ``date`` and compared against the current naive
+        UTC clock. Returns ``False`` when either field is missing — an undated row
+        is never treated as "fresh".
+        """
+        if position.date is None or position.time_open is None:
+            return False
+        opened_at = datetime.combine(position.date, position.time_open)
+        now = datetime.now(UTC).replace(tzinfo=None)
+        return (now - opened_at).total_seconds() < seconds
+
+    def _mark_never_opened(self, position: Position) -> None:
+        """Mark a provisional row that never became a real IG position.
+
+        A row whose ``deal_id`` never bound and that ``GET /positions`` never
+        lists (past the grace window) corresponds to an order that did not
+        execute — the ``/confirms`` round-trip failed or IG rejected it without a
+        clean rejection signal. It was never a trade, so it must NOT be recorded
+        as a ``closed_externally`` close at €0: that manufactures a phantom that
+        is counted in the day's trade count and drags the win rate. It is flagged
+        with a distinct ``never_opened`` reason instead, which the dashboard
+        excludes from every win/loss/trade aggregation. The row is kept (not
+        deleted) for an audit trail; should the position actually surface at IG
+        later it carries no ``deal_id``, so the adoption path re-creates it.
+        """
+        now = datetime.now(UTC)
+        position.state = PositionState.CLOSE
+        position.time_close = now.time()
+        position.reason_close = "never_opened"
+        position.euro = Decimal("0")
+        position.win = 0
+        if position.level_close is None:
+            position.level_close = position.level_open
+        logger.warning(
+            "Position %s (dealRef=%s) never bound a dealId and is absent from IG "
+            "%.0fs after open — marking never_opened (excluded from stats)",
+            position.epic,
+            position.deal_reference,
+            RECONCILE_GRACE_SECONDS,
+        )
+
     async def manage_position(
         self,
         position: Position,
@@ -1118,6 +1368,7 @@ class TradingService:
         ):
             position.level_follower = Decimal(str(round(decision.new_stop_level, 3)))
             position.stop_update = (position.stop_update or 0) + 1
+            self._append_stop_history(position, decision.new_stop_level)
             await self._push_stop_to_ig(position, decision.new_stop_level)
             await self._db.commit()
             logger.debug(
@@ -1199,6 +1450,7 @@ class TradingService:
 
         position.level_follower = Decimal(str(round(new_stop, 3)))
         position.stop_update = (position.stop_update or 0) + 1
+        self._append_stop_history(position, new_stop)
         await self._push_stop_to_ig(position, new_stop)
         await self._db.commit()
         logger.debug(
@@ -1207,6 +1459,18 @@ class TradingService:
             new_stop,
             atr_value,
         )
+
+    @staticmethod
+    def _append_stop_history(position: Position, level: float) -> None:
+        """Record a timestamped point on the stop's trajectory.
+
+        Appended on every ratchet (and seeded with the initial stop at open) so
+        the chart can draw the stop's real stepped path rather than a single
+        flat line at the frozen initial level. A fresh list is assigned (not an
+        in-place append) so the ORM detects the change on the plain JSON column.
+        """
+        point = {"t": datetime.now(UTC).isoformat(), "level": round(level, 5)}
+        position.stop_history = [*(position.stop_history or []), point]
 
     def _clamp_trailing_distance(
         self, raw_distance: float, position: Position, spread: float

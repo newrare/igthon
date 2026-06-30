@@ -240,6 +240,12 @@ class Settings(BaseSettings):
     strategy_daily_loss_limit: float = -500.0
     strategy_daily_win_target: float = 300.0
     strategy_min_win_rate: float = 0.40
+    # Master switch for the daily-risk circuit-breakers (daily loss/target, max
+    # trades, win-rate floor). True in production; can be turned off at runtime
+    # from the dashboard in dev/test to let the bot keep opening and observe the
+    # system's behaviour. The per-epic gates (duplicate epic, max positions) are
+    # unaffected. Persisted across restarts via SelectionPreference(kind="risk").
+    strategy_daily_risk_enabled: bool = True
     strategy_hour_start: int = 9
     strategy_hour_end: int = 16
     strategy_hour_close: int = 17  # global fallback close hour (UTC)
@@ -250,6 +256,12 @@ class Settings(BaseSettings):
     strategy_close_target: str = "follower"
     strategy_compensate_loose: bool = False
     strategy_euro_loss: float = 4000.0
+    # Safety margin added on top of IG's minimum stop distance when placing an
+    # order. IG rejects a stop that sits at/inside its minimum-distance rule, and
+    # the price drifts between the market snapshot and the order landing, so a
+    # stop clamped exactly to the minimum is frequently rejected ("Stop trop
+    # près"). Padding the floor by this fraction (0.15 = 15%) absorbs that drift.
+    strategy_stop_min_distance_margin: float = 0.15
     # Max margin (EUR) to open one minimum-size BUY; epics above this are dropped
     # from the tradable/streaming set — pointless to analyze (and subscribe to)
     # markets we could never afford to open. Set to 0 to disable the filter.

@@ -1,11 +1,11 @@
 """Tests for the recorder service — in-memory log buffer retention."""
 
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
 import pytest
 
-from src.core.recorder import LogBuffer, setup_logging
+from src.core.recorder import API_ERROR_LOGGER, LogBuffer, log_api_error, setup_logging
 
 
 def _make_logger(buf: LogBuffer) -> logging.Logger:
@@ -97,6 +97,49 @@ def test_setup_logging_rotates_when_exceeding_max_bytes(tmp_path, restore_root_l
 
     assert log_file.exists()
     assert (tmp_path / "ig_bot.log.1").exists()
+
+
+def test_log_api_error_writes_to_dedicated_file(tmp_path, restore_root_logging):
+    """log_api_error appends abandoned calls to a dedicated, durable file, and
+    those records never leak into the main log (propagate is disabled)."""
+    main_log = tmp_path / "ig_bot.log"
+    err_log = tmp_path / "ig_api_errors.log"
+    api_logger = logging.getLogger(API_ERROR_LOGGER)
+    try:
+        setup_logging(
+            "INFO",
+            log_file=main_log,
+            api_log_file=None,
+            api_error_log_file=err_log,
+        )
+
+        log_api_error(
+            method="POST",
+            endpoint="/positions/otc",
+            version=2,
+            http_status=400,
+            ig_error_code="validation.failed",
+            attempts=3,
+            error="boom",
+            label="open X",
+        )
+        for handler in api_logger.handlers:
+            handler.flush()
+
+        content = err_log.read_text()
+        assert "POST /positions/otc (v2)" in content
+        assert "HTTP 400" in content
+        assert "IG=validation.failed" in content
+        assert "open X" in content
+        # Propagate is disabled, so it must NOT appear in the main log.
+        assert "/positions/otc" not in main_log.read_text()
+    finally:
+        # Detach the tmp_path file handler so a later log_api_error never writes
+        # into the deleted temp dir.
+        for handler in list(api_logger.handlers):
+            if isinstance(handler, TimedRotatingFileHandler):
+                api_logger.removeHandler(handler)
+                handler.close()
 
 
 def test_setup_logging_none_disables_file_sink(restore_root_logging):

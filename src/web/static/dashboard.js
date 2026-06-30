@@ -115,9 +115,38 @@ async function toggleJobMode(action, cb) {
     }
 }
 
+// ── Strategy / close-profile change confirmation ─────────────────────────────
+// Both title-bar dropdowns funnel through this Promise-based confirm so a
+// mis-click never swaps the live trading logic without an explicit OK.
+let _strategyConfirmResolve = null;
+
+function openStrategyConfirmModal(kind, name) {
+    return new Promise(function(resolve) {
+        _strategyConfirmResolve = resolve;
+        document.getElementById('strategy-confirm-kind').textContent = kind;
+        document.getElementById('strategy-confirm-target').textContent =
+            name.replace(/_/g, ' ');
+        document.getElementById('strategy-confirm-modal').style.display = 'flex';
+    });
+}
+
+function closeStrategyConfirmModal(confirmed) {
+    document.getElementById('strategy-confirm-modal').style.display = 'none';
+    if (_strategyConfirmResolve) {
+        _strategyConfirmResolve(confirmed);
+        _strategyConfirmResolve = null;
+    }
+}
+
 // Switch the active trading strategy from the title-bar dropdown.
 async function switchStrategy(name, sel) {
     const previous = sel.dataset.current || sel.value;
+    if (name === previous) return;  // no-op re-selection
+    const confirmed = await openStrategyConfirmModal('entry strategy', name);
+    if (!confirmed) {
+        sel.value = previous;  // revert the dropdown on cancel
+        return;
+    }
     sel.disabled = true;
     try {
         const res = await fetch('/api/strategy/' + encodeURIComponent(name), { method: 'POST' });
@@ -139,6 +168,12 @@ async function switchStrategy(name, sel) {
 // Switch the active close profile from the title-bar dropdown.
 async function switchCloseProfile(name, sel) {
     const previous = sel.dataset.current || sel.value;
+    if (name === previous) return;  // no-op re-selection
+    const confirmed = await openStrategyConfirmModal('close profile', name);
+    if (!confirmed) {
+        sel.value = previous;  // revert the dropdown on cancel
+        return;
+    }
     sel.disabled = true;
     try {
         const res = await fetch('/api/close-profile/' + encodeURIComponent(name), { method: 'POST' });
@@ -488,6 +523,37 @@ function closeWinRateModal() {
     document.getElementById('winrate-modal').style.display = 'none';
 }
 
+// ── Daily Risk Safety modal ───────────────────────────────────────────────────
+// Opened from the Opening KPI tile. The body (frag-risk_modal) refreshes with
+// the 2s poll, so the breaker values stay live while the modal is open.
+function openRiskModal() {
+    document.getElementById('risk-modal').style.display = 'block';
+}
+function closeRiskModal() {
+    document.getElementById('risk-modal').style.display = 'none';
+}
+
+// Arm/disarm the daily-risk circuit-breakers. Persists server-side; the badge
+// and modal repaint on the next poll.
+async function toggleRiskGuard(enabled, el) {
+    el.disabled = true;
+    try {
+        const res = await fetch('/api/risk/' + (enabled ? 'on' : 'off'), { method: 'POST' });
+        if (res.ok) {
+            showToast('Daily risk', enabled ? 'Safety ARMED' : 'Safety DISABLED (dev)',
+                enabled ? 'success' : 'warning');
+        } else {
+            el.checked = !enabled;  // revert on failure
+            showToast('Daily risk', 'Failed to switch', 'error');
+        }
+    } catch (e) {
+        el.checked = !enabled;
+        showToast('Daily risk', 'Network error', 'error');
+    } finally {
+        el.disabled = false;
+    }
+}
+
 // ── Buy Confirmation Modal ────────────────────────────────────────────────────
 let _buyConfirmResolve = null;
 
@@ -530,10 +596,12 @@ document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
         if (document.getElementById('buy-confirm-modal').style.display !== 'none') closeBuyConfirmModal(false);
         if (document.getElementById('close-confirm-modal').style.display !== 'none') closeCloseConfirmModal(false);
+        if (document.getElementById('strategy-confirm-modal').style.display !== 'none') closeStrategyConfirmModal(false);
         if (document.getElementById('epics-modal').style.display !== 'none') closeEpicsModal();
         if (document.getElementById('positions-modal').style.display !== 'none') closePositionsModal();
         if (document.getElementById('closed-modal').style.display !== 'none') closeClosedModal();
         if (document.getElementById('winrate-modal').style.display !== 'none') closeWinRateModal();
+        if (document.getElementById('risk-modal').style.display !== 'none') closeRiskModal();
     }
 });
 
@@ -707,6 +775,15 @@ async function closePosition(positionId, epic, btn) {
 // it opens a position on the right market without re-passing the epic.
 let _chartModalEpic = null;
 
+// Auto-refresh handle for the open chart. The 2 s fragment poll only swaps
+// dashboard section HTML — it never touches an open chart — so without this the
+// curve would freeze at the moment the modal was opened and never show new bids.
+let _chartRefreshTimer = null;
+// Candles stream in (and are persisted) roughly once per minute, but the latest
+// candle's bid moves intra-bar; refresh a few seconds apart so new ticks land
+// promptly without hammering the whole-day chart endpoint.
+const CHART_REFRESH_MS = 3000;
+
 // Convert a UTC ISO string (e.g. "2026-06-08T08:30:00+00:00") to a naive local
 // datetime string in Europe/Paris (e.g. "2026-06-08T10:30:00") so that Plotly
 // displays the correct French hour without applying any extra offset.
@@ -743,13 +820,32 @@ async function openChartModal(epic) {
     lucide.createIcons();
     container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
     modal.style.display = 'block';
+    if (_chartRefreshTimer) { clearInterval(_chartRefreshTimer); _chartRefreshTimer = null; }
+    await _loadChart(epic, true);
+    // Keep the open chart live: re-fetch and repaint in place so new bids show
+    // up without the user closing and reopening the modal.
+    _chartRefreshTimer = setInterval(function() {
+        if (_chartModalEpic) _loadChart(_chartModalEpic, false);
+    }, CHART_REFRESH_MS);
+}
+
+// Fetch the whole-day curve for ``epic`` and (re)draw it. ``initial`` paints the
+// "Loading…"/error placeholders and uses Plotly.newPlot; a refresh keeps the
+// current chart visible and uses Plotly.react for a flicker-free in-place update.
+async function _loadChart(epic, initial) {
+    const container = document.getElementById('chart-container');
     try {
         const res = await fetch('/api/chart/' + encodeURIComponent(epic));
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+        // A slow response that lands after the modal was closed or switched to
+        // another epic must not paint over the current view.
+        if (_chartModalEpic !== epic) return;
         const candles = data.candles || [];
         if (!candles.length) {
-            container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">No price data available yet.</div>';
+            if (initial) {
+                container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">No price data available yet.</div>';
+            }
             return;
         }
         const trades = data.trades || [];
@@ -769,8 +865,18 @@ async function openChartModal(epic) {
         let lo = Math.min(Math.min.apply(null, rawBids), Math.min.apply(null, rawOffers));
         let hi = Math.max(Math.max.apply(null, rawBids), Math.max.apply(null, rawOffers));
         trades.forEach(function(t) {
-            ['open', 'openBid', 'zero', 'stop', 'target', 'close'].forEach(function(k) {
+            ['open', 'openBid', 'zero', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
                 const v = t[k];
+                if (typeof v === 'number' && isFinite(v)) {
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            });
+            // Either stop (follower / loose) can ratchet above the initial level,
+            // so fold both whole stepped trajectories into the bounds too — else a
+            // high stop would be clipped at the top of the view.
+            (t.stopsFollower || []).concat(t.stopsLoose || []).forEach(function(pt) {
+                const v = pt.level;
                 if (typeof v === 'number' && isFinite(v)) {
                     if (v < lo) lo = v;
                     if (v > hi) hi = v;
@@ -894,6 +1000,46 @@ async function openChartModal(epic) {
             });
         }
 
+        // Stepped stop trajectory: one protective stop's real path over the trade
+        // — the initial level plus every ratchet update. Each point holds until
+        // the next update (Plotly 'hv' = step-after); the last level is carried to
+        // the exit (or last candle for a still-open trade) so the line spans the
+        // whole trade. Drawn once per stop (the bot software stop and the IG
+        // broker stop), each in its own colour/label, replacing the old single
+        // flat line that only showed the frozen initial level and never matched
+        // the live stop at exit once it had ratcheted up. Returns true when a
+        // stepped line was drawn, false to let the caller fall back to a flat one.
+        function addStopStep(stops, closeTimeStr, color, label, dash) {
+            if (!Array.isArray(stops) || !stops.length) return false;
+            const xs = [], ys = [];
+            stops.forEach(function(pt) {
+                if (typeof pt.level !== 'number' || !isFinite(pt.level)) return;
+                xs.push(_toParisNaive(pt.t));
+                ys.push(toPct(pt.level));
+            });
+            if (!xs.length) return false;
+            // Carry the last level to the exit so the step spans the trade.
+            const endX = closeTimeStr
+                ? _toParisNaive(closeTimeStr)
+                : timestamps[timestamps.length - 1];
+            xs.push(endX);
+            ys.push(ys[ys.length - 1]);
+            const last = stops[stops.length - 1].level;
+            traces.push({
+                x: xs, y: ys,
+                type: 'scatter', mode: 'lines', name: label,
+                line: { color: color, width: 1.2, shape: 'hv', dash: dash || 'solid' },
+                hoverinfo: 'skip'
+            });
+            annotations.push({
+                xref: 'paper', x: 1, xanchor: 'right', yref: 'y',
+                y: toPct(last), yanchor: 'bottom',
+                text: label + ' ' + last.toFixed(4), showarrow: false,
+                font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
+            });
+            return true;
+        }
+
         // Close reasons whose exit level/time were derived (the position vanished
         // from IG), not captured from a real fill — flagged as estimated.
         const _ESTIMATED_CLOSE = { closed_externally: 1, not_found_in_ig: 1 };
@@ -908,14 +1054,29 @@ async function openChartModal(epic) {
             // the bid (openBid = level_zero - spread), so the gap up to this line
             // is exactly the spread; the bid curve reaching it = break-even.
             addLevelLine(t.zero, '#cbd5e1', 'solid', 'Break-even');
-            addLevelLine(t.stop, '#ef4444', 'solid', 'Stop');
+            // Two protective stops, each its own line. Prefer the real stepped
+            // path; fall back to a flat line at the scalar level for positions
+            // opened before the history was captured.
+            //   - Follower (red, solid): the application-side trailing stop that
+            //     ratchets up with the market past break-even + margin — the level
+            //     a close is actually decided on between two bid polls.
+            //   - Loose (violet, dashed): the protective stop resting at the
+            //     broker (the gap-safety net). It can sit BELOW the follower (IG's
+            //     min-distance rule widened it at open), which is why a close can
+            //     fire on the follower while this line is still untouched.
+            if (!addStopStep(t.stopsFollower, t.closeTime, '#ef4444', 'Follower', 'solid')) {
+                addLevelLine(t.stopFollower, '#ef4444', 'solid', 'Follower');
+            }
+            if (!addStopStep(t.stopsLoose, t.closeTime, '#a78bfa', 'Loose', 'dot')) {
+                addLevelLine(t.stopLoose, '#a78bfa', 'dot', 'Loose');
+            }
             addEventMarker(t.openTime, t.openBid, '#E0B341', 'Entry', false);
             addEventMarker(t.closeTime, t.close, '#60a5fa', 'Exit',
                 !!_ESTIMATED_CLOSE[t.closeReason]);
         });
         const xIsDate = true;
 
-        Plotly.newPlot(container, traces, {
+        const layout = {
             paper_bgcolor: '#1c1714',
             plot_bgcolor: '#1c1714',
             font: { color: '#94a3b8', size: 11 },
@@ -937,13 +1098,27 @@ async function openChartModal(epic) {
                 range: [-3, 103],
                 title: ''
             },
-        }, { responsive: true, displayModeBar: false });
+        };
+        const config = { responsive: true, displayModeBar: false };
+        // newPlot for the first paint (clears the Loading placeholder); react for
+        // refreshes so the chart updates in place without flicker or reset zoom.
+        if (initial) {
+            Plotly.newPlot(container, traces, layout, config);
+        } else {
+            Plotly.react(container, traces, layout, config);
+        }
     } catch(e) {
-        container.innerHTML = '<div style="color:#ef4444;padding:3rem;text-align:center;">Failed to load data: ' + e.message + '</div>';
+        // Only blank the chart on an initial-load failure; a transient refresh
+        // error should leave the last good chart on screen.
+        if (initial) {
+            container.innerHTML = '<div style="color:#ef4444;padding:3rem;text-align:center;">Failed to load data: ' + e.message + '</div>';
+        }
     }
 }
 
 function closeChartModal() {
+    if (_chartRefreshTimer) { clearInterval(_chartRefreshTimer); _chartRefreshTimer = null; }
+    _chartModalEpic = null;
     document.getElementById('chart-modal').style.display = 'none';
     Plotly.purge(document.getElementById('chart-container'));
 }

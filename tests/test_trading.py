@@ -4,15 +4,27 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
+from src.core.api.client import IGAPIError
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal
 from src.execution.trading import (
+    CONFIRM_MAX_ATTEMPTS,
     TradeConfig,
     TradingService,
 )
 from src.feed.price_buffer import Candle, EpicBuffer
 from src.models.position import Position, PositionState
+
+
+def _ig_error(status: int, code: str = "") -> IGAPIError:
+    """An IGAPIError carrying a real HTTP status and IG error code."""
+    request = httpx.Request("GET", "https://demo-api.ig.com/gateway/deal/confirms/REF1")
+    response = httpx.Response(status, request=request)
+    return IGAPIError(
+        f"HTTP {status}", request=request, response=response, ig_error_code=code
+    )
 
 
 def _service() -> TradingService:
@@ -286,6 +298,43 @@ class TestTrailingStop:
 
         client.put.assert_not_awaited()
 
+    async def test_ratchet_appends_to_stop_history(self):
+        svc, _, _ = _trailing_service()
+        buf = _buffer_with_atr2()
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),
+            level_follower=None,
+            stop_history=[{"t": "2026-06-08T10:00:00+00:00", "level": 95.0}],
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        # Initial seed kept, the ratchet appended a new point at the new level.
+        assert len(pos.stop_history) == 2
+        assert pos.stop_history[0] == {"t": "2026-06-08T10:00:00+00:00", "level": 95.0}
+        assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
+        assert "t" in pos.stop_history[-1]
+
+    async def test_no_ratchet_leaves_stop_history_untouched(self):
+        svc, _, _ = _trailing_service()
+        buf = _buffer_with_atr2()
+        seed = [{"t": "2026-06-08T10:00:00+00:00", "level": 103.0}]
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),
+            level_follower=Decimal("103"),  # candidate 100 < current -> no change
+            stop_history=list(seed),
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        assert pos.stop_history == seed
+
 
 def _open_signal(*, bid: float, level_security: float) -> TradingSignal:
     """Minimal BUY signal for open_position; only epic/levels are read."""
@@ -380,6 +429,8 @@ class TestOpenPosition:
 
     async def test_clamps_stop_out_to_minimum_distance(self):
         svc, client, _ = _open_service()
+        # Isolate the clamp from the safety margin (tested separately).
+        svc._config.stop_min_distance_margin = 0.0
         # Strategy stop only 1 point away; IG minimum is 8 points (0.0008).
         signal = _open_signal(bid=1.21000, level_security=1.20990)
         client.get.side_effect = [
@@ -396,17 +447,128 @@ class TestOpenPosition:
         assert payload["stopLevel"] == pytest.approx(1.20920)
         assert float(pos.level_stop) == pytest.approx(1.20920)
 
+    async def test_stop_min_distance_margin_pads_the_floor(self):
+        """The order stop is padded past IG's bare minimum by the safety margin,
+        so a fast-moving market can't push it back under the floor ("Stop trop
+        près"). With a 15% margin the 8-point minimum becomes 9.2 points."""
+        svc, client, _ = _open_service()
+        svc._config.stop_min_distance_margin = 0.15
+        # Strategy stop 1 point away; IG minimum 8 points → floor padded to 9.2.
+        signal = _open_signal(bid=1.21000, level_security=1.20990)
+        client.get.side_effect = [
+            _open_market(min_stop=8.0),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        payload = client.post.await_args.args[1]
+        # 1.21000 - 0.0008 * 1.15 = 1.20908.
+        assert payload["stopLevel"] == pytest.approx(1.20908)
+        assert float(pos.level_stop) == pytest.approx(1.20908)
+
+    async def test_clamp_realigns_decoupled_software_stop(self):
+        """Decoupled path: the close profile sets ONE stop
+        (follower == loose == security). When IG widens it to the minimum
+        distance, every software stop level must follow — otherwise the bot
+        enforces a stop tighter than the one resting at the broker and closes the
+        position in the noise at a level IG would never have hit."""
+        svc, client, _ = _open_service()
+        # Isolate the clamp from the safety margin (tested separately).
+        svc._config.stop_min_distance_margin = 0.0
+        bid = 1.21000
+        spread = 0.0003
+        stop = 1.20990  # 1 point away; IG minimum is 8 points → must widen out
+        signal = TradingSignal(
+            epic="CS.D.AUDNZD.CFD.IP",
+            score=0.9,
+            direction="BUY",
+            regression=RegressionResult(slope=0.1, intercept=bid, r_squared=0.9),
+            sma_fast=bid,
+            sma_slow=bid,
+            roc=0.1,
+            spread=spread,
+            avg_spread=spread,
+            position_in_range=55.0,
+            levels=TradingLevels(
+                bid=bid,
+                offer=bid + spread,
+                spread=spread,
+                high=bid + 0.01,
+                low=bid - 0.01,
+                scope=0.02,
+                average=bid,
+                level_follower=stop,
+                level_win=bid + 0.01,
+                level_zero=bid + spread,
+                level_loose=stop,
+                level_security=stop,
+                stop_distance=1,
+            ),
+        )
+        client.get.side_effect = [
+            _open_market(min_stop=8.0),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": bid},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        # Broker stop widened to the 8-point minimum...
+        assert float(pos.level_stop) == pytest.approx(1.20920)
+        # ...and every software stop level followed it (none tighter than broker).
+        assert float(pos.level_follower) == pytest.approx(1.20920)
+        assert float(pos.level_loose) == pytest.approx(1.20920)
+        assert float(pos.level_security) == pytest.approx(1.20920)
+        # The seeded stop trajectory uses the realigned follower, not the tight one.
+        assert pos.stop_history[0]["level"] == pytest.approx(1.20920)
+
+    async def test_legacy_distinct_levels_not_collapsed_by_clamp(self):
+        """A legacy strategy with an intentionally tighter follower/loose keeps
+        them: only levels that equalled the pre-clamp security are realigned."""
+        svc, client, _ = _open_service()
+        # Isolate the clamp from the safety margin (tested separately).
+        svc._config.stop_min_distance_margin = 0.0
+        # _open_signal sets follower=bid-0.001, loose=bid-0.003, security=param
+        # (all distinct). The clamp widens the order stop but must touch none.
+        signal = _open_signal(bid=1.21000, level_security=1.20990)
+        client.get.side_effect = [
+            _open_market(min_stop=8.0),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        assert float(pos.level_stop) == pytest.approx(1.20920)
+        # Distinct legacy levels preserved (not folded to the broker stop).
+        assert float(pos.level_follower) == pytest.approx(1.20900)  # bid - 0.001
+        assert float(pos.level_loose) == pytest.approx(1.20700)  # bid - 0.003
+
 
 class TestOpenPositionPersistence:
     """The position is recorded the instant IG accepts the order — before the
     /confirms round-trip — so a failed confirm can never leave a live position
     untracked (the "margin in use with no open position" bug)."""
 
-    async def test_persists_before_confirm_and_keeps_row_when_confirm_fails(self):
+    async def test_persists_before_confirm_and_keeps_row_when_confirm_fails(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("src.execution.trading.asyncio.sleep", AsyncMock())
         svc, client, db = _open_service()
         signal = _open_signal(bid=1.21000, level_security=1.20550)
-        # market OK, then the confirm raises (timeout / rate-limit / 5xx).
-        client.get.side_effect = [_open_market(), RuntimeError("confirm timeout")]
+
+        # market OK, then every confirm attempt 404s (deal not resolvable yet).
+        def _get(endpoint, **_kw):
+            if "confirms" in endpoint:
+                raise _ig_error(404, "error.confirms.deal-not-found")
+            return _open_market()
+
+        client.get.side_effect = _get
         client.post = AsyncMock(return_value={"dealReference": "REF1"})
 
         pos = await svc.open_position(signal)
@@ -417,6 +579,67 @@ class TestOpenPositionPersistence:
         assert pos.deal_reference == "REF1"
         assert pos.deal_id is None  # unresolved — sync will bind it
         assert pos.state == PositionState.OPEN
+        db.delete.assert_not_called()
+        # The 404 (deal not ready) was retried, not abandoned on the first call.
+        confirm_calls = [
+            c for c in client.get.call_args_list if "confirms" in c.args[0]
+        ]
+        assert len(confirm_calls) == CONFIRM_MAX_ATTEMPTS
+
+    async def test_confirm_retries_then_succeeds(self, monkeypatch):
+        monkeypatch.setattr("src.execution.trading.asyncio.sleep", AsyncMock())
+        svc, client, db = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+
+        # 404 on the first confirm poll, then IG resolves the deal.
+        seq = [
+            _ig_error(404, "error.confirms.deal-not-found"),
+            {"dealStatus": "ACCEPTED", "dealId": "D-OK", "level": 1.21000},
+        ]
+        confirm_iter = iter(seq)
+
+        def _get(endpoint, **_kw):
+            if "confirms" in endpoint:
+                nxt = next(confirm_iter)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
+            return _open_market()
+
+        client.get.side_effect = _get
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        assert pos.deal_id == "D-OK"  # bound on the retry
+        db.delete.assert_not_called()
+
+    async def test_confirm_permanent_4xx_is_not_retried(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("src.execution.trading.asyncio.sleep", sleep_mock)
+        svc, client, db = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+
+        # A non-404 4xx (e.g. bad request) is permanent — stop immediately.
+        def _get(endpoint, **_kw):
+            if "confirms" in endpoint:
+                raise _ig_error(400, "error.public-api.failure.validation")
+            return _open_market()
+
+        client.get.side_effect = _get
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        # Row kept (sync reconciles), but confirm tried exactly once — no backoff.
+        assert pos is not None
+        assert pos.deal_id is None
+        confirm_calls = [
+            c for c in client.get.call_args_list if "confirms" in c.args[0]
+        ]
+        assert len(confirm_calls) == 1
+        sleep_mock.assert_not_awaited()
         db.delete.assert_not_called()
 
     async def test_rejected_deal_removes_the_draft_row(self):
@@ -512,6 +735,27 @@ class TestSyncAdoption:
         db.commit.assert_awaited()
         assert "IX.D.StoxxBank.FNI3.IP" in live
 
+    async def test_does_not_re_adopt_a_known_deal_id(self):
+        """Idempotency: a live IG position whose dealId is already recorded in the
+        DB (in ANY state — e.g. an earlier adopted row since CLOSEd) is never
+        adopted again. This is the fix for duplicate 'adopted' rows piling up
+        across the 20s sync (observed: 6 rows for one DAX dealId)."""
+        client = AsyncMock()
+        db = AsyncMock()
+        db.add = MagicMock()
+        open_result = MagicMock()
+        open_result.scalars.return_value.all.return_value = []  # no OPEN rows
+        known_result = MagicMock()
+        known_result.all.return_value = [("D1",)]  # D1 already known (any state)
+        db.execute = AsyncMock(side_effect=[open_result, known_result])
+        svc = TradingService(client=client, db_session=db, config=TradeConfig())
+        entry = _ig_entry(deal_id="D1", epic="IX.D.StoxxBank.FNI3.IP")
+        client.get = AsyncMock(return_value={"positions": [entry]})
+
+        await svc.sync_open_positions()
+
+        db.add.assert_not_called()
+
     async def test_does_not_adopt_non_buy(self):
         svc, client, db = _sync_service(db_open=[])
         entry = _ig_entry(deal_id="D2", epic="CS.D.EURUSD.CEF.IP", direction="SELL")
@@ -542,6 +786,45 @@ class TestSyncAdoption:
         db.add.assert_not_called()
         # Unrealized euro refreshed from the live bid: (101 - 100) * 10.
         assert float(prov.euro) == pytest.approx(10.0)
+
+    async def test_binds_provisional_row_by_deal_reference_over_level(self):
+        # An executed-but-unconfirmed order: the provisional row holds the
+        # dealReference IG echoes on the live position. Binding must match on it
+        # directly, NOT guess by closest level — which here would pick the wrong
+        # entry. prov's ref points at the 105 entry while the 100 entry (closer
+        # to prov's level) belongs to another row by exact dealId.
+        prov = Position(
+            epic="E1",
+            epic_name="E1",
+            deal_id=None,
+            deal_reference="REF-X",
+            date=date(2026, 6, 16),
+            state=PositionState.OPEN,
+            level_open=Decimal("100.0"),
+            euro_per_point=Decimal("10.0"),
+        )
+        other = Position(
+            epic="E1",
+            epic_name="E1",
+            deal_id="D-CLOSE",
+            date=date(2026, 6, 16),
+            state=PositionState.OPEN,
+            level_open=Decimal("100.0"),
+            euro_per_point=Decimal("10.0"),
+        )
+        svc, client, db = _sync_service(db_open=[prov, other])
+        entry_match = _ig_entry(deal_id="D-REF", epic="E1", level=105.0, bid=105.0)
+        entry_match["position"]["dealReference"] = "REF-X"
+        entry_close = _ig_entry(deal_id="D-CLOSE", epic="E1", level=100.0, bid=100.0)
+        entry_close["position"]["dealReference"] = "REF-OTHER"
+        client.get = AsyncMock(return_value={"positions": [entry_match, entry_close]})
+
+        await svc.sync_open_positions()
+
+        # prov bound by dealReference (the 105 entry), not the closer-level one.
+        assert prov.deal_id == "D-REF"
+        assert other.deal_id == "D-CLOSE"
+        db.add.assert_not_called()
 
     async def test_heals_rows_sharing_one_deal_id_without_duplicating(self):
         # Legacy corruption: three same-epic rows all stamped with the LAST
@@ -576,3 +859,81 @@ class TestSyncAdoption:
         # No new rows created, and every live dealId is now bound exactly once.
         db.add.assert_not_called()
         assert sorted(r.deal_id for r in rows) == ["A", "B", "C"]
+
+
+@pytest.mark.asyncio
+class TestSyncReconcileUnconfirmed:
+    """sync_open_positions must not turn provisional rows whose open never
+    confirmed (deal_id stayed None) into phantom closed_externally trades at €0.
+    """
+
+    def _provisional(self, *, opened: datetime, level: float = 100.0) -> Position:
+        return Position(
+            epic="E1",
+            epic_name="E1",
+            deal_id=None,  # provisional: /confirms never bound a dealId
+            deal_reference="REF-PROV",
+            date=opened.date(),
+            time_open=opened.time(),
+            state=PositionState.OPEN,
+            level_open=Decimal(str(level)),
+            euro_per_point=Decimal("10.000000"),
+        )
+
+    async def test_fresh_unconfirmed_row_is_left_alone_within_grace(self):
+        # Opened a moment ago and absent from IG /positions (eventual
+        # consistency). It must be neither closed nor adopted — just held so a
+        # later sync can bind it.
+        now = datetime.now(UTC).replace(tzinfo=None)
+        prov = self._provisional(opened=now)
+        svc, client, db = _sync_service(db_open=[prov])
+        client.get = AsyncMock(return_value={"positions": []})
+
+        await svc.sync_open_positions()
+
+        assert prov.state == PositionState.OPEN
+        assert prov.reason_close is None
+        db.add.assert_not_called()
+
+    async def test_stale_unconfirmed_row_is_marked_never_opened(self):
+        # Past the grace window with still no dealId and still absent from IG:
+        # the order never executed. It is flagged never_opened (NOT a real
+        # closed_externally trade) so the dashboard excludes it from stats.
+        old = datetime(2026, 6, 16, 10, 0)
+        prov = self._provisional(opened=old)
+        svc, client, db = _sync_service(db_open=[prov])
+        client.get = AsyncMock(return_value={"positions": []})
+
+        await svc.sync_open_positions()
+
+        assert prov.state == PositionState.CLOSE
+        assert prov.reason_close == "never_opened"
+        assert float(prov.euro) == 0.0
+        assert prov.win == 0
+        # No phantom level move: close defaults to the open level.
+        assert prov.level_close == prov.level_open
+        db.commit.assert_awaited()
+
+    async def test_confirmed_row_that_vanishes_is_still_closed_externally(self):
+        # Regression guard: a row WITH a real dealId that disappears from IG is a
+        # genuine external close and must keep reconciling as closed_externally,
+        # regardless of how recently it opened.
+        now = datetime.now(UTC).replace(tzinfo=None)
+        real = Position(
+            epic="E1",
+            epic_name="E1",
+            deal_id="D-REAL",
+            date=now.date(),
+            time_open=now.time(),
+            state=PositionState.OPEN,
+            level_open=Decimal("100.0"),
+            euro=Decimal("12.5"),
+            euro_per_point=Decimal("10.000000"),
+        )
+        svc, client, db = _sync_service(db_open=[real])
+        client.get = AsyncMock(return_value={"positions": []})
+
+        await svc.sync_open_positions()
+
+        assert real.state == PositionState.CLOSE
+        assert real.reason_close == "closed_externally"

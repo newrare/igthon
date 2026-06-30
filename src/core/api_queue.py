@@ -35,6 +35,7 @@ from itertools import count
 from typing import TYPE_CHECKING
 
 from src.core.api_guard import _QUOTA_EXCEEDED_CODES
+from src.core.recorder import log_api_error
 
 if TYPE_CHECKING:
     from src.core.api.client import IGClient
@@ -533,3 +534,16 @@ class APIQueue:
         )
         if len(self._errors) > self._errors_size:
             del self._errors[0 : len(self._errors) - self._errors_size]
+
+        # Mirror onto the durable, day-rotated error-log file so the failure
+        # outlives this in-memory buffer, a restart, and the main log's rotation.
+        log_api_error(
+            method=call.method,
+            endpoint=call.endpoint,
+            version=call.version,
+            http_status=status,
+            ig_error_code=ig_code,
+            attempts=call.attempts,
+            error=str(exc),
+            label=call.label,
+        )

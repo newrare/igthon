@@ -26,6 +26,7 @@ class OpenGateConfig(Protocol):
     day_euro_finish_win: float
     max_trades_day: int
     min_win_rate: float
+    daily_risk_enabled: bool
 
 
 def evaluate_open_gates(
@@ -60,20 +61,45 @@ def evaluate_open_gates(
     if open_count >= config.max_positions:
         return False, f"Max positions reached ({open_count})"
 
-    if daily_pnl <= config.day_euro_finish_loose:
-        return False, f"Daily loss limit reached ({daily_pnl:.2f}€)"
-    if daily_pnl >= config.day_euro_finish_win:
-        return False, f"Daily target reached ({daily_pnl:.2f}€)"
-
-    if trade_count >= config.max_trades_day:
-        return False, f"Max daily trades reached ({trade_count})"
-    if trade_count >= 10 and win_rate < config.min_win_rate:
-        return (
-            False,
-            f"Win rate too low ({win_rate:.0%} after {trade_count} trades)",
+    # Daily circuit-breakers — skippable at runtime (dev/test) via the dashboard.
+    if getattr(config, "daily_risk_enabled", True):
+        blocked = daily_risk_block(
+            daily_pnl=daily_pnl,
+            trade_count=trade_count,
+            win_rate=win_rate,
+            config=config,
         )
+        if blocked is not None:
+            return False, blocked
 
     return True, "OK"
+
+
+def daily_risk_block(
+    *,
+    daily_pnl: float,
+    trade_count: int,
+    win_rate: float,
+    config: OpenGateConfig,
+) -> str | None:
+    """Day-scope circuit-breakers that block *all* opening for the rest of the day.
+
+    Returns the reason string when a daily gate has tripped, else ``None``. Split
+    out of :func:`evaluate_open_gates` (which still calls it) so the dashboard can
+    show *why* the bot has stopped opening without re-deriving the thresholds —
+    keeping the live gate and the indicator in lockstep. Unlike the per-epic gates
+    (duplicate epic, max positions), these depend only on the day's realized P&L
+    and trade record, so they apply identically whatever epic would be opened next.
+    """
+    if daily_pnl <= config.day_euro_finish_loose:
+        return f"Daily loss limit reached ({daily_pnl:.2f}€)"
+    if daily_pnl >= config.day_euro_finish_win:
+        return f"Daily target reached ({daily_pnl:.2f}€)"
+    if trade_count >= config.max_trades_day:
+        return f"Max daily trades reached ({trade_count})"
+    if trade_count >= 10 and win_rate < config.min_win_rate:
+        return f"Win rate too low ({win_rate:.0%} after {trade_count} trades)"
+    return None
 
 
 def compute_quantity_multiplier(

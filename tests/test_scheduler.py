@@ -6,6 +6,7 @@ live feed through the hourly tradable refresh, so a trade's price history keeps
 recording until it closes.
 """
 
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -77,6 +78,89 @@ class TestSetStrategy:
         assert sched._strategy is None
 
 
+class TestOpenEpicGuarded:
+    """The per-epic open lock serialises the gate + order placement so two
+    concurrent callers (analysis tick, manual dashboard open, two browser tabs)
+    can never both pass the duplicate-epic gate and place two orders.
+    """
+
+    def test_lock_is_per_epic_and_stable(self):
+        sched = _make_scheduler(MagicMock())
+        assert sched._open_lock("A") is sched._open_lock("A")  # same epic reused
+        assert sched._open_lock("A") is not sched._open_lock("B")  # distinct epics
+
+    async def test_gate_refusal_short_circuits_open(self):
+        sched = _make_scheduler(MagicMock())
+        opened = False
+
+        class _Trading:
+            async def can_open_intent(self, intent):
+                return False, "Epic IX.D.DAX.IFMM.IP already open"
+
+            async def open_from_intent(self, intent, buf):
+                nonlocal opened
+                opened = True
+                return object()
+
+        intent = SimpleNamespace(epic="IX.D.DAX.IFMM.IP", direction="BUY")
+        position, reason = await sched.open_epic_guarded(_Trading(), intent, None)
+        assert position is None
+        assert reason == "Epic IX.D.DAX.IFMM.IP already open"
+        assert opened is False  # never reaches the order when the gate refuses
+
+    async def test_success_returns_position_and_no_reason(self):
+        sched = _make_scheduler(MagicMock())
+        sentinel = object()
+
+        class _Trading:
+            async def can_open_intent(self, intent):
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return sentinel
+
+        intent = SimpleNamespace(epic="E", direction="BUY")
+        position, reason = await sched.open_epic_guarded(_Trading(), intent, None)
+        assert position is sentinel
+        assert reason is None
+
+    async def test_concurrent_same_epic_calls_are_serialised(self):
+        sched = _make_scheduler(MagicMock())
+        order: list[tuple[str, str]] = []
+        release = asyncio.Event()
+
+        class _Trading:
+            def __init__(self, tag: str) -> None:
+                self.tag = tag
+
+            async def can_open_intent(self, intent):
+                order.append(("gate", self.tag))
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                order.append(("open-start", self.tag))
+                if self.tag == "A":
+                    await release.wait()  # hold the lock until released
+                order.append(("open-end", self.tag))
+                return object()
+
+        intent = SimpleNamespace(epic="E", direction="BUY")
+        task_a = asyncio.create_task(
+            sched.open_epic_guarded(_Trading("A"), intent, None)
+        )
+        await asyncio.sleep(0)  # let A acquire the lock and start its order
+        task_b = asyncio.create_task(
+            sched.open_epic_guarded(_Trading("B"), intent, None)
+        )
+        await asyncio.sleep(0)
+        # B is blocked on the per-epic lock — its gate must not have run yet.
+        assert ("gate", "B") not in order
+        release.set()
+        await asyncio.gather(task_a, task_b)
+        # B's gate ran only after A's order fully completed (true serialisation).
+        assert order.index(("open-end", "A")) < order.index(("gate", "B"))
+
+
 class TestSelectionPersistence:
     """Dashboard selection is saved to the DB and restored on startup."""
 
@@ -101,6 +185,19 @@ class TestSelectionPersistence:
         restarted._settings.close_profile_name = "atr_trailing"
         await restarted.load_selection_preferences()
         assert restarted.active_close_profile_name == "atr_trailing_profit"
+
+    async def test_daily_risk_toggle_persists_and_restores(self, session_factory):
+        sched = _make_scheduler(session_factory)
+        sched._settings.strategy_daily_risk_enabled = True
+        assert sched.daily_risk_enabled is True
+        assert await sched.select_daily_risk(False) is True
+        assert sched.daily_risk_enabled is False
+
+        # A fresh scheduler (restart) restores the disarmed choice.
+        restarted = _make_scheduler(session_factory)
+        restarted._settings.strategy_daily_risk_enabled = True
+        await restarted.load_selection_preferences()
+        assert restarted.daily_risk_enabled is False
 
     async def test_rejected_selection_is_not_persisted(self, session_factory):
         sched = _make_scheduler(session_factory)

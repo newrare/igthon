@@ -30,9 +30,10 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from itertools import groupby
 
 from src.entry.base import EntryStrategy
-from src.execution.risk import evaluate_open_gates
+from src.execution.risk import daily_risk_block, evaluate_open_gates
 from src.execution.trading import TradeConfig
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
 from src.feed.price_buffer import Candle, EpicBuffer
@@ -58,6 +59,11 @@ class SimulationConfig:
     base_price: float = 8000.0
     euro_per_point: float = 1.0  # fictional contract value, € per point
     quantity: int = 1
+    # Percentage lens: spread cost charged at each open, as a % of the entry bid.
+    # The engine (stop placement, risk gate) is unaffected — this only sets the
+    # per-trade malus subtracted from the bid→bid % return reported alongside the
+    # euro figures (see SimulationResult.summary).
+    spread_malus_pct: float = 0.0
 
 
 @dataclass(slots=True)
@@ -74,6 +80,7 @@ class SimulatedTrade:
     level_stop: float  # broker-side protective stop (trails upward)
     euro_stop: float
     level_margin: float = 0.0  # margin level frozen at open (read by the profile)
+    level_open_bid: float = 0.0  # bid at open (for the bid→bid % return lens)
     euro_per_point: float = 0.0  # € per point of movement (read by the profile)
     close_time: str | None = None
     level_close: float | None = None
@@ -95,6 +102,25 @@ class SimulationResult:
     buy_signals: int = 0
     rejections: Counter = field(default_factory=Counter)
     daily_pnl: list[float] = field(default_factory=list)
+    spread_malus_pct: float = 0.0  # % charged per open in the percentage lens
+
+    def _net_pcts(self) -> list[float]:
+        """Per-trade net return in %, bid→bid, minus the spread malus.
+
+        The fictional-points lens the dashboard asks for: gross move measured on
+        the bid scale (the offer fill is ignored here so the spread cost is *only*
+        the explicit malus), then the per-open malus is subtracted::
+
+            gross_pct = (level_close - level_open_bid) / level_open_bid * 100
+            net_pct   = gross_pct - spread_malus_pct
+        """
+        pcts: list[float] = []
+        for t in self.trades:
+            if not t.level_open_bid or t.level_close is None:
+                continue
+            gross = (t.level_close - t.level_open_bid) / t.level_open_bid * 100.0
+            pcts.append(gross - self.spread_malus_pct)
+        return pcts
 
     @property
     def wins(self) -> int:
@@ -124,6 +150,21 @@ class SimulationResult:
             max_drawdown = max(max_drawdown, peak - total)
             equity.append(round(total, 2))
 
+        # Percentage lens (fictional points): bid→bid return minus spread malus.
+        net_pcts = self._net_pcts()
+        win_pcts = [p for p in net_pcts if p > 0]
+        loss_pcts = [p for p in net_pcts if p <= 0]
+        equity_pct: list[float] = []
+        total_pct = 0.0
+        peak_pct = 0.0
+        max_dd_pct = 0.0
+        for p in net_pcts:
+            total_pct += p
+            peak_pct = max(peak_pct, total_pct)
+            max_dd_pct = max(max_dd_pct, peak_pct - total_pct)
+            equity_pct.append(round(total_pct, 4))
+        n_pct = len(net_pcts)
+
         reasons = Counter(t.reason_close or "?" for t in self.trades)
         count = len(pnls)
         return {
@@ -148,6 +189,23 @@ class SimulationResult:
                 if count
                 else 0.0
             ),
+            # Percentage lens — fictional points, spread charged as an explicit %.
+            "spread_malus_pct": round(self.spread_malus_pct, 4),
+            "wins_pct": len(win_pcts),
+            "losses_pct": len(loss_pcts),
+            "win_rate_pct": round(len(win_pcts) / n_pct, 4) if n_pct else 0.0,
+            "total_pct": round(total_pct, 4),
+            "avg_win_pct": (
+                round(sum(win_pcts) / len(win_pcts), 4) if win_pcts else 0.0
+            ),
+            "avg_loss_pct": (
+                round(sum(loss_pcts) / len(loss_pcts), 4) if loss_pcts else 0.0
+            ),
+            "best_pct": round(max(net_pcts), 4) if net_pcts else 0.0,
+            "worst_pct": round(min(net_pcts), 4) if net_pcts else 0.0,
+            "max_drawdown_pct": round(max_dd_pct, 4),
+            "equity_pct": equity_pct,
+            "net_pcts": [round(p, 4) for p in net_pcts],
         }
 
 
@@ -204,7 +262,7 @@ class StrategySimulator:
         per day, exactly like the synthetic :meth:`run`. This is the entry point
         used by the historical backtester (see :mod:`src.backtest.backtester`).
         """
-        result = SimulationResult()
+        result = SimulationResult(spread_malus_pct=self._sim.spread_malus_pct)
         for day_index, day in enumerate(days):
             if len(result.trades) >= self._sim.target_trades:
                 break
@@ -225,7 +283,27 @@ class StrategySimulator:
         curves: Sequence[tuple[str, list[Candle]]],
         result: SimulationResult,
     ) -> None:
-        """Play one trading day: feed every epic's candles and apply the rules.
+        """Play one trading day, dispatching on the entry's selection model.
+
+        A **cross-epic ranker** (``cross_epic_selection``, e.g.
+        ``projection_ranking``) keeps a single rolling position chosen as the
+        best of all epics — handled by :meth:`_run_day_ranker`, a faithful
+        mirror of the scheduler's ``_select_and_open``. A **per-epic gate**
+        (``donchian_*``) opens whatever epic fires first — handled by
+        :meth:`_run_day_gated`.
+        """
+        if self._entry.cross_epic_selection:
+            self._run_day_ranker(day, curves, result)
+        else:
+            self._run_day_gated(day, curves, result)
+
+    def _run_day_gated(
+        self,
+        day: int,
+        curves: Sequence[tuple[str, list[Candle]]],
+        result: SimulationResult,
+    ) -> None:
+        """Per-epic gate day: feed every epic's candles and open on first BUY.
 
         Candles across epics are merged into a single timestamp-ordered event
         stream so misaligned real-market series (different start times and
@@ -277,6 +355,159 @@ class StrategySimulator:
             if candle is not None:
                 self._close(position, candle, candle.bid_close, "end_of_day")
                 result.trades.append(position)
+
+    def _run_day_ranker(
+        self,
+        day: int,
+        curves: Sequence[tuple[str, list[Candle]]],
+        result: SimulationResult,
+    ) -> None:
+        """Cross-epic ranker day — a faithful mirror of ``_select_and_open``.
+
+        Holds ``entry.concurrent_positions`` rolling positions (1 for
+        ``projection_ranking``). The merged event stream is processed **one
+        timestamp at a time**: every epic's candle for that tick is ingested and
+        open positions are monitored first (a close frees a slot); then, while a
+        slot is free, *all* eligible epics are scored, ranked by score, and the
+        best one that clears the open gates is opened. An epic opened earlier in
+        the day is dropped from the candidate set (``used_today``) so the rolling
+        position rotates across markets — exactly the scheduler's diversity rule.
+
+        Scoring every epic only happens while a slot is free; in the steady state
+        (slot filled) the tick is monitor-only, matching the live cheap path.
+        """
+        buffers = [EpicBuffer(epic=label) for label, _ in curves]
+        open_positions: dict[int, SimulatedTrade] = {}
+        closed_today: list[SimulatedTrade] = []
+        last_candles: list[Candle | None] = [None] * len(curves)
+        used_today: set[int] = set()  # epics already opened today (diversity rule)
+        target = max(int(getattr(self._entry, "concurrent_positions", 1)), 1)
+
+        events = sorted(
+            (
+                (candle.timestamp, e, candle)
+                for e, (_, candles) in enumerate(curves)
+                for candle in candles
+            ),
+            key=lambda ev: (ev[0], ev[1]),
+        )
+
+        for ts, group in groupby(events, key=lambda ev: ev[0]):
+            # Stop once the run target is met and nothing is left to wind down.
+            if len(result.trades) >= self._sim.target_trades and not open_positions:
+                break
+
+            # 1. Ingest this tick's candles and monitor open positions; a close
+            #    here frees a slot the selection step below can immediately refill.
+            for _ts2, e, candle in group:
+                buffers[e].add(candle)
+                last_candles[e] = candle
+                position = open_positions.get(e)
+                if position is not None and self._monitor(position, candle, buffers[e]):
+                    del open_positions[e]
+                    closed_today.append(position)
+                    result.trades.append(position)
+
+            # 2. Refill free slots with the best-ranked eligible epics.
+            self._select_and_open(
+                ts,
+                day,
+                buffers,
+                last_candles,
+                open_positions,
+                closed_today,
+                used_today,
+                target,
+                result,
+            )
+
+        # Force-close anything still open at the end of the day.
+        for e, position in list(open_positions.items()):
+            candle = last_candles[e]
+            if candle is not None:
+                self._close(position, candle, candle.bid_close, "end_of_day")
+                result.trades.append(position)
+
+    def _select_and_open(
+        self,
+        ts: datetime,
+        day: int,
+        buffers: list[EpicBuffer],
+        last_candles: list[Candle | None],
+        open_positions: dict[int, SimulatedTrade],
+        closed_today: list[SimulatedTrade],
+        used_today: set[int],
+        target: int,
+        result: SimulationResult,
+    ) -> None:
+        """Score every eligible epic, rank by score, open the best into free slots.
+
+        Mirror of the scheduler's rolling selector: candidates are epics that are
+        not already open, not used earlier today, and have enough buffered history
+        to score. They are ranked highest-score-first and opened (through the same
+        gates as ``_run_day_gated``) until the target position count is reached.
+        """
+        slots = target - len(open_positions)
+        if slots <= 0:
+            return  # target met — a position is already running (cheap path)
+
+        # Trading-hours gate is a property of the tick, identical for every epic —
+        # check it once here rather than scoring the whole pool then rejecting each
+        # candidate out-of-hours (the live selector likewise never opens off-hours).
+        if not (self._config.hour_start <= ts.hour < self._config.hour_end):
+            return
+
+        # Day-scope circuit breakers: once a daily gate trips (target/loss hit,
+        # max trades, win-rate floor), the live bot stops opening for the rest of
+        # the day. Short-circuit here too — both for fidelity and to skip the
+        # costly per-tick scoring of the whole pool while opening is closed.
+        if getattr(self._config, "daily_risk_enabled", True):
+            trade_count = len(closed_today)
+            wins = sum(1 for t in closed_today if t.win)
+            win_rate = wins / trade_count if trade_count else 1.0
+            daily_pnl = sum(t.euro or 0.0 for t in closed_today)
+            blocked = daily_risk_block(
+                daily_pnl=daily_pnl,
+                trade_count=trade_count,
+                win_rate=win_rate,
+                config=self._config,
+            )
+            if blocked is not None:
+                result.rejections[blocked.split("(")[0].strip()] += 1
+                return
+
+        ranked: list[tuple] = []
+        for e, buf in enumerate(buffers):
+            if e in open_positions or e in used_today:
+                continue
+            if len(buf) < self._entry.warmup:
+                continue
+            intent = self._entry.evaluate(buf.epic, buf)
+            if intent is not None and intent.direction == "BUY":
+                ranked.append((intent.score, e, intent))
+        if not ranked:
+            return
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        result.buy_signals += len(ranked)
+
+        for _score, e, intent in ranked:
+            if slots <= 0:
+                break
+            candle = last_candles[e]
+            if candle is None:
+                continue
+            if self._try_open(
+                day,
+                e,
+                candle,
+                buffers[e],
+                intent,
+                open_positions,
+                closed_today,
+                result,
+            ):
+                used_today.add(e)
+                slots -= 1
 
     # ------------------------------------------------------------------ #
     # Opening                                                             #
@@ -366,6 +597,7 @@ class StrategySimulator:
             day=day,
             open_time=candle.timestamp.strftime("%H:%M"),
             level_open=round(candle.offer_close, 5),
+            level_open_bid=round(candle.bid_close, 5),
             level_win=round(plan.target_level, 5),
             level_zero=round(plan.level_zero, 5),
             level_loose=round(plan.stop_level, 5),
@@ -567,6 +799,7 @@ def run_close_visual(
         day=0,
         open_time=open_candle.timestamp.strftime("%H:%M"),
         level_open=round(open_candle.offer_close, 5),  # market BUY fills at offer
+        level_open_bid=round(open_candle.bid_close, 5),
         level_win=round(plan.target_level, 5),
         level_zero=round(plan.level_zero, 5),
         level_loose=round(plan.stop_level, 5),

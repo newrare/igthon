@@ -156,6 +156,16 @@ ______________________________________________________________________
 - Log levels: `DEBUG` for detailed traces, `INFO` for normal operations, `WARNING` for recoverable issues, `ERROR` for failures.
 - Never use `print()` in production code.
 
+### Frontend / static assets
+
+- Static assets (`src/web/static/`) are loaded with a cache-busting query string
+  in `src/web/routes/dashboard/shell.py` (`dashboard.js?v=N`, `style.css?v=N`).
+- **Whenever you edit a file under `src/web/static/`, bump its `?v=N` in
+  `shell.py`** (e.g. `dashboard.js?v=14` → `?v=15`). The page HTML is rendered
+  dynamically (never cached), so a new version forces the browser to fetch the
+  updated asset. Forgetting this leaves users on a stale cached file and the
+  change silently never deploys.
+
 ### Markdown formatting
 
 - Use `mdformat` to align Markdown tables before running tests or committing code:

@@ -6,7 +6,11 @@ Portfolio/risk gates and martingale sizing — exit- and entry-agnostic, no I/O.
 from datetime import time
 from types import SimpleNamespace
 
-from src.execution.risk import compute_quantity_multiplier, evaluate_open_gates
+from src.execution.risk import (
+    compute_quantity_multiplier,
+    daily_risk_block,
+    evaluate_open_gates,
+)
 
 
 def _config(**overrides) -> SimpleNamespace:
@@ -16,6 +20,7 @@ def _config(**overrides) -> SimpleNamespace:
         "day_euro_finish_win": 300.0,
         "max_trades_day": 50,
         "min_win_rate": 0.40,
+        "daily_risk_enabled": True,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -74,6 +79,59 @@ class TestOpenGates:
     def test_low_win_rate_blocks_only_after_ten_trades(self):
         assert _gate(trade_count=9, win_rate=0.0)[0] is True
         assert _gate(trade_count=12, win_rate=0.1)[0] is False
+
+    def test_disabled_daily_risk_bypasses_all_daily_breakers(self):
+        # With the safety disarmed, daily loss / target / trade-count / win-rate
+        # gates are skipped — the bot keeps opening (dev/test).
+        cfg = _config(daily_risk_enabled=False)
+        assert _gate(config=cfg, daily_pnl=-9999.0)[0] is True
+        assert _gate(config=cfg, trade_count=999)[0] is True
+        assert _gate(config=cfg, trade_count=20, win_rate=0.0)[0] is True
+
+    def test_disabled_daily_risk_still_enforces_per_epic_gates(self):
+        # Per-epic limits are NOT daily-risk; they must still block.
+        cfg = _config(daily_risk_enabled=False)
+        assert _gate(config=cfg, epic_already_open=True)[0] is False
+        assert _gate(config=cfg, open_count=4)[0] is False
+
+
+class TestDailyRiskBlock:
+    """The day-scope circuit-breakers the dashboard surfaces as the Opening badge.
+
+    Must stay in lockstep with ``evaluate_open_gates`` (which delegates to it):
+    same thresholds, same reason strings — and it must ignore the per-epic gates
+    (duplicate epic, max positions), which are not daily-risk reasons.
+    """
+
+    def _block(self, **overrides):
+        base = {
+            "daily_pnl": 0.0,
+            "trade_count": 0,
+            "win_rate": 1.0,
+            "config": _config(),
+        }
+        base.update(overrides)
+        return daily_risk_block(**base)
+
+    def test_clean_state_is_none(self):
+        assert self._block() is None
+
+    def test_daily_loss_limit(self):
+        assert "loss" in self._block(daily_pnl=-500.0)
+
+    def test_daily_target(self):
+        assert "target" in self._block(daily_pnl=300.0)
+
+    def test_max_trades(self):
+        assert "Max daily trades" in self._block(trade_count=50)
+
+    def test_win_rate_floor_only_after_ten_trades(self):
+        assert self._block(trade_count=9, win_rate=0.0) is None
+        assert "Win rate" in self._block(trade_count=12, win_rate=0.1)
+
+    def test_matches_evaluate_open_gates_reason(self):
+        # The badge string and the live gate's refusal reason are identical.
+        assert self._block(daily_pnl=-500.0) == _gate(daily_pnl=-500.0)[1]
 
 
 class TestQuantityMultiplier:

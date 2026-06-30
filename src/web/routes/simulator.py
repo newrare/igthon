@@ -55,12 +55,15 @@ class SimulationRequest(BaseModel):
 
     profile: str = Field("random", pattern="^[a-z_]+$")
     strategy: str | None = Field(None, pattern="^[a-z_]+$")
+    close_profile: str | None = Field(None, pattern="^[a-z_]+$")
     seed: int | None = Field(None, ge=0, lt=_MAX_SEED)
     target_trades: int = Field(100, ge=1, le=1000)
-    epics_per_day: int = Field(3, ge=1, le=10)
+    epics_per_day: int = Field(3, ge=1, le=40)
     candles_per_day: int = Field(600, ge=100, le=2000)
     base_price: float = Field(8000.0, gt=0)
     euro_per_point: float = Field(1.0, gt=0, le=1000)
+    # Spread malus charged at each open, as a % of the entry bid (percentage lens).
+    spread_malus_pct: float = Field(0.0, ge=0, le=10)
 
 
 @router.get("/api/simulator/curve")
@@ -181,6 +184,10 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         return JSONResponse(
             {"error": f"Unknown strategy: {body.strategy}"}, status_code=400
         )
+    if body.close_profile is not None and body.close_profile not in CLOSE_PROFILES:
+        return JSONResponse(
+            {"error": f"Unknown close profile: {body.close_profile}"}, status_code=400
+        )
     seed = body.seed if body.seed is not None else random.randrange(_MAX_SEED)
 
     sim_config = SimulationConfig(
@@ -191,17 +198,20 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         seed=seed,
         base_price=body.base_price,
         euro_per_point=body.euro_per_point,
+        spread_malus_pct=body.spread_malus_pct,
     )
     settings = request.app.state.settings
     strategy_name = body.strategy or settings.entry_strategy_name
+    close_profile_name = body.close_profile or settings.close_profile_name
     result = await asyncio.to_thread(
-        run_simulation, settings, sim_config, strategy_name
+        run_simulation, settings, sim_config, strategy_name, close_profile_name
     )
 
     return JSONResponse(
         {
             "seed": seed,
             "strategy": strategy_name,
+            "close_profile": close_profile_name,
             "summary": result.summary(),
             "trades": [
                 {
@@ -265,6 +275,14 @@ async def simulator_page(request: Request) -> HTMLResponse:
         f"{name}{' (live)' if name == live_strategy else ''}</option>"
         for name in sorted(ENTRY_STRATEGIES)
     )
+    # Cross-epic rankers (projection_ranking, …) select the best of many markets,
+    # so the UI bumps "Epics / day" to the live pool size (~40) when one is chosen.
+    ranker_names = [
+        name
+        for name, cls in ENTRY_STRATEGIES.items()
+        if getattr(cls, "cross_epic_selection", False)
+    ]
+    ranker_json = "[" + ",".join(f'"{n}"' for n in ranker_names) + "]"
     # Close-profile dropdown defaults to the live CLOSE_PROFILE_NAME.
     live_close = request.app.state.settings.close_profile_name
     close_options = "".join(
@@ -287,9 +305,17 @@ async def simulator_page(request: Request) -> HTMLResponse:
         step="10",
     )
     sim_epics = _stepper(
-        "Epics / day", "sim-epics", value="3", minimum="1", maximum="10", step="1"
+        "Epics / day", "sim-epics", value="3", minimum="1", maximum="40", step="1"
     )
     sim_epp = _stepper("&euro; / point", "sim-epp", value="1", minimum="0.01", step="1")
+    sim_malus = _stepper(
+        "Spread malus %",
+        "sim-malus",
+        value="0.02",
+        minimum="0",
+        maximum="10",
+        step="0.01",
+    )
     op_base = _stepper("Base price", "op-base", value="8000", minimum="1", step="100")
     cp_base = _stepper("Base price", "cp-base", value="8000", minimum="1", step="100")
     cp_epp = _stepper("&euro; / point", "cp-epp", value="1", minimum="0.01", step="1")
@@ -405,10 +431,15 @@ async def simulator_page(request: Request) -> HTMLResponse:
         <div class="section-body">
             <p class="sim-hint">Replays the bot's real opening/closing rules
             (signal score, pre-open gates, win/stop levels, ATR trailing stop)
-            over generated days until the trade target is reached.</p>
+            over generated days until the trade target is reached. The
+            <strong>% lens</strong> charges the spread malus at every open and
+            tallies win%/loss% in fictional points (bid&rarr;bid, % of entry).</p>
             <div class="sim-controls">
-                <label>Strategy
-                    <select id="sim-strategy">{strategy_options}</select>
+                <label>Entry strategy
+                    <select id="sim-strategy" onchange="onSimStrategyChange()">{strategy_options}</select>
+                </label>
+                <label>Close profile
+                    <select id="sim-close">{close_options}</select>
                 </label>
                 <label>Profile
                     <select id="sim-profile">{profile_options}</select>
@@ -416,13 +447,23 @@ async def simulator_page(request: Request) -> HTMLResponse:
                 <label>Seed <input type="number" id="sim-seed" min="0" placeholder="random"></label>
                 {sim_target}
                 {sim_epics}
+                {sim_malus}
                 {sim_epp}
                 <button class="nav-btn" id="sim-run-btn" onclick="runSimulation()">
                     <i data-lucide="play" class="lc-icon"></i> Run simulation
                 </button>
             </div>
+            <p class="sim-hint" id="sim-ranker-hint" style="display:none;">
+            <strong>Ranker mode:</strong> scores all <strong>Epics / day</strong>
+            markets each tick, holds one rolling position (best of the pool), and
+            re-ranks on close — skipping epics already used that day, exactly like
+            the live scheduler.</p>
             <div id="sim-status" class="sim-meta"></div>
             <div id="sim-results" style="display:none;">
+                <h3 class="sim-block-title">% lens — fictional points (spread malus applied)</h3>
+                <div class="kpi-bar" id="sim-kpis-pct"></div>
+                <div id="equity-chart-pct" style="min-height:300px;margin-top:1rem;"></div>
+                <h3 class="sim-block-title">&euro; lens — engine P&amp;L (offer fill, curve spread)</h3>
                 <div class="kpi-bar" id="sim-kpis"></div>
                 <div id="equity-chart" style="min-height:300px;margin-top:1rem;"></div>
                 <div class="sim-tables">
@@ -439,7 +480,7 @@ async def simulator_page(request: Request) -> HTMLResponse:
                         <div class="sim-trades-wrap">
                         <table><thead><tr>
                             <th>#</th><th>Day</th><th>Open</th><th>Close</th>
-                            <th>Reason</th><th>P&amp;L €</th>
+                            <th>Reason</th><th>Net %</th><th>P&amp;L €</th>
                         </tr></thead>
                         <tbody id="sim-trades"></tbody></table>
                         </div>
@@ -496,6 +537,9 @@ async def simulator_page(request: Request) -> HTMLResponse:
     margin-top:1.2rem; }}
 .sim-tables h3 {{ font-size:0.8rem; color:var(--primary); margin:0 0 0.4rem;
     text-transform:uppercase; letter-spacing:0.8px; }}
+.sim-block-title {{ font-size:0.78rem; color:var(--primary); margin:1.2rem 0 0.2rem;
+    text-transform:uppercase; letter-spacing:0.8px; font-weight:600; }}
+.sim-block-title:first-child {{ margin-top:0; }}
 .sim-trades-wrap {{ max-height:24rem; overflow-y:auto; }}
 @media (max-width:900px) {{ .sim-tables {{ grid-template-columns:1fr; }} }}
 /* Inline spinner shown while a simulation is running. */
@@ -515,10 +559,32 @@ const PLOTLY_LAYOUT = {{
     font: {{color: "#94a3b8"}},
 }};
 
+// Cross-epic rankers pick the best of ~40 streamed markets, so the aggregate
+// simulation must feed that whole pool — selecting one bumps Epics/day to 40.
+const RANKER_STRATEGIES = new Set({ranker_json});
+
+function onSimStrategyChange() {{
+    const strat = document.getElementById("sim-strategy").value;
+    const epics = document.getElementById("sim-epics");
+    const hint = document.getElementById("sim-ranker-hint");
+    if (RANKER_STRATEGIES.has(strat)) {{
+        epics.value = 40;  // live pool size — score all, hold one rolling position
+        hint.style.display = "";
+    }} else {{
+        hint.style.display = "none";
+    }}
+}}
+
 // Format a euro amount with the symbol glued to the number (e.g. 88.01€).
 function eur(v, signed) {{
     const n = (signed && v > 0 ? "+" : "") + v.toFixed(2);
     return n + "€";
+}}
+
+// Format a percentage (fictional points), e.g. +0.34% / -0.12%.
+function pct(v, signed) {{
+    const n = (signed && v > 0 ? "+" : "") + v.toFixed(2);
+    return n + "%";
 }}
 
 // −/+ stepper: nudge a numeric field by its step, clamped to min/max.
@@ -573,10 +639,12 @@ async function runSimulation() {{
     // Clear any previous run so stale numbers/charts never linger on screen.
     results.style.display = "none";
     document.getElementById("sim-kpis").innerHTML = "";
+    document.getElementById("sim-kpis-pct").innerHTML = "";
     document.getElementById("sim-reasons").innerHTML = "";
     document.getElementById("sim-rejections").innerHTML = "";
     document.getElementById("sim-trades").innerHTML = "";
     Plotly.purge("equity-chart");
+    Plotly.purge("equity-chart-pct");
 
     // Loading state: spinner in the button + status line.
     btn.disabled = true;
@@ -593,9 +661,11 @@ async function runSimulation() {{
     const body = {{
         profile: document.getElementById("sim-profile").value,
         strategy: document.getElementById("sim-strategy").value,
+        close_profile: document.getElementById("sim-close").value,
         target_trades: parseInt(document.getElementById("sim-target").value) || 100,
         epics_per_day: parseInt(document.getElementById("sim-epics").value) || 3,
         euro_per_point: parseFloat(document.getElementById("sim-epp").value) || 1,
+        spread_malus_pct: parseFloat(document.getElementById("sim-malus").value) || 0,
     }};
     if (seedVal !== "") body.seed = parseInt(seedVal);
 
@@ -616,11 +686,36 @@ async function runSimulation() {{
     restoreButton();
 
     const s = data.summary;
-    status.innerHTML = `strategy=<strong>${{data.strategy}}</strong> ` +
+    status.innerHTML = `entry=<strong>${{data.strategy}}</strong> · ` +
+        `close=<strong>${{data.close_profile}}</strong> · ` +
+        `spread malus=<strong>${{s.spread_malus_pct}}%</strong> · ` +
         `seed=<strong>${{data.seed}}</strong> — ` +
         `${{s.days_simulated}} fictional days, ${{s.buy_signals}} BUY signals ` +
         `(reuse the seed to replay)`;
     document.getElementById("sim-results").style.display = "block";
+
+    // ---- % lens (fictional points, spread malus applied) ----
+    const pctColor = s.total_pct >= 0 ? "#4ade80" : "#f87171";
+    document.getElementById("sim-kpis-pct").innerHTML =
+        kpi("Trades", s.trades, "#e2e8f0") +
+        kpi("Wins", s.wins_pct, "#4ade80") +
+        kpi("Losses", s.losses_pct, "#f87171") +
+        kpi("Win rate", (s.win_rate_pct * 100).toFixed(1) + "%",
+            s.win_rate_pct >= 0.5 ? "#4ade80" : "#fbbf24") +
+        kpi("Cumulative", pct(s.total_pct, true), pctColor) +
+        kpi("Avg win", pct(s.avg_win_pct, true), "#4ade80") +
+        kpi("Avg loss", pct(s.avg_loss_pct, true), "#f87171") +
+        kpi("Best / Worst", pct(s.best_pct, true) + " / " + pct(s.worst_pct, true),
+            "#e2e8f0") +
+        kpi("Max drawdown", pct(s.max_drawdown_pct), "#fbbf24");
+
+    Plotly.newPlot("equity-chart-pct", [{{
+        y: s.equity_pct, mode: "lines", name: "Cumulative % (fictional points)",
+        line: {{color: pctColor, width: 1.8}},
+        fill: "tozeroy", fillcolor: "rgba(96,165,250,0.08)",
+    }}], {{...PLOTLY_LAYOUT, height: 300,
+        xaxis: {{title: "Closed trades"}}, yaxis: {{title: "Cumulative % (fictional points)"}}}},
+        {{displayModeBar: false, responsive: true}});
 
     const pnlColor = s.total_pnl >= 0 ? "#4ade80" : "#f87171";
     document.getElementById("sim-kpis").innerHTML =
@@ -651,13 +746,18 @@ async function runSimulation() {{
     fill("sim-reasons", s.close_reasons);
     fill("sim-rejections", s.rejections);
 
+    const netPcts = s.net_pcts || [];
     document.getElementById("sim-trades").innerHTML = data.trades.map((t, i) => {{
         const c = t.euro >= 0 ? "#4ade80" : "#f87171";
+        const np = netPcts[i];
+        const npCol = np >= 0 ? "#4ade80" : "#f87171";
+        const npCell = np === undefined ? "—" : pct(np, true);
         return `<tr><td class="number">${{i + 1}}</td>` +
             `<td class="number">${{t.day + 1}}</td>` +
             `<td>${{t.open_time}} @ ${{t.level_open}}</td>` +
             `<td>${{t.close_time}} @ ${{t.level_close}}</td>` +
             `<td>${{t.reason}}</td>` +
+            `<td class="number" style="color:${{npCol}};">${{npCell}}</td>` +
             `<td class="number" style="color:${{c}};">${{eur(t.euro, true)}}</td></tr>`;
     }}).join("");
     lucide.createIcons();
@@ -823,6 +923,7 @@ async function runCloseProfile() {{
 }}
 
 lucide.createIcons();
+onSimStrategyChange();  // honour the live default if it is a ranker
 generateCurve();
 runOpenStrategy();
 runCloseProfile();

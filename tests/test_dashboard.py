@@ -35,6 +35,7 @@ _FRAGMENT_KEYS = {
     "epic_list_modal",
     "positions_modal",
     "closed_positions_modal",
+    "risk_modal",
     "actions",
     "logs_section",
 }
@@ -221,6 +222,61 @@ class TestBuildFragments:
         assert "Wallet" in kpi_bar
         assert "In use: —" in kpi_bar
 
+    def test_opening_tile_active_when_not_blocked(self):
+        # No daily circuit-breaker tripped -> green "Active" Opening tile.
+        kpi_bar = _build_fragments(_base_state())["kpi_bar"]
+        assert "Opening" in kpi_bar
+        assert "Active" in kpi_bar
+        assert "No daily risk block" in kpi_bar
+
+    def test_opening_tile_shows_block_reason(self):
+        # A daily-risk reason renders as a BLOCKED Opening tile carrying the
+        # exact reason string from the live gate.
+        reason = "Daily loss limit reached (-480.79€)"
+        state = _base_state(kpis={**_base_kpis(), "open_block_reason": reason})
+        kpi_bar = _build_fragments(state)["kpi_bar"]
+        assert "BLOCKED" in kpi_bar
+        assert "Daily loss limit reached" in kpi_bar
+
+    def test_opening_tile_disabled_state(self):
+        # Risk disarmed -> amber "Risk OFF" tile, even if a reason was computed.
+        state = _base_state(
+            kpis={
+                **_base_kpis(),
+                "daily_risk_enabled": False,
+                "open_block_reason": None,
+            }
+        )
+        kpi_bar = _build_fragments(state)["kpi_bar"]
+        assert "Risk OFF" in kpi_bar
+        assert "openRiskModal()" in kpi_bar  # tile is clickable
+
+    def test_risk_modal_lists_breakers_and_armed_switch(self):
+        kpis = {
+            **_base_kpis(),
+            "daily_risk_enabled": True,
+            "risk_daily_pnl": -480.79,
+            "risk_trade_count": 14,
+            "risk_win_rate": 0.143,
+            "risk_loss_limit": -500.0,
+            "risk_win_target": 300.0,
+            "risk_max_trades": 50,
+            "risk_min_win_rate": 0.40,
+        }
+        modal = _build_fragments(_base_state(kpis=kpis))["risk_modal"]
+        assert "Daily loss limit" in modal
+        assert "Max daily trades" in modal
+        assert "Win-rate floor" in modal
+        assert "ARMED" in modal
+        assert "toggleRiskGuard(this.checked, this)" in modal
+        assert "checked" in modal  # switch reflects the armed state
+
+    def test_risk_modal_disarmed_marks_rules_ignored(self):
+        kpis = {**_base_kpis(), "daily_risk_enabled": False}
+        modal = _build_fragments(_base_state(kpis=kpis))["risk_modal"]
+        assert "DISABLED (dev)" in modal
+        assert "ignored" in modal  # breakers shown inactive when disarmed
+
     def test_open_positions_rendered_in_modal(self):
         pos = SimpleNamespace(
             id=1,
@@ -281,7 +337,11 @@ class TestBuildFragments:
         modal = _build_fragments(state)["closed_positions_modal"]
         assert "DAX" in modal
         assert "08/06/2026" in modal  # open/close date
-        assert "11:30:00" in modal  # close time
+        # Times are stored UTC and rendered on the Europe/Paris wall clock
+        # (CEST = UTC+2 in June): 10:00 UTC -> 12:00, 11:30 UTC -> 13:30.
+        assert "12:00:00" in modal  # open time (Paris)
+        assert "13:30:00" in modal  # close time (Paris)
+        assert "11:30:00" not in modal  # raw UTC must not leak through
         assert "Manual" in modal  # open reason label
         assert "Target hit" in modal  # close reason label
         assert "No closed positions" not in modal
@@ -316,7 +376,7 @@ class TestTradeOverlay:
         assert ov["id"] == 7
         assert ov["open"] == 18000.0
         assert ov["zero"] == 18002.0
-        assert ov["stop"] == 17950.0
+        assert ov["stopLoose"] == 17950.0
         assert ov["target"] == 18050.0
         assert ov["openTime"] == "2026-06-08T10:00:00+00:00"
         # An open trade has no close level/time yet.
@@ -342,6 +402,119 @@ class TestTradeOverlay:
         ov = _trade_overlay(pos)
         assert ov["close"] == 18050.0
         assert ov["closeTime"] == "2026-06-08T11:30:00+00:00"
+
+    def test_stop_history_serialised_as_stepped_points(self):
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=9,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=time(11, 30, 0),
+            level_open=18000.0,
+            level_zero=18002.0,
+            level_stop=17950.0,
+            level_win=18050.0,
+            level_close=18020.0,
+            euro=-3.0,
+            stop_history=[
+                {"t": "2026-06-08T10:00:00+00:00", "level": 17950.0},
+                {"t": "2026-06-08T10:30:00+00:00", "level": 18010.0},
+            ],
+        )
+        ov = _trade_overlay(pos)
+        # The bot software-stop trajectory is the raw ratchet history.
+        assert ov["stopsFollower"] == [
+            {"t": "2026-06-08T10:00:00+00:00", "level": 17950.0},
+            {"t": "2026-06-08T10:30:00+00:00", "level": 18010.0},
+        ]
+        # The frozen initial stop is still exposed for the pre-history fallback.
+        assert ov["stopLoose"] == 17950.0
+
+    def test_bot_and_ig_stop_lines_diverge_at_open(self):
+        """The IG broker line keeps the (wider) clamped open stop; the bot line
+        keeps the tighter software stop. They share every later ratchet point."""
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=12,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=time(11, 0, 0),
+            level_open=460.0,
+            level_zero=460.4,
+            level_stop=458.3,  # broker stop: widened to IG's min distance
+            level_follower=459.3,  # software stop: tighter, what the bot enforces
+            level_win=0.0,
+            level_close=459.2,
+            euro=-57.0,
+            # Seeded with the software stop; the ratchet at 10:30 was pushed to IG.
+            stop_history=[
+                {"t": "2026-06-08T10:00:00+00:00", "level": 459.3},
+                {"t": "2026-06-08T10:30:00+00:00", "level": 459.8},
+            ],
+        )
+        ov = _trade_overlay(pos)
+        assert ov["stopsFollower"] == [
+            {"t": "2026-06-08T10:00:00+00:00", "level": 459.3},
+            {"t": "2026-06-08T10:30:00+00:00", "level": 459.8},
+        ]
+        # IG line: broker's initial clamped level, then the same pushed ratchet.
+        assert ov["stopsLoose"] == [
+            {"t": "2026-06-08T10:00:00+00:00", "level": 458.3},
+            {"t": "2026-06-08T10:30:00+00:00", "level": 459.8},
+        ]
+        assert ov["stopFollower"] == 459.3
+        assert ov["stopLoose"] == 458.3
+
+    def test_stop_history_absent_yields_none(self):
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=10,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=None,
+            level_open=18000.0,
+            level_zero=18002.0,
+            level_stop=17950.0,
+            level_follower=17960.0,
+            level_win=18050.0,
+            level_close=None,
+            euro=0.0,
+        )
+        ov = _trade_overlay(pos)
+        # No ratchet history → both trajectories are None; the chart falls back to
+        # the flat scalars (bot = level_follower, IG = level_stop).
+        assert ov["stopsFollower"] is None
+        assert ov["stopsLoose"] is None
+        assert ov["stopFollower"] == 17960.0
+        assert ov["stopLoose"] == 17950.0
+
+    def test_stop_history_drops_malformed_and_zero_levels(self):
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=11,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=None,
+            level_open=18000.0,
+            level_zero=18002.0,
+            level_stop=17950.0,
+            level_win=18050.0,
+            level_close=None,
+            euro=0.0,
+            stop_history=[
+                {"t": "2026-06-08T10:00:00+00:00", "level": 17950.0},
+                {"t": "2026-06-08T10:05:00+00:00", "level": 0},  # unset → dropped
+                {"level": 18010.0},  # missing time → dropped
+                "garbage",  # not a dict → dropped
+            ],
+        )
+        assert _trade_overlay(pos)["stopsFollower"] == [
+            {"t": "2026-06-08T10:00:00+00:00", "level": 17950.0},
+        ]
 
     def test_blocked_guard_renders_block_info(self):
         guard = SimpleNamespace(
@@ -414,6 +587,29 @@ class TestRenderDashboard:
         ).read_text()
         assert "/api/dashboard-fragments" in js
         assert "location.reload()" not in js
+
+    def test_strategy_change_requires_confirmation(self):
+        # Both title-bar dropdowns must route through the shared confirm dialog
+        # so a mis-click never swaps the live trading logic silently.
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="strategy-confirm-modal"' in html
+        assert 'id="strategy-confirm-target"' in html
+        # Each select carries its current value so cancel reverts correctly.
+        assert 'data-current="donchian_er"' in html  # entry strategy
+        assert 'data-current="atr_trailing"' in html  # close profile
+        js = (
+            Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
+        ).read_text()
+        assert "function openStrategyConfirmModal" in js
+        # Both switch handlers await the confirmation before fetching.
+        assert js.count("await openStrategyConfirmModal(") >= 2
+
+    def test_dashboard_js_cache_version_is_current(self):
+        # The script tag must point at the committed dashboard.js; bump the
+        # ``?v=`` query whenever the file changes so browsers don't serve a
+        # stale cached copy (the reason a JS change can appear to "not work").
+        html = _render_dashboard(_settings(), _base_state())
+        assert "/static/dashboard.js?v=14" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -692,6 +888,19 @@ class _NoopSession:
         return None
 
 
+async def _guarded_open(trading, intent, buf):
+    """Faithful stand-in for ``BotScheduler.open_epic_guarded``.
+
+    Mirrors the real method's contract — gate first, then open — so the manual
+    route's delegation is exercised without spinning up a full scheduler. The
+    per-epic lock itself is covered by the scheduler unit tests.
+    """
+    allowed, reason = await trading.can_open_intent(intent)
+    if not allowed:
+        return None, reason
+    return await trading.open_from_intent(intent, buf), None
+
+
 def _manual_app() -> object:
     """App wired for the manual-open path: queue, session, scheduler, one candle."""
     epic = "IX.D.DAX.IFMM.IP"
@@ -700,7 +909,10 @@ def _manual_app() -> object:
     app = create_app(settings=_settings(), buffer=buffer, api_queue=_FakeQueue({}))
     app.state.session_factory = lambda: _NoopSession()
     # The active close profile is opaque here — the route only forwards it.
-    app.state.scheduler = SimpleNamespace(close_profile=object())
+    # ``open_epic_guarded`` mirrors the real scheduler so the route can delegate.
+    app.state.scheduler = SimpleNamespace(
+        close_profile=object(), open_epic_guarded=_guarded_open
+    )
     return app, epic
 
 
@@ -733,9 +945,7 @@ class TestManualOpenEndpoint:
             async def open_from_intent(self, intent, buf):  # pragma: no cover
                 raise AssertionError("must not open when the gate refuses")
 
-        monkeypatch.setattr(
-            _ROUTER_MOD, "TradingService", _GatedTrading
-        )
+        monkeypatch.setattr(_ROUTER_MOD, "TradingService", _GatedTrading)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(f"/api/positions/open/{epic}")
@@ -761,9 +971,7 @@ class TestManualOpenEndpoint:
             async def open_from_intent(self, intent, buf):
                 return position
 
-        monkeypatch.setattr(
-            _ROUTER_MOD, "TradingService", _OkTrading
-        )
+        monkeypatch.setattr(_ROUTER_MOD, "TradingService", _OkTrading)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(f"/api/positions/open/{epic}")
@@ -796,9 +1004,7 @@ class TestManualOpenEndpoint:
             async def open_from_intent(self, intent, buf):
                 return None  # market closed / risk cap / IG rejection
 
-        monkeypatch.setattr(
-            _ROUTER_MOD, "TradingService", _RejectTrading
-        )
+        monkeypatch.setattr(_ROUTER_MOD, "TradingService", _RejectTrading)
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(f"/api/positions/open/{epic}")

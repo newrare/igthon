@@ -4,7 +4,7 @@ import enum
 from datetime import date, time
 from decimal import Decimal
 
-from sqlalchemy import Date, Enum, Integer, Numeric, String, Time
+from sqlalchemy import JSON, Date, Enum, Integer, Numeric, String, Time
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.database import Base
@@ -73,6 +73,13 @@ class Position(Base):
     quantity: Mapped[int | None] = mapped_column(Integer)
     win: Mapped[int | None] = mapped_column(Integer)
     stop_update: Mapped[int | None] = mapped_column(Integer)
+    # Timestamped trajectory of the protective stop: the initial level set at
+    # open plus one entry per ratchet update. Each element is
+    # ``{"t": "<UTC ISO8601>", "level": <float>}``. Lets the chart draw the
+    # stop's real stepped path instead of a single flat line at the frozen
+    # initial level (which never matched the live trailing stop at exit). See
+    # migration f7a8b9c0d1e2.
+    stop_history: Mapped[list | None] = mapped_column(JSON)
     euro: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro_stop: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     # Euros of realized/unrealized P&L per 1.0 of price movement for the whole

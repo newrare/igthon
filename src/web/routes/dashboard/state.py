@@ -9,6 +9,8 @@ from fastapi import Request
 from sqlalchemy import select
 
 from src.core.api_queue import Priority
+from src.execution.risk import daily_risk_block
+from src.execution.trading import TradeConfig
 from src.models.day import Day
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
@@ -233,6 +235,7 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
         "manual": ("Manual", "#60a5fa"),
         "closed_externally": ("IG / external", "#a78bfa"),
         "not_found_in_ig": ("Not found (IG)", "#94a3b8"),
+        "never_opened": ("Never opened", "#64748b"),
     }
     if reason in mapping:
         return mapping[reason]
@@ -343,34 +346,28 @@ async def _gather_dashboard_state(request: Request) -> dict:
                 .where(Position.date == today, Position.state == PositionState.CLOSE)
                 .order_by(Position.time_close.desc())
             )
-            closed_positions = list(closed_pos)
+            # Drop "never_opened" phantoms: provisional rows whose order never
+            # confirmed at IG (deal_id never bound). They are not real trades, so
+            # they must not appear in the closed table nor count toward the day's
+            # P&L / wins / losses / trade count. Filtered in Python so a NULL
+            # reason_close (legacy rows) is kept (SQL ``!=`` would drop NULLs).
+            closed_positions = [
+                p for p in closed_pos if p.reason_close != "never_opened"
+            ]
 
             kpis["open_trades"] = len(open_positions)
-            # Compute live unrealized PnL. Prefer the in-memory buffer price (fresh
-            # to the second for streamed epics); fall back to the stored ``euro``,
-            # which the sync_positions job refreshes from IG every 20s — this is the
-            # only source for manually-opened epics not in the streaming set.
-            live_open_pnl = 0.0
-            for p in open_positions:
-                if not p.level_open:
-                    if p.euro is not None:
-                        live_open_pnl += float(p.euro)
-                    continue
-                buf_entry = buffer.get(p.epic)
-                if buf_entry and buf_entry.last:
-                    move = buf_entry.last.bid_close - float(p.level_open)
-                    if p.euro_per_point is not None and float(p.euro_per_point) != 0:
-                        # Currency-converted euro value of one point of movement.
-                        live_open_pnl += move * float(p.euro_per_point)
-                    elif p.euro_stop and p.size and float(p.size) > 0:
-                        live_open_pnl += move * float(p.euro_stop) / float(p.size)
-                    else:
-                        # Last-resort fallback: raw points × quantity.
-                        live_open_pnl += move * (p.quantity or 1)
-                elif p.euro is not None:
-                    # No live buffer price — use the value synced from IG.
-                    live_open_pnl += float(p.euro)
-            kpis["open_pnl"] = live_open_pnl
+            # Aggregate open P&L from the stored ``euro`` — IG's last recorded
+            # unrealized figure, refreshed by the sync_positions job (~every 20s).
+            # This is deliberately the SAME source the per-epic table row uses
+            # (``Position.euro``), so the "OPEN" tile and the open-positions table
+            # can never disagree. We do NOT recompute from the live streaming bid
+            # here: that estimate (move * euro_per_point) drifted away from IG's
+            # figure between syncs and made the tile and the table show different
+            # P&L for the same epic. The trade-off — the figure lags the market by
+            # up to one sync interval — is surfaced via the "as of" timestamp below.
+            kpis["open_pnl"] = sum(
+                float(p.euro) for p in open_positions if p.euro is not None
+            )
 
             kpis["closed_trades"] = len(closed_positions)
             # Compute display PnL: use stored euro when non-zero,
@@ -413,6 +410,10 @@ async def _gather_dashboard_state(request: Request) -> dict:
             total_losses = 0
             total_closed = 0
             for p in all_closed:
+                # Exclude never_opened phantoms (unconfirmed orders) from the
+                # whole-history track record, same as the daily figures above.
+                if p.reason_close == "never_opened":
+                    continue
                 total_closed += 1
                 pnl_val = _display_pnl(p)
                 if pnl_val > 0:
@@ -453,6 +454,19 @@ async def _gather_dashboard_state(request: Request) -> dict:
             "win_rate": 0.0,
         }
 
+    # "As of" time of the open P&L figures — the last successful IG position
+    # sync. The OPEN tile shows IG's last recorded value (not a live estimate),
+    # so it carries the time that value was relevé to make the lag explicit.
+    positions_synced_at: datetime | None = (
+        scheduler.positions_synced_at if scheduler else None
+    )
+    if positions_synced_at is not None:
+        kpis["open_pnl_as_of"] = positions_synced_at.astimezone(_PARIS).strftime(
+            "%H:%M:%S"
+        )
+    else:
+        kpis["open_pnl_as_of"] = None
+
     kpis["all_epics_count"] = len(all_epics)
     kpis["epic_kpi_color"] = epic_kpi_color
     kpis["refresh_label"] = refresh_label
@@ -469,6 +483,44 @@ async def _gather_dashboard_state(request: Request) -> dict:
     else:
         kpis["wallet_available"] = None
         kpis["wallet_used"] = None
+
+    # Daily-risk opening indicator: surface *why* the bot has stopped opening when
+    # a day-scope circuit-breaker has tripped (daily loss/target, max trades,
+    # win-rate floor). Computed from the same inputs the live gate uses — today's
+    # CLOSE rows, stored ``euro`` for P&L and the ``win`` flag for the rate — so
+    # the badge and ``evaluate_open_gates`` never disagree. ``None`` = not blocked.
+    open_block_reason: str | None = None
+    daily_risk_enabled = True
+    settings = getattr(request.app.state, "settings", None)
+    if settings is not None:
+        try:
+            cfg = TradeConfig.from_settings(settings)
+            daily_risk_enabled = cfg.daily_risk_enabled
+            daily_count = len(closed_positions)
+            daily_euro = sum(float(p.euro or 0) for p in closed_positions)
+            daily_wins = sum(1 for p in closed_positions if (p.win or 0) > 0)
+            daily_win_rate = daily_wins / daily_count if daily_count else 1.0
+            # Live figures + thresholds for the risk modal (one row per breaker).
+            kpis["risk_daily_pnl"] = daily_euro
+            kpis["risk_trade_count"] = daily_count
+            kpis["risk_win_rate"] = daily_win_rate
+            kpis["risk_loss_limit"] = cfg.day_euro_finish_loose
+            kpis["risk_win_target"] = cfg.day_euro_finish_win
+            kpis["risk_max_trades"] = cfg.max_trades_day
+            kpis["risk_min_win_rate"] = cfg.min_win_rate
+            # Only report a block reason while the gates are armed; disarmed, the
+            # bot opens regardless so there is nothing to block on.
+            if daily_risk_enabled:
+                open_block_reason = daily_risk_block(
+                    daily_pnl=daily_euro,
+                    trade_count=daily_count,
+                    win_rate=daily_win_rate,
+                    config=cfg,
+                )
+        except Exception:  # pragma: no cover - defensive: never break the 2s poll
+            logger.debug("Could not compute daily-risk open block", exc_info=True)
+    kpis["daily_risk_enabled"] = daily_risk_enabled
+    kpis["open_block_reason"] = open_block_reason
 
     # API Guard & Error log
     guard = request.app.state.guard
