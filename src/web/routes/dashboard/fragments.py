@@ -461,7 +461,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
                 title="Close this position manually",
             )
             pos_rows_html += f"""
-                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
                         <td class="err-ts">{html.escape(t_open)}</td>
                         <td class="epic-col">{epic_esc}</td>
                         <td class="desc-col">{html.escape(p.epic_name)}</td>
@@ -495,7 +495,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
             close_label, close_color = _close_reason_label(p.reason_close)
             epic_esc = html.escape(p.epic)
             closed_rows_html += f"""
-                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
                         <td class="err-ts" title="{html.escape(d_str)}">{html.escape(t_open)}</td>
                         <td class="err-ts" title="{html.escape(d_str)}">{html.escape(t_close)}</td>
                         <td class="epic-col">{html.escape(p.epic)}</td>
@@ -528,7 +528,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
             ),
         )
         market_rows += f"""
-        <tr class="clickable-row" onclick="openChartModal('{epic_esc}')">
+        <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
             <td class="epic-col">{epic_esc}</td>
             <td class="desc-col">{html.escape(str(s.get('name', '—')))}</td>
             <td class="number">{spread_str}</td>

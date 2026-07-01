@@ -982,3 +982,50 @@ footer {
   border: 1px solid rgba(59, 130, 246, 0.5);
   color: #93c5fd;
 }
+
+/* ── Chart carousel arrows + zoom-pause badge ─────────────────────────────── */
+/* Overlaid on the chart-container edges to step through the source table's
+   epics (see _chartEpicList in dashboard.js). Hidden when the list has one epic. */
+.chart-nav-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 5;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid #4a3a30;
+  background: rgba(28, 23, 20, 0.82);
+  color: #e07b39;
+  font-size: 1.7rem;
+  line-height: 1;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+.chart-nav-btn:hover {
+  background: rgba(74, 58, 48, 0.95);
+  color: #f0a35c;
+}
+.chart-nav-prev {
+  left: 8px;
+}
+.chart-nav-next {
+  right: 8px;
+}
+/* Shown by JS while the chart is zoomed/panned and the live refresh is frozen. */
+#chart-paused-badge {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  background: rgba(28, 23, 20, 0.88);
+  border: 1px solid #b45309;
+  color: #f59e0b;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  pointer-events: none;
+}

@@ -301,7 +301,8 @@ class TestBuildFragments:
         assert "No open positions" not in modal
         # Row opens the chart modal for the epic; levels/markers are fetched from
         # /api/chart/{epic} (all trades for the day), not embedded in the row.
-        assert "openChartModal('IX.D.DAX.IFMM.IP')" in modal
+        # ``event`` is passed so the chart carousel can rebuild the table's list.
+        assert "openChartModal('IX.D.DAX.IFMM.IP', event)" in modal
         # The Close button must not bubble up into the row's chart handler.
         assert "event.stopPropagation(); closePosition" in modal
 
@@ -347,7 +348,7 @@ class TestBuildFragments:
         assert "No closed positions" not in modal
         # Row opens the chart modal for the epic; entry/exit markers are fetched
         # from /api/chart/{epic}, not embedded in the row.
-        assert "openChartModal('IX.D.DAX.IFMM.IP')" in modal
+        assert "openChartModal('IX.D.DAX.IFMM.IP', event)" in modal
 
     def test_closed_positions_modal_empty_state(self):
         modal = _build_fragments(_base_state())["closed_positions_modal"]
@@ -609,7 +610,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=14" in html
+        assert "/static/dashboard.js?v=15" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())

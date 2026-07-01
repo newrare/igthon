@@ -20,12 +20,14 @@ from src.exit.atr_trailing import AtrTrailingExit
 from src.exit.atr_trailing_positive import AtrTrailingPositiveExit
 from src.exit.atr_trailing_profit import AtrTrailingProfitExit
 from src.exit.base import CloseDecision, CloseProfile, OpenPlan
+from src.exit.support_atr_profit import SupportAtrProfitExit
 
 #: Name → class map. Keys are the valid ``CLOSE_PROFILE_NAME`` values.
 CLOSE_PROFILES: dict[str, type[CloseProfile]] = {
     AtrTrailingExit.name: AtrTrailingExit,
     AtrTrailingPositiveExit.name: AtrTrailingPositiveExit,
     AtrTrailingProfitExit.name: AtrTrailingProfitExit,
+    SupportAtrProfitExit.name: SupportAtrProfitExit,
 }
 
 
@@ -48,6 +50,7 @@ __all__ = [
     "AtrTrailingExit",
     "AtrTrailingPositiveExit",
     "AtrTrailingProfitExit",
+    "SupportAtrProfitExit",
     "CloseDecision",
     "CloseProfile",
     "OpenPlan",

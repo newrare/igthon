@@ -593,7 +593,15 @@ function closeCloseConfirmModal(confirmed) {
 }
 
 document.addEventListener('keydown', function(e) {
+    // Arrow keys step the chart carousel while the chart modal is open.
+    const chartOpen = document.getElementById('chart-modal').style.display !== 'none';
+    if (chartOpen && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        if (e.key === 'ArrowLeft')  chartNavPrev();
+        if (e.key === 'ArrowRight') chartNavNext();
+        return;
+    }
     if (e.key === 'Escape') {
+        if (chartOpen) { closeChartModal(); return; }
         if (document.getElementById('buy-confirm-modal').style.display !== 'none') closeBuyConfirmModal(false);
         if (document.getElementById('close-confirm-modal').style.display !== 'none') closeCloseConfirmModal(false);
         if (document.getElementById('strategy-confirm-modal').style.display !== 'none') closeStrategyConfirmModal(false);
@@ -775,6 +783,19 @@ async function closePosition(positionId, epic, btn) {
 // it opens a position on the right market without re-passing the epic.
 let _chartModalEpic = null;
 
+// Carousel state: the ordered list of epics from the table the chart was opened
+// from, and our position in it. The left/right arrows step through this list so
+// the user can browse every row's curve without closing the modal. Rebuilt from
+// the source table on each fresh open (see _buildChartEpicList).
+let _chartEpicList  = [];
+let _chartEpicIndex = -1;
+
+// True while the user has manually zoomed/panned the chart. The auto-refresh
+// repaints with Plotly.react and a fresh (auto-ranged) layout, which would snap
+// the view back to full-day; freezing the refresh while zoomed keeps the user's
+// selected window stable until they double-click to reset (autorange).
+let _chartZoomed = false;
+
 // Auto-refresh handle for the open chart. The 2 s fragment poll only swaps
 // dashboard section HTML — it never touches an open chart — so without this the
 // curve would freeze at the moment the modal was opened and never show new bids.
@@ -811,22 +832,105 @@ function _toParisNaive(utcISOStr) {
 // Each trade draws its break-even (zero)/stop/target reference lines plus a
 // labelled entry and exit vertical marker (with the Paris time), so multiple
 // open/close cycles on the same epic are all visible at once.
-async function openChartModal(epic) {
-    const modal     = document.getElementById('chart-modal');
-    const titleEl   = document.getElementById('chart-modal-title');
-    const container = document.getElementById('chart-container');
-    _chartModalEpic = epic;
-    titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
-    lucide.createIcons();
-    container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
+async function openChartModal(epic, evt) {
+    const modal = document.getElementById('chart-modal');
+    // Snapshot the source table's epics for the carousel before painting.
+    _buildChartEpicList(epic, evt);
+    _showChartEpic(epic);
     modal.style.display = 'block';
     if (_chartRefreshTimer) { clearInterval(_chartRefreshTimer); _chartRefreshTimer = null; }
     await _loadChart(epic, true);
     // Keep the open chart live: re-fetch and repaint in place so new bids show
-    // up without the user closing and reopening the modal.
+    // up without the user closing and reopening the modal — but hold still while
+    // the user is zoomed in, so the refresh doesn't reset their selected window.
     _chartRefreshTimer = setInterval(function() {
-        if (_chartModalEpic) _loadChart(_chartModalEpic, false);
+        if (_chartModalEpic && !_chartZoomed) _loadChart(_chartModalEpic, false);
     }, CHART_REFRESH_MS);
+}
+
+// Paint the title/loading state for ``epic`` and reset the zoom freeze. Shared
+// by the initial open and by carousel navigation (which reuses the live timer).
+function _showChartEpic(epic) {
+    const titleEl   = document.getElementById('chart-modal-title');
+    const container = document.getElementById('chart-container');
+    _chartModalEpic = epic;
+    _setChartZoomed(false);
+    titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
+    lucide.createIcons();
+    container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
+    _updateChartNav();
+}
+
+// ── Chart carousel ────────────────────────────────────────────────────────────
+// Rebuild the ordered epic list from the table the chart was opened from, so the
+// arrows browse exactly the rows the user sees (skipping filter-hidden ones).
+function _buildChartEpicList(epic, evt) {
+    _chartEpicList = [];
+    const src   = evt && (evt.currentTarget || evt.target);
+    const scope = src && src.closest ? src.closest('table') : null;
+    if (scope) {
+        scope.querySelectorAll('tr.clickable-row').forEach(function(tr) {
+            if (tr.classList.contains('hidden')) return;  // respect active filter
+            const m = /openChartModal\('([^']+)'/.exec(tr.getAttribute('onclick') || '');
+            if (m) _chartEpicList.push(m[1]);
+        });
+    }
+    _chartEpicIndex = _chartEpicList.indexOf(epic);
+    // Fallback (opened outside a table, or epic not found): a single-item list.
+    if (_chartEpicIndex < 0) { _chartEpicList = [epic]; _chartEpicIndex = 0; }
+}
+
+// Show/hide the arrows (only when there is more than one epic to browse).
+function _updateChartNav() {
+    const many = _chartEpicList.length > 1;
+    ['chart-nav-prev', 'chart-nav-next'].forEach(function(id) {
+        const b = document.getElementById(id);
+        if (b) b.style.display = many ? 'flex' : 'none';
+    });
+}
+
+// Step ``delta`` positions through the carousel, wrapping around at the ends.
+function chartNavStep(delta) {
+    if (_chartEpicList.length < 2) return;
+    const n = _chartEpicList.length;
+    _chartEpicIndex = (_chartEpicIndex + delta + n) % n;
+    const epic = _chartEpicList[_chartEpicIndex];
+    _showChartEpic(epic);
+    _loadChart(epic, true);  // the live timer keeps refreshing the new epic
+}
+function chartNavPrev() { chartNavStep(-1); }
+function chartNavNext() { chartNavStep(1); }
+
+// ── Chart zoom freeze ───────────────────────────────────────────────────────
+function _setChartZoomed(zoomed) {
+    _chartZoomed = zoomed;
+    const badge = document.getElementById('chart-paused-badge');
+    if (badge) badge.style.display = zoomed ? 'block' : 'none';
+}
+
+// Plotly relayout handler: a manual zoom/pan sets an explicit x-range (freeze);
+// a double-click restores autorange (resume). Pure resize/autosize events carry
+// neither key and are ignored.
+function _onChartRelayout(ev) {
+    if (!ev) return;
+    // Double-click reset restores autorange → resume. A user zoom/pan sets the
+    // bracket-notation range keys → freeze. (The full ``xaxis.range`` array key
+    // is deliberately not treated as a zoom: it also appears on programmatic
+    // autorange/resize, which would falsely freeze the refresh.)
+    if (ev['xaxis.autorange'] === true) {
+        _setChartZoomed(false);
+    } else if (ev['xaxis.range[0]'] !== undefined || ev['xaxis.range[1]'] !== undefined) {
+        _setChartZoomed(true);
+    }
+}
+
+// Attach (idempotently) the zoom listener to a freshly-plotted chart div.
+function _attachChartZoomListener(container) {
+    if (!container || typeof container.on !== 'function') return;
+    if (typeof container.removeAllListeners === 'function') {
+        container.removeAllListeners('plotly_relayout');
+    }
+    container.on('plotly_relayout', _onChartRelayout);
 }
 
 // Fetch the whole-day curve for ``epic`` and (re)draw it. ``initial`` paints the
@@ -1104,6 +1208,8 @@ async function _loadChart(epic, initial) {
         // refreshes so the chart updates in place without flicker or reset zoom.
         if (initial) {
             Plotly.newPlot(container, traces, layout, config);
+            // Freeze the live refresh while the user zooms/pans this fresh plot.
+            _attachChartZoomListener(container);
         } else {
             Plotly.react(container, traces, layout, config);
         }
@@ -1119,6 +1225,9 @@ async function _loadChart(epic, initial) {
 function closeChartModal() {
     if (_chartRefreshTimer) { clearInterval(_chartRefreshTimer); _chartRefreshTimer = null; }
     _chartModalEpic = null;
+    _chartEpicList  = [];
+    _chartEpicIndex = -1;
+    _setChartZoomed(false);
     document.getElementById('chart-modal').style.display = 'none';
     Plotly.purge(document.getElementById('chart-container'));
 }

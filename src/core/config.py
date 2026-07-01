@@ -229,10 +229,12 @@ class Settings(BaseSettings):
     strategy_atr_k_post: float = 2.5  # kept equal: do not tighten after break-even
     strategy_trailing_step_ratio: float = 0.3  # min gain (xATR) before a PUT
 
-    # Close profiles "atr_trailing_positive" and "atr_trailing_profit" — their
-    # shaping parameters are constants in src/exit/atr_trailing_positive.py and
-    # src/exit/atr_trailing_profit.py (not .env): tune them there and select the
-    # profile at runtime from the dashboard.
+    # Close profiles "atr_trailing_positive", "atr_trailing_profit" and
+    # "support_atr_profit" — their shaping parameters are constants in the
+    # matching src/exit/*.py modules (not .env): tune them there and select the
+    # profile at runtime from the dashboard. "support_atr_profit" reuses the
+    # profit-gated trailing but anchors the initial stop below a recency-weighted
+    # last-hour support (see src/exit/support_atr_profit.py).
 
     # Position / Risk management
     strategy_max_positions: int = 6

@@ -122,7 +122,24 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                         'onmouseleave="hideFundsTooltip()"'
                     ),
                 ),
-                body='<div id="chart-container" style="height:100%;min-height:420px;"></div>',
+                # The chart sits in a relative wrapper so the carousel arrows
+                # (previous/next epic in the source table) and the "paused"
+                # zoom badge can be overlaid on its edges. The arrows are hidden
+                # by JS when the source list holds a single epic.
+                body=(
+                    '<div style="position:relative;height:100%;min-height:420px;">'
+                    '<button id="chart-nav-prev" class="chart-nav-btn chart-nav-prev" '
+                    'onclick="chartNavPrev()" title="Previous epic (←)" '
+                    'style="display:none;">‹</button>'
+                    '<div id="chart-paused-badge" style="display:none;">'
+                    "⏸ Paused (zoomed) — double-click to resume</div>"
+                    '<div id="chart-container" style="height:100%;'
+                    'min-height:420px;"></div>'
+                    '<button id="chart-nav-next" class="chart-nav-btn chart-nav-next" '
+                    'onclick="chartNavNext()" title="Next epic (→)" '
+                    'style="display:none;">›</button>'
+                    "</div>"
+                ),
             ),
             render_modal(
                 modal_id="epics-modal",
@@ -279,7 +296,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=4">
+    <link rel="stylesheet" href="/static/style.css?v=5">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -437,6 +454,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=14"></script>
+<script src="/static/dashboard.js?v=15"></script>
 </body>
 </html>"""
