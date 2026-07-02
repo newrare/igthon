@@ -17,7 +17,12 @@ from src.utils.tools import _to_float, euro_per_point, margin_factor_pct
 from src.web.routes.dashboard.fragments import _build_fragments
 from src.web.routes.dashboard.pages import _render_tradable_list_page
 from src.web.routes.dashboard.shell import _render_dashboard
-from src.web.routes.dashboard.state import _PARIS, _gather_dashboard_state
+from src.web.routes.dashboard.state import (
+    _PARIS,
+    _gather_dashboard_state,
+    _to_float_or_none,
+    force_account_balance_refresh,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +463,35 @@ async def api_queue_errors_clear(request: Request) -> JSONResponse:
     if api_queue is not None:
         api_queue.clear_errors()
     return JSONResponse({"cleared": True})
+
+
+@router.post("/api/wallet/resync")
+async def wallet_resync(request: Request) -> JSONResponse:
+    """Force an immediate account-balance refresh (wallet KPI resync button).
+
+    The balance shown on the dashboard is otherwise refreshed only in the
+    background, at most once every 15 s. This endpoint awaits a fresh
+    ``GET /accounts`` so the user can pull the current figure on demand (e.g.
+    after topping up a demo account from the IG web platform — IG exposes no
+    REST endpoint to reset the demo balance, so the reset stays a manual step
+    there and this button just re-reads the new value).
+    """
+    api_queue = getattr(request.app.state, "api_queue", None)
+    if api_queue is None:
+        return JSONResponse({"error": "API not available"}, status_code=503)
+    try:
+        balance = await force_account_balance_refresh(request.app.state)
+    except Exception as exc:
+        logger.warning("Wallet resync failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    if not balance:
+        return JSONResponse({"error": "Balance unavailable"}, status_code=502)
+    return JSONResponse(
+        {
+            "available": _to_float_or_none(balance.get("available")),
+            "used": _to_float_or_none(balance.get("deposit")),
+        }
+    )
 
 
 @router.get("/api/positions/funds/{epic}")

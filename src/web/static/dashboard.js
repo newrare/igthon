@@ -296,6 +296,31 @@ async function clearErrors() {
     }
 }
 
+// Wallet resync — force an immediate GET /accounts so the balance reflects a
+// manual demo top-up done on the IG web platform (IG has no REST reset endpoint).
+async function resyncWallet(btn) {
+    if (btn) { btn.classList.add('spinning'); btn.disabled = true; }
+    try {
+        const res  = await fetch('/api/wallet/resync', { method: 'POST' });
+        const data = await res.json().catch(function() { return {}; });
+        if (res.ok) {
+            const val = (typeof data.available === 'number')
+                ? data.available.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '€'
+                : '—';
+            showToast('Wallet resynced', 'Available: ' + val, 'success');
+        } else {
+            showToast('Wallet resync failed', data.error || 'Unknown error', 'error');
+        }
+    } catch (e) {
+        console.error('Wallet resync failed', e);
+        showToast('Wallet resync failed', 'Network error', 'error');
+    } finally {
+        // The KPI fragment re-renders on the next 1 s poll and replaces this
+        // button, so clearing the spin state here is only for the no-poll case.
+        if (btn) { btn.classList.remove('spinning'); btn.disabled = false; }
+    }
+}
+
 async function clearQueueErrors() {
     try {
         await fetch('/api/queue/errors/clear', { method: 'POST' });

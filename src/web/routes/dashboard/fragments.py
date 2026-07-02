@@ -467,7 +467,12 @@ def _build_fragments(state: dict) -> dict[str, str]:
     )
     wallet_tile = f"""
         <div class="kpi-tile" style="border-left-color:{wallet_color};">
-            <div class="kpi-label"><i data-lucide="wallet" class="lc-icon"></i> Wallet</div>
+            <div class="kpi-label">
+                <span><i data-lucide="wallet" class="lc-icon"></i> Wallet</span>
+                <button class="kpi-resync" onclick="resyncWallet(this)" title="Resync balance">
+                    <i data-lucide="refresh-cw" class="lc-icon"></i>
+                </button>
+            </div>
             <div class="kpi-value" style="color:{wallet_color};">{wallet_value}</div>
             <div class="kpi-sub">{wallet_sub}</div>
         </div>"""

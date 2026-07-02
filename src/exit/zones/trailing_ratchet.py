@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.core.indicators import adverse_tick_noise
 from src.exit.trailing import compute_trailing_stop
 from src.exit.zones.base import StopContext, StopUpdater
 from src.feed.price_buffer import EpicBuffer
@@ -40,6 +41,17 @@ class TrailingRatchetStop(StopUpdater):
     atr_k_pre: float = 2.5
     atr_k_post: float = 2.5
     trailing_step_ratio: float = 0.3  # min advance (× ATR) before re-pushing stop
+
+    # Adverse-noise floor on the trailing distance. The candle ATR does not
+    # capture the bid's tick-to-tick jitter and shrinks in a clean trend, so the
+    # stop can end up hugging the bid and be knocked out by an ordinary pull-back
+    # while the trade is still running (observed live on IX.D.StoxxBank.FNI2.IP).
+    # The stop is held at least ``noise_mult ×`` the adverse tick-noise band
+    # below the bid — measured per-tick, per-epic — so normal noise cannot reach
+    # it. See :func:`~src.core.indicators.adverse_tick_noise`.
+    noise_window: int = 20  # steps measured for the adverse-noise band
+    noise_std_k: float = 2.0  # σ band added to the mean down-move
+    noise_mult: float = 2.0  # multiple of that band kept between bid and stop
 
     @staticmethod
     def _last_two_bids_rising(buf: EpicBuffer) -> bool:
@@ -66,6 +78,14 @@ class TrailingRatchetStop(StopUpdater):
         # is positive beyond the noise margin, so it protects acquired gain rather
         # than the risk accepted at open. The ``2 × spread`` anti-noise floor still
         # applies inside ``compute_trailing_stop``.
+        #
+        # The adverse tick-noise band (measured on the live bid) sets a per-tick
+        # floor on the trailing distance so the stop is never parked closer to
+        # the bid than an ordinary pull-back — the fix for winners stopped out on
+        # noise in a clean trend where the candle ATR has shrunk.
+        noise_floor = self.noise_mult * adverse_tick_noise(
+            ctx.buf.bid_closes, self.noise_window, self.noise_std_k
+        )
         new_stop = compute_trailing_stop(
             ctx.current_bid,
             atr_value=ctx.atr_value,
@@ -75,6 +95,7 @@ class TrailingRatchetStop(StopUpdater):
             euro_per_point=ctx.euro_per_point,
             euro_stop=0.0,
             config=self,
+            noise_floor=noise_floor,
         )
         if new_stop is None:
             return None

@@ -82,6 +82,22 @@ def _schedule_account_balance_refresh(app_state) -> None:
     asyncio.create_task(_refresh_account_balance(app_state, api_queue))
 
 
+async def force_account_balance_refresh(app_state) -> dict | None:
+    """Refresh the account balance now and return it (manual resync button).
+
+    Unlike :func:`_fetch_account_balance` — the non-blocking poll read that only
+    ever schedules a background refresh — this awaits the ``GET /accounts`` call
+    so the caller (the wallet "resync" endpoint) can return the fresh figure in
+    the same response. It is a user-triggered action, not the 1 s poll, so
+    awaiting the queue here is safe.
+    """
+    api_queue = getattr(app_state, "api_queue", None)
+    if api_queue is None:
+        return None
+    await _refresh_account_balance(app_state, api_queue)
+    return getattr(app_state, "account_balance", None)
+
+
 async def _refresh_account_balance(app_state, api_queue) -> None:
     """Fetch the balance via the queue and update the in-memory cache."""
     try:

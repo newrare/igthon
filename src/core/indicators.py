@@ -169,6 +169,45 @@ def atr(candles: list[Candle], period: int = 14) -> float:
     return sum(true_ranges) / period
 
 
+def adverse_tick_noise(
+    bid_closes: list[float], window: int = 20, std_k: float = 2.0
+) -> float:
+    """Typical *adverse* (downward) tick-to-tick amplitude of the bid.
+
+    Sizes a long's trailing stop off the noise that can actually hit it. Only
+    downward moves are counted — for a long, upward jitter never triggers the
+    stop, so a symmetric measure (mean ``|Δbid|``) would be inflated by the
+    trend's upward drift and misstate the real pull-back risk. Each step
+    contributes ``max(0, bid[i-1] - bid[i])``; up-ticks contribute ``0``.
+
+    Returns ``mean(down) + std_k × std(down)``: the centre of the down-move
+    distribution plus a volatility band, so the result sits *beyond* a normal
+    down-tick rather than at its average. This is the natural per-tick floor for
+    the trailing distance, complementing the (candle-based) ATR which does not
+    capture bid jitter.
+
+    Args:
+        bid_closes: Ordered bid closes (oldest first).
+        window: Number of most-recent steps to measure over.
+        std_k: Multiplier on the down-move standard deviation.
+
+    Returns:
+        The adverse tick-noise amplitude in price points, or 0.0 when there are
+        fewer than two bids.
+    """
+    if window < 1 or len(bid_closes) < 2:
+        return 0.0
+
+    recent = bid_closes[-(window + 1) :]
+    downs = [max(0.0, prev - cur) for prev, cur in zip(recent, recent[1:])]
+    if not downs:
+        return 0.0
+
+    mean = sum(downs) / len(downs)
+    variance = sum((d - mean) ** 2 for d in downs) / len(downs)
+    return mean + std_k * math.sqrt(variance)
+
+
 def efficiency_ratio(values: list[float], period: int) -> float:
     """Kaufman Efficiency Ratio over the last ``period`` values (0-1).
 

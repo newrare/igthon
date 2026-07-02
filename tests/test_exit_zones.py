@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from src.core.indicators import atr
 from src.exit.zones import (
     BreakevenBandStop,
+    BreakevenLockStop,
     StopContext,
     StopZone,
     TrailingRatchetStop,
@@ -96,6 +97,52 @@ class TestHoldingZones:
         assert BreakevenBandStop().propose(ctx) is None
 
 
+class TestBreakevenLock:
+    # ``_buffer`` builds a monotonically rising bid, so ``adverse_tick_noise`` is
+    # 0 and the required gap floors on ``2 × spread`` (= 1.0 at spread 0.5). The
+    # lock target is ``level_zero + 1 × spread`` (= 8000.5 below).
+
+    def test_locks_a_hair_above_break_even_when_bid_is_clear(self):
+        buf = _buffer([8000.0 + i for i in range(40)])
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,  # 4.5 above the 8000.5 target → clears the 1.0 gap
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        new_stop = BreakevenLockStop().propose(ctx)
+        assert new_stop == 8000.5
+        assert ctx.level_zero < new_stop < ctx.current_bid
+        assert new_stop > ctx.level_follower
+
+    def test_holds_while_bid_hugs_break_even(self):
+        # Bid only a hair above break-even → gap to the lock target is under the
+        # noise floor → do not pull the stop up into the noise.
+        buf = _buffer([8000.0 + i for i in range(40)])
+        ctx = _ctx(
+            buf,
+            current_bid=8000.8,  # 0.3 above the 8000.5 target < the 1.0 gap
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert BreakevenLockStop().propose(ctx) is None
+
+    def test_never_lowers_an_already_pushed_stop(self):
+        # Follower already above the lock target (e.g. pushed by the profit zone on
+        # an earlier excursion) → hold rather than pull it back down.
+        buf = _buffer([8000.0 + i for i in range(40)])
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8001.0,  # > 8000.5 target
+        )
+        assert BreakevenLockStop().propose(ctx) is None
+
+
 class TestTrailingRatchet:
     def test_rising_bids_far_in_profit_ratchets_up(self):
         buf = _buffer([8000.0 + i for i in range(60)])
@@ -163,3 +210,28 @@ class TestTrailingRatchet:
         )
         assert narrow is not None and wide is not None
         assert wide < narrow  # wider width → stop further below the bid
+
+    def test_noise_floor_pushes_stop_further_below_a_noisy_bid(self):
+        # A rising-but-noisy bid (up 6 / down 3 saw-tooth, then a rising tail):
+        # the candle ATR stays small while the bid jitters, so the adverse-noise
+        # floor must hold the stop further below the bid than the ATR alone would.
+        closes = [8000.0]
+        v = 8000.0
+        for i in range(36):
+            v += 6.0 if i % 2 == 0 else -3.0
+            closes.append(v)
+        for _ in range(3):  # rising tail so the momentum gate passes
+            v += 1.0
+            closes.append(v)
+        buf = _buffer(closes)
+        bid = buf.last.bid_close
+        kw = dict(
+            current_bid=bid,
+            level_zero=8000.0,
+            level_margin=8001.0,  # low, so neither stop lands in the dead band
+            level_follower=7900.0,
+        )
+        without = TrailingRatchetStop(noise_mult=0.0).propose(_ctx(buf, **kw))
+        with_floor = TrailingRatchetStop(noise_mult=5.0).propose(_ctx(buf, **kw))
+        assert without is not None and with_floor is not None
+        assert with_floor < without  # noise floor → stop further below the bid

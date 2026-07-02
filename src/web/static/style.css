@@ -225,6 +225,42 @@ a.kpi-tile:hover {
   letter-spacing: 0.8px;
   font-weight: 600;
   margin-bottom: 0.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+/* Small icon button in a KPI label (e.g. the Wallet resync). */
+.kpi-resync {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 0;
+  display: inline-flex;
+  transition: color 0.15s;
+}
+
+.kpi-resync:hover {
+  color: var(--text);
+}
+
+.kpi-resync .lc-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.kpi-resync.spinning .lc-icon {
+  animation: kpi-spin 0.7s linear infinite;
+}
+
+@keyframes kpi-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .kpi-value {

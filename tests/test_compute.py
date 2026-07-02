@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from src.core.indicators import (
+    adverse_tick_noise,
     atr,
     compute_levels,
     linear_regression,
@@ -61,6 +62,38 @@ class TestATR:
 
     def test_empty(self):
         assert atr([], period=14) == 0.0
+
+
+class TestAdverseTickNoise:
+    """Tests for the adverse (downward) tick-noise band."""
+
+    def test_pure_uptrend_has_zero_adverse_noise(self):
+        # Every step is upward → no down-move contributes → 0.0.
+        assert adverse_tick_noise([100.0, 101.0, 102.0, 103.0]) == 0.0
+
+    def test_only_downward_moves_are_counted(self):
+        # Up-drift is ignored; only the down-ticks size the band. Steps here are
+        # +5, -2, +5 → downs = [0, 2, 0]: mean=2/3, var=8/9, std=2√2/3.
+        closes = [100.0, 105.0, 103.0, 108.0]
+        expected = 2 / 3 + 2.0 * ((8 / 9) ** 0.5)
+        assert adverse_tick_noise(closes, window=20, std_k=2.0) == pytest.approx(
+            expected
+        )
+
+    def test_symmetric_noise_ignores_up_legs(self):
+        # A saw-tooth: the +1/-1 legs give the same down-band whatever the drift.
+        assert adverse_tick_noise(
+            [100.0, 99.0, 100.0, 99.0, 100.0], std_k=0.0
+        ) == pytest.approx(0.5)
+
+    def test_window_limits_the_lookback(self):
+        # An old large down-tick outside the window is excluded.
+        closes = [100.0, 80.0] + [100.0 + i for i in range(30)]
+        assert adverse_tick_noise(closes, window=5) == 0.0
+
+    def test_insufficient_data(self):
+        assert adverse_tick_noise([100.0]) == 0.0
+        assert adverse_tick_noise([]) == 0.0
 
 
 class TestLinearRegression:

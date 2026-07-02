@@ -16,12 +16,14 @@ from __future__ import annotations
 
 from src.stops.base import StopDistance
 from src.stops.stop_atr import StopAtr
+from src.stops.stop_regression import StopRegression, residual_sigma
 from src.stops.stop_support import StopSupport, weighted_support
 
 #: Name → class map. Keys are the valid ``STOP_STRATEGY`` values.
 STOP_DISTANCES: dict[str, type[StopDistance]] = {
     StopAtr.name: StopAtr,
     StopSupport.name: StopSupport,
+    StopRegression.name: StopRegression,
 }
 
 
@@ -43,7 +45,9 @@ __all__ = [
     "STOP_DISTANCES",
     "StopAtr",
     "StopSupport",
+    "StopRegression",
     "StopDistance",
     "get_stop_distance",
     "weighted_support",
+    "residual_sigma",
 ]

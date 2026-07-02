@@ -57,18 +57,25 @@ def clamp_trailing_distance(
     spread: float,
     euro_per_point: float,
     euro_stop: float,
+    noise_floor: float = 0.0,
 ) -> float:
     """Bound the trailing distance between two safety limits.
 
-    Floor: a couple of spreads, so the bid/offer oscillation alone cannot
-    trigger the stop (avoids closing on noise). Ceiling: the initial planned
-    euro risk (``euro_stop`` / ``euro_per_point``), so the trailing stop is
-    never further from price than the loss accepted at open.
+    Floor: the widest of a couple of spreads (bid/offer churn) and the measured
+    ``noise_floor`` (the adverse tick-noise band, see
+    :func:`~src.core.indicators.adverse_tick_noise`), so neither the bid/offer
+    oscillation nor an ordinary bid pull-back can trigger the stop. Ceiling: the
+    initial planned euro risk (``euro_stop`` / ``euro_per_point``), so the
+    trailing stop is never further from price than the loss accepted at open.
+
+    The ceiling is applied to the raw distance only; the floor always wins, so a
+    noise floor wider than the euro-risk ceiling still holds — protecting an
+    already-profitable trade from being knocked out by noise takes precedence.
     """
     distance = raw_distance
     if euro_per_point > 0 and euro_stop > 0:
         distance = min(distance, euro_stop / euro_per_point)
-    floor = max(spread * 2.0, 0.0)
+    floor = max(spread * 2.0, noise_floor, 0.0)
     return max(distance, floor)
 
 
@@ -82,6 +89,7 @@ def compute_trailing_stop(
     euro_per_point: float,
     euro_stop: float,
     config: TrailingConfig,
+    noise_floor: float = 0.0,
 ) -> float | None:
     """Pure ATR chandelier trailing-stop shared by live trading and the simulator.
 
@@ -90,6 +98,11 @@ def compute_trailing_stop(
     (``atr_k_pre`` / ``atr_k_post``), but the application keeps them EQUAL: for a
     trend-following breakout, tightening after break-even cuts winners short. The
     capability is retained so the two-speed regime can still be configured.
+
+    ``noise_floor`` (points) sets a lower bound on the trailing distance measured
+    from the live bid noise, so the stop never hugs the bid closer than an
+    ordinary pull-back — the candle-based ATR alone can shrink to near-zero in a
+    clean trend and stop a still-running winner out on jitter.
 
     Returns:
         The new stop level, or None when no update is warranted.
@@ -104,6 +117,7 @@ def compute_trailing_stop(
         spread=spread,
         euro_per_point=euro_per_point,
         euro_stop=euro_stop,
+        noise_floor=noise_floor,
     )
 
     # Trail a full ATR distance below price. The ratchet below ensures the stop
