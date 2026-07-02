@@ -115,82 +115,8 @@ async function toggleJobMode(action, cb) {
     }
 }
 
-// ── Strategy / close-profile change confirmation ─────────────────────────────
-// Both title-bar dropdowns funnel through this Promise-based confirm so a
-// mis-click never swaps the live trading logic without an explicit OK.
-let _strategyConfirmResolve = null;
-
-function openStrategyConfirmModal(kind, name) {
-    return new Promise(function(resolve) {
-        _strategyConfirmResolve = resolve;
-        document.getElementById('strategy-confirm-kind').textContent = kind;
-        document.getElementById('strategy-confirm-target').textContent =
-            name.replace(/_/g, ' ');
-        document.getElementById('strategy-confirm-modal').style.display = 'flex';
-    });
-}
-
-function closeStrategyConfirmModal(confirmed) {
-    document.getElementById('strategy-confirm-modal').style.display = 'none';
-    if (_strategyConfirmResolve) {
-        _strategyConfirmResolve(confirmed);
-        _strategyConfirmResolve = null;
-    }
-}
-
-// Switch the active trading strategy from the title-bar dropdown.
-async function switchStrategy(name, sel) {
-    const previous = sel.dataset.current || sel.value;
-    if (name === previous) return;  // no-op re-selection
-    const confirmed = await openStrategyConfirmModal('entry strategy', name);
-    if (!confirmed) {
-        sel.value = previous;  // revert the dropdown on cancel
-        return;
-    }
-    sel.disabled = true;
-    try {
-        const res = await fetch('/api/strategy/' + encodeURIComponent(name), { method: 'POST' });
-        if (res.ok) {
-            sel.dataset.current = name;
-            showToast('Strategy', 'Now running ' + name.replace(/_/g, ' '), 'success');
-        } else {
-            sel.value = previous;  // revert on failure
-            showToast('Strategy', 'Failed to switch strategy', 'error');
-        }
-    } catch (e) {
-        sel.value = previous;
-        showToast('Strategy', 'Network error', 'error');
-    } finally {
-        sel.disabled = false;
-    }
-}
-
-// Switch the active close profile from the title-bar dropdown.
-async function switchCloseProfile(name, sel) {
-    const previous = sel.dataset.current || sel.value;
-    if (name === previous) return;  // no-op re-selection
-    const confirmed = await openStrategyConfirmModal('close profile', name);
-    if (!confirmed) {
-        sel.value = previous;  // revert the dropdown on cancel
-        return;
-    }
-    sel.disabled = true;
-    try {
-        const res = await fetch('/api/close-profile/' + encodeURIComponent(name), { method: 'POST' });
-        if (res.ok) {
-            sel.dataset.current = name;
-            showToast('Close profile', 'Now exiting with ' + name.replace(/_/g, ' '), 'success');
-        } else {
-            sel.value = previous;  // revert on failure
-            showToast('Close profile', 'Failed to switch close profile', 'error');
-        }
-    } catch (e) {
-        sel.value = previous;
-        showToast('Close profile', 'Network error', 'error');
-    } finally {
-        sel.disabled = false;
-    }
-}
+// The open / stop / close selection is set in .env (the single source of truth)
+// and shown read-only in the title bar — there is no runtime switching here.
 
 // General pause-all / resume-all — flips every job at once.
 async function setAllJobs(auto, btn) {
@@ -523,37 +449,6 @@ function closeWinRateModal() {
     document.getElementById('winrate-modal').style.display = 'none';
 }
 
-// ── Daily Risk Safety modal ───────────────────────────────────────────────────
-// Opened from the Opening KPI tile. The body (frag-risk_modal) refreshes with
-// the 2s poll, so the breaker values stay live while the modal is open.
-function openRiskModal() {
-    document.getElementById('risk-modal').style.display = 'block';
-}
-function closeRiskModal() {
-    document.getElementById('risk-modal').style.display = 'none';
-}
-
-// Arm/disarm the daily-risk circuit-breakers. Persists server-side; the badge
-// and modal repaint on the next poll.
-async function toggleRiskGuard(enabled, el) {
-    el.disabled = true;
-    try {
-        const res = await fetch('/api/risk/' + (enabled ? 'on' : 'off'), { method: 'POST' });
-        if (res.ok) {
-            showToast('Daily risk', enabled ? 'Safety ARMED' : 'Safety DISABLED (dev)',
-                enabled ? 'success' : 'warning');
-        } else {
-            el.checked = !enabled;  // revert on failure
-            showToast('Daily risk', 'Failed to switch', 'error');
-        }
-    } catch (e) {
-        el.checked = !enabled;
-        showToast('Daily risk', 'Network error', 'error');
-    } finally {
-        el.disabled = false;
-    }
-}
-
 // ── Buy Confirmation Modal ────────────────────────────────────────────────────
 let _buyConfirmResolve = null;
 
@@ -609,7 +504,6 @@ document.addEventListener('keydown', function(e) {
         if (document.getElementById('positions-modal').style.display !== 'none') closePositionsModal();
         if (document.getElementById('closed-modal').style.display !== 'none') closeClosedModal();
         if (document.getElementById('winrate-modal').style.display !== 'none') closeWinRateModal();
-        if (document.getElementById('risk-modal').style.display !== 'none') closeRiskModal();
     }
 });
 

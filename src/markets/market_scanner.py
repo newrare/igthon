@@ -24,6 +24,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import time
+from typing import ClassVar
 from urllib.parse import quote
 
 from src.core.api.client import IGAPIError, IGClient
@@ -69,7 +70,7 @@ class MarketInfo:
     # Today's market close, in UTC, parsed from IG's ``instrument.openingHours``
     # when it is present AND the timezone offset is known (so it can be resolved
     # to UTC with confidence). None otherwise — callers then fall back to the
-    # global ``hour_close``. Drives the per-epic "close before the market closes"
+    # default close hour. Drives the per-epic "close before the market closes"
     # rule; never guessed (an unknown/ambiguous schedule stays None).
     market_close_utc: time | None = None
 
@@ -96,7 +97,7 @@ def parse_market_close_utc(instrument: dict) -> time | None:
     Defensive by design: returns None whenever the schedule is absent, malformed,
     a 24h market (open == close), or the timezone offset is unknown — i.e. unless
     a real daily close can be resolved to UTC with confidence. The caller falls
-    back to the global ``hour_close`` on None, so a wrong/ambiguous schedule can
+    back to the default close hour on None, so a wrong/ambiguous schedule can
     never cause a mistimed close.
 
     IG returns ``openingHours`` as ``{"marketTimes": [{"openTime": "08:00",
@@ -146,12 +147,17 @@ class MarketScanner:
 
     Args:
         client: Authenticated IG client.
-        settings: Application settings (spread threshold, search terms).
-        max_spread_ratio: Override the spread filter (default: from settings).
+        settings: Application settings (search terms).
+        max_spread_ratio: Override the spread filter (default:
+            :data:`DEFAULT_MAX_SPREAD_RATIO`).
         inter_call_delay: Seconds to sleep between consecutive discovery API
             calls.  Keeps burst rate well below the IG per-minute quota.
             Set to 0 to disable (useful in unit tests with mocked HTTP).
     """
+
+    # Reject epics whose bid/offer spread exceeds this fraction of price — the
+    # intraday edge is spread-sized, so a wide spread kills it. Tune here.
+    DEFAULT_MAX_SPREAD_RATIO: ClassVar[float] = 0.0010
 
     client: IGClient
     settings: Settings
@@ -160,7 +166,7 @@ class MarketScanner:
 
     def __post_init__(self) -> None:
         if self.max_spread_ratio is None:
-            self.max_spread_ratio = self.settings.strategy_max_spread_ratio
+            self.max_spread_ratio = self.DEFAULT_MAX_SPREAD_RATIO
         # Epics that caused HTTP 500 "Transformation failure" when fetched alone.
         # Cached across calls to avoid re-probing known-bad instruments each scan.
         self._poison_epics: set[str] = set()

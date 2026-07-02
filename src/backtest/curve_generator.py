@@ -35,7 +35,7 @@ _MIXTE_MIX = [*_RANDOM_MIX, "mean_reverting"]
 
 DEFAULT_NUM_CANDLES = 600  # one trading day of 1-minute candles (07:00→17:00)
 DEFAULT_BASE_PRICE = 8000.0
-DEFAULT_START_HOUR = 7  # UTC — before strategy_hour_start so buffers warm up
+DEFAULT_START_HOUR = 7  # UTC — early enough that indicator buffers warm up
 
 
 @dataclass(slots=True)

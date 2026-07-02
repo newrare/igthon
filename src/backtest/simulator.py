@@ -5,7 +5,7 @@ exact same decoupled decision pipeline used live:
 
 - open: an :class:`src.entry.base.EntryStrategy` produces a direction-only
   :class:`~src.entry.base.EntryIntent`;
-- pre-open gates: :func:`src.execution.risk.evaluate_open_gates`;
+- pre-open gates: :func:`src.execution.gates.evaluate_open_gates`;
 - exit: a :class:`src.exit.base.CloseProfile` chosen *independently* picks the
   initial stop (``initial_plan``) and drives every per-tick close decision
   (``evaluate``).
@@ -33,7 +33,7 @@ from datetime import datetime, timedelta
 from itertools import groupby
 
 from src.entry.base import EntryStrategy
-from src.execution.risk import daily_risk_block, evaluate_open_gates
+from src.execution.gates import evaluate_open_gates
 from src.execution.trading import TradeConfig
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
 from src.feed.price_buffer import Candle, EpicBuffer
@@ -286,7 +286,7 @@ class StrategySimulator:
         """Play one trading day, dispatching on the entry's selection model.
 
         A **cross-epic ranker** (``cross_epic_selection``, e.g.
-        ``projection_ranking``) keeps a single rolling position chosen as the
+        ``open_ranking``) keeps a single rolling position chosen as the
         best of all epics — handled by :meth:`_run_day_ranker`, a faithful
         mirror of the scheduler's ``_select_and_open``. A **per-epic gate**
         (``donchian_*``) opens whatever epic fires first — handled by
@@ -365,7 +365,7 @@ class StrategySimulator:
         """Cross-epic ranker day — a faithful mirror of ``_select_and_open``.
 
         Holds ``entry.concurrent_positions`` rolling positions (1 for
-        ``projection_ranking``). The merged event stream is processed **one
+        ``open_ranking``). The merged event stream is processed **one
         timestamp at a time**: every epic's candle for that tick is ingested and
         open positions are monitored first (a close frees a slot); then, while a
         slot is free, *all* eligible epics are scored, ranked by score, and the
@@ -451,31 +451,6 @@ class StrategySimulator:
         if slots <= 0:
             return  # target met — a position is already running (cheap path)
 
-        # Trading-hours gate is a property of the tick, identical for every epic —
-        # check it once here rather than scoring the whole pool then rejecting each
-        # candidate out-of-hours (the live selector likewise never opens off-hours).
-        if not (self._config.hour_start <= ts.hour < self._config.hour_end):
-            return
-
-        # Day-scope circuit breakers: once a daily gate trips (target/loss hit,
-        # max trades, win-rate floor), the live bot stops opening for the rest of
-        # the day. Short-circuit here too — both for fidelity and to skip the
-        # costly per-tick scoring of the whole pool while opening is closed.
-        if getattr(self._config, "daily_risk_enabled", True):
-            trade_count = len(closed_today)
-            wins = sum(1 for t in closed_today if t.win)
-            win_rate = wins / trade_count if trade_count else 1.0
-            daily_pnl = sum(t.euro or 0.0 for t in closed_today)
-            blocked = daily_risk_block(
-                daily_pnl=daily_pnl,
-                trade_count=trade_count,
-                win_rate=win_rate,
-                config=self._config,
-            )
-            if blocked is not None:
-                result.rejections[blocked.split("(")[0].strip()] += 1
-                return
-
         ranked: list[tuple] = []
         for e, buf in enumerate(buffers):
             if e in open_positions or e in used_today:
@@ -550,7 +525,7 @@ class StrategySimulator:
         closed_today: list[SimulatedTrade],
         result: SimulationResult,
     ) -> bool:
-        """Run the pre-open gates + euro-risk check and open on success.
+        """Run the pre-open gates and open on success.
 
         The close profile (not the entry) chooses the initial protective stop
         and any take-profit via ``initial_plan`` — exactly as the live
@@ -558,23 +533,11 @@ class StrategySimulator:
 
         Returns True when a position was opened.
         """
-        trade_count = len(closed_today)
-        wins = sum(1 for t in closed_today if t.win)
-        win_rate = wins / trade_count if trade_count else 1.0
-        daily_pnl = sum(t.euro or 0.0 for t in closed_today)
-
         allowed, reason = evaluate_open_gates(
             epic=buf.epic,
             direction=intent.direction,
-            in_trading_hours=(
-                self._config.hour_start <= candle.timestamp.hour < self._config.hour_end
-            ),
+            in_trading_hours=True,
             epic_already_open=epic_index in open_positions,
-            open_count=len(open_positions),
-            daily_pnl=daily_pnl,
-            trade_count=trade_count,
-            win_rate=win_rate,
-            config=self._config,
         )
         if not allowed:
             # Normalize the reason (drop per-run numbers) for the counter.
@@ -587,9 +550,6 @@ class StrategySimulator:
         stop_distance = candle.bid_close - plan.stop_level
         euro_per_point = self._sim.euro_per_point * self._sim.quantity
         euro_risk = stop_distance * euro_per_point
-        if euro_risk > self._config.euro_loss_max:
-            result.rejections["Euro risk too high"] += 1
-            return False
 
         # A market BUY fills at the offer (same as IG's confirmation level).
         open_positions[epic_index] = SimulatedTrade(
@@ -628,9 +588,9 @@ class StrategySimulator:
 
         # Broker-side protective stop: the close profile owns the stop level
         # (``level_follower``), so this models IG filling the *pushed* stop when
-        # the low touches it. The profile may move the stop down as well as up
-        # (e.g. atr_trailing_positive giving a soft dip room), hence the level is
-        # taken as-is rather than ratcheted here.
+        # the low touches it. The profile may in principle move the stop down as
+        # well as up (a zone updater could give a soft dip room), hence the level
+        # is taken as-is rather than ratcheted here.
         broker_stop = position.level_follower
         if candle.bid_low <= broker_stop:
             reason = "follower" if position.stop_updates else "stop"
@@ -683,9 +643,11 @@ def run_simulation(
 
     The provider derives one deterministic seed per (day, epic) from the master
     seed, so a run is fully reproducible while every curve stays distinct. The
-    entry strategy and close profile are resolved by name (decoupled); when a
-    name is omitted the configured ``ENTRY_STRATEGY_NAME`` / ``CLOSE_PROFILE_NAME``
-    is used — the simulator then replays exactly what the live bot would do.
+    entry strategy is resolved by name (``strategy_name`` or the configured
+    ``OPEN_STRATEGY``). The exit is the single composer profile built from
+    settings — its per-zone behaviour comes from the ``CLOSE_ZONE*`` selectors, so
+    ``close_profile_name`` is accepted for API compatibility but not used for
+    selection. The simulator thus replays exactly what the live bot would do.
     """
     from src.backtest.curve_generator import generate_curve
     from src.entry import get_entry_strategy
@@ -708,12 +670,8 @@ def run_simulation(
 
     simulator = StrategySimulator(
         trade_config=TradeConfig.from_settings(settings),
-        entry=get_entry_strategy(
-            strategy_name or settings.entry_strategy_name, settings
-        ),
-        close_profile=get_close_profile(
-            close_profile_name or settings.close_profile_name, settings
-        ),
+        entry=get_entry_strategy(strategy_name or settings.open_strategy, settings),
+        close_profile=get_close_profile(settings),
         sim_config=sim_config,
         curve_provider=provider,
     )
@@ -759,9 +717,7 @@ def run_close_visual(
         day=_BASE_DAY,
     )
 
-    profile = get_close_profile(
-        close_profile_name or settings.close_profile_name, settings
-    )
+    profile = get_close_profile(settings)
     config = TradeConfig.from_settings(settings)
 
     # The open must sit far enough in to have a warmup window for the ATR, and
@@ -930,7 +886,7 @@ def run_open_visual(
         day=_BASE_DAY,
     )
 
-    entry = get_entry_strategy(strategy_name or settings.entry_strategy_name, settings)
+    entry = get_entry_strategy(strategy_name or settings.open_strategy, settings)
 
     # Feed candles one at a time and evaluate exactly as the scheduler does:
     # only once the warmup window is filled, and stop on the first BUY.

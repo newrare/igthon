@@ -3,14 +3,14 @@
 These helpers carry no I/O and no dependency on the trading service: they take
 the live price plus the position's persisted levels and return a decision or a
 new stop level. They are shared by the live close path
-(:class:`~src.execution.trading.TradingService`), the
-:class:`~src.exit.atr_trailing.AtrTrailingExit` close profile, and the
+(:class:`~src.execution.trading.TradingService`), the profit-trailing zone
+updater (:class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`), and the
 simulator — which is exactly why they live in the exit domain rather than in
 the trading service.
 
 ``config`` is duck-typed (:class:`TrailingConfig`): any object exposing
 ``atr_k_pre`` / ``atr_k_post`` / ``trailing_step_ratio`` works, so both the
-live ``TradeConfig`` and a ``CloseProfile`` can drive the same maths.
+live ``TradeConfig`` and a zone updater can drive the same maths.
 """
 
 from __future__ import annotations

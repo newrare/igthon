@@ -20,7 +20,7 @@ from src.core.api.client import IGAPIError, IGClient
 from src.core.api_queue import APIQueue, Priority
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal, atr
 from src.entry.base import EntryIntent
-from src.execution.risk import compute_quantity_multiplier, evaluate_open_gates
+from src.execution.gates import evaluate_open_gates
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
 from src.exit.trailing import (
     clamp_trailing_distance,
@@ -59,6 +59,12 @@ RECONCILE_GRACE_SECONDS = 60.0
 CONFIRM_MAX_ATTEMPTS = 4
 CONFIRM_RETRY_DELAY_SECONDS = 0.4
 
+# Fallback market-close hour (UTC) used only when an epic exposes no per-epic
+# close time (``Epic.market_close_utc``). Positions are normally closed just
+# before each epic's own market close; this is the catch-all for the rare epic
+# with no known schedule (and the global end-of-day safety sweep).
+DEFAULT_MARKET_CLOSE_HOUR_UTC = 17
+
 # Re-exported for backward compatibility: these pure close helpers now live in
 # the exit domain (src/exit/trailing.py). Existing importers
 # (``from src.execution.trading import decide_close_reason``) keep working.
@@ -66,7 +72,6 @@ __all__ = [
     "TradeConfig",
     "TradingService",
     "clamp_trailing_distance",
-    "compute_quantity_multiplier",
     "compute_trailing_stop",
     "decide_close_reason",
     "evaluate_open_gates",
@@ -77,25 +82,12 @@ __all__ = [
 class TradeConfig:
     """Trading configuration parameters."""
 
-    max_positions: int = 4
-    hour_start: int = 9
-    hour_end: int = 16
-    hour_close: int = 17
+    # Fallback close hour (UTC); overridden per-epic by Epic.market_close_utc.
+    hour_close: int = DEFAULT_MARKET_CLOSE_HOUR_UTC
     # Minutes before a market's own close at which an open position on it is
     # force-closed (per-epic close rule). Applied to Epic.market_close_utc when
-    # known; otherwise the global hour_close is the fallback.
+    # known; otherwise ``hour_close`` is the fallback.
     close_margin_minutes: int = 5
-    euro_loss_max: float = 4000.0
-    day_euro_finish_win: float = 300.0
-    day_euro_finish_loose: float = -500.0
-    compensate_loose: bool = False
-    close_strategy: str = "follower"  # win | follower | now | zero
-    max_trades_day: int = 50
-    min_win_rate: float = 0.40
-    # Master switch for the daily-risk circuit-breakers (see Settings). When
-    # False, evaluate_open_gates skips daily_risk_block entirely — used in dev to
-    # keep opening regardless of the day's P&L / trade record.
-    daily_risk_enabled: bool = True
     # Fraction added on top of IG's minimum stop distance when clamping an order's
     # protective stop, so a fast-moving market can't push the stop back under
     # IG's floor between the market snapshot and the order ("Stop trop près").
@@ -110,19 +102,7 @@ class TradeConfig:
     def from_settings(cls, settings) -> "TradeConfig":
         """Build TradeConfig from application Settings."""
         return cls(
-            max_positions=settings.strategy_max_positions,
-            hour_start=settings.strategy_hour_start,
-            hour_end=settings.strategy_hour_end,
-            hour_close=settings.strategy_hour_close,
             close_margin_minutes=settings.strategy_close_margin_minutes,
-            euro_loss_max=settings.strategy_euro_loss,
-            day_euro_finish_win=settings.strategy_daily_win_target,
-            day_euro_finish_loose=settings.strategy_daily_loss_limit,
-            compensate_loose=settings.strategy_compensate_loose,
-            close_strategy=settings.strategy_close_target,
-            max_trades_day=settings.strategy_max_trades_day,
-            min_win_rate=settings.strategy_min_win_rate,
-            daily_risk_enabled=getattr(settings, "strategy_daily_risk_enabled", True),
             stop_min_distance_margin=getattr(
                 settings, "strategy_stop_min_distance_margin", 0.15
             ),
@@ -154,13 +134,6 @@ class TradingService:
         # chosen independently of the entry strategy (open/close decoupling).
         self._close_profile = close_profile
 
-    async def _count_open_positions(self) -> int:
-        """Count currently open positions in DB."""
-        result = await self._db.execute(
-            select(Position).where(Position.state == PositionState.OPEN)
-        )
-        return len(result.scalars().all())
-
     async def _is_epic_open(self, epic: str) -> bool:
         """Check if a position is already open for this epic."""
         result = await self._db.execute(
@@ -170,38 +143,6 @@ class TradingService:
             )
         )
         return result.scalar_one_or_none() is not None
-
-    async def _get_daily_pnl(self) -> float:
-        """Get today's total P&L from closed positions."""
-        today = date.today()
-        result = await self._db.execute(
-            select(Position).where(
-                Position.date == today,
-                Position.state == PositionState.CLOSE,
-            )
-        )
-        positions = result.scalars().all()
-        return sum(float(p.euro or 0) for p in positions)
-
-    async def _get_daily_stats(self) -> tuple[int, float]:
-        """Get today's trade count and win rate.
-
-        Returns:
-            (trade_count, win_rate) where win_rate is 0-1.
-        """
-        today = date.today()
-        result = await self._db.execute(
-            select(Position).where(
-                Position.date == today,
-                Position.state == PositionState.CLOSE,
-            )
-        )
-        positions = result.scalars().all()
-        count = len(positions)
-        if count == 0:
-            return 0, 1.0
-        wins = sum(1 for p in positions if (p.win or 0) > 0)
-        return count, wins / count
 
     async def _epic_close_utc(self, epic: str) -> time | None:
         """The epic's own market close (UTC) from the Epic table, or None."""
@@ -235,9 +176,7 @@ class TradingService:
         Checks:
         1. Signal direction is BUY
         2. No duplicate epic open
-        3. Max simultaneous positions
-        4. Daily P&L circuit breaker
-        5. Market is TRADEABLE (checked during open_position)
+        3. Market is TRADEABLE (checked during open_position)
 
         Note: there is no wall-clock trading-hours gate live — the real
         "is the market open?" signal is the per-epic ``marketStatus ==
@@ -245,38 +184,26 @@ class TradingService:
         :meth:`open_position`), so ``in_trading_hours`` is always satisfied
         here. The simulator keeps its own hour gate (no live status to read).
         """
-        trade_count, win_rate = await self._get_daily_stats()
         return evaluate_open_gates(
             epic=signal.epic,
             direction=signal.direction,
             in_trading_hours=True,
             epic_already_open=await self._is_epic_open(signal.epic),
-            open_count=await self._count_open_positions(),
-            daily_pnl=await self._get_daily_pnl(),
-            trade_count=trade_count,
-            win_rate=win_rate,
-            config=self._config,
         )
 
     async def can_open_intent(self, intent: EntryIntent) -> tuple[bool, str]:
         """Pre-open gates for a decoupled :class:`EntryIntent`.
 
-        Same portfolio/risk rules as :meth:`can_open_position`, but driven by an
+        Same pre-open rules as :meth:`can_open_position`, but driven by an
         exit-agnostic entry intent rather than a signal carrying levels. As there,
         the live market-open gate is the per-epic ``marketStatus == TRADEABLE``
         check, not a wall-clock window, so ``in_trading_hours`` is always True.
         """
-        trade_count, win_rate = await self._get_daily_stats()
         return evaluate_open_gates(
             epic=intent.epic,
             direction=intent.direction,
             in_trading_hours=True,
             epic_already_open=await self._is_epic_open(intent.epic),
-            open_count=await self._count_open_positions(),
-            daily_pnl=await self._get_daily_pnl(),
-            trade_count=trade_count,
-            win_rate=win_rate,
-            config=self._config,
         )
 
     async def open_from_intent(
@@ -373,9 +300,7 @@ class TradingService:
         Args:
             signal: Computed trading signal with levels.
             quantity_multiplier: Multiplies the minimum deal size (default 1).
-                Used by the ``trend_template`` martingale to scale up after a
-                loss; the ``euro_loss_max`` risk gate below still bounds the
-                resulting euro exposure.
+                Optional sizing hook for entries that scale up.
 
         Returns:
             Created Position object, or None if open failed.
@@ -478,10 +403,11 @@ class TradingService:
         # 3. Quantity — minimum deal size scaled by the (martingale) multiplier.
         quantity = max(int(min_deal_size), 1) * max(int(quantity_multiplier), 1)
 
-        # 4. Check euro risk. ``euro_per_point`` is the currency-converted euro
-        # value of one full point of price movement for the whole position, so
-        # the worst-case loss is simply distance × euro_per_point. Fall back to a
-        # rough estimate only when the contract size is unknown.
+        # 4. Compute the worst-case euro risk for logging. ``euro_per_point`` is
+        # the currency-converted euro value of one full point of price movement
+        # for the whole position, so the worst-case loss is simply
+        # distance × euro_per_point. Fall back to a rough estimate only when the
+        # contract size is unknown.
         currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
         expiry = instrument.get("expiry", "-")
         epp = euro_per_point(market_data, quantity, currency)
@@ -489,15 +415,6 @@ class TradingService:
             euro_risk = stop_price_distance * epp
         else:
             euro_risk = quantity * stop_price_distance
-
-        if euro_risk > self._config.euro_loss_max:
-            logger.info(
-                "Euro risk too high for %s: %.2f > %.2f",
-                epic,
-                euro_risk,
-                self._config.euro_loss_max,
-            )
-            return None
 
         # 5. Send order with an absolute stop level (avoids any point/price
         # unit conversion on the IG side).
@@ -1411,8 +1328,8 @@ class TradingService:
         )
 
         if reason is None:
-            # Follower strategy: trail the stop upward with an ATR-based distance
-            if current_bid > level_open and self._config.close_strategy == "follower":
+            # Trail the stop upward with an ATR-based distance once in profit.
+            if current_bid > level_open:
                 await self._update_trailing_stop(position, current_bid, buf)
             return False
 

@@ -34,13 +34,11 @@ def _ig_error(epics_str: str, status_code: int, ig_error_code: str = "") -> IGAP
 
 
 def _make_settings(
-    max_spread: float = 0.002,
     search_terms: list[str] | None = None,
     max_funds: float = 0.0,
     allowed_types: list[str] | None = None,
 ) -> MagicMock:
     s = MagicMock()
-    s.strategy_max_spread_ratio = max_spread
     s.scanner_search_terms = search_terms if search_terms is not None else []
     # 0 disables the funds filter — most tests don't supply margin data.
     s.max_funds_per_position = max_funds
@@ -284,7 +282,7 @@ async def test_get_tradeable_markets_includes_wide_spread() -> None:
             ]
         }
     )
-    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.002))
+    scanner = MarketScanner(client=client, settings=_make_settings())
 
     result = await scanner.get_tradeable_markets(["WIDE.EPIC", "TIGHT.EPIC"])
     epics = [m.epic for m in result]
@@ -309,7 +307,7 @@ async def test_get_tradeable_markets_excludes_non_tradeable() -> None:
             ]
         }
     )
-    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.01))
+    scanner = MarketScanner(client=client, settings=_make_settings())
 
     result = await scanner.get_tradeable_markets(["CLOSED.EPIC", "OPEN.EPIC"])
     epics = [m.epic for m in result]
@@ -330,7 +328,7 @@ async def test_get_tradeable_markets_excludes_zero_price() -> None:
             ]
         }
     )
-    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.01))
+    scanner = MarketScanner(client=client, settings=_make_settings())
 
     result = await scanner.get_tradeable_markets(["NO.PRICE", "HAS.PRICE"])
     epics = [m.epic for m in result]
@@ -358,7 +356,7 @@ async def test_tradable_collapses_product_variants_keeping_tightest_spread() -> 
             ]
         }
     )
-    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.01))
+    scanner = MarketScanner(client=client, settings=_make_settings())
 
     result = await scanner.get_tradeable_markets(
         ["IX.D.DAX.IFMM.IP", "IX.D.DAX.IMF.IP", "CS.D.EURGBP.CFD.IP"]
@@ -395,7 +393,7 @@ async def test_tradable_drops_unaffordable_epics_keeps_unknown() -> None:
         }
     )
     scanner = MarketScanner(
-        client=client, settings=_make_settings(max_spread=0.01, max_funds=500.0)
+        client=client, settings=_make_settings(max_funds=500.0)
     )
 
     result = await scanner.get_tradeable_markets(
@@ -512,7 +510,7 @@ async def test_batch_500_bisects_to_drop_only_the_bad_epic() -> None:
 
     client = MagicMock()
     client.get = AsyncMock(side_effect=mock_get)
-    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.01))
+    scanner = MarketScanner(client=client, settings=_make_settings())
 
     result = await scanner.get_tradeable_markets(["G1", "BAD.EPIC", "G2", "G3"])
     epics = [m.epic for m in result]
@@ -535,7 +533,7 @@ async def test_batch_non_500_error_does_not_bisect() -> None:
 
     client = MagicMock()
     client.get = AsyncMock(side_effect=mock_get)
-    scanner = MarketScanner(client=client, settings=_make_settings(max_spread=0.01))
+    scanner = MarketScanner(client=client, settings=_make_settings())
 
     result = await scanner.get_tradeable_markets(["A", "B", "C", "D"])
 

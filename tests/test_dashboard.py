@@ -35,7 +35,6 @@ _FRAGMENT_KEYS = {
     "epic_list_modal",
     "positions_modal",
     "closed_positions_modal",
-    "risk_modal",
     "actions",
     "logs_section",
 }
@@ -112,28 +111,14 @@ def _settings() -> SimpleNamespace:
     """Settings stand-in carrying only the attributes the shell reads."""
     return SimpleNamespace(
         ig_env=SimpleNamespace(value="demo"),
-        strategy_hour_start=8,
-        strategy_hour_end=20,
-        strategy_hour_close=21,
-        strategy_max_positions=3,
-        strategy_max_trades_day=5,
-        strategy_daily_loss_limit=100,
-        strategy_daily_win_target=200,
-        strategy_min_r2=0.7,
-        strategy_min_score=5,
-        strategy_stop_multiplier=2,
-        strategy_target_multiplier=3,
-        strategy_max_spread_ratio=0.1,
-        strategy_close_target=0.8,
-        strategy_name="donchian_er",
-        entry_strategy_name="donchian_er",
-        close_profile_name="atr_trailing",
+        open_strategy="open_donchian",
+        stop_strategy="stop_support",
+        close_zonestart="hold",
+        close_zonemarge="hold",
+        close_zoneprofit="trailing_ratchet",
         web_port=8000,
         # Extra knobs read by TradeConfig.from_settings (manual-open path).
         strategy_close_margin_minutes=5,
-        strategy_euro_loss=4000.0,
-        strategy_compensate_loose=False,
-        strategy_min_win_rate=0.4,
         strategy_atr_period=14,
         strategy_atr_k_pre=2.5,
         strategy_atr_k_post=1.5,
@@ -221,61 +206,6 @@ class TestBuildFragments:
         kpi_bar = _build_fragments(state)["kpi_bar"]
         assert "Wallet" in kpi_bar
         assert "In use: —" in kpi_bar
-
-    def test_opening_tile_active_when_not_blocked(self):
-        # No daily circuit-breaker tripped -> green "Active" Opening tile.
-        kpi_bar = _build_fragments(_base_state())["kpi_bar"]
-        assert "Opening" in kpi_bar
-        assert "Active" in kpi_bar
-        assert "No daily risk block" in kpi_bar
-
-    def test_opening_tile_shows_block_reason(self):
-        # A daily-risk reason renders as a BLOCKED Opening tile carrying the
-        # exact reason string from the live gate.
-        reason = "Daily loss limit reached (-480.79€)"
-        state = _base_state(kpis={**_base_kpis(), "open_block_reason": reason})
-        kpi_bar = _build_fragments(state)["kpi_bar"]
-        assert "BLOCKED" in kpi_bar
-        assert "Daily loss limit reached" in kpi_bar
-
-    def test_opening_tile_disabled_state(self):
-        # Risk disarmed -> amber "Risk OFF" tile, even if a reason was computed.
-        state = _base_state(
-            kpis={
-                **_base_kpis(),
-                "daily_risk_enabled": False,
-                "open_block_reason": None,
-            }
-        )
-        kpi_bar = _build_fragments(state)["kpi_bar"]
-        assert "Risk OFF" in kpi_bar
-        assert "openRiskModal()" in kpi_bar  # tile is clickable
-
-    def test_risk_modal_lists_breakers_and_armed_switch(self):
-        kpis = {
-            **_base_kpis(),
-            "daily_risk_enabled": True,
-            "risk_daily_pnl": -480.79,
-            "risk_trade_count": 14,
-            "risk_win_rate": 0.143,
-            "risk_loss_limit": -500.0,
-            "risk_win_target": 300.0,
-            "risk_max_trades": 50,
-            "risk_min_win_rate": 0.40,
-        }
-        modal = _build_fragments(_base_state(kpis=kpis))["risk_modal"]
-        assert "Daily loss limit" in modal
-        assert "Max daily trades" in modal
-        assert "Win-rate floor" in modal
-        assert "ARMED" in modal
-        assert "toggleRiskGuard(this.checked, this)" in modal
-        assert "checked" in modal  # switch reflects the armed state
-
-    def test_risk_modal_disarmed_marks_rules_ignored(self):
-        kpis = {**_base_kpis(), "daily_risk_enabled": False}
-        modal = _build_fragments(_base_state(kpis=kpis))["risk_modal"]
-        assert "DISABLED (dev)" in modal
-        assert "ignored" in modal  # breakers shown inactive when disarmed
 
     def test_open_positions_rendered_in_modal(self):
         pos = SimpleNamespace(
@@ -559,14 +489,18 @@ class TestRenderDashboard:
         assert "location.reload()" not in html
         assert "Live — updating every 1 s" in html
 
-    def test_title_renders_strategy_switcher(self):
+    def test_title_displays_active_strategy_names_readonly(self):
         html = _render_dashboard(_settings(), _base_state())
-        # A dropdown in the title posts to /api/strategy on change, with the
-        # active entry strategy preselected and every registered entry strategy
-        # offered (only donchian_er is ported so far).
-        assert 'class="strategy-select"' in html
-        assert "switchStrategy(this.value" in html
-        assert '<option value="donchian_er" selected>' in html
+        # The .env selection is the single source of truth: the title bar only
+        # DISPLAYS the active open/stop/close names, read-only — there is no
+        # dropdown and no runtime switching.
+        assert 'class="strategy-name"' in html
+        assert "open_donchian" in html
+        assert "stop_support" in html
+        # The close side shows the three per-zone selections (start/margin/profit).
+        assert "hold/hold/trailing_ratchet" in html
+        assert 'class="strategy-select"' not in html
+        assert "switchStrategy(" not in html
 
     def test_degraded_mode_shows_connection_error_banner(self):
         # When IG login fails the web server still serves the dashboard; it must
@@ -589,28 +523,25 @@ class TestRenderDashboard:
         assert "/api/dashboard-fragments" in js
         assert "location.reload()" not in js
 
-    def test_strategy_change_requires_confirmation(self):
-        # Both title-bar dropdowns must route through the shared confirm dialog
-        # so a mis-click never swaps the live trading logic silently.
+    def test_no_runtime_strategy_switching_ui(self):
+        # There is no dashboard switching any more: no confirm modal, no switch
+        # handlers in the JS. The selection is edited in .env only.
         html = _render_dashboard(_settings(), _base_state())
-        assert 'id="strategy-confirm-modal"' in html
-        assert 'id="strategy-confirm-target"' in html
-        # Each select carries its current value so cancel reverts correctly.
-        assert 'data-current="donchian_er"' in html  # entry strategy
-        assert 'data-current="atr_trailing"' in html  # close profile
+        assert "strategy-confirm-modal" not in html
         js = (
             Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
         ).read_text()
-        assert "function openStrategyConfirmModal" in js
-        # Both switch handlers await the confirmation before fetching.
-        assert js.count("await openStrategyConfirmModal(") >= 2
+        assert "openStrategyConfirmModal" not in js
+        assert "switchStopDistance" not in js
+        assert "switchStrategy" not in js
+        assert "switchCloseProfile" not in js
 
     def test_dashboard_js_cache_version_is_current(self):
         # The script tag must point at the committed dashboard.js; bump the
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=15" in html
+        assert "/static/dashboard.js?v=18" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -685,34 +616,18 @@ class TestFragmentsEndpoint:
         assert resp.status_code == 200
         assert 'id="frag-kpi_bar"' in resp.text
 
-    async def test_strategy_switch_no_scheduler_returns_503(self, app):
+    async def test_runtime_strategy_switch_endpoints_are_gone(self, app):
+        # Strategy selection is edited in .env only; the runtime-switch endpoints
+        # were removed, so they must no longer be routed.
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/api/strategy/donchian_er")
-        assert resp.status_code == 503
-
-    async def test_strategy_switch_unknown_name_rejected(self, app):
-        # Rejected on the registry check before the scheduler is ever called.
-        app.state.scheduler = SimpleNamespace()
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/api/strategy/not_a_strategy")
-        assert resp.status_code == 400
-
-    async def test_strategy_switch_valid_calls_scheduler(self, app):
-        calls: list[str] = []
-
-        async def _select(name: str) -> bool:
-            calls.append(name)
-            return True
-
-        app.state.scheduler = SimpleNamespace(select_strategy=_select)
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/api/strategy/donchian_er")
-        assert resp.status_code == 200
-        assert resp.json()["strategy"] == "donchian_er"
-        assert calls == ["donchian_er"]
+            for path in (
+                "/api/strategy/open_donchian",
+                "/api/close-profile/close_zoneprofit",
+                "/api/stop-distance/stop_support",
+            ):
+                resp = await client.post(path)
+                assert resp.status_code == 404
 
     async def test_poll_never_blocks_on_a_busy_queue(self):
         """The fragments poll must not await external IG calls.
@@ -941,7 +856,7 @@ class TestManualOpenEndpoint:
                 pass
 
             async def can_open_intent(self, intent):
-                return False, "Max positions reached"
+                return False, "Epic already open"
 
             async def open_from_intent(self, intent, buf):  # pragma: no cover
                 raise AssertionError("must not open when the gate refuses")
@@ -951,7 +866,7 @@ class TestManualOpenEndpoint:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(f"/api/positions/open/{epic}")
         assert resp.status_code == 400
-        assert resp.json()["error"] == "Max positions reached"
+        assert resp.json()["error"] == "Epic already open"
 
     async def test_happy_path_forces_buy_through_close_profile(self, monkeypatch):
         app, epic = _manual_app()

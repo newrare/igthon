@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     streaming_bootstrap_points: int = 50  # /prices fallback seed size (>= sma_slow)
     streaming_max_epics: int = 40  # IG hard cap: 40 subscriptions per connection
     # Recent window (minutes) read from the candle table to rehydrate the buffer
-    # on startup — wide enough to hold >= strategy_sma_slow one-minute candles.
+    # on startup — wide enough to cover the longest indicator lookback.
     streaming_rehydrate_window_minutes: int = 90
     streaming_reconnect_max_backoff_seconds: int = 60
     # Watchdog: an open position's epic must always have a live feed. If its most
@@ -131,90 +131,38 @@ class Settings(BaseSettings):
     # the candle resolution (3x a 1-minute bar) to avoid churn on slow markets.
     streaming_stale_seconds: int = 180
 
-    # Open/close selection — entry strategy and close profile are decoupled and
-    # chosen independently. The entry strategy (src/entry/) decides only the
-    # direction; the close profile (src/exit/) owns the stop/target/trailing.
-    # The rest of the pipeline (gates, orders, sizing, simulator, dashboard) is
-    # shared. Registered names: src/entry/__init__.py and src/exit/__init__.py.
-    entry_strategy_name: str = "donchian_projection"
-    close_profile_name: str = "atr_trailing_profit"
+    # Open / stop / close selection — the trading decisions are decoupled and
+    # chosen independently, and the ``.env`` file is the SINGLE source of truth:
+    # there is no code default (empty string here), no database persistence and no
+    # dashboard switching. The entry strategy (src/entry/) decides only the
+    # direction; the stop policy (src/stops/) places the initial protective stop;
+    # the close profile (src/exit/) owns the break-even/margin references and
+    # every per-tick stop update. The rest of the pipeline (gates, orders, sizing,
+    # simulator, dashboard) is shared. Registered names: src/entry/__init__.py,
+    # src/stops/__init__.py and src/exit/zones/__init__.py.
+    #
+    # The close side is split into THREE independent zones (the single composer
+    # profile ``close_zoneprofit`` wires one updater per zone), each selected on
+    # its own so its behaviour can be tuned without influencing the other two:
+    #   CLOSE_ZONESTART  — open → break-even   (ZONESTART_UPDATERS)
+    #   CLOSE_ZONEMARGE  — break-even → margin (ZONEMARGE_UPDATERS)
+    #   CLOSE_ZONEPROFIT — above the margin    (ZONEPROFIT_UPDATERS)
+    #
+    # Each field is REQUIRED: a missing/empty or unknown value makes startup fail
+    # with a clear "configure your .env" message (see
+    # ``validate_strategy_selection`` in src/core/scheduler.py).
+    open_strategy: str = ""  # e.g. open_donchian / open_projection / open_ranking
+    stop_strategy: str = ""  # e.g. stop_support / stop_atr
+    close_zonestart: str = ""  # zone open→break-even   (e.g. hold)
+    close_zonemarge: str = ""  # zone break-even→margin (e.g. hold)
+    close_zoneprofit: str = ""  # zone above margin      (e.g. trailing_ratchet)
 
-    # Deprecated alias kept for the legacy strategies/ registry still used by
-    # not-yet-ported entries; new code reads entry_strategy_name.
-    strategy_name: str = "donchian_er"
-
-    # Donchian breakout (strategy_name = "donchian_er")
-    strategy_donchian_channel: int = 20  # channel lookback (candles)
-    strategy_donchian_stop_atr_k: float = 2.5  # stop distance in ATR multiples
-    # Regime gate: only trade epics whose Kaufman Efficiency Ratio over the
-    # window reaches the threshold — i.e. skip sideways chop, keep clean trends.
-    # Raised to 0.60 (from 0.45): on real 1-minute data the looser gate let too
-    # many marginal breakouts through, and each one bled the bid/offer spread
-    # ("spread churn"). A stricter regime gate trades less but cleaner.
-    strategy_efficiency_period: int = 30
-    strategy_min_efficiency: float = 0.60
-
-    # Donchian + multi-model projection consensus
-    # (entry_strategy_name = "donchian_projection") — same breakout + ER gate as
-    # donchian_er plus a projection-consensus gate. Its parameters are constants
-    # in src/entry/donchian_projection.py (not .env): tune them there and select
-    # the strategy at runtime from the dashboard.
-
-    # Projection ranking (entry_strategy_name = "projection_ranking") — cross-epic
-    # ranker that keeps a rolling position open all day. Its parameters (scoring
-    # windows/weights and the rolling-selection knobs) are constants in
-    # ``src/entry/projection_ranking.py``, not settings: tune them there, and
-    # select the strategy at runtime from the dashboard.
-
-    # Trend follower (strategy_name = "trend_follower") — Trend Volume Intraday
-    strategy_min_r2: float = 0.70
-    strategy_min_score: float = 0.75
-    strategy_lookback_points: int = 20
-    strategy_sma_fast: int = 5
-    strategy_sma_slow: int = 20
-    strategy_roc_period: int = 10
-    strategy_max_spread_ratio: float = 0.0010  # tightened: scalper edge is spread-sized
-    strategy_stop_multiplier: float = 2.5
-    strategy_target_multiplier: float = 4.0
-    strategy_tactic: str = "spread"
-
-    # Momentum scalper (strategy_name = "momentum_scalper") — high-frequency,
-    # buy fresh up-ticks and grab a spread-multiple of profit immediately.
-    strategy_scalper_momentum_period: int = 8  # recent-trend ROC window (candles)
-    strategy_scalper_min_roc: float = 0.20  # min ROC over the window, in percent
-    strategy_scalper_confirm_period: int = 1  # very-recent rising-closes to confirm
-    strategy_scalper_win_ratio: float = 4.0  # take-profit in net spread multiples
-    strategy_scalper_stop_lookback: int = 60  # support window (≈ last hour, candles)
-    strategy_scalper_stop_buffer_atr_k: float = 0.5  # ATR buffer below the support
-    strategy_scalper_max_stop_atr_k: float = 3.0  # cap on stop distance (ATR mult)
-
-    # Trend template (strategy_name = "trend_template") — hourly cross-epic
-    # selector. Every hour it ranks all tradable epics by how close their recent
-    # curve is to a theoretical up-trend (R² of an upward linear regression) and
-    # opens only the single best one. Quantity follows a martingale on the day's
-    # trailing loss streak (win → ×1, each consecutive loss → ×base_multiplier).
-    # The cross-epic ranking + sizing live in the scheduler; this block tunes the
-    # per-epic eligibility/levels in src/strategies/trend_template.py.
-    strategy_trend_template_regression_period: int = 30  # candles for the R² fit
-    strategy_trend_template_min_r2: float = 0.80  # min R² to be a clean up-trend
-    strategy_trend_template_win_ratio: float = 2.0  # take-profit in net spreads
-    strategy_trend_template_projection_horizon: int = 60  # candles (~1h) to target
-    strategy_trend_template_stop_lookback: int = 60  # support window — last hour
-    strategy_trend_template_stop_buffer_atr_k: float = 0.5  # ATR cushion below support
-    strategy_trend_template_base_multiplier: int = 3  # martingale factor per loss
-    strategy_trend_template_max_multiplier: int = 27  # hard cap on martingale size
-
-    # Dip rebound (strategy_name = "dip_rebound") — per-epic, buy a significant
-    # pullback inside a globally rising market the moment the price turns back
-    # up, capturing the bounce from a better entry than chasing fresh highs.
-    strategy_dip_rebound_trend_period: int = 60  # candles for the up-trend fit
-    strategy_dip_rebound_min_trend_r2: float = 0.55  # looser R²: a dip dents the fit
-    strategy_dip_rebound_pullback_lookback: int = 30  # window for the swing high
-    strategy_dip_rebound_min_pullback_atr_k: float = 1.5  # min dip depth, in ATR
-    strategy_dip_rebound_rebound_period: int = 2  # rising closes confirming the bounce
-    strategy_dip_rebound_win_ratio: float = 2.0  # take-profit in reward/risk multiples
-    strategy_dip_rebound_stop_lookback: int = 10  # window for the dip bottom (stop)
-    strategy_dip_rebound_stop_buffer_atr_k: float = 0.5  # ATR cushion below the dip
+    # Open strategies (open_donchian, open_projection, open_ranking), stop policies
+    # (stop_support, stop_atr) and the close profile (close_zoneprofit) keep their
+    # parameters as constants on their own classes under src/entry/, src/stops/ and
+    # src/exit/ — including the Donchian channel / ATR / Efficiency-Ratio knobs and
+    # the market-scanner spread gate (MarketScanner.DEFAULT_MAX_SPREAD_RATIO). Tune
+    # them there; only the selection names above live in the environment.
 
     # Trailing stop (ATR-based chandelier follower)
     # Distance = k x ATR(period); the stop trails k×ATR below the running high
@@ -229,35 +177,17 @@ class Settings(BaseSettings):
     strategy_atr_k_post: float = 2.5  # kept equal: do not tighten after break-even
     strategy_trailing_step_ratio: float = 0.3  # min gain (xATR) before a PUT
 
-    # Close profiles "atr_trailing_positive", "atr_trailing_profit" and
-    # "support_atr_profit" — their shaping parameters are constants in the
-    # matching src/exit/*.py modules (not .env): tune them there and select the
-    # profile at runtime from the dashboard. "support_atr_profit" reuses the
-    # profit-gated trailing but anchors the initial stop below a recency-weighted
-    # last-hour support (see src/exit/support_atr_profit.py).
+    # The "close_zoneprofit" close profile composes a stop policy (src/stops/) at
+    # open with three per-zone stop updaters (src/exit/zones/) — their shaping
+    # parameters are constants in the matching modules (not .env): tune them there.
+    # The "stop_support" distance anchors the initial stop below a recency-weighted
+    # last-hour support (see src/stops/stop_support.py).
 
-    # Position / Risk management
-    strategy_max_positions: int = 6
-    strategy_max_trades_day: int = 50
-    strategy_daily_loss_limit: float = -500.0
-    strategy_daily_win_target: float = 300.0
-    strategy_min_win_rate: float = 0.40
-    # Master switch for the daily-risk circuit-breakers (daily loss/target, max
-    # trades, win-rate floor). True in production; can be turned off at runtime
-    # from the dashboard in dev/test to let the bot keep opening and observe the
-    # system's behaviour. The per-epic gates (duplicate epic, max positions) are
-    # unaffected. Persisted across restarts via SelectionPreference(kind="risk").
-    strategy_daily_risk_enabled: bool = True
-    strategy_hour_start: int = 9
-    strategy_hour_end: int = 16
-    strategy_hour_close: int = 17  # global fallback close hour (UTC)
+    # Position management
     # Minutes before an epic's own market close to force-close a position on it.
     # Applied to the per-epic Epic.market_close_utc when known (IG openingHours);
-    # falls back to strategy_hour_close otherwise.
+    # falls back to the execution layer's default close hour otherwise.
     strategy_close_margin_minutes: int = 5
-    strategy_close_target: str = "follower"
-    strategy_compensate_loose: bool = False
-    strategy_euro_loss: float = 4000.0
     # Safety margin added on top of IG's minimum stop distance when placing an
     # order. IG rejects a stop that sits at/inside its minimum-distance rule, and
     # the price drifts between the market snapshot and the order landing, so a

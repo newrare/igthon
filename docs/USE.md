@@ -232,21 +232,22 @@ for the full reference.
 Key settings:
 
 ```env
-STRATEGY_MIN_R2=0.70          # Minimum R² to validate a trend
-STRATEGY_MIN_SCORE=0.75       # Minimum composite score to open a position
-STRATEGY_LOOKBACK_POINTS=20   # Candles used for linear regression
-STRATEGY_SMA_FAST=5           # Fast SMA period
-STRATEGY_SMA_SLOW=20          # Slow SMA period
-STRATEGY_STOP_MULTIPLIER=2.5  # Stop = X × spread
-STRATEGY_TARGET_MULTIPLIER=4.0 # Take-profit = X × spread
-STRATEGY_MAX_POSITIONS=6      # Max simultaneous open positions
-STRATEGY_DAILY_LOSS_LIMIT=-500  # Stop trading below this daily P&L (€)
-STRATEGY_DAILY_WIN_TARGET=300   # Stop trading above this daily P&L (€)
-STRATEGY_HOUR_START=9         # No positions before this hour
-STRATEGY_HOUR_END=16          # No new positions after this hour
-STRATEGY_HOUR_CLOSE=17        # Force-close all positions at HH:30
-STRATEGY_CLOSE_TARGET=follower  # follower | win | now | zero
+# Only the selection names live in the environment; every parameter is a
+# constant on its entry/stop/exit class (src/entry/, src/stops/, src/exit/).
+# These are the single source of truth and are REQUIRED — there is no default
+# and no runtime switching; the bot refuses to start if any is missing or
+# unknown. The exit is split into three independently-selected zones
+# (open→break-even, break-even→margin, above-margin).
+OPEN_STRATEGY=open_projection
+STOP_STRATEGY=stop_support
+CLOSE_ZONESTART=hold
+CLOSE_ZONEMARGE=hold
+CLOSE_ZONEPROFIT=trailing_ratchet
 ```
+
+There is no trading-hours gate: an epic is opened whenever its live market
+status is TRADEABLE, and each position is closed just before its own market
+close (per-epic `Epic.market_close_utc`).
 
 ______________________________________________________________________
 
@@ -276,17 +277,14 @@ ______________________________________________________________________
 
 ```
 08:50   python -m src.main --web
+        → subscribe to the tradeable epics via Lightstreamer
 
-09:00   Trading starts (STRATEGY_HOUR_START=9)
-        → prices every 30 seconds
-        → positions open when score > 0.75 and R² > 0.70
-
-09:00–16:00   Active window
+During market hours
+        → an epic is opened whenever its live status is TRADEABLE
         → monitor via http://localhost:8000/positions/summary
 
-16:00   No new positions (STRATEGY_HOUR_END=16)
-
-17:30   Force-close all open positions
+Per epic, just before its own market close
+        → the open position on that epic is force-closed
 
 18:00   Daily summary → http://localhost:8000/positions/summary
 ```

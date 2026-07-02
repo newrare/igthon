@@ -1,7 +1,7 @@
 """Full-page dashboard shell (skeleton embedding the dynamic fragments)."""
 
-from src.entry import ENTRY_STRATEGIES
-from src.exit import CLOSE_PROFILES
+import html
+
 from src.web.routes.dashboard.components import (
     render_button,
     render_confirm_modal,
@@ -12,79 +12,49 @@ from src.web.routes.dashboard.fragments import (
     _render_config_grid,
 )
 
-#: Human-readable labels for the registered strategy names. Anything not listed
-#: falls back to a title-cased version of the raw ``STRATEGY_NAME`` value.
-_STRATEGY_LABELS: dict[str, str] = {
-    "donchian_er": "Donchian ER Breakout",
-    "momentum_scalper": "Momentum Scalper",
-    "trend_follower": "Trend Follower",
-    "trend_template": "Trend Template (hourly)",
-    "dip_rebound": "Dip Rebound",
-}
 
-
-#: Human-readable labels for the registered close-profile names.
-_CLOSE_PROFILE_LABELS: dict[str, str] = {
-    "atr_trailing": "ATR Trailing Stop",
-    "atr_trailing_positive": "ATR Trailing (Positive)",
-    "atr_trailing_profit": "ATR Trailing (Profit-gated)",
-}
-
-
-def _strategy_label(name: str) -> str:
-    """Return a display label for the active strategy name."""
-    return _STRATEGY_LABELS.get(name, name.replace("_", " ").title())
-
-
-def _close_profile_label(name: str) -> str:
-    """Return a display label for the active close-profile name."""
-    return _CLOSE_PROFILE_LABELS.get(name, name.replace("_", " ").title())
-
-
-def _render_close_profile_select(current: str) -> str:
-    """Build the title-bar dropdown that switches the active close profile.
-
-    Mirrors :func:`_render_strategy_select`: an ``onchange`` posts to the backend,
-    which swaps the live close profile without a restart (the entry strategy is
-    chosen independently). The current name is preselected; every registered close
-    profile is offered. Positions already open keep the profile persisted on them
-    — only positions opened after the switch use the new exit.
-    """
-    options = "".join(
-        f'<option value="{name}"{" selected" if name == current else ""}>'
-        f"{_close_profile_label(name)}</option>"
-        for name in sorted(CLOSE_PROFILES)
-    )
+# The open / stop / close selection is chosen exclusively in ``.env`` (the single
+# source of truth) — the dashboard only *displays* the active names, read-only.
+def _render_selection_name(name: str, *, icon: str, cls: str, title: str) -> str:
+    """Render one active selection name as a read-only title-bar chip."""
     return (
-        '<span class="dashboard-title-exit">'
-        '<i data-lucide="shield" class="lc-icon"></i>'
-        '<select class="strategy-select" title="Active close profile (exit)" '
-        f'data-current="{current}" '
-        f'onchange="switchCloseProfile(this.value, this)">{options}</select>'
+        f'<span class="{cls}" title="{title}">'
+        f'<i data-lucide="{icon}" class="lc-icon"></i>'
+        f'<span class="strategy-name">{html.escape(name or "—")}</span>'
         "</span>"
     )
 
 
-def _render_strategy_select(current: str) -> str:
-    """Build the title-bar dropdown that switches the active entry strategy.
-
-    Mirrors the job-toggle pattern: an ``onchange`` posts to the backend, which
-    swaps the live entry strategy without a restart (the close profile is chosen
-    independently). The current name is preselected; every registered entry
-    strategy is offered.
-    """
-    options = "".join(
-        f'<option value="{name}"{" selected" if name == current else ""}>'
-        f"{_strategy_label(name)}</option>"
-        for name in sorted(ENTRY_STRATEGIES)
+def _render_strategy_name(current: str) -> str:
+    """Read-only title-bar chip for the active entry (open) strategy."""
+    return _render_selection_name(
+        current,
+        icon="cpu",
+        cls="dashboard-title-strategy",
+        title="Active entry (open) strategy — set OPEN_STRATEGY in .env",
     )
-    return (
-        '<span class="dashboard-title-strategy">'
-        '<i data-lucide="cpu" class="lc-icon"></i>'
-        '<select class="strategy-select" title="Active trading strategy" '
-        f'data-current="{current}" '
-        f'onchange="switchStrategy(this.value, this)">{options}</select>'
-        "</span>"
+
+
+def _render_stop_distance_name(current: str) -> str:
+    """Read-only title-bar chip for the active stop policy."""
+    return _render_selection_name(
+        current,
+        icon="ruler",
+        cls="dashboard-title-stop",
+        title="Active stop policy (initial stop) — set STOP_STRATEGY in .env",
+    )
+
+
+def _render_close_profile_name(current: str) -> str:
+    """Read-only title-bar chip for the active close zones (start/margin/profit)."""
+    return _render_selection_name(
+        current,
+        icon="shield",
+        cls="dashboard-title-exit",
+        title=(
+            "Active close zones (exit) — set CLOSE_ZONESTART / CLOSE_ZONEMARGE / "
+            "CLOSE_ZONEPROFIT in .env"
+        ),
     )
 
 
@@ -184,33 +154,6 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     "padding:0.4rem 1rem;border-radius:4px;"
                 ),
             ),
-            # Shared confirm dialog for switching the live entry strategy or
-            # close profile. Both dropdowns route through it (the JS fills in the
-            # kind/target text) so a mis-click never swaps the live trading logic
-            # without an explicit confirmation.
-            render_confirm_modal(
-                modal_id="strategy-confirm-modal",
-                close_fn="closeStrategyConfirmModal",
-                title="Confirm Strategy Change",
-                title_color="#E07B39",
-                lead_html=(
-                    '<p style="color:#cbd5e1;margin:0 0 0.4rem;">Switch the active '
-                    '<span id="strategy-confirm-kind">strategy</span> to '
-                    '<strong id="strategy-confirm-target" style="color:#f0fdf4;">'
-                    "</strong>?</p>"
-                ),
-                note=(
-                    "This changes the live trading logic immediately. Open "
-                    "positions keep their current plan; only positions opened "
-                    "after the switch use the new one."
-                ),
-                confirm_label="Confirm Change",
-                confirm_style=(
-                    "background:#b45309;border:1px solid #b45309;color:#fff7ed;"
-                    "cursor:pointer;font-size:0.85rem;font-weight:600;"
-                    "padding:0.4rem 1rem;border-radius:4px;"
-                ),
-            ),
             render_modal(
                 modal_id="positions-modal",
                 close_fn="closePositionsModal",
@@ -236,15 +179,6 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 close_fn="closeWinRateModal",
                 title='<i data-lucide="settings" class="lc-icon"></i> Configuration',
                 body=_render_config_grid(settings),
-            ),
-            render_modal(
-                modal_id="risk-modal",
-                close_fn="closeRiskModal",
-                title=(
-                    '<i data-lucide="shield-alert" class="lc-icon"></i> '
-                    "Daily Risk Safety"
-                ),
-                body=f'<div id="frag-risk_modal">{frags["risk_modal"]}</div>',
             ),
         ]
     )
@@ -296,7 +230,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=5">
+    <link rel="stylesheet" href="/static/style.css?v=6">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -306,14 +240,19 @@ def _render_dashboard(settings, state: dict) -> str:
 
     {_render_connection_banner(state)}
 
-    <!-- Main title — active entry strategy (open) + close profile (exit) -->
+    <!-- Main title — entry (open) → stop distance (initial stop) → close (exit) -->
     <div class="dashboard-title">
         <i data-lucide="bot" class="lc-icon"></i>
         <h1>IG Trading Bot</h1>
         <span class="dashboard-title-sep">·</span>
-        {_render_strategy_select(settings.entry_strategy_name)}
+        {_render_strategy_name(settings.open_strategy)}
         <i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>
-        {_render_close_profile_select(settings.close_profile_name)}
+        {_render_stop_distance_name(settings.stop_strategy)}
+        <i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>
+        {_render_close_profile_name(
+            f"{settings.close_zonestart}/{settings.close_zonemarge}/"
+            f"{settings.close_zoneprofit}"
+        )}
     </div>
 
     <!-- KPI Bar -->
@@ -454,6 +393,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=15"></script>
+<script src="/static/dashboard.js?v=18"></script>
 </body>
 </html>"""

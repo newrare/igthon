@@ -17,9 +17,19 @@ import pytest
 
 from src.entry.base import EntryIntent
 from src.execution.trading import TradeConfig, TradingService
-from src.exit.atr_trailing import AtrTrailingExit
+from src.exit import CloseZoneProfit
 from src.feed.price_buffer import Candle, EpicBuffer
 from src.models.position import Position, PositionState
+from src.stops import StopAtr
+
+
+def _profile() -> CloseZoneProfit:
+    """The composed close profile with a deterministic flat-ATR initial stop.
+
+    The flat-ATR distance keeps the open-time stop assertion exact (entry −
+    2.5×ATR); the per-tick zone routing is the profile's own.
+    """
+    return CloseZoneProfit(stop_distance=StopAtr())
 
 
 def _buffer_atr2(n: int = 20, close: float = 100.0) -> EpicBuffer:
@@ -39,6 +49,31 @@ def _buffer_atr2(n: int = 20, close: float = 100.0) -> EpicBuffer:
                 offer_low=close - 1,
             )
         )
+    return buf
+
+
+def _buffer_rising(n: int = 60, start: float = 100.0, step: float = 1.0) -> EpicBuffer:
+    """Steadily rising buffer (rising last-3 bids) for the profit-zone ratchet."""
+    buf = EpicBuffer(epic="X", max_candles=n + 10)
+    prev = start
+    for i in range(n):
+        close = start + i * step
+        high = max(prev, close) + 1
+        low = min(prev, close) - 1
+        buf.add(
+            Candle(
+                timestamp=datetime(2026, 1, 1, 10, 0, tzinfo=UTC),
+                bid_open=prev,
+                bid_close=close,
+                bid_high=high,
+                bid_low=low,
+                offer_open=prev,
+                offer_close=close,
+                offer_high=high,
+                offer_low=low,
+            )
+        )
+        prev = close
     return buf
 
 
@@ -74,7 +109,7 @@ def _market() -> dict:
 
 class TestOpenFromIntent:
     async def test_close_profile_chooses_stop_and_stamps_position(self):
-        svc, client, _ = _service(close_profile=AtrTrailingExit())
+        svc, client, _ = _service(close_profile=_profile())
         buf = _buffer_atr2(close=100.0)  # ATR 2 -> stop 2.5*2 = 5 below entry
         client.get.side_effect = [
             _market(),
@@ -85,12 +120,12 @@ class TestOpenFromIntent:
         pos = await svc.open_from_intent(EntryIntent(epic="X", direction="BUY"), buf)
 
         assert pos is not None
-        # The stop was chosen by the close profile (entry - 2.5*ATR = 95), not
-        # by the entry strategy.
+        # The stop was chosen by the close profile's stop-distance policy
+        # (entry - 2.5*ATR = 95), not by the entry strategy.
         payload = client.post.await_args.args[1]
         assert payload["stopLevel"] == pytest.approx(95.0)
         # The position remembers which profile manages its exit.
-        assert pos.close_profile == "atr_trailing"
+        assert pos.close_profile == "close_zoneprofit"
 
     async def test_requires_a_close_profile(self):
         svc, _, _ = _service(close_profile=None)
@@ -101,34 +136,40 @@ class TestOpenFromIntent:
 
 class TestManagePosition:
     async def test_ratchets_stop_via_profile(self):
-        # Never a close-hour so the trailing branch is exercised deterministically.
-        svc, client, db = _service(close_profile=AtrTrailingExit(), hour_close=99)
-        buf = _buffer_atr2()  # ATR 2, k_pre 2.5 -> distance 5
+        # Never a close-hour so the profit-zone trailing branch is exercised. The
+        # bid is far above the (open-frozen) margin and the tail is rising, so the
+        # profit-gated profile ratchets the stop up below the bid.
+        svc, client, db = _service(close_profile=_profile(), hour_close=99)
+        buf = _buffer_rising()  # rising last-3 bids → momentum confirmed
+        bid = buf.last.bid_close
         pos = Position(
             epic="X",
             deal_id="D1",
             level_open=Decimal("100"),
-            level_zero=Decimal("110"),  # not reached at bid 105
+            level_zero=Decimal("100"),  # break-even at entry
             level_follower=Decimal("0"),
             level_win=Decimal("0"),
             level_loose=Decimal("0"),
         )
 
-        closed = await svc.manage_position(pos, current_bid=105.0, buf=buf)
+        closed = await svc.manage_position(pos, current_bid=bid, buf=buf)
 
         assert closed is False
-        assert float(pos.level_follower) == pytest.approx(100.0)  # 105 - 5
+        # Stop ratcheted up: strictly below the bid and above the initial 0.
+        assert 0.0 < float(pos.level_follower) < bid
         assert pos.stop_update == 1
         client.put.assert_awaited_once()
         db.commit.assert_awaited()
 
     async def test_holds_below_entry(self):
-        svc, client, _ = _service(close_profile=AtrTrailingExit(), hour_close=99)
+        # Below break-even (underwater zone) → hold, stop untouched.
+        svc, client, _ = _service(close_profile=_profile(), hour_close=99)
         buf = _buffer_atr2()
         pos = Position(
             epic="X",
             deal_id="D1",
             level_open=Decimal("100"),
+            level_zero=Decimal("100"),
             level_follower=Decimal("0"),
             level_win=Decimal("0"),
             level_loose=Decimal("0"),
@@ -141,7 +182,7 @@ class TestManagePosition:
 
     async def test_end_of_day_closes_via_profile(self):
         # hour_close 0 → always a close-hour → profile returns CLOSE(end_of_day).
-        svc, client, _ = _service(close_profile=AtrTrailingExit(), hour_close=0)
+        svc, client, _ = _service(close_profile=_profile(), hour_close=0)
         buf = _buffer_atr2()
         pos = Position(
             epic="X",

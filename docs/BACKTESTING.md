@@ -96,11 +96,10 @@ would otherwise count the same bet three times. One epic per underlying is kept
 (the richest series); the dropped epics are reported in the run response.
 
 `build_days` groups each epic's candles by **calendar date**; every date becomes
-one trading day holding all epics that traded it. Daily gates (max trades,
-daily P&L target, win-rate circuit-breaker) reset per day — identical to the
-live scheduler. Within a day, candles across epics are merged into a single
-timestamp-ordered stream, so misaligned real series (different start times /
-lengths) interleave correctly.
+one trading day holding all epics that traded it — identical to the live
+scheduler's per-day reset. Within a day, candles across epics are merged into a
+single timestamp-ordered stream, so misaligned real series (different start times
+/ lengths) interleave correctly.
 
 The replay applies the **same** rules as production: the pluggable entry
 strategy (`evaluate`), the pre-open gates
@@ -116,7 +115,7 @@ Open **`/backtest`** (linked from the nav bar on every page):
 1. **Archived data** — pick a week from the dropdown. The page shows the epics
    available that week and their candle counts. Optionally tick specific epics
    to narrow the run (leave all unticked to backtest the whole week).
-1. **Run backtest** — choose the strategy (defaults to the live `STRATEGY_NAME`,
+1. **Run backtest** — choose the strategy (defaults to the live `OPEN_STRATEGY`,
    other entries allow comparison) and the trades target, then run.
 1. **Results** — win/loss counts, win rate, total return, average win/loss, max
    drawdown, the cumulative-return equity curve, close-reason and open-rejection
@@ -149,7 +148,7 @@ result = run_backtest(
     settings,
     candles,
     BacktestConfig(target_trades=100),
-    strategy_name="donchian_er",                      # defaults to STRATEGY_NAME
+    strategy_name="open_donchian",                    # defaults to OPEN_STRATEGY
 )
 print(percentage_summary(result.trades))             # returns in %, price-based
 ```
@@ -181,6 +180,6 @@ returns **503** if the process has no candle store (e.g. a web-only deployment).
 
 ## Related
 
-- [STRATEGY.md](STRATEGY.md) — the shared risk management and daily cycle.
 - [strategies/README.md](strategies/README.md) — the pluggable strategy system.
-- [CONFIGURATION.md](CONFIGURATION.md) — `CANDLE_RETENTION_DAYS`, `CANDLE_DUMP_DIR`.
+- [CONFIGURATION.md](CONFIGURATION.md) — trading hours and the per-position
+  `STRATEGY_EURO_LOSS` cap plus `CANDLE_RETENTION_DAYS`, `CANDLE_DUMP_DIR`.

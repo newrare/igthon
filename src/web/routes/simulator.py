@@ -28,7 +28,13 @@ from src.backtest.simulator import (
     run_simulation,
 )
 from src.entry import ENTRY_STRATEGIES
-from src.exit import CLOSE_PROFILES
+from src.exit import CloseZoneProfit
+
+# The exit is a single composer profile; its behaviour is set by the three
+# per-zone selectors (CLOSE_ZONESTART / CLOSE_ZONEMARGE / CLOSE_ZONEPROFIT) read
+# from settings. The simulator's "close profile" selector is thus a single fixed
+# entry — the zone selection is not overridable per sim run.
+_CLOSE_PROFILE_NAMES = frozenset({CloseZoneProfit.name})
 
 router = APIRouter()
 
@@ -114,7 +120,7 @@ async def api_simulator_close_profile(
         return JSONResponse(
             {"error": f"Unknown profile: {curve_profile}"}, status_code=400
         )
-    if close_profile is not None and close_profile not in CLOSE_PROFILES:
+    if close_profile is not None and close_profile not in _CLOSE_PROFILE_NAMES:
         return JSONResponse(
             {"error": f"Unknown close profile: {close_profile}"}, status_code=400
         )
@@ -184,7 +190,10 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         return JSONResponse(
             {"error": f"Unknown strategy: {body.strategy}"}, status_code=400
         )
-    if body.close_profile is not None and body.close_profile not in CLOSE_PROFILES:
+    if (
+        body.close_profile is not None
+        and body.close_profile not in _CLOSE_PROFILE_NAMES
+    ):
         return JSONResponse(
             {"error": f"Unknown close profile: {body.close_profile}"}, status_code=400
         )
@@ -201,8 +210,8 @@ async def api_simulator_run(request: Request, body: SimulationRequest) -> JSONRe
         spread_malus_pct=body.spread_malus_pct,
     )
     settings = request.app.state.settings
-    strategy_name = body.strategy or settings.entry_strategy_name
-    close_profile_name = body.close_profile or settings.close_profile_name
+    strategy_name = body.strategy or settings.open_strategy
+    close_profile_name = body.close_profile or CloseZoneProfit.name
     result = await asyncio.to_thread(
         run_simulation, settings, sim_config, strategy_name, close_profile_name
     )
@@ -269,13 +278,13 @@ async def simulator_page(request: Request) -> HTMLResponse:
     )
     # Entry-strategy dropdown defaults to the live ENTRY_STRATEGY_NAME so the
     # simulation replays exactly what the bot would do; other entries compare.
-    live_strategy = request.app.state.settings.entry_strategy_name
+    live_strategy = request.app.state.settings.open_strategy
     strategy_options = "".join(
         f'<option value="{name}"{" selected" if name == live_strategy else ""}>'
         f"{name}{' (live)' if name == live_strategy else ''}</option>"
         for name in sorted(ENTRY_STRATEGIES)
     )
-    # Cross-epic rankers (projection_ranking, …) select the best of many markets,
+    # Cross-epic rankers (open_ranking, …) select the best of many markets,
     # so the UI bumps "Epics / day" to the live pool size (~40) when one is chosen.
     ranker_names = [
         name
@@ -283,12 +292,13 @@ async def simulator_page(request: Request) -> HTMLResponse:
         if getattr(cls, "cross_epic_selection", False)
     ]
     ranker_json = "[" + ",".join(f'"{n}"' for n in ranker_names) + "]"
-    # Close-profile dropdown defaults to the live CLOSE_PROFILE_NAME.
-    live_close = request.app.state.settings.close_profile_name
+    # Close-profile dropdown: the single composer profile (its per-zone behaviour
+    # is set in .env and not overridable per sim run).
+    live_close = CloseZoneProfit.name
     close_options = "".join(
         f'<option value="{name}"{" selected" if name == live_close else ""}>'
         f"{name}{' (live)' if name == live_close else ''}</option>"
-        for name in sorted(CLOSE_PROFILES)
+        for name in sorted(_CLOSE_PROFILE_NAMES)
     )
     curve_candles = _stepper(
         "Candles", "curve-candles", value="600", minimum="50", maximum="2000", step="50"

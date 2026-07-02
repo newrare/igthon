@@ -93,41 +93,32 @@ ______________________________________________________________________
 
 ### Indicators
 
-| Variable                    | Default  | Description                                      |
-| --------------------------- | -------- | ------------------------------------------------ |
-| `STRATEGY_SMA_FAST`         | `5`      | Fast SMA period                                  |
-| `STRATEGY_SMA_SLOW`         | `20`     | Slow SMA period                                  |
-| `STRATEGY_ROC_PERIOD`       | `10`     | Rate-of-Change lookback                          |
-| `STRATEGY_MAX_SPREAD_RATIO` | `0.0015` | Max relative spread (0.15%) — skip noisy markets |
+| Variable              | Default | Description             |
+| --------------------- | ------- | ----------------------- |
+| `STRATEGY_SMA_FAST`   | `5`     | Fast SMA period         |
+| `STRATEGY_SMA_SLOW`   | `20`    | Slow SMA period         |
+| `STRATEGY_ROC_PERIOD` | `10`    | Rate-of-Change lookback |
+
+The market-scanner spread gate is no longer an env variable — it is a class
+constant (`MarketScanner.DEFAULT_MAX_SPREAD_RATIO`), tuned in
+`src/markets/market_scanner.py`.
 
 ### Position sizing
 
-| Variable                     | Default    | Description                                  |
-| ---------------------------- | ---------- | -------------------------------------------- |
-| `STRATEGY_STOP_MULTIPLIER`   | `2.5`      | Stop distance = X × spread                   |
-| `STRATEGY_TARGET_MULTIPLIER` | `4.0`      | Take-profit = X × spread                     |
-| `STRATEGY_TACTIC`            | `spread`   | `spread`, `percentage`, or `point`           |
-| `STRATEGY_CLOSE_TARGET`      | `follower` | `follower`, `win`, `now`, or `zero`          |
-| `STRATEGY_COMPENSATE_LOOSE`  | `false`    | Increase size after a loss (not recommended) |
-| `STRATEGY_EURO_LOSS`         | `4000.0`   | Max loss per position in EUR                 |
+| Variable                     | Default  | Description                        |
+| ---------------------------- | -------- | ---------------------------------- |
+| `STRATEGY_STOP_MULTIPLIER`   | `2.5`    | Stop distance = X × spread         |
+| `STRATEGY_TARGET_MULTIPLIER` | `4.0`    | Take-profit = X × spread           |
+| `STRATEGY_TACTIC`            | `spread` | `spread`, `percentage`, or `point` |
 
-### Risk management
+### Opening and closing
 
-| Variable                    | Default  | Description                                       |
-| --------------------------- | -------- | ------------------------------------------------- |
-| `STRATEGY_MAX_POSITIONS`    | `6`      | Max simultaneous open positions                   |
-| `STRATEGY_MAX_TRADES_DAY`   | `50`     | Stop opening new trades after this count          |
-| `STRATEGY_DAILY_LOSS_LIMIT` | `-500.0` | Stop trading if daily P&L drops below this (€)    |
-| `STRATEGY_DAILY_WIN_TARGET` | `300.0`  | Stop trading if daily P&L reaches this (€)        |
-| `STRATEGY_MIN_WIN_RATE`     | `0.40`   | Stop if win rate drops below 40% after 10+ trades |
-
-### Trading hours (local server time)
-
-| Variable              | Default | Description                          |
-| --------------------- | ------- | ------------------------------------ |
-| `STRATEGY_HOUR_START` | `9`     | No positions opened before this hour |
-| `STRATEGY_HOUR_END`   | `16`    | No new positions after this hour     |
-| `STRATEGY_HOUR_CLOSE` | `17`    | Force-close all positions at HH:30   |
+There is no wall-clock trading-hours gate: an epic can be opened whenever its
+live market status is TRADEABLE (from the Lightstreamer subscription). Each open
+position is force-closed just before its **own** market close, derived per epic
+from `Epic.market_close_utc` (IG `openingHours`); epics with no known schedule
+fall back to the execution layer's default close hour
+(`trading.DEFAULT_MARKET_CLOSE_HOUR_UTC`).
 
 ______________________________________________________________________
 

@@ -45,7 +45,7 @@ class EntryIntent:
 class EntryStrategy(ABC):
     """Entry-signal generator — the *open* decision, exit-agnostic."""
 
-    #: Registry key and ``ENTRY_STRATEGY_NAME`` value (kebab/snake, stable).
+    #: Registry key and ``OPEN_STRATEGY`` value (snake_case, stable).
     name: str = "base"
 
     #: How the orchestration layer drives this strategy. The default per-epic
@@ -55,7 +55,7 @@ class EntryStrategy(ABC):
     #: per-epic auto-open loop leaves it alone, and the scheduler scores all
     #: tradable epics, ranks them and opens the best one(s) to maintain a target
     #: number of open positions. See
-    #: :class:`~src.entry.projection_ranking.ProjectionRankingEntry`.
+    #: :class:`~src.entry.open_ranking.OpenRanking`.
     cross_epic_selection: bool = False
 
     #: Rolling cross-epic selection knobs — consulted by the scheduler only when

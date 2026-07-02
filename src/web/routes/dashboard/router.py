@@ -10,10 +10,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
 
 from src.core.api_queue import Priority
-from src.entry import ENTRY_STRATEGIES
 from src.entry.base import EntryIntent
 from src.execution.trading import TradeConfig, TradingService
-from src.exit import CLOSE_PROFILES
 from src.models.position import Position, PositionState
 from src.utils.tools import _to_float, euro_per_point, margin_factor_pct
 from src.web.routes.dashboard.fragments import _build_fragments
@@ -165,61 +163,6 @@ async def set_job_mode(request: Request, action: str, mode: str) -> JSONResponse
     if not ok:
         return JSONResponse({"error": "Could not change job mode"}, status_code=400)
     return JSONResponse({"status": "ok", "action": action, "auto": mode == "auto"})
-
-
-@router.post("/api/strategy/{name}")
-async def set_strategy(request: Request, name: str) -> JSONResponse:
-    """Switch the active entry strategy at runtime and persist the choice."""
-    scheduler = request.app.state.scheduler
-    if not scheduler:
-        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
-    if name not in ENTRY_STRATEGIES:
-        return JSONResponse({"error": f"Unknown strategy: {name}"}, status_code=400)
-    if not await scheduler.select_strategy(name):
-        return JSONResponse({"error": "Could not switch strategy"}, status_code=400)
-    return JSONResponse({"status": "ok", "strategy": name})
-
-
-@router.post("/api/close-profile/{name}")
-async def set_close_profile(request: Request, name: str) -> JSONResponse:
-    """Switch the active close profile at runtime and persist the choice."""
-    scheduler = request.app.state.scheduler
-    if not scheduler:
-        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
-    if name not in CLOSE_PROFILES:
-        return JSONResponse(
-            {"error": f"Unknown close profile: {name}"}, status_code=400
-        )
-    if not await scheduler.select_close_profile(name):
-        return JSONResponse(
-            {"error": "Could not switch close profile"}, status_code=400
-        )
-    return JSONResponse({"status": "ok", "close_profile": name})
-
-
-@router.post("/api/risk/{value}")
-async def set_daily_risk(request: Request, value: str) -> JSONResponse:
-    """Arm/disarm the daily-risk circuit-breakers at runtime and persist it.
-
-    ``value`` is ``on``/``off`` (also accepts ``enable``/``disable``,
-    ``true``/``false``, ``1``/``0``). Off lets the bot keep opening regardless of
-    the day's P&L / trade record — meant for dev/test, with the dashboard badge
-    flagging the disarmed state in production.
-    """
-    scheduler = request.app.state.scheduler
-    if not scheduler:
-        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
-    truthy = {"on", "enable", "enabled", "true", "1"}
-    falsy = {"off", "disable", "disabled", "false", "0"}
-    key = value.strip().lower()
-    if key in truthy:
-        enabled = True
-    elif key in falsy:
-        enabled = False
-    else:
-        return JSONResponse({"error": f"Invalid risk value: {value}"}, status_code=400)
-    await scheduler.select_daily_risk(enabled)
-    return JSONResponse({"status": "ok", "daily_risk_enabled": enabled})
 
 
 @router.get("/api/prices/{epic}")
@@ -639,10 +582,10 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             if reason:
                 return JSONResponse({"error": reason}, status_code=400)
             if position is None:
-                # open_position returned None: market not TRADEABLE, euro risk
-                # above euro_loss_max, or IG rejected the deal.
+                # open_position returned None: market not TRADEABLE or IG
+                # rejected the deal.
                 return JSONResponse(
-                    {"error": "Open rejected (market closed or risk cap reached)"},
+                    {"error": "Open rejected (market closed or deal rejected)"},
                     status_code=400,
                 )
 

@@ -30,14 +30,21 @@ igthon/
 │   ├── markets/            # MARCHÉS — build the tradeable epic list
 │   │   └── market_scanner.py
 │   ├── entry/              # OUVERTURE — entry strategies (open decision only)
-│   │   ├── base.py         # EntryStrategy → EntryIntent (direction, NO exit levels)
-│   │   └── donchian_er.py  # Donchian breakout + Efficiency-Ratio regime gate
+│   │   ├── base.py            # EntryStrategy → EntryIntent (direction, NO exit levels)
+│   │   ├── open_donchian.py   # Donchian breakout + Efficiency-Ratio regime gate
+│   │   ├── open_projection.py # Breakout confirmed by a multi-model projection
+│   │   └── open_ranking.py    # Cross-epic ranker, one rolling position
+│   ├── stops/              # ARRÊT — initial-stop placement (drives sizing)
+│   │   ├── base.py            # StopDistance → initial_stop()
+│   │   ├── stop_support.py    # Stop below a recency-weighted support
+│   │   └── stop_atr.py        # Flat stop_atr_k × ATR from the entry
 │   ├── exit/               # FERMETURE — close profiles (own the whole exit)
-│   │   ├── base.py         # CloseProfile → OpenPlan / CloseDecision
-│   │   ├── trailing.py     # Pure close maths (decide_close_reason, trailing stop)
-│   │   └── atr_trailing.py # Reference profile: ATR chandelier trailing stop
+│   │   ├── base.py            # CloseProfile → OpenPlan / CloseDecision
+│   │   ├── trailing.py        # Pure close maths (decide_close_reason, trailing stop)
+│   │   ├── close_zoneprofit.py# Reference profile: per-zone stop management
+│   │   └── zones/             # Per-zone stop updaters (underwater / band / profit)
 │   ├── execution/          # MAINS — turn decisions into broker/DB effects
-│   │   ├── risk.py         # Pure open gates + sizing
+│   │   ├── gates.py        # Pure pre-open gates
 │   │   └── trading.py      # TradingService: order placement, close, reconcile
 │   ├── backtest/           # OUTILS — offline evaluation (no DB, no IG API)
 │   │   ├── simulator.py    # Replay entry+close over synthetic curves
@@ -46,9 +53,7 @@ igthon/
 │   │   └── curve_generator.py
 │   ├── models/             # DATA — SQLAlchemy ORM (database.py + tables)
 │   ├── utils/              # tools.py — formatting, misc helpers
-│   ├── web/                # VUES — FastAPI app + dashboard/routes
-│   └── strategies/         # LEGACY — pre-decoupling strategies (not on live
-│                           #          path; to be ported into entry/ + exit/)
+│   └── web/                # VUES — FastAPI app + dashboard/routes
 └── tests/                  # One test file per module + isolated entry/exit tests
 ```
 
@@ -74,7 +79,11 @@ Consequences: a new opening idea is a new `entry/` module; a new exit scenario
 is a new `exit/` module; either can be swapped or unit-tested in isolation, and
 a close profile can be measured on synthetic price paths with no entry involved.
 
-Selection is one line each: `ENTRY_STRATEGY_NAME` / `CLOSE_PROFILE_NAME`.
+Selection is one line each in `.env` — the single source of truth, all required
+(no default, no DB persistence, no runtime switching): `OPEN_STRATEGY` /
+`STOP_STRATEGY` and the three per-zone close selectors `CLOSE_ZONESTART` /
+`CLOSE_ZONEMARGE` / `CLOSE_ZONEPROFIT` (the close side is split into three
+independently-tuned zones — open→break-even, break-even→margin, above-margin).
 
 ______________________________________________________________________
 

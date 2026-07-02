@@ -1,56 +1,52 @@
-"""Close-profile registry — pick the *exit* scenario by name.
+"""Close-profile registry — the *exit* side of the decoupled pipeline.
 
-The orchestration layer asks this registry for a
-:class:`~src.exit.base.CloseProfile` and composes it with an independently
-chosen :class:`~src.entry.base.EntryStrategy`. Selecting an exit is a one-line
-config change (``CLOSE_PROFILE_NAME`` in ``.env``), and a position remembers
-which profile opened it so the same exit manages it for its whole life.
+The orchestration layer asks this module for a
+:class:`~src.exit.base.CloseProfile` and composes it with an independently chosen
+:class:`~src.entry.base.EntryStrategy` and — through the profile — a
+:class:`~src.stops.base.StopDistance`. A position remembers which profile opened
+it so the same exit manages it for its whole life.
 
-Adding a close profile:
+There is a single close profile,
+:class:`~src.exit.close_zoneprofit.CloseZoneProfit`. It is a **composer**: it wires
+a swappable initial stop distance (:mod:`src.stops`, ``STOP_STRATEGY``) with three
+**independently-selectable** per-zone stop updaters (:mod:`src.exit.zones`), one
+per price zone:
 
-1. implement it in ``src/exit/<name>.py`` (subclass ``CloseProfile``);
-2. register the class in :data:`CLOSE_PROFILES` below;
-3. document it in ``docs/strategies/`` if it has tunable parameters;
-4. add its parameters to ``src/config.py`` (and ``.env.example``).
+- ``CLOSE_ZONESTART``  → open → break-even   (``ZONESTART_UPDATERS``);
+- ``CLOSE_ZONEMARGE``  → break-even → margin (``ZONEMARGE_UPDATERS``);
+- ``CLOSE_ZONEPROFIT`` → above the margin    (``ZONEPROFIT_UPDATERS``).
+
+Each zone's behaviour is thus a one-line ``.env`` change and can be tuned without
+influencing the other two. Adding a per-zone behaviour is a new
+:class:`~src.exit.zones.base.StopUpdater` registered in the relevant zone registry.
 """
 
 from __future__ import annotations
 
-from src.exit.atr_trailing import AtrTrailingExit
-from src.exit.atr_trailing_positive import AtrTrailingPositiveExit
-from src.exit.atr_trailing_profit import AtrTrailingProfitExit
 from src.exit.base import CloseDecision, CloseProfile, OpenPlan
-from src.exit.support_atr_profit import SupportAtrProfitExit
-
-#: Name → class map. Keys are the valid ``CLOSE_PROFILE_NAME`` values.
-CLOSE_PROFILES: dict[str, type[CloseProfile]] = {
-    AtrTrailingExit.name: AtrTrailingExit,
-    AtrTrailingPositiveExit.name: AtrTrailingPositiveExit,
-    AtrTrailingProfitExit.name: AtrTrailingProfitExit,
-    SupportAtrProfitExit.name: SupportAtrProfitExit,
-}
+from src.exit.close_zoneprofit import CloseZoneProfit
+from src.exit.zones import (
+    ZONEMARGE_UPDATERS,
+    ZONEPROFIT_UPDATERS,
+    ZONESTART_UPDATERS,
+)
 
 
-def get_close_profile(name: str, settings) -> CloseProfile:
-    """Build the close profile registered under ``name`` from settings.
+def get_close_profile(settings) -> CloseProfile:
+    """Build the close profile from settings.
 
-    Raises:
-        ValueError: when ``name`` is not a registered close profile.
+    There is a single composer profile; the exit behaviour is chosen through the
+    three per-zone selectors (``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` /
+    ``CLOSE_ZONEPROFIT``) and the initial stop distance (``STOP_STRATEGY``).
     """
-    cls = CLOSE_PROFILES.get(name)
-    if cls is None:
-        raise ValueError(
-            f"Unknown close profile: {name!r} (available: {sorted(CLOSE_PROFILES)})"
-        )
-    return cls.from_settings(settings)
+    return CloseZoneProfit.from_settings(settings)
 
 
 __all__ = [
-    "CLOSE_PROFILES",
-    "AtrTrailingExit",
-    "AtrTrailingPositiveExit",
-    "AtrTrailingProfitExit",
-    "SupportAtrProfitExit",
+    "ZONESTART_UPDATERS",
+    "ZONEMARGE_UPDATERS",
+    "ZONEPROFIT_UPDATERS",
+    "CloseZoneProfit",
     "CloseDecision",
     "CloseProfile",
     "OpenPlan",

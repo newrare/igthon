@@ -13,8 +13,7 @@ Pipeline::
 
 ``build_days`` turns the per-epic candle series into the simulator's notion of a
 trading day: candles are grouped by calendar date, and each date becomes one day
-holding every epic that traded it. Daily gates (max trades, daily P&L target,
-win rate) therefore reset per calendar day, mirroring the live scheduler.
+holding every epic that traded it, mirroring the live scheduler's per-day reset.
 
 Everything runs in memory and reads only files — no DB session, no IG API — so a
 backtest is safe to run while the main process keeps recording the current week.
@@ -179,9 +178,11 @@ def run_backtest(
 ) -> SimulationResult:
     """Replay an entry strategy + close profile over archived candles.
 
-    Both are resolved by name (decoupled); when omitted the configured
-    ``ENTRY_STRATEGY_NAME`` / ``CLOSE_PROFILE_NAME`` are used, so the backtest
-    replays exactly what the live bot would do on that historical data.
+    The entry strategy is resolved by name (``strategy_name`` or the configured
+    ``OPEN_STRATEGY``). The exit is the single composer profile built from settings
+    — its per-zone behaviour comes from the ``CLOSE_ZONE*`` selectors, so
+    ``close_profile_name`` is accepted for API compatibility but not used for
+    selection. The backtest thus replays exactly what the live bot would do.
     """
     kept, dropped = dedupe_correlated_epics(candles_by_epic)
     if dropped:
@@ -193,12 +194,8 @@ def run_backtest(
     days = build_days(kept)
     simulator = StrategySimulator(
         trade_config=TradeConfig.from_settings(settings),
-        entry=get_entry_strategy(
-            strategy_name or settings.entry_strategy_name, settings
-        ),
-        close_profile=get_close_profile(
-            close_profile_name or settings.close_profile_name, settings
-        ),
+        entry=get_entry_strategy(strategy_name or settings.open_strategy, settings),
+        close_profile=get_close_profile(settings),
         sim_config=config.to_simulation_config(),
     )
     result = simulator.run_days(days)

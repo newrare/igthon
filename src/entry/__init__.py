@@ -3,7 +3,7 @@
 The orchestration layer asks this registry for an
 :class:`~src.entry.base.EntryStrategy` and composes it with an independently
 chosen :class:`~src.exit.base.CloseProfile`. Selecting an entry is a one-line
-config change (``ENTRY_STRATEGY_NAME`` in ``.env``).
+config change (``OPEN_STRATEGY`` in ``.env``).
 
 Adding an entry strategy:
 
@@ -16,15 +16,15 @@ Adding an entry strategy:
 from __future__ import annotations
 
 from src.entry.base import EntryIntent, EntryStrategy
-from src.entry.donchian_er import DonchianEntry
-from src.entry.donchian_projection import DonchianProjectionEntry
-from src.entry.projection_ranking import ProjectionRankingEntry
+from src.entry.open_donchian import OpenDonchian
+from src.entry.open_projection import OpenProjection
+from src.entry.open_ranking import OpenRanking
 
-#: Name → class map. Keys are the valid ``ENTRY_STRATEGY_NAME`` values.
+#: Name → class map. Keys are the valid ``OPEN_STRATEGY`` values.
 ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
-    DonchianEntry.name: DonchianEntry,
-    DonchianProjectionEntry.name: DonchianProjectionEntry,
-    ProjectionRankingEntry.name: ProjectionRankingEntry,
+    OpenDonchian.name: OpenDonchian,
+    OpenProjection.name: OpenProjection,
+    OpenRanking.name: OpenRanking,
 }
 
 
@@ -45,9 +45,9 @@ def get_entry_strategy(name: str, settings) -> EntryStrategy:
 
 __all__ = [
     "ENTRY_STRATEGIES",
-    "DonchianEntry",
-    "DonchianProjectionEntry",
-    "ProjectionRankingEntry",
+    "OpenDonchian",
+    "OpenProjection",
+    "OpenRanking",
     "EntryIntent",
     "EntryStrategy",
     "get_entry_strategy",

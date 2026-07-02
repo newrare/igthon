@@ -52,8 +52,8 @@ class OpenPlan:
         level_margin: Absolute "margin" level frozen at open — break-even plus
             the profile's noise margin (``0.0`` when the profile has no such
             band). Persisted so the band the stop must clear never drifts with
-            later volatility. Used by ``atr_trailing_profit`` to forbid parking
-            the stop between break-even and this level.
+            later volatility. Used by the profit-trailing zone updater to forbid
+            parking the stop between break-even and this level.
         profile: Name of the close profile that produced this plan; persisted on
             the position so the same profile manages it for its whole life.
     """
@@ -85,7 +85,9 @@ class CloseDecision:
 class CloseProfile(ABC):
     """Self-contained exit manager for an open position."""
 
-    #: Registry key and ``CLOSE_PROFILE_NAME`` value (kebab/snake, stable).
+    #: Stable profile identifier persisted on the position (snake_case). The exit
+    #: behaviour is selected per zone via ``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE``
+    #: / ``CLOSE_ZONEPROFIT`` (see :mod:`src.exit`), not by this name.
     name: str = "base"
 
     @classmethod

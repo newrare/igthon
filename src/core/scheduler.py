@@ -25,10 +25,17 @@ from src.core.config import Settings
 from src.core.recorder import Recorder
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
 from src.execution.trading import (
+    DEFAULT_MARKET_CLOSE_HOUR_UTC,
     TradeConfig,
     TradingService,
 )
-from src.exit import CLOSE_PROFILES, CloseProfile, get_close_profile
+from src.exit import (
+    ZONEMARGE_UPDATERS,
+    ZONEPROFIT_UPDATERS,
+    ZONESTART_UPDATERS,
+    CloseProfile,
+    get_close_profile,
+)
 from src.feed.candle_store import CandleStore
 from src.feed.market_data import MarketDataService
 from src.feed.price_buffer import DEFAULT_MAX_CANDLES, EpicBuffer, PriceBuffer
@@ -38,12 +45,48 @@ from src.models.epic import Epic
 from src.models.job_preference import JobPreference
 from src.models.position import Position, PositionState
 from src.models.resume import Resume
-from src.models.selection_preference import SelectionPreference
+from src.stops import STOP_DISTANCES
 
 if TYPE_CHECKING:
     from src.feed.streaming import IGStreamingClient
 
 logger = logging.getLogger(__name__)
+
+
+def validate_strategy_selection(settings: Settings) -> None:
+    """Ensure the three strategy selections from ``.env`` are set and known.
+
+    The ``.env`` file is the single source of truth for the open / stop / close
+    selection — there is no code default and no persistence. A missing, empty or
+    unknown name raises a single actionable error naming every offending
+    variable, so the bot and the dashboard can surface a "configure your .env"
+    message instead of failing obscurely deep in the pipeline.
+
+    Raises:
+        ValueError: when any of ``OPEN_STRATEGY`` / ``STOP_STRATEGY`` /
+            ``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT`` is
+            empty or not a registered name.
+    """
+    checks = (
+        ("OPEN_STRATEGY", settings.open_strategy, ENTRY_STRATEGIES),
+        ("STOP_STRATEGY", settings.stop_strategy, STOP_DISTANCES),
+        ("CLOSE_ZONESTART", settings.close_zonestart, ZONESTART_UPDATERS),
+        ("CLOSE_ZONEMARGE", settings.close_zonemarge, ZONEMARGE_UPDATERS),
+        ("CLOSE_ZONEPROFIT", settings.close_zoneprofit, ZONEPROFIT_UPDATERS),
+    )
+    problems: list[str] = []
+    for var, name, registry in checks:
+        if not name:
+            problems.append(f"{var} is not set")
+        elif name not in registry:
+            problems.append(
+                f"{var}={name!r} is unknown (available: {sorted(registry)})"
+            )
+    if problems:
+        raise ValueError(
+            "Invalid strategy selection — please configure your .env file:\n  - "
+            + "\n  - ".join(problems)
+        )
 
 
 # Registry of schedulable jobs surfaced in the dashboard "Actions" section.
@@ -94,7 +137,7 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
             "Backstop for the rolling cross-epic selection (also runs every "
             "analysis tick): re-ranks tradable epics and tops the portfolio up "
             "to its target open-position count. Active only with a cross-epic "
-            "ranker entry (e.g. projection_ranking); a no-op for per-epic entries."
+            "ranker entry (e.g. open_ranking); a no-op for per-epic entries."
         ),
         "schedule": "Hourly · 09–16 · Mon–Fri",
         "danger": "safe",
@@ -215,7 +258,7 @@ class BotScheduler:
         self._running = False
         self._paused = False
         # Entry strategy (open) and close profile (exit) — decoupled and chosen
-        # independently by name (ENTRY_STRATEGY_NAME / CLOSE_PROFILE_NAME). Built
+        # independently (OPEN_STRATEGY / the three CLOSE_ZONE* selectors). Built
         # lazily so a scheduler constructed with stub settings (tests) never
         # resolves them.
         self._strategy: EntryStrategy | None = None
@@ -334,7 +377,7 @@ class BotScheduler:
             self._end_of_day,
             "cron",
             day_of_week="mon-fri",
-            hour=self._settings.strategy_hour_close,
+            hour=DEFAULT_MARKET_CLOSE_HOUR_UTC,
             minute=30,
             id="end_of_day",
             name="End of day close",
@@ -466,7 +509,7 @@ class BotScheduler:
             job = self._scheduler.get_job(entry["job_id"]) if self._running else None
             schedule = entry["schedule"]
             if entry["action"] == "end_of_day":
-                schedule = f"Daily {self._settings.strategy_hour_close}:30 · Mon–Fri"
+                schedule = f"Daily {DEFAULT_MARKET_CLOSE_HOUR_UTC}:30 · Mon–Fri"
             statuses.append(
                 {
                     "action": entry["action"],
@@ -1008,10 +1051,10 @@ class BotScheduler:
 
     @property
     def strategy(self) -> EntryStrategy:
-        """The entry strategy selected by ``ENTRY_STRATEGY_NAME`` (built once)."""
+        """The entry strategy selected by ``OPEN_STRATEGY`` (built once)."""
         if self._strategy is None:
             self._strategy = get_entry_strategy(
-                self._settings.entry_strategy_name, self._settings
+                self._settings.open_strategy, self._settings
             )
             logger.info(
                 "Entry strategy plugged in: '%s' (warmup=%d candles)",
@@ -1022,172 +1065,49 @@ class BotScheduler:
 
     @property
     def close_profile(self) -> CloseProfile:
-        """The close profile selected by ``CLOSE_PROFILE_NAME`` (built once).
+        """The close profile composed from the three zone selectors (built once).
 
         Independent of the entry strategy: it owns every exit decision for the
-        positions opened this session.
+        positions opened this session. Each zone (``CLOSE_ZONESTART`` /
+        ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT``) is selected independently.
         """
         if self._close_profile_obj is None:
-            self._close_profile_obj = get_close_profile(
-                self._settings.close_profile_name, self._settings
+            self._close_profile_obj = get_close_profile(self._settings)
+            logger.info(
+                "Close profile plugged in: '%s' (zones: start=%s margin=%s profit=%s)",
+                self._close_profile_obj.name,
+                self._settings.close_zonestart,
+                self._settings.close_zonemarge,
+                self._settings.close_zoneprofit,
             )
-            logger.info("Close profile plugged in: '%s'", self._close_profile_obj.name)
         return self._close_profile_obj
 
+    # The active selection is read straight from settings (``.env`` is the single
+    # source of truth): there is no runtime switching or database persistence, so
+    # these are plain read-only views used by the dashboard header.
     @property
     def active_strategy_name(self) -> str:
-        """Name of the currently selected entry strategy."""
-        return self._settings.entry_strategy_name
+        """Name of the selected entry (open) strategy."""
+        return self._settings.open_strategy
 
-    def set_strategy(self, name: str) -> bool:
-        """Switch the active entry strategy at runtime (in-memory only).
-
-        Validates ``name`` against the entry registry, updates the in-memory
-        setting and clears the cached instance so the ``strategy`` property
-        rebuilds it on next use. The close profile is unaffected (open/close are
-        decoupled). This does **not** persist; use :meth:`select_strategy` (the
-        dashboard path) to also save the choice across restarts.
-
-        Returns:
-            True on success, False for an unknown entry strategy name.
-        """
-        if name not in ENTRY_STRATEGIES:
-            logger.warning("Rejected switch to unknown entry strategy: %r", name)
-            return False
-        self._settings.entry_strategy_name = name
-        self._strategy = None  # force rebuild via the ``strategy`` property
-        logger.info("Active entry strategy switched to '%s'", name)
-        return True
-
-    async def select_strategy(self, name: str) -> bool:
-        """Switch the active entry strategy and persist the choice.
-
-        The dashboard path: applies :meth:`set_strategy` and, on success, saves
-        the selection to the database so it is restored on the next startup
-        (``ENTRY_STRATEGY_NAME`` in ``.env`` is only the initial fallback).
-        """
-        if not self.set_strategy(name):
-            return False
-        await self._save_selection("entry", name)
-        return True
+    @property
+    def active_close_zone_names(self) -> tuple[str, str, str]:
+        """The three selected per-zone updater names (start, margin, profit)."""
+        return (
+            self._settings.close_zonestart,
+            self._settings.close_zonemarge,
+            self._settings.close_zoneprofit,
+        )
 
     @property
     def active_close_profile_name(self) -> str:
-        """Name of the currently selected close profile."""
-        return self._settings.close_profile_name
-
-    def set_close_profile(self, name: str) -> bool:
-        """Switch the active close profile at runtime (in-memory only).
-
-        Validates ``name`` against the exit registry, updates the in-memory
-        setting and clears the cached instance so the ``close_profile`` property
-        rebuilds it on next use. The entry strategy is unaffected (open/close are
-        decoupled), and positions already open keep the profile persisted on them
-        — only positions opened after the switch use the new one. This does
-        **not** persist; use :meth:`select_close_profile` (the dashboard path) to
-        also save the choice across restarts.
-
-        Returns:
-            True on success, False for an unknown close-profile name.
-        """
-        if name not in CLOSE_PROFILES:
-            logger.warning("Rejected switch to unknown close profile: %r", name)
-            return False
-        self._settings.close_profile_name = name
-        self._close_profile_obj = None  # rebuild via the ``close_profile`` property
-        logger.info("Active close profile switched to '%s'", name)
-        return True
-
-    async def select_close_profile(self, name: str) -> bool:
-        """Switch the active close profile and persist the choice.
-
-        The dashboard path: applies :meth:`set_close_profile` and, on success,
-        saves the selection to the database so it is restored on the next startup
-        (``CLOSE_PROFILE_NAME`` in ``.env`` is only the initial fallback).
-        """
-        if not self.set_close_profile(name):
-            return False
-        await self._save_selection("close", name)
-        return True
+        """Compact ``start/margin/profit`` label of the active close zones."""
+        return "/".join(self.active_close_zone_names)
 
     @property
-    def daily_risk_enabled(self) -> bool:
-        """Whether the daily-risk circuit-breakers are currently armed."""
-        return bool(getattr(self._settings, "strategy_daily_risk_enabled", True))
-
-    def set_daily_risk_enabled(self, enabled: bool) -> None:
-        """Arm/disarm the daily-risk gates at runtime (in-memory only).
-
-        Flips the setting the next ``_build_trade_config`` reads, so the change
-        takes effect on the following open evaluation. Disarming lets the bot keep
-        opening regardless of the day's P&L / trade record (dev/test); the
-        per-epic gates (duplicate epic, max positions) are unaffected.
-        """
-        self._settings.strategy_daily_risk_enabled = bool(enabled)
-        logger.info(
-            "Daily-risk circuit-breakers %s", "armed" if enabled else "DISABLED"
-        )
-
-    async def select_daily_risk(self, enabled: bool) -> bool:
-        """Arm/disarm the daily-risk gates and persist across restarts (dashboard).
-
-        Mirrors :meth:`select_strategy`: applies the in-memory change and saves it
-        so the choice survives a restart (the ``.env`` default is the fallback).
-        """
-        self.set_daily_risk_enabled(enabled)
-        await self._save_selection("risk", "on" if enabled else "off")
-        return True
-
-    async def load_selection_preferences(self) -> None:
-        """Restore the dashboard-chosen entry strategy and close profile.
-
-        Called once on startup. Reads the persisted selections and applies them
-        in-memory via :meth:`set_strategy` / :meth:`set_close_profile`, so a
-        restart resumes with the same choice the user made on the dashboard.
-        Falls back silently to the ``.env`` defaults when nothing is persisted
-        (or the table does not exist yet — before the migration is applied).
-        """
-        try:
-            async with self._session_factory() as session:
-                rows = await session.scalars(select(SelectionPreference))
-                selection = {row.kind: row.name for row in rows}
-        except Exception as exc:
-            logger.warning("Could not load selection preferences: %s", exc)
-            return
-
-        entry = selection.get("entry")
-        if entry and entry in ENTRY_STRATEGIES:
-            self.set_strategy(entry)
-        close = selection.get("close")
-        if close and close in CLOSE_PROFILES:
-            self.set_close_profile(close)
-        risk = selection.get("risk")
-        if risk in {"on", "off"}:
-            self.set_daily_risk_enabled(risk == "on")
-        if entry or close or risk:
-            logger.info(
-                "Selection restored: entry=%s close=%s risk=%s",
-                entry or "(default)",
-                close or "(default)",
-                risk or "(default)",
-            )
-
-    async def _save_selection(self, kind: str, name: str) -> None:
-        """Upsert the persisted entry/close selection for one ``kind``."""
-        now = datetime.now(UTC)
-        try:
-            async with self._session_factory() as session:
-                existing = await session.get(SelectionPreference, kind)
-                if existing:
-                    existing.name = name
-                    existing.updated_at = now
-                else:
-                    session.add(
-                        SelectionPreference(kind=kind, name=name, updated_at=now)
-                    )
-                await session.commit()
-        except Exception as exc:
-            logger.error("Failed to persist %s selection '%s': %s", kind, name, exc)
+    def active_stop_distance_name(self) -> str:
+        """Name of the selected stop policy."""
+        return self._settings.stop_strategy
 
     # ------------------------------------------------------------------
     # Epic list management
@@ -1614,7 +1534,7 @@ class BotScheduler:
         """Maintain the rolling cross-epic portfolio at its target size.
 
         Active only for a cross-epic ranker entry (``cross_epic_selection``, e.g.
-        ``projection_ranking``); a no-op otherwise. The selection knobs are
+        ``open_ranking``); a no-op otherwise. The selection knobs are
         constants on the strategy class (``concurrent_positions``,
         ``wallet_reserve``), not settings. The goal is to
         stay in the market all day: hold ``concurrent_positions`` open positions
@@ -1718,8 +1638,7 @@ class BotScheduler:
                         logger.debug("Rolling select skip %s: %s", intent.epic, reason)
                         continue
                     # Wallet gate: only open while the available balance (minus the
-                    # reserve) covers this epic's margin. Unknown margin -> allow
-                    # (the euro_loss_max gate in open_position bounds the downside).
+                    # reserve) covers this epic's margin. Unknown margin -> allow.
                     need = funds_map.get(intent.epic)
                     if spendable is not None and need is not None and need > spendable:
                         logger.info(

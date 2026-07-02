@@ -100,28 +100,13 @@ body {
   padding: 0.3rem 0.7rem;
 }
 .dashboard-title-exit .lc-icon { color: var(--text-muted); }
-/* Strategy switcher dropdown, styled to read as part of the title pill. */
-.strategy-select {
-  appearance: none;
-  -webkit-appearance: none;
-  background: transparent;
-  border: none;
-  color: var(--primary);
+/* Active selection name, read-only, reads as part of the title pill. The open /
+   stop / close selection is set in .env — the dashboard only displays it. */
+.strategy-name {
   font: inherit;
-  font-size: 0.8rem;
+  color: inherit;
   font-weight: 700;
-  text-transform: uppercase;
   letter-spacing: 1px;
-  cursor: pointer;
-  padding: 0;
-  outline: none;
-}
-.strategy-select:disabled { opacity: 0.5; cursor: default; }
-.strategy-select option {
-  background: var(--surface);
-  color: var(--text);
-  text-transform: none;
-  letter-spacing: normal;
 }
 
 /* ── Navigation ─────────────────────────────────────────────── */

@@ -29,8 +29,6 @@ cp .env.example .env
 # Create the database
 alembic upgrade head
 
-# Verify the IG API connection
-python src/scripts/verify_connection.py
 ```
 
 ______________________________________________________________________
@@ -41,14 +39,11 @@ Utility scripts live in `src/scripts/` — they are not part of the importable p
 are meant to be run directly for debugging or one-off tasks.
 
 ```bash
-# Smoke-test IG API connectivity (no trading)
-python src/scripts/verify_connection.py
+# Trace the activity/audit trail for a deal or epic
+python src/scripts/trace_activity.py
 
-# Discover tradeable markets and print results
-python src/scripts/fetch_markets.py
-
-# Inspect the in-memory price buffer state
-python src/scripts/test_buffer.py
+# Adopt orphan IG positions the bot lost track of
+python src/scripts/adopt_orphans.py
 ```
 
 ______________________________________________________________________

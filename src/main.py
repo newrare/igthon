@@ -21,7 +21,7 @@ from src.core.api_queue import APIQueue
 from src.core.config import get_settings
 from src.core.indicators import compute_signal
 from src.core.recorder import DEFAULT_LOG_FILE, LogBuffer, Recorder, setup_logging
-from src.core.scheduler import BotScheduler
+from src.core.scheduler import BotScheduler, validate_strategy_selection
 from src.feed.candle_store import CandleStore
 from src.feed.market_data import MarketDataService
 from src.feed.price_buffer import PriceBuffer
@@ -181,11 +181,8 @@ async def _run_connected(
     # Start scheduler (all jobs start in manual mode by default).
     scheduler.start()
 
-    # Restore the dashboard-chosen entry strategy / close profile so the bot
-    # resumes with the user's last selection (the .env names are only the
-    # initial fallback). Done before jobs are resumed below so the first
-    # analysis tick already uses the right strategy.
-    await scheduler.load_selection_preferences()
+    # The open / stop / close selection comes straight from .env (validated at
+    # startup); there is no persisted selection to restore.
 
     # Restore the last-saved auto/manual mode for each job so the bot
     # resumes exactly as the user left it before the server was stopped.
@@ -240,6 +237,17 @@ async def run_bot(
     error_log = APIErrorLog(max_entries=20)
     guard = APIGuard(max_per_minute=50, max_per_second=25)
 
+    # The .env file is the single source of truth for the open / stop / close
+    # selection. Validate it up front: a missing or unknown name must not start
+    # trading. In --web mode we still bring the dashboard up (degraded) so it can
+    # display the "configure your .env" message; otherwise we log and exit.
+    config_error: str | None = None
+    try:
+        validate_strategy_selection(settings)
+    except ValueError as exc:
+        config_error = str(exc)
+        logger.error("%s", config_error)
+
     logger.info("Starting IG Trading Bot (%s environment)", settings.ig_env.value)
 
     # Graceful shutdown — installed once, shared by the connection loop.
@@ -274,8 +282,8 @@ async def run_bot(
             candle_store=None,
             log_buffer=log_buffer,
         )
-        app.state.startup_error = None
-        app.state.connecting = True
+        app.state.startup_error = config_error
+        app.state.connecting = config_error is None
         config = uvicorn.Config(
             app,
             host=settings.web_host,
@@ -296,9 +304,17 @@ async def run_bot(
             settings.web_port,
         )
 
+    # Invalid .env strategy selection: never connect or trade. In web mode keep
+    # the (degraded) dashboard up until shutdown so the error stays visible.
+    if config_error is not None:
+        if with_web:
+            await stop_event.wait()
+        else:
+            logger.error("Exiting — fix the strategy selection in .env and restart.")
+
     # Connection loop: (re)connect to IG until a clean shutdown. A connection
     # failure no longer aborts the process — in web mode we surface it and retry.
-    while not stop_event.is_set():
+    while not stop_event.is_set() and config_error is None:
         try:
             async with IGClient(settings, error_log=error_log, guard=guard) as client:
                 await _run_connected(

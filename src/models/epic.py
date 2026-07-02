@@ -37,5 +37,5 @@ class Epic(Base):
     not_tradable_reason: Mapped[str | None] = mapped_column(String(50))
     # Today's market close in UTC, parsed from IG's instrument.openingHours when
     # resolvable to UTC (else NULL). Drives the per-epic "close before the market
-    # closes" rule; NULL falls back to the global strategy_hour_close.
+    # closes" rule; NULL falls back to the execution layer's default close hour.
     market_close_utc: Mapped[time | None] = mapped_column(Time)

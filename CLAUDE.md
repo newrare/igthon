@@ -11,9 +11,8 @@ ______________________________________________________________________
 
 ## Project scope
 
-The new Python project is developed exclusively in the `python/` folder.
-The existing PHP code (root-level `MyClass/`, `cron/`, `script/`) is **legacy** — do not modify it.
-All new architecture, modules, and files belong inside `python/`.
+The project is developed exclusively in the `src/` folder.
+All architecture, modules, and files belong inside `src/`.
 
 ______________________________________________________________________
 
@@ -58,16 +57,18 @@ src/
 ├── feed/                   # FLUX — streaming, market_data, price_buffer, candle_store
 ├── markets/                # MARCHÉS — market_scanner (build the epic list)
 ├── entry/                  # OUVERTURE — EntryStrategy → EntryIntent (direction only)
-│   ├── base.py
-│   └── donchian_er.py
+│   ├── base.py · open_donchian.py · open_projection.py · open_ranking.py
+├── stops/                  # ARRÊT — StopDistance.initial_stop() (drives sizing)
+│   ├── base.py · stop_support.py · stop_atr.py
 ├── exit/                   # FERMETURE — CloseProfile (owns stop/target/trailing)
-│   ├── base.py · trailing.py · atr_trailing.py
-├── execution/              # MAINS — risk.py (gates+sizing), trading.py (TradingService)
+│   ├── base.py · trailing.py · close_zoneprofit.py
+│   └── zones/              # per-zone stop updaters (underwater, breakeven_band, trailing_ratchet)
+├── execution/              # MAINS — gates.py (pre-open gates), trading.py (TradingService)
 ├── backtest/               # OUTILS — simulator, backtester, archive, curve_generator
 ├── models/                 # DATA — SQLAlchemy ORM (database.py + tables)
 ├── web/                    # VUES — FastAPI app + dashboard/routes
-├── utils/                  # tools.py
-└── strategies/             # LEGACY — pre-decoupling strategies, to be ported to entry/+exit/
+├── scripts/                # OPS — one-off tools (trace_activity, adopt_orphans)
+└── utils/                  # tools.py
 tests/                      # one test file per module + isolated entry/exit/risk tests
 ```
 
@@ -79,11 +80,18 @@ tests/                      # one test file per module + isolated entry/exit/ris
 - **Closing** code lives only in `src/exit/`. A `CloseProfile` owns the entire
   exit: `initial_plan()` chooses the protective stop at open (which drives
   sizing) and `evaluate()` makes every per-tick decision (hold / close / ratchet
-  stop). New closing scenarios are new modules here.
+  stop). The single composer profile (`close_zoneprofit`) splits the exit into
+  **three price zones** — open→break-even, break-even→margin, above-margin — each
+  managed by a `StopUpdater` (`src/exit/zones/`) **selected independently** so a
+  zone can be tuned without influencing the others. New closing scenarios are new
+  updater modules registered in the relevant zone registry.
 - They are **composed at runtime** by `core/scheduler.py` + `execution/` and are
   linked only through the persisted `Position.close_profile`. Each can be
-  swapped or unit-tested in isolation. Selection: `ENTRY_STRATEGY_NAME` /
-  `CLOSE_PROFILE_NAME`.
+  swapped or unit-tested in isolation. Selection is the `.env` file — the
+  **single source of truth**, all **required** (no default in `config.py`, no DB
+  persistence, no runtime switching): `OPEN_STRATEGY` / `STOP_STRATEGY` and the
+  three per-zone close selectors `CLOSE_ZONESTART` / `CLOSE_ZONEMARGE` /
+  `CLOSE_ZONEPROFIT`.
 
 ______________________________________________________________________
 

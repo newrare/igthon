@@ -9,8 +9,6 @@ from fastapi import Request
 from sqlalchemy import select
 
 from src.core.api_queue import Priority
-from src.execution.risk import daily_risk_block
-from src.execution.trading import TradeConfig
 from src.models.day import Day
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
@@ -483,44 +481,6 @@ async def _gather_dashboard_state(request: Request) -> dict:
     else:
         kpis["wallet_available"] = None
         kpis["wallet_used"] = None
-
-    # Daily-risk opening indicator: surface *why* the bot has stopped opening when
-    # a day-scope circuit-breaker has tripped (daily loss/target, max trades,
-    # win-rate floor). Computed from the same inputs the live gate uses — today's
-    # CLOSE rows, stored ``euro`` for P&L and the ``win`` flag for the rate — so
-    # the badge and ``evaluate_open_gates`` never disagree. ``None`` = not blocked.
-    open_block_reason: str | None = None
-    daily_risk_enabled = True
-    settings = getattr(request.app.state, "settings", None)
-    if settings is not None:
-        try:
-            cfg = TradeConfig.from_settings(settings)
-            daily_risk_enabled = cfg.daily_risk_enabled
-            daily_count = len(closed_positions)
-            daily_euro = sum(float(p.euro or 0) for p in closed_positions)
-            daily_wins = sum(1 for p in closed_positions if (p.win or 0) > 0)
-            daily_win_rate = daily_wins / daily_count if daily_count else 1.0
-            # Live figures + thresholds for the risk modal (one row per breaker).
-            kpis["risk_daily_pnl"] = daily_euro
-            kpis["risk_trade_count"] = daily_count
-            kpis["risk_win_rate"] = daily_win_rate
-            kpis["risk_loss_limit"] = cfg.day_euro_finish_loose
-            kpis["risk_win_target"] = cfg.day_euro_finish_win
-            kpis["risk_max_trades"] = cfg.max_trades_day
-            kpis["risk_min_win_rate"] = cfg.min_win_rate
-            # Only report a block reason while the gates are armed; disarmed, the
-            # bot opens regardless so there is nothing to block on.
-            if daily_risk_enabled:
-                open_block_reason = daily_risk_block(
-                    daily_pnl=daily_euro,
-                    trade_count=daily_count,
-                    win_rate=daily_win_rate,
-                    config=cfg,
-                )
-        except Exception:  # pragma: no cover - defensive: never break the 2s poll
-            logger.debug("Could not compute daily-risk open block", exc_info=True)
-    kpis["daily_risk_enabled"] = daily_risk_enabled
-    kpis["open_block_reason"] = open_block_reason
 
     # API Guard & Error log
     guard = request.app.state.guard

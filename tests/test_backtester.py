@@ -33,35 +33,12 @@ def _settings(dump_dir="./dumps") -> SimpleNamespace:
         ig_env=SimpleNamespace(value="demo"),
         web_port=8000,
         candle_dump_dir=str(dump_dir),
-        entry_strategy_name="donchian_er",
-        close_profile_name="atr_trailing",
-        strategy_name="donchian_er",
-        strategy_donchian_channel=20,
-        strategy_donchian_stop_atr_k=2.5,
-        strategy_efficiency_period=30,
-        strategy_min_efficiency=0.45,
-        strategy_lookback_points=20,
-        strategy_sma_fast=5,
-        strategy_sma_slow=20,
-        strategy_roc_period=10,
-        strategy_min_r2=0.70,
-        strategy_min_score=0.75,
-        strategy_max_spread_ratio=0.0015,
-        strategy_stop_multiplier=2.5,
-        strategy_target_multiplier=4.0,
-        strategy_tactic="spread",
-        strategy_max_positions=6,
-        strategy_max_trades_day=50,
-        strategy_daily_loss_limit=-500.0,
-        strategy_daily_win_target=300.0,
-        strategy_min_win_rate=0.40,
-        strategy_hour_start=9,
-        strategy_hour_end=16,
-        strategy_hour_close=17,
+        open_strategy="open_donchian",
+        stop_strategy="stop_support",
+        close_zonestart="hold",
+        close_zonemarge="hold",
+        close_zoneprofit="trailing_ratchet",
         strategy_close_margin_minutes=5,
-        strategy_close_target="follower",
-        strategy_compensate_loose=False,
-        strategy_euro_loss=4000.0,
         strategy_atr_period=14,
         strategy_atr_k_pre=2.5,
         strategy_atr_k_post=1.5,
@@ -214,15 +191,6 @@ class TestRunBacktest:
         assert s["wins"] + s["losses"] == s["trades"]
         assert len(s["equity"]) == s["trades"]
         assert sum(s["close_reasons"].values()) == s["trades"]
-
-    def test_opens_only_within_trading_hours(self):
-        days = [("EPIC.A", s, datetime(2026, 6, 8, tzinfo=UTC)) for s in range(4)]
-        result = run_backtest(
-            _settings(), _archive_candles(days), BacktestConfig(target_trades=50)
-        )
-        for t in result.trades:
-            hour = int(t.open_time.split(":")[0])
-            assert 9 <= hour < 16
 
     def test_empty_candles_no_trades(self):
         result = run_backtest(_settings(), {}, BacktestConfig())

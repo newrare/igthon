@@ -15,7 +15,7 @@ import pytest
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.core.scheduler import BotScheduler
+from src.core.scheduler import BotScheduler, validate_strategy_selection
 from src.feed.price_buffer import Candle, PriceBuffer
 from src.models.database import Base
 from src.models.job_preference import JobPreference
@@ -50,32 +50,25 @@ def _make_scheduler(session_factory) -> BotScheduler:
     )
 
 
-class TestSetStrategy:
-    """Runtime entry-strategy switching via the dashboard title dropdown.
+class TestActiveSelection:
+    """The active open/stop/close names are read straight from settings.
 
-    Switching swaps the *entry* (open) strategy only; the close profile is
-    chosen independently (open/close decoupling). The entry registry currently
-    holds ``donchian_er`` (others are ported later).
+    The ``.env`` file is the single source of truth: there is no runtime
+    switching or persistence, so these properties are plain read-only views used
+    by the dashboard header.
     """
 
-    def test_switch_to_registered_strategy(self):
+    def test_active_names_reflect_settings(self):
         sched = _make_scheduler(MagicMock())
-        sched._settings.entry_strategy_name = "something_else"
-        assert sched.set_strategy("donchian_er") is True
-        assert sched.active_strategy_name == "donchian_er"
-
-    def test_unknown_strategy_is_rejected(self):
-        sched = _make_scheduler(MagicMock())
-        sched._settings.entry_strategy_name = "donchian_er"
-        assert sched.set_strategy("not_a_strategy") is False
-        assert sched.active_strategy_name == "donchian_er"
-
-    def test_switch_clears_cached_instance(self):
-        sched = _make_scheduler(MagicMock())
-        sched._strategy = object()  # pretend a strategy was already built
-        sched.set_strategy("donchian_er")
-        # Cleared so the ``strategy`` property rebuilds from the new name.
-        assert sched._strategy is None
+        sched._settings.open_strategy = "open_donchian"
+        sched._settings.stop_strategy = "stop_support"
+        sched._settings.close_zonestart = "hold"
+        sched._settings.close_zonemarge = "hold"
+        sched._settings.close_zoneprofit = "trailing_ratchet"
+        assert sched.active_strategy_name == "open_donchian"
+        assert sched.active_stop_distance_name == "stop_support"
+        assert sched.active_close_zone_names == ("hold", "hold", "trailing_ratchet")
+        assert sched.active_close_profile_name == "hold/hold/trailing_ratchet"
 
 
 class TestOpenEpicGuarded:
@@ -161,64 +154,51 @@ class TestOpenEpicGuarded:
         assert order.index(("open-end", "A")) < order.index(("gate", "B"))
 
 
-class TestSelectionPersistence:
-    """Dashboard selection is saved to the DB and restored on startup."""
+class TestValidateStrategySelection:
+    """The ``.env`` selection is validated up front (single source of truth).
 
-    async def test_select_strategy_persists_and_restores(self, session_factory):
-        sched = _make_scheduler(session_factory)
-        sched._settings.entry_strategy_name = "donchian_er"
-        assert await sched.select_strategy("projection_ranking") is True
+    A missing/empty or unknown name must raise a clear error naming every
+    offending variable, so the bot and dashboard can tell the user to configure
+    the ``.env`` file instead of failing deep in the pipeline.
+    """
 
-        # A fresh scheduler (simulating a restart) restores the saved choice,
-        # overriding its initial .env fallback.
-        restarted = _make_scheduler(session_factory)
-        restarted._settings.entry_strategy_name = "donchian_er"
-        await restarted.load_selection_preferences()
-        assert restarted.active_strategy_name == "projection_ranking"
+    def test_valid_selection_passes(self):
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zoneprofit="trailing_ratchet",
+        )
+        validate_strategy_selection(settings)  # does not raise
 
-    async def test_select_close_profile_persists_and_restores(self, session_factory):
-        sched = _make_scheduler(session_factory)
-        sched._settings.close_profile_name = "atr_trailing"
-        assert await sched.select_close_profile("atr_trailing_profit") is True
+    def test_empty_selection_is_rejected(self):
+        settings = SimpleNamespace(
+            open_strategy="",
+            stop_strategy="",
+            close_zonestart="",
+            close_zonemarge="",
+            close_zoneprofit="",
+        )
+        with pytest.raises(ValueError) as exc:
+            validate_strategy_selection(settings)
+        message = str(exc.value)
+        assert "OPEN_STRATEGY" in message
+        assert "STOP_STRATEGY" in message
+        assert "CLOSE_ZONESTART" in message
+        assert "CLOSE_ZONEMARGE" in message
+        assert "CLOSE_ZONEPROFIT" in message
 
-        restarted = _make_scheduler(session_factory)
-        restarted._settings.close_profile_name = "atr_trailing"
-        await restarted.load_selection_preferences()
-        assert restarted.active_close_profile_name == "atr_trailing_profit"
-
-    async def test_daily_risk_toggle_persists_and_restores(self, session_factory):
-        sched = _make_scheduler(session_factory)
-        sched._settings.strategy_daily_risk_enabled = True
-        assert sched.daily_risk_enabled is True
-        assert await sched.select_daily_risk(False) is True
-        assert sched.daily_risk_enabled is False
-
-        # A fresh scheduler (restart) restores the disarmed choice.
-        restarted = _make_scheduler(session_factory)
-        restarted._settings.strategy_daily_risk_enabled = True
-        await restarted.load_selection_preferences()
-        assert restarted.daily_risk_enabled is False
-
-    async def test_rejected_selection_is_not_persisted(self, session_factory):
-        sched = _make_scheduler(session_factory)
-        sched._settings.entry_strategy_name = "donchian_er"
-        assert await sched.select_strategy("not_a_strategy") is False
-
-        restarted = _make_scheduler(session_factory)
-        restarted._settings.entry_strategy_name = "donchian_er"
-        await restarted.load_selection_preferences()
-        # Nothing persisted → stays on the fallback.
-        assert restarted.active_strategy_name == "donchian_er"
-
-    async def test_load_with_no_persisted_selection_keeps_fallback(
-        self, session_factory
-    ):
-        sched = _make_scheduler(session_factory)
-        sched._settings.entry_strategy_name = "donchian_projection"
-        sched._settings.close_profile_name = "atr_trailing"
-        await sched.load_selection_preferences()
-        assert sched.active_strategy_name == "donchian_projection"
-        assert sched.active_close_profile_name == "atr_trailing"
+    def test_unknown_name_is_rejected(self):
+        settings = SimpleNamespace(
+            open_strategy="not_a_strategy",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zoneprofit="trailing_ratchet",
+        )
+        with pytest.raises(ValueError, match="OPEN_STRATEGY"):
+            validate_strategy_selection(settings)
 
 
 class TestLastScheduledFire:

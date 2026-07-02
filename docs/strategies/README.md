@@ -1,85 +1,111 @@
-# Strategies — pluggable entry strategies
+# Strategies — decoupled entry, stop distance and close profile
 
-The bot's architecture separates **shared infrastructure** from the **entry
-strategy**. Everything below stays identical whatever strategy is plugged in:
+The bot's architecture separates **shared infrastructure** from the three trading
+decisions, which are themselves **fully decoupled** and each selected by name:
+
+- **Opening** lives in `src/entry/` — an `EntryStrategy.evaluate()` returns an
+  `EntryIntent` (direction only, never an exit level).
+- **Initial-stop placement** lives in `src/stops/` — a `StopDistance.initial_stop()`
+  returns the absolute protective stop at open (which drives sizing). Swappable
+  without touching the entry idea or the exit management.
+- **Closing** lives in `src/exit/` — a `CloseProfile` composes the stop distance at
+  open (`initial_plan()`) and, on every tick (`evaluate()`), classifies the live
+  bid into one of three zones (underwater / break-even band / real profit) and
+  delegates the hold/close/ratchet decision to the matching stop updater in
+  `src/exit/zones/`.
+
+They are composed at runtime and linked only through the persisted
+`Position.close_profile`. Everything below stays identical whatever entry, stop
+distance and exit are plugged in:
 
 - scheduler jobs (collect & analyze, monitor, sync, end-of-day…)
 - API queue, IG client, streaming feed, price buffer
-- pre-open gates (`evaluate_open_gates`: hours, max positions, daily P&L
-  circuit breakers, win-rate guard)
+- pre-open gates (`evaluate_open_gates`: trading hours, BUY direction,
+  duplicate-epic suppression)
 - order placement and the broker-side protective stop (`TradingService`)
-- close rules + ATR trailing stop (`decide_close_reason`,
-  `compute_trailing_stop`)
 - the simulator, the dashboard, the charts
 
-The strategy is the single decision point that turns a price buffer into an
-entry signal. It is selected **by name** in the configuration:
+Entry, stop distance and exit are each selected **by name** in the configuration.
+The exit is split into three independently-selected **zones** (open→break-even,
+break-even→margin, above-margin) so each zone's stop behaviour is tuned without
+influencing the others. The `.env` file is the **single source of truth**: every
+selection is **required** (there is no default in `config.py`, no database
+persistence and no runtime switching from the dashboard). If any is missing or
+unknown the bot and the dashboard refuse to start with a clear error.
 
 ```bash
 # .env
-STRATEGY_NAME=donchian_er
+OPEN_STRATEGY=open_projection
+STOP_STRATEGY=stop_support
+CLOSE_ZONESTART=hold              # zone open → break-even
+CLOSE_ZONEMARGE=hold             # zone break-even → margin
+CLOSE_ZONEPROFIT=trailing_ratchet  # zone above the margin
 ```
 
-## Available strategies
+## Available entry strategies
 
-| Name               | File                                 | Doc                                        | Style                                | Status            |
-| ------------------ | ------------------------------------ | ------------------------------------------ | ------------------------------------ | ----------------- |
-| `donchian_er`      | `src/strategies/donchian.py`         | [donchian-er.md](donchian-er.md)           | Breakout gated by trend efficiency   | **Live default**  |
-| `trend_follower`   | `src/strategies/trend_follower.py`   | [trend-follower.md](trend-follower.md)     | Composite-score trend confirmation   | Legacy (original) |
-| `momentum_scalper` | `src/strategies/momentum_scalper.py` | [momentum-scalper.md](momentum-scalper.md) | High-frequency spread-multiple scalp | Experimental      |
-| `trend_template`   | `src/strategies/trend_template.py`   | [trend-template.md](trend-template.md)     | Hourly cross-epic up-trend selector  | Experimental      |
-| `dip_rebound`      | `src/strategies/dip_rebound.py`      | [dip-rebound.md](dip-rebound.md)           | Buy the pullback in a rising market  | Experimental      |
-| —                  | `src/backtest/strategies.py` (lab)   | [research-lab.md](research-lab.md)         | 5-candidate research backtests       | Research only     |
+Registered in [src/entry/\_\_init\_\_.py](../../src/entry/__init__.py):
 
-## How it works
+| Name              | File                           | Doc                                      | Style                                   |
+| ----------------- | ------------------------------ | ---------------------------------------- | --------------------------------------- |
+| `open_donchian`   | `src/entry/open_donchian.py`   | [open_donchian.md](open_donchian.md)     | Breakout gated by trend efficiency      |
+| `open_projection` | `src/entry/open_projection.py` | [open_projection.md](open_projection.md) | Breakout + multi-model projection gate  |
+| `open_ranking`    | `src/entry/open_ranking.py`    | [open_ranking.md](open_ranking.md)       | Cross-epic ranker, one rolling position |
 
-```
-                    ┌──────────────────────────────┐
-   STRATEGY_NAME ──▶│  src/strategies/__init__.py  │  get_strategy(name, settings)
-                    └──────────────┬───────────────┘
-                                   ▼
-                       BaseStrategy.evaluate(epic, buf)
-                                   │  TradingSignal | None
-              ┌────────────────────┼────────────────────┐
-              ▼                    ▼                     ▼
-        live scheduler        simulator             (future: CLI)
-     _evaluate_epic()      StrategySimulator
-              │                    │
-              └──────── shared pipeline ────────────────┘
-        evaluate_open_gates → open_position → check_and_close
-              (gates)          (orders)     (close + ATR trail)
-```
+## Available stop-distance policies
 
-The contract ([src/strategies/base.py](../../src/strategies/base.py)):
+Registered in [src/stops/\_\_init\_\_.py](../../src/stops/__init__.py):
 
-- `warmup` — minimum candles needed before the first evaluation;
-- `evaluate(epic, buf) -> TradingSignal | None` — return a full signal
-  (direction + the position levels `level_win` / `level_zero` / `level_loose`
-  / `level_security` / `level_follower`) or `None` to stay flat.
+| Name           | File                        | Style                                           |
+| -------------- | --------------------------- | ----------------------------------------------- |
+| `stop_support` | `src/stops/stop_support.py` | Stop below a recency-weighted last-hour support |
+| `stop_atr`     | `src/stops/stop_atr.py`     | Flat `stop_atr_k × ATR` from the entry          |
 
-Convention: `level_win = 0` means "no fixed take-profit" — the win check is
-skipped and the position exits through the trailing stop (or end-of-day).
+## Available close profiles
 
-## Adding a strategy
+Registered in [src/exit/\_\_init\_\_.py](../../src/exit/__init__.py):
 
-1. Implement `src/strategies/<name>.py`, subclassing `BaseStrategy`
-   (provide `name`, `warmup`, `from_settings`, `evaluate`).
-1. Register the class in `STRATEGIES` (`src/strategies/__init__.py`).
-1. Add its parameters to `src/core/config.py` and `.env.example`.
-1. Document it here: `docs/strategies/<name>.md` (one detailed file per
-   strategy — mechanics, parameters, backtest results, limitations).
-1. Add tests in `tests/test_strategies.py`.
-1. Validate on the simulator (`/simulator` page lets you pick the strategy and
+| Name               | File                           | Doc                                        | Style                                              |
+| ------------------ | ------------------------------ | ------------------------------------------ | -------------------------------------------------- |
+| `close_zoneprofit` | `src/exit/close_zoneprofit.py` | [close_zoneprofit.md](close_zoneprofit.md) | Composes a stop distance + three per-zone updaters |
+
+## Contract
+
+Entry ([src/entry/base.py](../../src/entry/base.py)):
+
+- `warmup` — minimum candles before the first evaluation;
+- `evaluate(epic, buf) -> EntryIntent | None` — return a direction (+ optional
+  size hint) or `None` to stay flat.
+
+Stop distance ([src/stops/base.py](../../src/stops/base.py)):
+
+- `initial_stop(entry_level, direction, buf) -> float` — the absolute protective
+  stop chosen at open (drives sizing).
+
+Close ([src/exit/base.py](../../src/exit/base.py)):
+
+- `initial_plan(...)` — delegates the stop to the distance policy, freezes the
+  break-even / margin references;
+- `evaluate(...)` — the per-tick hold / close / ratchet-stop decision, split by
+  zone in `src/exit/zones/`.
+
+## Adding an entry, a stop distance or a close profile
+
+1. Implement it in `src/entry/<name>.py` (subclass `EntryStrategy`),
+   `src/stops/<name>.py` (subclass `StopDistance`) or `src/exit/<name>.py`
+   (subclass `CloseProfile`).
+1. Register the class in `ENTRY_STRATEGIES` / `STOP_DISTANCES` / `CLOSE_PROFILES`.
+1. Tune its parameters — most entries/profiles keep them as constants in their
+   own class; the shared breakout/regime knobs live in `.env` (`STRATEGY_*`).
+1. Document it here: `docs/strategies/<name>.md`.
+1. Add tests in `tests/` (isolated entry/exit tests).
+1. Validate on the simulator (`/simulator` page lets you pick the entry and
    compare it with the live one on identical seeds).
 
-## Testing a strategy
+## Testing
 
-- **Web**: the `/simulator` page has a *Strategy* selector; runs replay the
-  exact live pipeline (gates, trailing, end-of-day) on synthetic curves.
-- **Research lab**: `python -m src.scripts.compare_strategies` benchmarks the
-  five research candidates (long + short) across all curve profiles;
-  `python -m src.scripts.donchian_regime_filter` sweeps the efficiency-ratio
-  gate thresholds.
+- **Web**: the `/simulator` page runs replays of the exact live pipeline (gates,
+  trailing, end-of-day) on synthetic curves.
 
 > ⚠️ Synthetic-curve results are a **coherence check of the rules**, not a
 > market prediction. Trending profiles are cleaner than any real market, so

@@ -120,7 +120,7 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
         )
 
     settings = request.app.state.settings
-    strategy_name = body.strategy or settings.entry_strategy_name
+    strategy_name = body.strategy or settings.open_strategy
     archive = _archive(request)
     config = BacktestConfig(target_trades=body.target_trades)
 
@@ -216,7 +216,7 @@ def _stepper(
 @router.get("/backtest", response_class=HTMLResponse)
 async def backtest_page(request: Request) -> HTMLResponse:
     """Render the backtest page (archive picker + strategy replay)."""
-    live_strategy = request.app.state.settings.entry_strategy_name
+    live_strategy = request.app.state.settings.open_strategy
     strategy_options = "".join(
         f'<option value="{name}"{" selected" if name == live_strategy else ""}>'
         f"{name}{' (live)' if name == live_strategy else ''}</option>"
