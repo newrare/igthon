@@ -21,7 +21,9 @@ from src.core.api_queue import APIQueue, Priority
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal, atr
 from src.entry.base import EntryIntent
 from src.execution.gates import evaluate_open_gates
+from src.execution.recovery import RECOVERY_QTY_MULTIPLIER
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
+from src.exit.recovery_short import RecoveryShortProfile
 from src.exit.trailing import (
     clamp_trailing_distance,
     compute_trailing_stop,
@@ -133,6 +135,10 @@ class TradingService:
         # through ``open_from_intent`` / managed by ``manage_position``. It is
         # chosen independently of the entry strategy (open/close decoupling).
         self._close_profile = close_profile
+        # Dedicated exit for recovery SELL positions (built lazily). The main
+        # close profile is long-only; a short is routed here by ``manage_position``
+        # regardless of the configured long profile.
+        self._recovery_short_profile: RecoveryShortProfile | None = None
 
     async def _is_epic_open(self, epic: str) -> bool:
         """Check if a position is already open for this epic."""
@@ -566,6 +572,203 @@ class TradingService:
 
         return position
 
+    async def open_recovery_short(
+        self,
+        closed_position: Position,
+        buf: EpicBuffer,
+        *,
+        quantity_multiplier: int = RECOVERY_QTY_MULTIPLIER,
+    ) -> Position | None:
+        """Open a double-size SELL to recover a stopped-out long's loss.
+
+        The loss-recovery feature calls this right after a long closes on the
+        "trend-reversal at open" pattern (see :func:`src.execution.recovery`).
+        It sells the same epic betting on the confirmed decline, at
+        ``quantity_multiplier ×`` the closed long's size, with the mirrored short
+        exit (:class:`~src.exit.recovery_short.RecoveryShortProfile`) placing the
+        initial stop *above* the entry. The short is stamped ``reason_open =
+        "recovery"`` so it can never itself trigger another recovery (anti-loop).
+
+        Mirrors :meth:`open_position` for a SELL rather than reusing it, so the
+        long-only open path stays untouched. Returns the created ``Position`` or
+        ``None`` when the market is not tradeable, the stop breaks the dealing
+        rules, or IG rejects the order.
+        """
+        epic = closed_position.epic
+        last = buf.last
+        if last is None:
+            logger.info("No candle for %s — cannot open recovery short", epic)
+            return None
+
+        # A SELL is filled at the bid; that is the recovery short's entry.
+        entry_level = last.bid_close
+        profile = self._short_profile()
+        plan = profile.initial_plan(entry_level=entry_level, direction="SELL", buf=buf)
+
+        # 1. Market info + dealing rules (same validation as open_position).
+        market_data = await self._client.get(
+            f"/markets/{epic}",
+            version=3,
+            priority=Priority.URGENT,
+            label=f"recovery {epic}: market",
+        )
+        instrument = market_data.get("instrument", {})
+        snapshot = market_data.get("snapshot", {})
+        dealing_rules = market_data.get("dealingRules", {})
+
+        if snapshot.get("marketStatus") != "TRADEABLE":
+            logger.info(
+                "Recovery short skipped — %s not tradeable: %s",
+                epic,
+                snapshot.get("marketStatus"),
+            )
+            return None
+
+        min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
+        max_stop_rule = dealing_rules.get("maxStopOrLimitDistance", {})
+        min_deal_size = dealing_rules.get("minDealSize", {}).get("value", 1)
+        scaling_factor = (
+            float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
+        )
+
+        def _rule_to_price_distance(rule: dict, default: float) -> float:
+            raw = rule.get("value")
+            if raw is None:
+                return default
+            value = float(raw)
+            if rule.get("unit") == "PERCENTAGE":
+                return value * entry_level / 100
+            return value / scaling_factor
+
+        min_stop_price = _rule_to_price_distance(min_stop_rule, 0.0)
+        max_stop_price = _rule_to_price_distance(max_stop_rule, float("inf"))
+        min_stop_price *= 1 + self._config.stop_min_distance_margin
+
+        # A short's stop sits ABOVE the entry; the distance is positive upward.
+        stop_level = plan.stop_level
+        stop_price_distance = stop_level - entry_level
+        if stop_price_distance < min_stop_price:
+            stop_price_distance = min_stop_price
+            stop_level = entry_level + stop_price_distance
+        if stop_price_distance > max_stop_price:
+            logger.info(
+                "Recovery short stop too large for %s: %.5f > max %.5f",
+                epic,
+                stop_price_distance,
+                max_stop_price,
+            )
+            return None
+
+        # 2. Quantity — double the closed long's size (bounded to the min deal).
+        base_qty = max(int(closed_position.quantity or int(min_deal_size) or 1), 1)
+        quantity = base_qty * max(int(quantity_multiplier), 1)
+
+        currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
+        expiry = instrument.get("expiry", "-")
+        epp = euro_per_point(market_data, quantity, currency)
+        euro_risk = stop_price_distance * epp if epp else quantity * stop_price_distance
+
+        # 3. Send the SELL order with an absolute stop level (above entry).
+        order_payload = {
+            "epic": epic,
+            "expiry": expiry,
+            "direction": "SELL",
+            "size": str(quantity),
+            "orderType": "MARKET",
+            "currencyCode": currency,
+            "guaranteedStop": False,
+            "stopLevel": round(stop_level, 5),
+            "forceOpen": True,
+        }
+        logger.info(
+            "Recovery short: epic=%s, qty=%d, stop=%.5f (+%.5f), risk=%.2f€",
+            epic,
+            quantity,
+            stop_level,
+            stop_price_distance,
+            euro_risk,
+        )
+        try:
+            result = await self._client.post(
+                "/positions/otc",
+                order_payload,
+                version=2,
+                priority=Priority.URGENT,
+                label=f"recovery {epic}: order",
+            )
+        except Exception as exc:
+            logger.error("Failed to open recovery short for %s: %s", epic, exc)
+            return None
+
+        deal_reference = result.get("dealReference")
+        if not deal_reference:
+            logger.error("No dealReference for recovery short %s", epic)
+            return None
+
+        now = datetime.now(UTC)
+        position = Position(
+            epic=epic,
+            epic_name=instrument.get("name", epic)[:10],
+            deal_reference=deal_reference,
+            deal_id=None,
+            direction="SELL",
+            date=now.date(),
+            time_open=now.time(),
+            state=PositionState.OPEN,
+            strategy=PositionStrategy.TARGET,
+            reason_open="recovery",
+            close_profile=plan.profile,
+            level_open=Decimal(str(round(entry_level, 5))),
+            level_win=Decimal("0"),
+            level_zero=Decimal(str(round(plan.level_zero, 5))),
+            level_follower=Decimal(str(round(stop_level, 5))),
+            level_loose=Decimal(str(round(stop_level, 5))),
+            level_security=Decimal(str(round(stop_level, 5))),
+            level_stop=Decimal(str(round(stop_level, 5))),
+            level_margin=Decimal(str(round(plan.level_margin, 5))),
+            pip_spread=Decimal(str(round(last.spread, 5))),
+            quantity=quantity,
+            size=int(round(stop_price_distance * scaling_factor)),
+            euro_stop=Decimal(str(round(euro_risk, 3))),
+            euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
+            stop_history=[{"t": now.isoformat(), "level": round(float(stop_level), 5)}],
+        )
+        self._db.add(position)
+        await self._db.commit()
+        await self._db.refresh(position)
+
+        confirmation = await self._confirm_with_retry(deal_reference, epic)
+        if confirmation is None:
+            logger.error(
+                "Could not confirm recovery short %s for %s — kept, sync reconciles",
+                deal_reference,
+                epic,
+            )
+            return position
+        if confirmation.get("dealStatus") != "ACCEPTED":
+            reason = confirmation.get("reason", "UNKNOWN")
+            logger.warning(
+                "Recovery short rejected for %s: %s — removing draft row", epic, reason
+            )
+            await self._db.delete(position)
+            await self._db.commit()
+            return None
+
+        deal_id = confirmation.get("dealId", "")
+        open_level = float(confirmation.get("level", entry_level))
+        position.deal_id = deal_id or None
+        position.level_open = Decimal(str(round(open_level, 5)))
+        await self._db.commit()
+
+        logger.info(
+            "Recovery short opened: epic=%s, deal=%s, level=%.5f, stop=%.5f",
+            epic,
+            deal_id,
+            open_level,
+            stop_level,
+        )
+        return position
+
     async def _confirm_with_retry(self, deal_reference: str, epic: str) -> dict | None:
         """Poll ``GET /confirms/{ref}`` until IG can resolve the deal reference.
 
@@ -644,8 +847,9 @@ class TradingService:
 
         Preferred path: ``euro_per_point`` is the currency-converted euro value
         of one full point of movement for the whole position, so the P&L is
-        simply ``(level - open) * euro_per_point``. This is correct for JPY/USD
-        pairs (currency conversion applied) and indices alike.
+        ``(level - open) * euro_per_point`` for a long and ``(open - level) *
+        euro_per_point`` for a short. This is correct for JPY/USD pairs (currency
+        conversion applied) and indices alike.
 
         Legacy fallback (positions opened before ``euro_per_point`` existed):
         derive a per-pip value from ``euro_stop`` / ``size`` / ``quantity``.
@@ -653,7 +857,10 @@ class TradingService:
         until ``reconcile_realized_pnl`` overwrites it with IG's figure.
         """
         open_level = float(position.level_open or 0)
+        # A short gains when the price falls, so its P&L is the mirror of a long's.
         move = level - open_level
+        if position.direction == "SELL":
+            move = -move
         if position.euro_per_point is not None and float(position.euro_per_point) != 0:
             return move * float(position.euro_per_point)
         euro_per_pip = (
@@ -1009,10 +1216,16 @@ class TradingService:
                     position.deal_id = ig_deal_id
                     dirty = True
 
-            # Update live unrealized P&L and excursion from the current bid.
+            # Update live unrealized P&L and excursion from the current price. A
+            # long marks against the bid (sell-to-close); a short against the
+            # offer (buy-to-close). Fall back to the bid if the offer is absent.
             bid = market.get("bid")
-            if bid is not None:
-                euro_pnl = self._euro_pnl(position, float(bid))
+            if position.direction == "SELL":
+                mark = market.get("offer", bid)
+            else:
+                mark = bid
+            if mark is not None:
+                euro_pnl = self._euro_pnl(position, float(mark))
                 position.euro = Decimal(str(round(euro_pnl, 3)))
                 position.euro_max = Decimal(
                     str(round(max(euro_pnl, float(position.euro_max or euro_pnl)), 3))
@@ -1268,10 +1481,17 @@ class TradingService:
         Returns:
             True if the position was closed, False otherwise.
         """
-        if self._close_profile is None or buf is None or buf.last is None:
+        # Recovery SELL positions are managed by the mirrored short profile, never
+        # by the long-only close profile — route on the persisted trade side.
+        if position.direction == "SELL":
+            profile: CloseProfile | None = self._short_profile()
+        else:
+            profile = self._close_profile
+
+        if profile is None or buf is None or buf.last is None:
             return await self.check_and_close(position, current_bid, buf)
 
-        decision = self._close_profile.evaluate(
+        decision = profile.evaluate(
             position,
             current_bid,
             buf,
@@ -1283,18 +1503,50 @@ class TradingService:
             decision.action == ACTION_UPDATE_STOP
             and decision.new_stop_level is not None
         ):
-            position.level_follower = Decimal(str(round(decision.new_stop_level, 3)))
+            new_stop = decision.new_stop_level
+            current = float(position.level_follower or 0)
+            # Ratchet invariant, enforced here regardless of what the updater
+            # returned: a long's protective stop only ever moves up, a short's
+            # only ever down. Defence-in-depth on top of each updater's own guard
+            # — a stop already secured (e.g. pushed by the profit zone) must never
+            # be pulled back when a pull-back re-enters a lower zone. Rounding is
+            # 5 dp (matching the level column and stop_history) so the comparison
+            # is exact; a coarser round would let a genuinely lower stop slip past.
+            if current > 0 and not self._is_favourable_stop_move(
+                position.direction, new_stop, current
+            ):
+                return False
+            position.level_follower = Decimal(str(round(new_stop, 5)))
             position.stop_update = (position.stop_update or 0) + 1
-            self._append_stop_history(position, decision.new_stop_level)
-            await self._push_stop_to_ig(position, decision.new_stop_level)
+            self._append_stop_history(position, new_stop)
+            await self._push_stop_to_ig(position, new_stop)
             await self._db.commit()
             logger.debug(
                 "Trailing stop for %s -> %.3f (profile=%s)",
                 position.epic,
                 decision.new_stop_level,
-                self._close_profile.name,
+                profile.name,
             )
         return False
+
+    @staticmethod
+    def _is_favourable_stop_move(
+        direction: str | None, new_stop: float, current: float
+    ) -> bool:
+        """True when moving the follower to ``new_stop`` tightens protection.
+
+        A long's stop only ever ratchets **up**; a short's only ever **down**.
+        Used to enforce the ratchet invariant when applying a stop update.
+        """
+        if direction == "SELL":
+            return new_stop < current
+        return new_stop > current
+
+    def _short_profile(self) -> RecoveryShortProfile:
+        """The mirrored short exit for recovery SELL positions (built once)."""
+        if self._recovery_short_profile is None:
+            self._recovery_short_profile = RecoveryShortProfile()
+        return self._recovery_short_profile
 
     async def check_and_close(
         self,
@@ -1365,7 +1617,11 @@ class TradingService:
         if new_stop is None:
             return
 
-        position.level_follower = Decimal(str(round(new_stop, 3)))
+        # 5 dp to match the level column and stop_history: a coarser round would
+        # drop the 4th/5th digit on forex (e.g. 1.62413 → 1.624) and let the next
+        # tick's guard compare against a stop up to ~5 points below the real one,
+        # which then reads as the follower stepping *down* on the chart.
+        position.level_follower = Decimal(str(round(new_stop, 5)))
         position.stop_update = (position.stop_update or 0) + 1
         self._append_stop_history(position, new_stop)
         await self._push_stop_to_ig(position, new_stop)
@@ -1515,9 +1771,12 @@ class TradingService:
             return True
 
         logger.info("Closing %s with dealId=%s", position.epic, deal_id)
+        # Closing side is the opposite of the open side: SELL to close a long,
+        # BUY to close a short (the recovery SELL).
+        close_direction = "BUY" if position.direction == "SELL" else "SELL"
         close_payload = {
             "dealId": deal_id,
-            "direction": "SELL",
+            "direction": close_direction,
             "size": position.quantity or 1,
             "orderType": "MARKET",
             "timeInForce": "EXECUTE_AND_ELIMINATE",

@@ -336,6 +336,71 @@ class TestTrailingStop:
         assert pos.stop_history == seed
 
 
+class _StubProfile:
+    """Close profile that always proposes ``new_stop`` as a stop update."""
+
+    name = "stub"
+
+    def __init__(self, new_stop: float) -> None:
+        self._new_stop = new_stop
+
+    def evaluate(self, position, current_bid, buf, *, is_close_hour):
+        from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
+
+        return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=self._new_stop)
+
+
+class TestManagePositionRatchet:
+    """``manage_position`` enforces the ratchet invariant when applying a stop."""
+
+    def _svc_with_profile(self, profile):
+        svc, client, db = _trailing_service()
+        svc._is_epic_close_hour = AsyncMock(return_value=False)
+        svc._close_profile = profile
+        return svc, client, db
+
+    async def test_long_stop_is_never_lowered(self):
+        # A lower stop than the current follower (e.g. a pull-back re-entering a
+        # lower zone) must be rejected — a long's stop only ratchets up.
+        svc, _, db = self._svc_with_profile(_StubProfile(new_stop=1.62408))
+        pos = Position(
+            epic="X", deal_id="D", direction="BUY", level_follower=Decimal("1.62413")
+        )
+        closed = await svc.manage_position(
+            pos, current_bid=1.6250, buf=_buffer_with_atr2()
+        )
+        assert closed is False
+        assert float(pos.level_follower) == pytest.approx(1.62413)  # unchanged
+        db.commit.assert_not_awaited()
+
+    async def test_long_stop_raise_is_stored_at_full_precision(self):
+        # A higher stop is applied and persisted at 5 dp — the coarser 3 dp round
+        # would have collapsed 1.62418 to 1.624 and desynced the up-only guard.
+        svc, _, db = self._svc_with_profile(_StubProfile(new_stop=1.62418))
+        pos = Position(
+            epic="X", deal_id="D", direction="BUY", level_follower=Decimal("1.62413")
+        )
+        await svc.manage_position(pos, current_bid=1.6250, buf=_buffer_with_atr2())
+        assert float(pos.level_follower) == pytest.approx(1.62418)
+        db.commit.assert_awaited()
+
+    async def test_short_stop_is_never_raised(self):
+        # Mirror for a short: the stop only ratchets down, so a higher proposal is
+        # rejected. The short path routes through the recovery short profile.
+        svc, _, db = _trailing_service()
+        svc._is_epic_close_hour = AsyncMock(return_value=False)
+        svc._recovery_short_profile = _StubProfile(new_stop=1.62500)
+        pos = Position(
+            epic="X", deal_id="D", direction="SELL", level_follower=Decimal("1.62413")
+        )
+        closed = await svc.manage_position(
+            pos, current_bid=1.6230, buf=_buffer_with_atr2()
+        )
+        assert closed is False
+        assert float(pos.level_follower) == pytest.approx(1.62413)  # unchanged
+        db.commit.assert_not_awaited()
+
+
 def _open_signal(*, bid: float, level_security: float) -> TradingSignal:
     """Minimal BUY signal for open_position; only epic/levels are read."""
     spread = 0.0003

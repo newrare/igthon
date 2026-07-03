@@ -8,9 +8,12 @@ ATR chandelier that trails the bid up in steps.
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from src.core.indicators import atr
 from src.exit.zones import (
     BreakevenBandStop,
+    BreakevenLockParams,
     BreakevenLockStop,
     StopContext,
     StopZone,
@@ -19,6 +22,10 @@ from src.exit.zones import (
     classify_zone,
 )
 from src.feed.price_buffer import Candle, EpicBuffer
+
+# A confirm window larger than any test buffer disables the support-anchored
+# break-even FLOOR, isolating the chandelier for the tests that target it.
+_NO_FLOOR = BreakevenLockParams(confirm_window=999)
 
 _START = datetime(2024, 1, 1, 9, 0, tzinfo=UTC)
 
@@ -98,31 +105,53 @@ class TestHoldingZones:
 
 
 class TestBreakevenLock:
-    # ``_buffer`` builds a monotonically rising bid, so ``adverse_tick_noise`` is
-    # 0 and the required gap floors on ``2 × spread`` (= 1.0 at spread 0.5). The
-    # lock target is ``level_zero + 1 × spread`` (= 8000.5 below).
+    # A monotonically non-decreasing bid has zero adverse-tick-noise, so the gate
+    # reduces to ``swing_low > level_zero`` and the lock lands at
+    # ``level_zero + lock_fraction × (swing_low − level_zero)``. The buffers below
+    # climb, then hold at a plateau so the confirmation window's swing low is a
+    # known value while the bid stays inside the band (≤ level_margin).
 
-    def test_locks_a_hair_above_break_even_when_bid_is_clear(self):
-        buf = _buffer([8000.0 + i for i in range(40)])
+    def _held_buffer(self, plateau: float) -> EpicBuffer:
+        # Rise into a long flat plateau so ``min`` over the confirm window is the
+        # plateau level and the noise band is zero (non-decreasing closes).
+        rise = [7990.0, 7993.0, 7996.0, 7999.0]
+        return _buffer(rise + [plateau] * 20)
+
+    def test_locks_under_swing_low_once_move_has_held(self):
+        # Plateau at 8005 held for the whole window → swing_low = 8005, noise = 0.
+        # target = 8000 + 0.6 × (8005 − 8000) = 8003.0.
+        buf = self._held_buffer(8005.0)
         ctx = _ctx(
             buf,
-            current_bid=8005.0,  # 4.5 above the 8000.5 target → clears the 1.0 gap
+            current_bid=8005.0,  # in the band (≤ 8010), matches the plateau
             level_zero=8000.0,
             level_margin=8010.0,
             level_follower=7950.0,
         )
         new_stop = BreakevenLockStop().propose(ctx)
-        assert new_stop == 8000.5
+        assert new_stop == pytest.approx(8003.0)
         assert ctx.level_zero < new_stop < ctx.current_bid
         assert new_stop > ctx.level_follower
 
-    def test_holds_while_bid_hugs_break_even(self):
-        # Bid only a hair above break-even → gap to the lock target is under the
-        # noise floor → do not pull the stop up into the noise.
-        buf = _buffer([8000.0 + i for i in range(40)])
+    def test_holds_while_swing_low_has_not_cleared_break_even(self):
+        # A recent dip back to/under break-even inside the window → swing_low is
+        # not clear of break-even (net of noise) → the move has not held → hold.
+        buf = _buffer([8005.0] * 25 + [7999.0] + [8004.0] * 9)  # dip in last 10
         ctx = _ctx(
             buf,
-            current_bid=8000.8,  # 0.3 above the 8000.5 target < the 1.0 gap
+            current_bid=8004.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert BreakevenLockStop().propose(ctx) is None
+
+    def test_holds_with_too_few_candles(self):
+        # Fewer closes than the confirmation window → cannot assess persistence.
+        buf = _buffer([8004.0] * 5)
+        ctx = _ctx(
+            buf,
+            current_bid=8004.0,
             level_zero=8000.0,
             level_margin=8010.0,
             level_follower=7950.0,
@@ -132,19 +161,20 @@ class TestBreakevenLock:
     def test_never_lowers_an_already_pushed_stop(self):
         # Follower already above the lock target (e.g. pushed by the profit zone on
         # an earlier excursion) → hold rather than pull it back down.
-        buf = _buffer([8000.0 + i for i in range(40)])
+        buf = self._held_buffer(8005.0)
         ctx = _ctx(
             buf,
             current_bid=8005.0,
             level_zero=8000.0,
             level_margin=8010.0,
-            level_follower=8001.0,  # > 8000.5 target
+            level_follower=8004.0,  # > 8003.0 target
         )
         assert BreakevenLockStop().propose(ctx) is None
 
 
 class TestTrailingRatchet:
     def test_rising_bids_far_in_profit_ratchets_up(self):
+        # Chandelier clear of the margin and above the lock floor → it governs.
         buf = _buffer([8000.0 + i for i in range(60)])
         atr_v = atr(list(buf.candles), 14)
         bid = buf.last.bid_close  # far above entry, rising tail
@@ -160,8 +190,9 @@ class TestTrailingRatchet:
         assert new_stop > ctx.level_follower
         assert new_stop < bid
 
-    def test_single_spike_does_not_ratchet(self):
-        # A lone up-spike preceded by a down-step → only one rising step → hold.
+    def test_single_spike_does_not_ratchet_the_chandelier(self):
+        # A lone up-spike preceded by a down-step → only one rising step → the
+        # chandelier is not tightened. With the floor disabled, the zone holds.
         closes = [8000.0 + i for i in range(40)]
         closes[-2] = closes[-3] - 5.0
         buf = _buffer(closes)
@@ -174,11 +205,11 @@ class TestTrailingRatchet:
             level_margin=8005.0,
             level_follower=8000.0 - 2.5 * atr_v,
         )
-        assert TrailingRatchetStop().propose(ctx) is None
+        assert TrailingRatchetStop(lock=_NO_FLOOR).propose(ctx) is None
 
-    def test_new_stop_never_lands_in_the_dead_band(self):
+    def test_chandelier_never_lands_in_the_dead_band(self):
         # Rising and in profit, but the trailed stop would fall at/below the margin
-        # level → hold rather than park the stop in the band.
+        # → the chandelier is suppressed. With the floor disabled, the zone holds.
         buf = _buffer([8000.0 + i for i in range(40)])
         atr_v = atr(list(buf.candles), 14)
         bid = buf.last.bid_close
@@ -190,7 +221,44 @@ class TestTrailingRatchet:
             level_margin=bid - 2.5 * atr_v + 1.0,
             level_follower=8000.0 - 2.5 * atr_v,
         )
-        assert TrailingRatchetStop().propose(ctx) is None
+        assert TrailingRatchetStop(lock=_NO_FLOOR).propose(ctx) is None
+
+    def test_floor_establishes_first_stop_when_momentum_fails(self):
+        # Bid held on a flat plateau far in profit: the momentum gate fails (no
+        # rising tail) so the chandelier is idle, but the move HAS held above
+        # break-even → the support-anchored floor establishes the first stop. This
+        # is the "no unmanaged profit zone" guarantee.
+        buf = _buffer([7995.0, 7998.0] + [8050.0] * 20)  # flat plateau tail
+        ctx = _ctx(
+            buf,
+            current_bid=8050.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        new_stop = TrailingRatchetStop().propose(ctx)
+        # swing_low = 8050, noise = 0 → floor = 8000 + 0.6 × 50 = 8030.
+        assert new_stop == pytest.approx(8030.0)
+        assert ctx.level_follower < new_stop < ctx.current_bid
+
+    def test_floor_applies_when_chandelier_is_in_the_dead_band(self):
+        # The live scenario: rising in profit, but the chandelier (bid − k·ATR)
+        # would land in the dead band and is suppressed. The floor still places a
+        # support-anchored stop — which may sit below the margin, safely, because
+        # it is anchored under a real swing low.
+        buf = _buffer([8000.0 + i for i in range(60)])
+        bid = buf.last.bid_close
+        ctx = _ctx(
+            buf,
+            current_bid=bid,
+            level_zero=8000.0,
+            level_margin=bid - 0.5,  # so the chandelier is always ≤ margin
+            level_follower=7950.0,
+        )
+        new_stop = TrailingRatchetStop().propose(ctx)
+        # swing_low over the last 10 closes = 8050 → floor = 8000 + 0.6 × 50 = 8030.
+        assert new_stop == pytest.approx(8030.0)
+        assert new_stop < ctx.level_margin  # the floor may sit below the margin
 
     def test_wider_width_pushes_stop_further_below_bid(self):
         buf = _buffer([8000.0 + i for i in range(60)])
@@ -202,12 +270,13 @@ class TestTrailingRatchet:
             level_margin=8000.0 + max(0.5 * atr_v, buf.last.spread * 2.0),
             level_follower=8000.0 - 2.5 * atr_v,
         )
-        narrow = TrailingRatchetStop(atr_k_pre=2.5, atr_k_post=2.5).propose(
-            _ctx(buf, **kw)
-        )
-        wide = TrailingRatchetStop(atr_k_pre=3.5, atr_k_post=3.5).propose(
-            _ctx(buf, **kw)
-        )
+        # Floor disabled so the comparison isolates the chandelier width.
+        narrow = TrailingRatchetStop(
+            atr_k_pre=2.5, atr_k_post=2.5, lock=_NO_FLOOR
+        ).propose(_ctx(buf, **kw))
+        wide = TrailingRatchetStop(
+            atr_k_pre=3.5, atr_k_post=3.5, lock=_NO_FLOOR
+        ).propose(_ctx(buf, **kw))
         assert narrow is not None and wide is not None
         assert wide < narrow  # wider width → stop further below the bid
 
@@ -231,7 +300,12 @@ class TestTrailingRatchet:
             level_margin=8001.0,  # low, so neither stop lands in the dead band
             level_follower=7900.0,
         )
-        without = TrailingRatchetStop(noise_mult=0.0).propose(_ctx(buf, **kw))
-        with_floor = TrailingRatchetStop(noise_mult=5.0).propose(_ctx(buf, **kw))
+        # Floor disabled so the comparison isolates the chandelier noise floor.
+        without = TrailingRatchetStop(noise_mult=0.0, lock=_NO_FLOOR).propose(
+            _ctx(buf, **kw)
+        )
+        with_floor = TrailingRatchetStop(noise_mult=5.0, lock=_NO_FLOOR).propose(
+            _ctx(buf, **kw)
+        )
         assert without is not None and with_floor is not None
         assert with_floor < without  # noise floor → stop further below the bid

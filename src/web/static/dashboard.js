@@ -885,10 +885,19 @@ async function _loadChart(epic, initial) {
         // Normalisation bounds: include both curves and every trade's price levels
         // so their lines stay inside the [0, 100]% view even when stop/target sit
         // outside the recent bid range.
-        let lo = Math.min(Math.min.apply(null, rawBids), Math.min.apply(null, rawOffers));
+        // Noise-adjusted bid: the raw bid minus the per-candle adverse tick-noise
+        // band the zone gates test against (server-computed, in price points). Sits
+        // just under the bid; where IT clears break-even / margin is where the
+        // updaters treat the bid as genuinely in the band / profit zone (not mere
+        // bid/offer churn). Falls back to the raw bid when the band is absent.
+        const rawNoiseBid = candles.map(function(c) {
+            return (typeof c.noise === 'number' && isFinite(c.noise)) ? c.bid - c.noise : c.bid;
+        });
+        let lo = Math.min(Math.min.apply(null, rawBids), Math.min.apply(null, rawOffers),
+                          Math.min.apply(null, rawNoiseBid));
         let hi = Math.max(Math.max.apply(null, rawBids), Math.max.apply(null, rawOffers));
         trades.forEach(function(t) {
-            ['open', 'openBid', 'zero', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
+            ['open', 'openBid', 'zero', 'margin', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
                 const v = t[k];
                 if (typeof v === 'number' && isFinite(v)) {
                     if (v < lo) lo = v;
@@ -931,6 +940,19 @@ async function _loadChart(epic, initial) {
             line: { color: '#475569', width: 1, dash: 'dot' },
             name: 'Offer close',
             hovertemplate: 'Offer: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
+        }, {
+            // Noise-adjusted bid (bid − adverse tick-noise band): a dim orange line
+            // just below the bid. When this trace — not the raw bid — clears the
+            // Break-even / Margin lines is when the zone updaters stop reading the
+            // move as churn, so it explains why a stop does (or does not) ratchet.
+            x: timestamps,
+            y: rawNoiseBid.map(toPct),
+            customdata: rawNoiseBid,
+            type: 'scatter',
+            mode: 'lines',
+            line: { color: 'rgba(224,123,57,0.4)', width: 1, dash: 'dot' },
+            name: 'Bid − noise',
+            hovertemplate: 'Bid − noise: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
         }];
         const shapes = [];
         const annotations = [];
@@ -1077,6 +1099,11 @@ async function _loadChart(epic, initial) {
             // the bid (openBid = level_zero - spread), so the gap up to this line
             // is exactly the spread; the bid curve reaching it = break-even.
             addLevelLine(t.zero, '#cbd5e1', 'solid', 'Break-even');
+            // Margin line = break-even + noise margin (frozen at open): the
+            // boundary between the break-even band (zone 2) and real profit
+            // (zone 3). Cyan, dashed, to sit visually between break-even and the
+            // profit trailing without being mistaken for a stop.
+            addLevelLine(t.margin, '#22d3ee', 'dash', 'Margin');
             // Two protective stops, each its own line. Prefer the real stepped
             // path; fall back to a flat line at the scalar level for positions
             // opened before the history was captured.

@@ -44,6 +44,12 @@ class Position(Base):
     state: Mapped[PositionState] = mapped_column(
         Enum(PositionState), default=PositionState.OPEN
     )
+    # Trade side: "BUY" (long) or "SELL" (short). The live pipeline is long-only,
+    # so this defaults to BUY and every normal open leaves it BUY. The loss-recovery
+    # feature (src/execution/recovery.py) is the only path that opens a SELL, managed
+    # by a mirrored short exit (src/exit/recovery_short.py). Direction-aware P&L and
+    # close order side key off this column. See migration a1c2e3f4d5b6.
+    direction: Mapped[str] = mapped_column(String(4), nullable=False, default="BUY")
     strategy: Mapped[PositionStrategy | None] = mapped_column(Enum(PositionStrategy))
     # Price levels are stored with 5 decimals: forex pairs (e.g. GBP/EUR at
     # 1.15729) move below the 3rd decimal, so Numeric(10, 3) silently truncated

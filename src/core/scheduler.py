@@ -24,6 +24,7 @@ from src.core.api_queue import APIQueue, Priority
 from src.core.config import Settings
 from src.core.recorder import Recorder
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
+from src.execution.recovery import is_recovery_trigger
 from src.execution.trading import (
     DEFAULT_MARKET_CLOSE_HOUR_UTC,
     TradeConfig,
@@ -1737,8 +1738,62 @@ class BotScheduler:
                                 f"reason={position.reason_close} "
                                 f"P&L={position.euro}€"
                             )
+                            await self._maybe_open_recovery(
+                                trading, session, position, buf
+                            )
                 except Exception as exc:
                     logger.error("Error monitoring position %s: %s", position.epic, exc)
+
+    async def _maybe_open_recovery(
+        self,
+        trading: TradingService,
+        session: AsyncSession,
+        closed_position: Position,
+        buf: EpicBuffer | None,
+    ) -> None:
+        """Open a double-size SELL when a long stopped out on the reversal pattern.
+
+        Gated by ``RECOVERY_ENABLED``. Fires only when the just-closed position
+        matches :func:`~src.execution.recovery.is_recovery_trigger` (a quick,
+        never-in-profit long stop-out). The open is serialised under the same
+        lock as the rolling ranking selector and re-checks that no position is
+        open, so the recovery short and a ranker BUY can never both grab the
+        single freed slot — the recovery short takes it and, counting as the one
+        open position, blocks any further BUY while it runs.
+        """
+        if not self._settings.recovery_enabled:
+            return
+        if buf is None or buf.last is None:
+            return
+        if not is_recovery_trigger(closed_position):
+            return
+
+        async with self._select_lock:
+            open_count = (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(Position)
+                    .where(Position.state == PositionState.OPEN)
+                )
+            ) or 0
+            if open_count > 0:
+                logger.info(
+                    "Recovery skipped for %s: %d position(s) already open",
+                    closed_position.epic,
+                    open_count,
+                )
+                return
+            logger.info(
+                "Recovery trigger on %s (loss=%s€) — opening double-size SELL",
+                closed_position.epic,
+                closed_position.euro,
+            )
+            short = await trading.open_recovery_short(closed_position, buf)
+            if short is not None:
+                self._recorder.info(
+                    f"Recovery short opened: {closed_position.epic} "
+                    f"@ {short.level_open} (x{short.quantity})"
+                )
 
     async def _sync_positions(self) -> None:
         """Reconcile DB open positions against IG's live position list.

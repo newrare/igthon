@@ -133,3 +133,52 @@ def compute_trailing_stop(
     if new_stop <= level_follower + step:
         return None
     return new_stop
+
+
+def compute_trailing_stop_short(
+    current_offer: float,
+    *,
+    atr_value: float,
+    spread: float,
+    level_zero: float,
+    level_follower: float,
+    euro_per_point: float,
+    euro_stop: float,
+    config: TrailingConfig,
+    noise_floor: float = 0.0,
+) -> float | None:
+    """Mirror of :func:`compute_trailing_stop` for a SHORT position.
+
+    A short profits when the price falls, so the protective stop sits *above*
+    the price (at the offer, the buy-to-close cost) and only ever ratchets
+    **down**, tracking ``k × ATR`` above the running low. Everything else is
+    symmetric to the long: the distance is bounded by the same
+    :func:`clamp_trailing_distance` (magnitude only), and ``noise_floor`` keeps
+    the stop beyond ordinary up-jitter so a normal pull-back up cannot knock a
+    still-running short out.
+
+    Returns:
+        The new (lower) stop level, or None when no update is warranted.
+    """
+    if atr_value <= 0:
+        return None
+
+    # Past break-even for a short: the offer has fallen below the break-even
+    # level (real profit). Kept for the two-speed regime; the app keeps k equal.
+    past_zero = level_zero > 0 and current_offer <= level_zero
+    k = config.atr_k_post if past_zero else config.atr_k_pre
+    distance = clamp_trailing_distance(
+        k * atr_value,
+        spread=spread,
+        euro_per_point=euro_per_point,
+        euro_stop=euro_stop,
+        noise_floor=noise_floor,
+    )
+
+    new_stop = current_offer + distance
+
+    # Ratchet: only move down, and only when the gain is worth an API write.
+    step = config.trailing_step_ratio * atr_value
+    if new_stop >= level_follower - step:
+        return None
+    return new_stop

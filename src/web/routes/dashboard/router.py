@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import select
 
 from src.core.api_queue import Priority
+from src.core.indicators import adverse_tick_noise
 from src.entry.base import EntryIntent
 from src.execution.trading import TradeConfig, TradingService
 from src.models.position import Position, PositionState
@@ -27,6 +28,16 @@ from src.web.routes.dashboard.state import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Noise band drawn under the bid on the position chart. Mirrors the defaults on
+# the zone updaters (``BreakevenLockStop`` / ``TrailingRatchetStop`` in
+# ``src/exit/zones``): the same ``adverse_tick_noise`` window scaled by
+# ``noise_mult``, so the chart's noise-adjusted bid (``bid − band``) matches the
+# band those gates actually test against — making the moment it clears
+# break-even / margin (the zone the updaters see) visible on the chart.
+_CHART_NOISE_WINDOW = 20
+_CHART_NOISE_STD_K = 2.0
+_CHART_NOISE_MULT = 2.0
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -296,6 +307,10 @@ def _trade_overlay(p: Position) -> dict:
         "open": _level("level_open"),
         "openBid": open_bid,
         "zero": zero,
+        # Margin level frozen at open (break-even + noise margin): the boundary
+        # between the break-even band (zone 2) and real profit (zone 3). Drawn as
+        # its own reference line so the three zones are visible on the chart.
+        "margin": _level("level_margin"),
         # Loose stop (resting at the broker): the initial clamped level (never
         # lowered) and, when a ratchet history exists, the stepped path of every
         # level later pushed to IG.
@@ -354,6 +369,17 @@ async def api_chart(request: Request, epic: str) -> JSONResponse:
                 {"t": _iso_utc(c.timestamp), "bid": c.bid_close, "offer": c.offer_close}
                 for c in buf.candles
             ]
+
+    # Per-candle adverse tick-noise band (points). Computed on the rolling window
+    # of bid closes up to each candle, mirroring the updaters' gate/floor. The
+    # chart draws ``bid − band`` under the bid so the noise-adjusted trace the
+    # zone gates test is visible: where it clears break-even / margin is where the
+    # updaters treat the bid as truly in the band / profit zone.
+    bids = [c["bid"] for c in candles]
+    for i, candle in enumerate(candles):
+        candle["noise"] = _CHART_NOISE_MULT * adverse_tick_noise(
+            bids[: i + 1], _CHART_NOISE_WINDOW, _CHART_NOISE_STD_K
+        )
 
     # Every trade on this epic today (all open/close cycles, oldest first).
     trades: list[dict] = []

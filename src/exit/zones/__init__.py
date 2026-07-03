@@ -18,9 +18,11 @@ registry below — the other zones are untouched.
 from __future__ import annotations
 
 from src.exit.zones.base import (
+    BreakevenLockParams,
     StopContext,
     StopUpdater,
     StopZone,
+    breakeven_lock_level,
     build_zone_updater,
     classify_zone,
 )
@@ -48,6 +50,8 @@ __all__ = [
     "StopContext",
     "StopUpdater",
     "StopZone",
+    "BreakevenLockParams",
+    "breakeven_lock_level",
     "classify_zone",
     "build_zone_updater",
     "UnderwaterStop",

@@ -194,6 +194,18 @@ class Settings(BaseSettings):
     # stop clamped exactly to the minimum is frequently rejected ("Stop trop
     # près"). Padding the floor by this fraction (0.15 = 15%) absorbs that drift.
     strategy_stop_min_distance_margin: float = 0.15
+    # Loss-recovery — master switch (single boolean, the only .env knob here).
+    # When True, a long that closes on the "trend-reversal at open" pattern (a
+    # quick stop-out that never crossed break-even) immediately triggers a
+    # double-size SELL on the same epic, managed by a mirrored trailing_ratchet
+    # short exit, to try and recoup the loss on the ensuing decline. The detection
+    # thresholds and the size multiplier are constants in src/execution/recovery.py
+    # (convention: only selectors/switches live in .env). Anti-loop: a recovery
+    # short that itself loses never spawns another recovery. The recovery short
+    # counts as the single open position, so the ranking strategy's one-position
+    # budget still holds. See src/execution/recovery.py and src/exit/recovery_short.py.
+    recovery_enabled: bool = False
+
     # Max margin (EUR) to open one minimum-size BUY; epics above this are dropped
     # from the tradable/streaming set — pointless to analyze (and subscribe to)
     # markets we could never afford to open. Set to 0 to disable the filter.
