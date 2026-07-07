@@ -26,7 +26,6 @@ from src.core.recorder import Recorder
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
 from src.execution.recovery import is_recovery_trigger
 from src.execution.trading import (
-    DEFAULT_MARKET_CLOSE_HOUR_UTC,
     TradeConfig,
     TradingService,
 )
@@ -148,7 +147,7 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "job_id": "monitor_positions",
         "name": "Monitor Positions",
         "description": "Check all open positions and apply the close strategy.",
-        "schedule": "Every 30s · 08–18 · Mon–Fri",
+        "schedule": "Every 30s · 24/7",
         "danger": "safe",
     },
     {
@@ -166,8 +165,8 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "action": "end_of_day",
         "job_id": "end_of_day",
         "name": "End of Day",
-        "description": "Force close ALL open positions immediately.",
-        "schedule": "Daily — close hour · Mon–Fri",
+        "description": "Force close ALL open positions immediately (manual only).",
+        "schedule": "Manual only",
         "danger": "danger",
     },
     {
@@ -257,7 +256,6 @@ class BotScheduler:
         self._streaming = streaming
         self._scheduler = AsyncIOScheduler()
         self._running = False
-        self._paused = False
         # Entry strategy (open) and close profile (exit) — decoupled and chosen
         # independently (OPEN_STRATEGY / the three CLOSE_ZONE* selectors). Built
         # lazily so a scheduler constructed with stub settings (tests) never
@@ -278,6 +276,13 @@ class BotScheduler:
         # parallel (one lock each). Bounded by the tradable universe, so the dict
         # never grows without limit.
         self._open_locks: dict[str, asyncio.Lock] = {}
+        # Serialises position sync. APScheduler's ``max_instances=1`` only stops
+        # two *scheduled* sync jobs overlapping; a manual dashboard "Run" calls
+        # ``_sync_positions`` directly and bypasses that. Two concurrent syncs
+        # both read ``known_deal_ids`` before either commits, so both adopt the
+        # same live IG position → duplicate "adopted" rows (the very bug the
+        # idempotent-adoption guard exists to prevent). This lock closes that gap.
+        self._sync_lock = asyncio.Lock()
 
         # Epic lists — start with the provided seed list
         self._all_epics: list[str] = list(epics)
@@ -346,12 +351,17 @@ class BotScheduler:
             name="Hourly trend-template selection",
         )
 
-        # Position monitoring: every 30 seconds
+        # Position monitoring: every 30 seconds, 24/7. No hour/day restriction —
+        # a position must be watched for the WHOLE time its own market is open,
+        # which for CFD/forex and late-closing commodities/indices runs well past
+        # 18:00 UTC and across the weekend. The loop self-gates: it returns
+        # immediately when there is no open position, and skips any epic without a
+        # live bid, so running out of index-market hours is cheap. This is also
+        # what lets the per-epic close rule (close ~close_margin before an epic's
+        # own market close) fire for markets closing outside the old 8–18 window.
         self._scheduler.add_job(
             self._monitor_positions,
             "cron",
-            day_of_week="mon-fri",
-            hour="8-18",
             second="15,45",
             id="monitor_positions",
             name="Monitor open positions",
@@ -373,16 +383,11 @@ class BotScheduler:
             name="Sync open positions with IG",
         )
 
-        # End of day: force close + summary
-        self._scheduler.add_job(
-            self._end_of_day,
-            "cron",
-            day_of_week="mon-fri",
-            hour=DEFAULT_MARKET_CLOSE_HOUR_UTC,
-            minute=30,
-            id="end_of_day",
-            name="End of day close",
-        )
+        # No automatic end-of-day force-close job: positions are closed by each
+        # epic's own market close (the per-epic close rule + the non-TRADEABLE
+        # safety sweep on the hourly tradable refresh), never on a hard global
+        # hour. ``_end_of_day`` remains available as a MANUAL "force close all"
+        # action from the dashboard only.
 
         # Realized P&L reconciliation: pull IG's transaction history and overwrite
         # today's closed-position euro/levels with the broker's true figures.
@@ -440,8 +445,38 @@ class BotScheduler:
             name="Dump and purge old candles",
         )
 
-        # Trigger an immediate epic discovery on startup so we don't wait
-        # until 07:30 the next day when the bot is launched mid-session.
+        self._scheduler.start()
+        self._running = True
+        # Start every recurring job in manual mode (individually paused) — the
+        # user enables jobs one by one from the dashboard "Actions" section.
+        # Pausing per-job (rather than the whole scheduler) is what allows mixing
+        # automatic and manual jobs afterwards.
+        for job in self._scheduler.get_jobs():
+            job.pause()
+
+        # Streaming feed health watchdog: every minute, 24/7. Registered AFTER the
+        # pause loop (like the startup jobs below) so it is NEVER paused and NOT a
+        # dashboard-toggleable job — it is always-on infrastructure, not a trading
+        # action. Reconnects a session that went dark (laptop sleep / network
+        # change) and re-subscribes stalled open-position feeds. Independent of the
+        # market-hours analysis tick so a feed dying out of hours or while the loop
+        # is idle is still recovered. Second offset (:50) avoids the crowded
+        # 0/15/20/30/40/45 slots used by the analysis/monitor/sync jobs.
+        self._scheduler.add_job(
+            self._streaming_health_check,
+            "cron",
+            second="50",
+            id="streaming_health",
+            name="Streaming feed health check",
+        )
+
+        # One-shot startup discovery, registered AFTER the pause loop so it stays
+        # active and actually fires: an immediate epic crawl + tradable refresh so
+        # a mid-session launch doesn't wait until the next 07:30 / hour boundary.
+        # These are ``date`` jobs (not in JOB_DEFINITIONS), so the manual-mode
+        # pause loop above and the dashboard toggles never touch them; APScheduler
+        # drops each once it has run. (Previously added before the pause loop, so
+        # they were paused and the promised discovery never happened.)
         self._scheduler.add_job(
             self._refresh_epic_list,
             "date",
@@ -449,9 +484,6 @@ class BotScheduler:
             id="startup_epic_refresh",
             name="Epic list refresh on startup",
         )
-
-        # Refresh the tradable set shortly after the crawl so streaming seeds and
-        # subscribes immediately (instead of waiting for the next hour boundary).
         self._scheduler.add_job(
             self._refresh_tradable_epics,
             "date",
@@ -459,19 +491,9 @@ class BotScheduler:
             id="startup_tradable_refresh",
             name="Tradable epic refresh on startup",
         )
-
-        self._scheduler.start()
-        self._running = True
-        # Start every job in manual mode (individually paused) — the user enables
-        # jobs one by one from the dashboard "Actions" section. Pausing per-job
-        # (rather than the whole scheduler) is what allows mixing automatic and
-        # manual jobs afterwards.
-        for job in self._scheduler.get_jobs():
-            job.pause()
-        self._paused = True
         logger.info(
-            "Scheduler started — all jobs in manual mode — %d seed epics — "
-            "enable jobs via web dashboard",
+            "Scheduler started — recurring jobs in manual mode — %d seed epics — "
+            "startup discovery scheduled — enable jobs via web dashboard",
             len(self._all_epics),
         )
 
@@ -502,15 +524,12 @@ class BotScheduler:
         """Return every registered job with its current auto/manual mode.
 
         ``auto`` is True when the APScheduler job has a pending next run time; a
-        paused (manual) job reports ``next_run_time is None``. The end-of-day
-        schedule label is derived from the configured close hour.
+        paused (manual) job reports ``next_run_time is None``.
         """
         statuses: list[dict] = []
         for entry in JOB_DEFINITIONS:
             job = self._scheduler.get_job(entry["job_id"]) if self._running else None
             schedule = entry["schedule"]
-            if entry["action"] == "end_of_day":
-                schedule = f"Daily {DEFAULT_MARKET_CLOSE_HOUR_UTC}:30 · Mon–Fri"
             statuses.append(
                 {
                     "action": entry["action"],
@@ -554,7 +573,6 @@ class BotScheduler:
             job = self._scheduler.get_job(entry["job_id"])
             if job:
                 job.pause()
-        self._paused = True
         await self._save_all_job_preferences(auto=False)
         logger.info("All jobs switched to manual (paused)")
 
@@ -566,7 +584,6 @@ class BotScheduler:
             job = self._scheduler.get_job(entry["job_id"])
             if job:
                 job.resume()
-        self._paused = False
         await self._save_all_job_preferences(auto=True)
         logger.info("All jobs switched to automatic (active)")
 
@@ -1344,6 +1361,32 @@ class BotScheduler:
                 )
                 await streaming.resubscribe(epic)
 
+    async def _streaming_health_check(self) -> None:
+        """Every-minute streaming watchdog: reconnect a dead feed, repair stale epics.
+
+        Runs 24/7 as always-on infrastructure (never paused, not a toggleable
+        job), because the app runs on a laptop that sleeps or changes network
+        mid-session: on resume the Lightstreamer socket is dead and the feed goes
+        silent. The built-in status-callback reconnect only covers a subset of
+        disconnect states (a session wedged in ``DISCONNECTED:TRYING-RECOVERY`` is
+        never recovered), and the analysis-tick watchdog is gated to market hours
+        and simply bails when disconnected. This closes both gaps.
+
+        Connection-level first: if the session reports down, force a reconnect
+        (:meth:`~src.feed.streaming.IGStreamingClient.ensure_connected` tears the
+        client down and re-subscribes every epic). When connected, fall back to
+        the per-epic repair that re-subscribes a missing/stalled open-position
+        feed. A no-op when streaming is disabled (``self._streaming is None``).
+        """
+        streaming = self._streaming
+        if streaming is None:
+            return
+        if not streaming.is_connected:
+            logger.warning("Streaming health: session down — forcing reconnect")
+            await streaming.ensure_connected()
+            return
+        await self._ensure_open_epics_streamed()
+
     async def _collect_and_analyze(self) -> None:
         """Compute signals for all active epics and open positions on BUY.
 
@@ -1601,6 +1644,32 @@ class BotScheduler:
                     logger.debug("Rolling select: every epic already used today")
                     return
 
+                # Participation gate: only crown a winner once more than
+                # ``min_participation_ratio`` of the livestreamed tradable universe
+                # has warmed up (``len(buf) >= warmup``). Measured over the whole
+                # tradable set (not just today's untraded candidates) so the
+                # denominator reflects the live universe, not how far into the day
+                # we are. Guards against "false tournaments" right after a
+                # mid-session restart, when only a handful of epics have rebuilt
+                # enough history and the ranker would otherwise crown the least-bad
+                # of a tiny pool.
+                ratio = max(0.0, min(1.0, strategy.min_participation_ratio))
+                ready = sum(
+                    1
+                    for e in epics
+                    if (b := self._buffer.get(e)) is not None
+                    and len(b) >= strategy.warmup
+                )
+                if ready <= ratio * len(epics):
+                    logger.info(
+                        "Rolling select: only %d/%d epics warmed up "
+                        "(<= %.0f%% participation) — skipping tournament",
+                        ready,
+                        len(epics),
+                        ratio * 100,
+                    )
+                    return
+
                 # Score every epic with enough buffered history; keep BUY
                 # candidates, then rank by score (highest first).
                 ranked: list[tuple[EntryIntent, EpicBuffer]] = []
@@ -1698,6 +1767,10 @@ class BotScheduler:
     async def _monitor_positions(self) -> None:
         """Check open positions and apply close strategy.
 
+        Runs every 30s around the clock (see the job registration): a position is
+        watched for the whole time its own market is open, not only 8–18 UTC. It
+        returns immediately when no position is open, so the 24/7 cadence is cheap.
+
         Equivalent to apiCheckPosition.php.
         """
         config = self._build_trade_config()
@@ -1768,7 +1841,15 @@ class BotScheduler:
         if not is_recovery_trigger(closed_position):
             return
 
-        async with self._select_lock:
+        # Serialise like the ranker AND like a per-epic/manual BUY. Hold the
+        # cross-epic selection lock (so a ranker BUY and this recovery cannot both
+        # grab the single freed slot) AND the per-epic open lock (so a per-epic
+        # analysis-tick BUY or a manual dashboard open on THIS epic — both of which
+        # run under ``open_epic_guarded`` → the per-epic lock, not ``_select_lock``
+        # — cannot open the same epic concurrently with this SELL). Lock order
+        # matches ``_select_and_open`` → ``open_epic_guarded`` (``_select_lock``
+        # first, then the per-epic lock), so the two paths can never deadlock.
+        async with self._select_lock, self._open_lock(closed_position.epic):
             open_count = (
                 await session.scalar(
                     select(func.count())
@@ -1781,6 +1862,17 @@ class BotScheduler:
                     "Recovery skipped for %s: %d position(s) already open",
                     closed_position.epic,
                     open_count,
+                )
+                return
+            # Duplicate-epic gate, re-checked under the per-epic lock. This is the
+            # gate ``open_recovery_short`` otherwise bypasses (it never calls
+            # ``_is_epic_open``): it closes the gate→commit race a bare open_count
+            # check leaves open against a same-epic BUY still in flight, and guards
+            # the same-epic case should ``concurrent_positions`` ever exceed one.
+            if await trading._is_epic_open(closed_position.epic):
+                logger.info(
+                    "Recovery skipped for %s: a position on this epic is already open",
+                    closed_position.epic,
                 )
                 return
             logger.info(
@@ -1806,22 +1898,31 @@ class BotScheduler:
         manually outside the bot). This is what keeps the dashboard in step with the
         broker between strategy passes.
         """
-        config = self._build_trade_config()
-        async with self._session_factory() as session:
-            trading = TradingService(self._client, session, config)
-            try:
-                live = await trading.sync_open_positions()
-            except Exception as exc:
-                logger.error("Position sync failed: %s", exc)
-                return
-        # Stamp the "as of" time only on a successful sync so the dashboard can
-        # show when the displayed P&L figures were last refreshed from IG.
-        self._positions_synced_at = datetime.now(UTC)
-        if live:
-            logger.debug("Position sync: %d position(s) live at IG", len(live))
+        # Single-flight: a manual dashboard trigger must not run a second sync
+        # concurrently with the scheduled one (see ``self._sync_lock``).
+        async with self._sync_lock:
+            config = self._build_trade_config()
+            async with self._session_factory() as session:
+                trading = TradingService(self._client, session, config)
+                try:
+                    live = await trading.sync_open_positions()
+                except Exception as exc:
+                    logger.error("Position sync failed: %s", exc)
+                    return
+            # Stamp the "as of" time only on a successful sync so the dashboard
+            # can show when the displayed P&L figures were last refreshed from IG.
+            self._positions_synced_at = datetime.now(UTC)
+            if live:
+                logger.debug("Position sync: %d position(s) live at IG", len(live))
 
     async def _end_of_day(self) -> None:
-        """Force close all positions and generate daily summary."""
+        """Force close ALL open positions (MANUAL dashboard action only).
+
+        No longer scheduled: the automatic end-of-day sweep was removed so
+        positions close on each epic's own market close, never on a hard global
+        hour. Kept as a human "close everything now" override, then reconciles
+        P&L with IG's authoritative figures.
+        """
         logger.info("End of day: closing all positions")
 
         config = self._build_trade_config()

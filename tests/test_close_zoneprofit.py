@@ -192,3 +192,17 @@ class TestCloseTriggers:
         )
         assert decision.action == ACTION_CLOSE
         assert decision.reason == "stop"
+
+    def test_stop_backstop_fires_during_atr_warmup(self):
+        # Regression (#9): fewer than atr_period candles -> atr()==0. The backstop
+        # must still close a position whose bid has crossed the follower; the old
+        # ordering ran the atr<=0 HOLD guard first and disabled it for ~15 min
+        # after a restart.
+        buf = _buffer([8000.0, 8000.0, 8000.0])  # 3 candles << atr_period(14)
+        assert atr(list(buf.candles), 14) == 0.0
+        pos = _position(level_open=8030.0, level_follower=8010.0)
+        decision = CloseZoneProfit.from_settings(_settings()).evaluate(
+            pos, current_bid=8005.0, buf=buf, is_close_hour=False
+        )
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "stop"

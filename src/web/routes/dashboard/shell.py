@@ -393,6 +393,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=20"></script>
+<script src="/static/dashboard.js?v=21"></script>
 </body>
 </html>"""

@@ -310,3 +310,56 @@ def test_handle_status_tracks_connected(settings, fake_client):
 
     streamer.handle_status("STALLED")
     assert streamer.is_connected is False
+
+
+async def test_ensure_connected_noop_when_already_connected(
+    settings, fake_client, patch_lib
+):
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+    await streamer.start()
+    streamer._connected = True
+
+    assert await streamer.ensure_connected() is True
+    # No teardown/reconnect: only the initial connect fetched tokens.
+    assert fake_client.session.fetch_session_tokens.await_count == 1
+
+
+async def test_ensure_connected_reconnects_when_down(settings, fake_client, patch_lib):
+    # The watchdog case: the session went dark without a DISCONNECTED callback
+    # (laptop resumed from sleep). A forced reconnect rebuilds the client and
+    # re-subscribes every epic.
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+    streamer._reconnect_delay = 0  # avoid backoff sleep in the test
+    await streamer.start()
+    await streamer.set_epics(["EPIC.A"])
+    streamer._connected = False
+    old_ls = streamer._ls
+
+    await streamer.ensure_connected()
+
+    assert streamer._ls is not old_ls
+    assert fake_client.session.fetch_session_tokens.await_count == 2
+    assert streamer.subscribed_epics == ["EPIC.A"]
+    # The reconnect guard was released for the next call.
+    assert streamer._reconnecting is False
+
+
+async def test_ensure_connected_noop_when_not_started(settings, fake_client, patch_lib):
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+
+    assert await streamer.ensure_connected() is False
+    assert fake_client.session.fetch_session_tokens.await_count == 0
+
+
+async def test_ensure_connected_skips_when_reconnect_in_flight(
+    settings, fake_client, patch_lib
+):
+    # A reconnect is already running (callback path or a prior call): the
+    # watchdog must not launch a second one.
+    streamer = IGStreamingClient(fake_client, PriceBuffer(), settings)
+    await streamer.start()
+    streamer._connected = False
+    streamer._reconnecting = True
+
+    assert await streamer.ensure_connected() is False
+    assert fake_client.session.fetch_session_tokens.await_count == 1

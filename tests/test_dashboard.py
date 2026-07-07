@@ -334,6 +334,51 @@ class TestTradeOverlay:
         assert ov["close"] == 18050.0
         assert ov["closeTime"] == "2026-06-08T11:30:00+00:00"
 
+    def test_short_overlay_mirrors_entry_breakeven_exit(self):
+        # Regression (#16): for a SELL the entry sits on the bid (the sell fill =
+        # level_open, NOT level_zero - spread), and break-even / margin / exit —
+        # all offer-referenced (buy-to-close) — map one spread BELOW their stored
+        # levels on the bid curve the chart draws.
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=20,
+            direction="SELL",
+            date=date(2026, 7, 2),
+            time_open=time(16, 0, 0),
+            time_close=time(16, 30, 0),
+            level_open=1.10000,  # sell fill on the bid
+            level_zero=1.10000,  # break-even reference (offer terms)
+            level_margin=1.09900,
+            level_stop=1.10120,
+            level_follower=1.10100,
+            level_win=0.0,
+            level_close=1.09800,  # buy-to-close fill on the offer
+            pip_spread=0.00020,
+            euro=18.0,
+        )
+        ov = _trade_overlay(pos)
+        assert ov["direction"] == "SELL"
+        assert ov["openBid"] == pytest.approx(1.10000)
+        assert ov["zero"] == pytest.approx(1.10000 - 0.00020)
+        assert ov["margin"] == pytest.approx(1.09900 - 0.00020)
+        assert ov["close"] == pytest.approx(1.09800 - 0.00020)
+
+    def test_display_pnl_mirrors_for_short(self):
+        # Regression (#15): a short that won (price fell) must show a positive
+        # display P&L / win, not the long-signed negative.
+        from src.web.routes.dashboard.state import _display_pnl
+
+        pos = SimpleNamespace(
+            direction="SELL",
+            euro=None,  # force the level-based fallback
+            level_open=1.10000,
+            level_close=1.09000,  # price fell 0.01 -> a winning short
+            euro_per_point=20000.0,
+            quantity=1,
+        )
+        assert _display_pnl(pos) == pytest.approx(200.0)
+
     def test_stop_history_serialised_as_stepped_points(self):
         from src.web.routes.dashboard.router import _trade_overlay
 
@@ -397,6 +442,40 @@ class TestTradeOverlay:
         ]
         assert ov["stopFollower"] == 459.3
         assert ov["stopLoose"] == 458.3
+
+    def test_broker_loose_line_uses_per_point_broker_level(self):
+        """A ratchet point carrying the pushed broker level (a spread below the
+        software follower) drives the Loose line; the follower line stays on the
+        software stop and never leaks the internal ``broker`` key."""
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=13,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=time(11, 0, 0),
+            level_open=460.0,
+            level_zero=460.4,
+            level_stop=458.3,  # initial broker (coincides with the open follower)
+            level_follower=459.8,
+            level_win=0.0,
+            level_close=459.2,
+            euro=-5.0,
+            stop_history=[
+                {"t": "2026-06-08T10:00:00+00:00", "level": 458.3},  # open seed
+                # ratchet: follower 459.8, broker posted a spread below at 459.3.
+                {"t": "2026-06-08T10:30:00+00:00", "level": 459.8, "broker": 459.3},
+            ],
+        )
+        ov = _trade_overlay(pos)
+        assert ov["stopsFollower"] == [
+            {"t": "2026-06-08T10:00:00+00:00", "level": 458.3},
+            {"t": "2026-06-08T10:30:00+00:00", "level": 459.8},
+        ]
+        assert ov["stopsLoose"] == [
+            {"t": "2026-06-08T10:00:00+00:00", "level": 458.3},  # initial broker
+            {"t": "2026-06-08T10:30:00+00:00", "level": 459.3},  # per-point broker
+        ]
 
     def test_stop_history_absent_yields_none(self):
         from src.web.routes.dashboard.router import _trade_overlay
@@ -541,7 +620,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=20" in html
+        assert "/static/dashboard.js?v=21" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())

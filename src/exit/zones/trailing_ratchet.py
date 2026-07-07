@@ -58,6 +58,17 @@ class TrailingRatchetStop(StopUpdater):
     noise_std_k: float = 2.0  # σ band added to the mean down-move
     noise_mult: float = 2.0  # multiple of that band kept between bid and stop
 
+    # Sharp-drop guard. Even the support-anchored lock floor below — which, unlike
+    # the chandelier, is NOT momentum-gated — can still step the stop *up* while
+    # the live bid is falling hard: its swing-low anchor lags by ``confirm_window``
+    # candles, so an old low rolling out of that window lifts the floor even as
+    # price collapses. When the live bid has fallen more than ``drop_guard_k × ATR``
+    # below the highest of the last ``drop_guard_window`` recorded bids, hold the
+    # stop this tick rather than ratchet it up into a falling bid. The stop is
+    # never lowered, so the persisted follower keeps protecting the position.
+    drop_guard_window: int = 5  # recent bids scanned for the local high
+    drop_guard_k: float = 2.0  # × ATR drawdown from that high that blocks a raise
+
     #: Shared shaping of the support-anchored break-even lock used as this zone's
     #: FLOOR (see ``breakeven_lock_level``), so a bid that jumps straight past the
     #: margin — skipping the margin-zone updater — is never left on its open stop.
@@ -76,7 +87,33 @@ class TrailingRatchetStop(StopUpdater):
             return False
         return closes[-3] < closes[-2] < closes[-1]
 
+    def _sharp_drop(
+        self, buf: EpicBuffer, current_bid: float, atr_value: float
+    ) -> bool:
+        """True when the bid has dropped sharply from its recent high.
+
+        Measured as the drawdown of the live bid below the highest of the last
+        ``drop_guard_window`` recorded bid closes, expressed in ATR units. At or
+        beyond ``drop_guard_k × ATR`` the move is a genuine fall (not tick jitter),
+        so no zone should ratchet the stop up on this tick.
+        """
+        if atr_value <= 0 or self.drop_guard_window < 1:
+            return False
+        closes = buf.bid_closes
+        if not closes:
+            return False
+        recent_high = max(closes[-self.drop_guard_window :])
+        return recent_high - current_bid >= self.drop_guard_k * atr_value
+
     def propose(self, ctx: StopContext) -> float | None:
+        # Sharp-drop guard: never ratchet the stop up while the bid is collapsing.
+        # This gates BOTH candidates below — chiefly the lock floor, whose lagging
+        # swing-low anchor would otherwise keep lifting the stop as an old low
+        # rolls out of its window even though the live bid is falling hard. Holding
+        # (returning None) is safe: the persisted follower is never lowered.
+        if self._sharp_drop(ctx.buf, ctx.current_bid, ctx.atr_value):
+            return None
+
         # FLOOR: the support-anchored break-even lock (same rule as the margin
         # zone). This guarantees that entering profit always establishes a
         # protective stop even when the chandelier below is still suppressed — so a

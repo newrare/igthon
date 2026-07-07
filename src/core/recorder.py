@@ -5,9 +5,7 @@ Provides structured logging and optional email notifications.
 
 import collections
 import logging
-import smtplib
 from datetime import datetime
-from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from pathlib import Path
 
@@ -335,41 +333,6 @@ def log_api_error(
     )
 
 
-def send_email(
-    settings: Settings,
-    subject: str,
-    body: str,
-) -> bool:
-    """Send an email notification.
-
-    Args:
-        settings: Application settings with email config.
-        subject: Email subject.
-        body: Email body text.
-
-    Returns:
-        True if sent successfully, False otherwise.
-    """
-    if not hasattr(settings, "email_enabled") or not settings.email_enabled:
-        return False
-
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = f"[IG Bot] {subject}"
-        msg["From"] = settings.email_from
-        msg["To"] = settings.email_to
-        msg.set_content(body)
-
-        with smtplib.SMTP("localhost", 25) as server:
-            server.send_message(msg)
-
-        logger.info("Email sent: %s", subject)
-        return True
-    except Exception as exc:
-        logger.error("Failed to send email: %s", exc)
-        return False
-
-
 class Recorder:
     """Structured recorder for trading events.
 
@@ -393,25 +356,3 @@ class Recorder:
         """Log an error (failure requiring attention)."""
         extra = " ".join(f"{k}={v}" for k, v in kwargs.items())
         logger.error("%s %s", message, extra)
-
-    def trade_open(self, epic: str, **kwargs: object) -> None:
-        """Log a position opening."""
-        self.info(f"OPEN {epic}", **kwargs)
-        if self._settings:
-            send_email(
-                self._settings,
-                f"Position opened: {epic}",
-                f"Opened position on {epic}\n"
-                + "\n".join(f"  {k}: {v}" for k, v in kwargs.items()),
-            )
-
-    def trade_close(self, epic: str, reason: str, **kwargs: object) -> None:
-        """Log a position closing."""
-        self.info(f"CLOSE {epic} ({reason})", **kwargs)
-        if self._settings:
-            send_email(
-                self._settings,
-                f"Position closed: {epic} ({reason})",
-                f"Closed position on {epic}\nReason: {reason}\n"
-                + "\n".join(f"  {k}: {v}" for k, v in kwargs.items()),
-            )

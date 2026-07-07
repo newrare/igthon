@@ -19,10 +19,16 @@ def evaluate_open_gates(
     direction: str,
     in_trading_hours: bool,
     epic_already_open: bool,
+    closes_soon: bool = False,
 ) -> tuple[bool, str]:
     """Pure pre-open rule evaluation shared by live trading and the simulator.
 
     The caller gathers the live state and this function applies the rules to it.
+
+    ``closes_soon`` is True when the epic's own market closes within the pre-open
+    buffer: opening then would only pay the spread before the per-epic close rule
+    force-closes the trade. Defaults to False so callers with no per-epic close
+    time (e.g. the simulator) are unaffected.
 
     Returns:
         (allowed, reason) — reason explains the first failed gate.
@@ -35,5 +41,8 @@ def evaluate_open_gates(
 
     if epic_already_open:
         return False, f"Epic {epic} already open"
+
+    if closes_soon:
+        return False, f"Market {epic} closes soon"
 
     return True, "OK"

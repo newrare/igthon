@@ -85,16 +85,31 @@ class TestEuroPnl:
         assert _service()._euro_pnl(pos, 1.15649) == pytest.approx(-80.0, abs=0.01)
 
     def test_legacy_fallback_without_euro_per_point(self):
-        # No euro_per_point -> derive a per-pip value from euro_stop/size/quantity
+        # No euro_per_point -> reconstruct €/price-unit from euro_stop and the
+        # PRICE distance to the stop (scalingFactor-independent). Forex row: a
+        # 0.00100 (10-pip) stop risking 20€ -> 20000 €/price-unit; a +0.00050 move
+        # is +10€. The old size-based formula understated this by 10^4.
         pos = Position(
-            level_open=Decimal("100.0"),
+            level_open=Decimal("1.10000"),
             euro_per_point=None,
             euro_stop=Decimal("20.0"),
-            size=10,
+            level_loose=Decimal("1.09900"),  # stop 0.00100 below entry
             quantity=1,
         )
-        # per-pip = 20/10/1 = 2.0; move +5 -> 10.0
-        assert _service()._euro_pnl(pos, 105.0) == pytest.approx(10.0)
+        assert _service()._euro_pnl(pos, 1.10050) == pytest.approx(10.0)
+
+    def test_legacy_fallback_mirrors_for_short(self):
+        # Short: profits as the price falls. Stop 0.00100 ABOVE entry risking 20€;
+        # a 0.00050 fall is +10€ (the long formula would sign it -10€).
+        pos = Position(
+            direction="SELL",
+            level_open=Decimal("1.10000"),
+            euro_per_point=None,
+            euro_stop=Decimal("20.0"),
+            level_loose=Decimal("1.10100"),  # short stop sits above the entry
+            quantity=1,
+        )
+        assert _service()._euro_pnl(pos, 1.09950) == pytest.approx(10.0)
 
 
 class TestApplyTransaction:
@@ -318,6 +333,31 @@ class TestTrailingStop:
         assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
         assert "t" in pos.stop_history[-1]
 
+    async def test_broker_stop_pushed_one_spread_below_follower(self):
+        # The software follower is what the bot closes on; the stop posted at IG
+        # rests one spread below it (live spread), so the app-side stop is hit
+        # first and the broker order is a deeper safety net.
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2(spread=2.0)  # ATR 2 -> dist 5; live spread 2
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),
+            level_follower=None,
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        # Follower unchanged: 105 - 5 = 100.
+        assert float(pos.level_follower) == pytest.approx(100.0)
+        # Broker stop pushed a spread (2) below the follower.
+        payload = client.put.await_args.args[1]
+        assert payload["stopLevel"] == pytest.approx(98.0)
+        # History records both levels so the chart can draw the two lines apart.
+        assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
+        assert pos.stop_history[-1]["broker"] == pytest.approx(98.0)
+
     async def test_no_ratchet_leaves_stop_history_untouched(self):
         svc, _, _ = _trailing_service()
         buf = _buffer_with_atr2()
@@ -399,6 +439,122 @@ class TestManagePositionRatchet:
         assert closed is False
         assert float(pos.level_follower) == pytest.approx(1.62413)  # unchanged
         db.commit.assert_not_awaited()
+
+
+class TestReconcileVanishedCloseLevel:
+    """``_reconcile_vanished`` backs the close level out of the P&L, direction-aware."""
+
+    def test_short_close_level_is_above_entry_on_a_loss(self):
+        # Regression (#8): a short stopped out ABOVE its entry has a negative P&L;
+        # close = open - euro/epp must land ABOVE the open, not below it (the
+        # long-only ``open + euro/epp`` put it below and read as a phantom win).
+        svc = _service()
+        pos = Position(
+            direction="SELL",
+            level_open=Decimal("1.10000"),
+            level_close=None,
+            euro=Decimal("-20.0"),  # loss: price rose against the short
+            euro_per_point=Decimal("20000"),
+        )
+        svc._reconcile_vanished(pos)
+        assert pos.reason_close == "closed_externally"
+        # close = 1.10000 - (-20 / 20000) = 1.10100 (above the entry)
+        assert float(pos.level_close) == pytest.approx(1.10100)
+        assert float(pos.euro) == pytest.approx(-20.0)
+        assert pos.win == 0
+
+
+class TestManagePositionShortRouting:
+    """A recovery SELL must never fall into the long-only ``check_and_close``."""
+
+    async def test_short_with_no_buffer_is_not_closed_by_long_maths(self):
+        # Regression: on the first monitor tick after a restart the epic's price
+        # buffer is not yet streamed (``buf is None``). Falling back to
+        # ``check_and_close`` there is long-only: it fires ``loose`` on
+        # ``bid <= level_loose``, but a short's ``level_loose`` sits ABOVE the
+        # price, so that is true on nearly every tick and would close the
+        # double-size short at market regardless of P&L. It must hold instead and
+        # rely on the broker-side stop pushed at open.
+        svc, _, _ = _trailing_service()
+        svc._is_epic_close_hour = AsyncMock(return_value=False)
+        svc._close_position = AsyncMock(return_value=True)
+        pos = Position(
+            epic="X",
+            deal_id="D",
+            direction="SELL",
+            level_open=Decimal("1.6200"),
+            level_loose=Decimal("1.6250"),  # a short's stop sits ABOVE the entry
+            level_win=Decimal("0"),
+        )
+        closed = await svc.manage_position(pos, current_bid=1.6205, buf=None)
+        assert closed is False
+        svc._close_position.assert_not_awaited()
+
+
+class TestCloseRejectedByBroker:
+    """A close IG explicitly REJECTS (e.g. market closed on an EDITS_ONLY market)
+    must leave the position OPEN. Recording a fabricated close is the root cause
+    of the weekend-held-deal duplication: the DB thought the position was gone
+    while it stayed live at IG, so the next sync reused/duplicated its dealId and
+    the real close P&L landed on the wrong row."""
+
+    async def test_rejected_confirm_keeps_position_open(self):
+        svc, client, db = _trailing_service()
+        # IG accepts the DELETE (200 + dealReference) but the confirm reports the
+        # market-closed refusal as dealStatus=REJECTED.
+        client.delete = AsyncMock(return_value={"dealReference": "REF1"})
+        client.get = AsyncMock(
+            return_value={"dealStatus": "REJECTED", "reason": "MARKET_CLOSED"}
+        )
+        pos = Position(
+            epic="CC.D.LCC.UNC.IP",
+            deal_id="DEALX",
+            direction="BUY",
+            state=PositionState.OPEN,
+            quantity=1,
+            level_open=Decimal("3762.8"),
+            euro_stop=Decimal("400"),
+            euro_per_point=Decimal("11.6"),
+        )
+
+        result = await svc._close_position(pos, 4128.9, "market_closed")
+
+        # The close failed: position stays OPEN, no fabricated P&L, no commit.
+        assert result is False
+        assert pos.state == PositionState.OPEN
+        assert pos.reason_close is None
+        assert pos.euro is None
+        db.commit.assert_not_awaited()
+
+    async def test_accepted_confirm_still_closes(self):
+        # Guard against over-eager rejection: a normal ACCEPTED confirm closes.
+        svc, client, db = _trailing_service()
+        client.delete = AsyncMock(return_value={"dealReference": "REF1"})
+        client.get = AsyncMock(
+            return_value={
+                "dealStatus": "ACCEPTED",
+                "level": 4128.9,
+                "profit": 4247.01,
+                "profitCurrency": "EUR",
+            }
+        )
+        pos = Position(
+            epic="CC.D.LCC.UNC.IP",
+            deal_id="DEALX",
+            direction="BUY",
+            state=PositionState.OPEN,
+            quantity=1,
+            level_open=Decimal("3762.8"),
+            euro_stop=Decimal("400"),
+            euro_per_point=Decimal("11.6"),
+        )
+
+        result = await svc._close_position(pos, 4128.9, "stop")
+
+        assert result is True
+        assert pos.state == PositionState.CLOSE
+        assert pos.reason_close == "stop"
+        assert float(pos.euro) == pytest.approx(4247.01)
 
 
 def _open_signal(*, bid: float, level_security: float) -> TradingSignal:
@@ -979,12 +1135,9 @@ class TestSyncReconcileUnconfirmed:
         assert prov.level_close == prov.level_open
         db.commit.assert_awaited()
 
-    async def test_confirmed_row_that_vanishes_is_still_closed_externally(self):
-        # Regression guard: a row WITH a real dealId that disappears from IG is a
-        # genuine external close and must keep reconciling as closed_externally,
-        # regardless of how recently it opened.
+    def _real(self, *, euro: float = 12.5) -> Position:
         now = datetime.now(UTC).replace(tzinfo=None)
-        real = Position(
+        return Position(
             epic="E1",
             epic_name="E1",
             deal_id="D-REAL",
@@ -992,13 +1145,52 @@ class TestSyncReconcileUnconfirmed:
             time_open=now.time(),
             state=PositionState.OPEN,
             level_open=Decimal("100.0"),
-            euro=Decimal("12.5"),
+            euro=Decimal(str(euro)),
             euro_per_point=Decimal("10.000000"),
         )
+
+    async def test_confirmed_row_that_vanishes_is_closed_externally_on_404(self):
+        # A row WITH a real dealId that has dropped out of the bulk /positions
+        # list is reconciled as closed_externally ONLY once the targeted
+        # GET /positions/{dealId} authoritatively 404s (IG confirms it is gone).
+        real = self._real()
         svc, client, db = _sync_service(db_open=[real])
-        client.get = AsyncMock(return_value={"positions": []})
+        # 1st get() = bulk /positions (empty); 2nd = targeted probe → 404.
+        client.get = AsyncMock(side_effect=[{"positions": []}, _ig_error(404)])
 
         await svc.sync_open_positions()
 
         assert real.state == PositionState.CLOSE
         assert real.reason_close == "closed_externally"
+
+    async def test_confirmed_vanish_kept_open_when_targeted_refetch_still_open(self):
+        # The false-positive this fixes: a transient bulk /positions miss (seen
+        # right after a streaming reconnect rotated the session tokens) must NOT
+        # close a position that is still live at IG. The targeted re-fetch returns
+        # the position (200) → keep OPEN, never reconcile.
+        real = self._real()
+        svc, client, db = _sync_service(db_open=[real])
+        client.get = AsyncMock(
+            side_effect=[
+                {"positions": []},  # bulk list transiently omits the position
+                _ig_entry(deal_id="D-REAL", epic="E1"),  # targeted probe: still open
+            ]
+        )
+
+        await svc.sync_open_positions()
+
+        assert real.state == PositionState.OPEN
+        assert real.reason_close is None
+
+    async def test_confirmed_vanish_kept_open_on_transient_refetch_error(self):
+        # If the targeted re-fetch itself errors (network / 5xx / any non-404),
+        # the outcome is uncertain and the position must stay OPEN — a live
+        # position is never closed on a guess.
+        real = self._real()
+        svc, client, db = _sync_service(db_open=[real])
+        client.get = AsyncMock(side_effect=[{"positions": []}, _ig_error(500)])
+
+        await svc.sync_open_positions()
+
+        assert real.state == PositionState.OPEN
+        assert real.reason_close is None

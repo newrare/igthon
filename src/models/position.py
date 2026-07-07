@@ -34,8 +34,6 @@ class Position(Base):
     epic_name: Mapped[str] = mapped_column(String(10), nullable=False)
     deal_reference: Mapped[str | None] = mapped_column(String(30))
     deal_id: Mapped[str | None] = mapped_column(String(50))
-    fix_open: Mapped[int | None] = mapped_column(Integer)
-    fix_close: Mapped[int | None] = mapped_column(Integer)
     date: Mapped[date] = mapped_column(Date, nullable=False)
     time_open: Mapped[time | None] = mapped_column(Time)
     time_close: Mapped[time | None] = mapped_column(Time)
@@ -76,7 +74,6 @@ class Position(Base):
     # src/exit/__init__.py. See src/exit/ and migration d5e6f7a8b9c0.
     close_profile: Mapped[str | None] = mapped_column(String(30))
     size: Mapped[int | None] = mapped_column(Integer)
-    negative: Mapped[int | None] = mapped_column(Integer)
     quantity: Mapped[int | None] = mapped_column(Integer)
     win: Mapped[int | None] = mapped_column(Integer)
     stop_update: Mapped[int | None] = mapped_column(Integer)

@@ -74,7 +74,6 @@ class SimulatedTrade:
     day: int
     open_time: str
     level_open: float
-    level_win: float
     level_zero: float
     level_loose: float
     level_stop: float  # broker-side protective stop (trails upward)
@@ -90,7 +89,6 @@ class SimulatedTrade:
     stop_updates: int = 0
     # internal monitoring state (not part of the report)
     level_follower: float = 0.0
-    opened_at: datetime | None = None  # open timestamp (read by trend-aware exits)
 
 
 @dataclass
@@ -558,7 +556,6 @@ class StrategySimulator:
             open_time=candle.timestamp.strftime("%H:%M"),
             level_open=round(candle.offer_close, 5),
             level_open_bid=round(candle.bid_close, 5),
-            level_win=round(plan.target_level, 5),
             level_zero=round(plan.level_zero, 5),
             level_loose=round(plan.stop_level, 5),
             level_stop=round(plan.stop_level, 5),
@@ -566,7 +563,6 @@ class StrategySimulator:
             level_margin=round(plan.level_margin, 5),
             euro_stop=round(euro_risk, 2),
             euro_per_point=euro_per_point,
-            opened_at=candle.timestamp,
         )
         return True
 
@@ -756,7 +752,6 @@ def run_close_visual(
         open_time=open_candle.timestamp.strftime("%H:%M"),
         level_open=round(open_candle.offer_close, 5),  # market BUY fills at offer
         level_open_bid=round(open_candle.bid_close, 5),
-        level_win=round(plan.target_level, 5),
         level_zero=round(plan.level_zero, 5),
         level_loose=round(plan.stop_level, 5),
         level_stop=round(plan.stop_level, 5),
@@ -764,7 +759,6 @@ def run_close_visual(
         level_margin=round(plan.level_margin, 5),
         euro_stop=round(euro_risk, 2),
         euro_per_point=euro_per_point,
-        opened_at=open_candle.timestamp,
     )
 
     # The broker-side stop is the level the close profile owns (level_follower):

@@ -69,10 +69,20 @@ def parse_ig_pnl(raw: object) -> float | None:
 def conversion_rate(instrument: dict, currency_code: str | None = None) -> float:
     """Return the rate converting the instrument's quote currency to EUR.
 
-    IG ships the conversion rate inside ``instrument.currencies[].exchangeRate``
-    (the "converted at …" figure shown on the broker's statement). Picks the
-    entry matching ``currency_code``, else the default currency, else the first
-    one. Falls back to ``1.0`` (no conversion) when nothing is available.
+    IG ships the rate inside ``instrument.currencies[]`` (the "converted at …"
+    figure on the broker's statement). Picks the entry matching
+    ``currency_code``, else the default currency, else the first one. Falls back
+    to ``1.0`` (no conversion) when nothing is available.
+
+    Two rate fields exist and are reciprocals: ``exchangeRate`` is the
+    quote->account (EUR) rate we want; ``baseExchangeRate`` is its inverse
+    (account->quote). IG leaves ``exchangeRate`` as a ``1.0`` **placeholder** on
+    some markets (e.g. ``EDITS_ONLY`` / non-default currencies) while
+    ``baseExchangeRate`` keeps the real reference rate. Trusting that ``1.0`` for
+    a non-EUR quote currency silently under-states the euro risk (``euro_stop``)
+    by the whole conversion factor, so we invert ``baseExchangeRate`` instead.
+    Example — London Cocoa (GBP): ``exchangeRate=1.0`` (placeholder),
+    ``baseExchangeRate=0.854`` -> ``1 / 0.854 = 1.171`` (≈ the broker's 1.16).
     """
     currencies = instrument.get("currencies") or []
     entry = None
@@ -84,8 +94,17 @@ def conversion_rate(instrument: dict, currency_code: str | None = None) -> float
         entry = currencies[0]
     if not entry:
         return 1.0
-    rate = entry.get("exchangeRate", entry.get("baseExchangeRate"))
-    return _to_float(rate, default=1.0) or 1.0
+    code = entry.get("code")
+    exchange = _to_float(entry.get("exchangeRate"), default=0.0)
+    base = _to_float(entry.get("baseExchangeRate"), default=0.0)
+    # A 1.0 exchangeRate on a non-EUR currency is IG's placeholder, not a real
+    # 1:1 rate — prefer the reciprocal of baseExchangeRate when available.
+    placeholder = code not in (None, "EUR") and abs(exchange - 1.0) < 1e-9
+    if exchange > 0 and not placeholder:
+        return exchange
+    if base > 0:
+        return 1.0 / base
+    return exchange or 1.0
 
 
 def euro_per_point(

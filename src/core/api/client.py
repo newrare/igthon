@@ -224,78 +224,83 @@ class IGClient:
         Returns:
             Parsed JSON response as a dictionary.
         """
-        url = f"{self._settings.ig_base_url}{endpoint}"
-        headers = self._build_headers(version)
-        async with self._request_context():
-            logger.debug("GET %s", url)
-            response = await self.http.get(url, headers=headers)
-        self._raise_for_status(
-            response, "GET", url, suppress_error_logging=suppress_error_logging
+        return await self._send(
+            "get",
+            "GET",
+            endpoint,
+            version=version,
+            suppress_error_logging=suppress_error_logging,
         )
-        return response.json()
 
     async def post(self, endpoint: str, payload: dict, *, version: int = 1) -> dict:
-        """Perform a POST request to the IG API.
-
-        Args:
-            endpoint: API path (e.g. "/positions/otc").
-            payload: JSON body to send.
-            version: API version number for the endpoint.
-
-        Returns:
-            Parsed JSON response as a dictionary.
-        """
-        url = f"{self._settings.ig_base_url}{endpoint}"
-        headers = self._build_headers(version)
-        async with self._request_context():
-            # Log the payload too: POST is a mutating action (open a position,
-            # etc.) and the body is the audit record of *what* we asked for. No
-            # secrets pass here — login/refresh use the raw http client, not this.
-            logger.debug("POST %s payload=%s", url, payload)
-            response = await self.http.post(url, json=payload, headers=headers)
-        self._raise_for_status(response, "POST", url)
-        return response.json()
+        """POST to the IG API (e.g. open a position). Returns the parsed JSON."""
+        return await self._send(
+            "post", "POST", endpoint, version=version, payload=payload
+        )
 
     async def put(self, endpoint: str, payload: dict, *, version: int = 1) -> dict:
-        """Perform a PUT request to the IG API.
-
-        Args:
-            endpoint: API path (e.g. "/positions/otc/{dealId}").
-            payload: JSON body to send.
-            version: API version number for the endpoint.
-
-        Returns:
-            Parsed JSON response as a dictionary.
-        """
-        url = f"{self._settings.ig_base_url}{endpoint}"
-        headers = self._build_headers(version)
-        async with self._request_context():
-            logger.debug("PUT %s payload=%s", url, payload)
-            response = await self.http.put(url, json=payload, headers=headers)
-        self._raise_for_status(response, "PUT", url)
-        return response.json()
+        """PUT to the IG API (e.g. update a stop). Returns the parsed JSON."""
+        return await self._send(
+            "put", "PUT", endpoint, version=version, payload=payload
+        )
 
     async def delete(
         self, endpoint: str, payload: dict | None = None, *, version: int = 1
     ) -> dict:
-        """Perform a DELETE request to the IG API.
+        """DELETE on the IG API (e.g. close a position). Returns the parsed JSON.
 
-        IG's infrastructure does not reliably process DELETE bodies directly.
-        The officially supported workaround is POST with _method: DELETE header.
+        IG does not reliably process DELETE bodies, so the officially supported
+        workaround is a POST carrying the ``_method: DELETE`` header.
+        """
+        return await self._send(
+            "post",
+            "DELETE",
+            endpoint,
+            version=version,
+            payload=payload,
+            extra_headers={"_method": "DELETE"},
+        )
 
-        Args:
-            endpoint: API path (e.g. "/positions/otc").
-            payload: Optional JSON body (required by IG for position closes).
-            version: API version number for the endpoint.
+    async def _send(
+        self,
+        http_verb: str,
+        label: str,
+        endpoint: str,
+        *,
+        version: int,
+        payload: dict | None = None,
+        suppress_error_logging: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict:
+        """Shared request path for every verb: auth refresh → headers → call → raise.
 
-        Returns:
-            Parsed JSON response as a dictionary.
+        ``http_verb`` is the httpx method actually invoked ("get"/"post"/"put");
+        ``label`` is the logical method used for logging and error attribution
+        ("GET"/"POST"/"PUT"/"DELETE" — a DELETE is sent as a POST + ``_method``).
+
+        Headers are built INSIDE ``_request_context`` — i.e. AFTER ``_ensure_auth``
+        refreshes the token — so a bearer renewed on the ~60s expiry edge is used,
+        never a stale one. A stale bearer yields a 401 that the APIQueue drops as a
+        non-retryable client error, silently losing a mutating order. Centralising
+        this means the guarantee is enforced once rather than in four places.
         """
         url = f"{self._settings.ig_base_url}{endpoint}"
-        headers = self._build_headers(version)
-        headers["_method"] = "DELETE"
         async with self._request_context():
-            logger.debug("DELETE (via POST+_method) %s payload=%s", url, payload)
-            response = await self.http.post(url, json=payload, headers=headers)
-        self._raise_for_status(response, "DELETE", url)
+            headers = self._build_headers(version)
+            if extra_headers:
+                headers.update(extra_headers)
+            if payload is None:
+                logger.debug("%s %s", label, url)
+            else:
+                # The body is the audit record of *what* a mutating call asked for.
+                # No secrets pass here — login/refresh use the raw http client.
+                logger.debug("%s %s payload=%s", label, url, payload)
+            caller = getattr(self.http, http_verb)
+            if payload is None:
+                response = await caller(url, headers=headers)
+            else:
+                response = await caller(url, json=payload, headers=headers)
+        self._raise_for_status(
+            response, label, url, suppress_error_logging=suppress_error_logging
+        )
         return response.json()

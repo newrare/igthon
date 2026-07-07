@@ -31,6 +31,7 @@ from src.exit.base import (
     CloseDecision,
     CloseProfile,
     OpenPlan,
+    noise_margin,
 )
 from src.exit.trailing import compute_trailing_stop_short
 from src.feed.price_buffer import EpicBuffer
@@ -70,9 +71,8 @@ class RecoveryShortProfile(CloseProfile):
         return cls()
 
     def _noise_margin(self, atr_value: float, spread: float) -> float:
-        """Noise margin below break-even: the larger of a volatility fraction and
-        a spread floor — the smallest move that counts as real profit."""
-        return max(self.noise_k * atr_value, spread * 2.0)
+        """Noise margin below break-even (see :func:`~src.exit.base.noise_margin`)."""
+        return noise_margin(self.noise_k, atr_value, spread)
 
     def initial_plan(
         self, *, entry_level: float, direction: str, buf: EpicBuffer
@@ -123,21 +123,26 @@ class RecoveryShortProfile(CloseProfile):
         last = buf.last
         if last is None:
             return CloseDecision(action=ACTION_HOLD)
-        atr_value = atr(list(buf.candles), self.atr_period)
-        if atr_value <= 0:
-            return CloseDecision(action=ACTION_HOLD)
 
         # Buy-to-close cost is the offer, not the bid the monitor hands us.
         offer = last.offer_close
-        spread = last.spread
         level_zero = float(position.level_zero or 0)
         level_follower = float(position.level_follower or 0)
 
         # Software backstop aligned with the current short stop (above price): the
         # broker fills the pushed stop; this only guarantees a close if that fails.
-        # The stop never rises, so this also enforces the initial stop.
+        # The stop never rises, so this also enforces the initial stop. It runs
+        # BEFORE the ATR warm-up guard below — otherwise a restart with fewer than
+        # ``atr_period`` candles (``atr`` returns 0) would disable the only
+        # software close for ~atr_period minutes while the stop is live. (#9)
         if level_follower > 0 and offer >= level_follower:
             return CloseDecision(action=ACTION_CLOSE, reason="stop")
+
+        atr_value = atr(list(buf.candles), self.atr_period)
+        if atr_value <= 0:
+            return CloseDecision(action=ACTION_HOLD)
+
+        spread = last.spread
 
         # Margin level frozen at open (break-even − noise margin). Fall back to a
         # per-tick computation for rows opened before it was persisted.

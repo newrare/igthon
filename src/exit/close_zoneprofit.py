@@ -36,6 +36,7 @@ from src.exit.base import (
     CloseDecision,
     CloseProfile,
     OpenPlan,
+    noise_margin,
 )
 from src.exit.zones import (
     ZONEMARGE_UPDATERS,
@@ -98,12 +99,8 @@ class CloseZoneProfit(CloseProfile):
         )
 
     def _noise_margin(self, atr_value: float, spread: float) -> float:
-        """Noise margin: the larger of a volatility fraction and a spread floor.
-
-        ``max(noise_k × ATR, 2 × spread)`` — the smallest move that counts as
-        real profit rather than bid/offer churn.
-        """
-        return max(self.noise_k * atr_value, spread * 2.0)
+        """Noise margin (see :func:`~src.exit.base.noise_margin`)."""
+        return noise_margin(self.noise_k, atr_value, spread)
 
     def initial_plan(
         self, *, entry_level: float, direction: str, buf: EpicBuffer
@@ -140,6 +137,16 @@ class CloseZoneProfit(CloseProfile):
         if is_close_hour:
             return CloseDecision(action=ACTION_CLOSE, reason="end_of_day")
 
+        # Software backstop aligned with the current real stop (the follower): the
+        # broker fills the pushed stop, this only guarantees a close if that ever
+        # fails. The stop is never lowered, so this is also the initial stop. It
+        # runs BEFORE the ATR warm-up guard below — otherwise a restart with fewer
+        # than ``atr_period`` candles (``atr`` returns 0) would disable the only
+        # software close for ~atr_period minutes while the follower is live. (#9)
+        level_follower = float(position.level_follower or 0)
+        if level_follower > 0 and current_bid <= level_follower:
+            return CloseDecision(action=ACTION_CLOSE, reason="stop")
+
         last = buf.last
         if last is None:
             return CloseDecision(action=ACTION_HOLD)
@@ -149,14 +156,7 @@ class CloseZoneProfit(CloseProfile):
 
         level_open = float(position.level_open or 0)
         level_zero = float(position.level_zero or 0)
-        level_follower = float(position.level_follower or 0)
         spread = last.spread
-
-        # Software backstop aligned with the current real stop (the follower): the
-        # broker fills the pushed stop, this only guarantees a close if that ever
-        # fails. The stop is never lowered, so this is also the initial stop.
-        if level_follower > 0 and current_bid <= level_follower:
-            return CloseDecision(action=ACTION_CLOSE, reason="stop")
 
         # Margin level frozen at open (break-even + noise margin). Fall back to a
         # per-tick computation for positions opened before it was persisted.

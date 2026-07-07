@@ -269,6 +269,10 @@ def _display_pnl(position: Position) -> float:
         return stored
     if position.level_open and position.level_close:
         move = float(position.level_close) - float(position.level_open)
+        # A short gains when the price falls — mirror the move (same sign rule as
+        # TradingService._euro_pnl), else win/loss and the P&L read inverted.
+        if position.direction == "SELL":
+            move = -move
         if position.euro_per_point is not None and float(position.euro_per_point) != 0:
             return move * float(position.euro_per_point)
         return move * (position.quantity or 1)
@@ -395,6 +399,10 @@ async def _gather_dashboard_state(request: Request) -> dict:
                     pnl_val = stored
                 elif p.level_open and p.level_close:
                     move = float(p.level_close) - float(p.level_open)
+                    # Mirror for a short (gains when price falls), else the KPI
+                    # win/loss counters and the daily P&L tile invert its sign.
+                    if p.direction == "SELL":
+                        move = -move
                     if p.euro_per_point is not None and float(p.euro_per_point) != 0:
                         pnl_val = move * float(p.euro_per_point)
                     else:

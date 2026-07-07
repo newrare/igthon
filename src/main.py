@@ -6,7 +6,6 @@ Usage:
     cd python/
     python -m src.main                  # Start bot (scheduler only)
     python -m src.main --web            # Start bot + web dashboard
-    python -m src.main --analyze-only   # Single analysis pass (no trading)
 """
 
 import argparse
@@ -19,7 +18,6 @@ from src.core.api_error_log import APIErrorLog
 from src.core.api_guard import APIGuard
 from src.core.api_queue import APIQueue
 from src.core.config import get_settings
-from src.core.indicators import compute_signal
 from src.core.recorder import DEFAULT_LOG_FILE, LogBuffer, Recorder, setup_logging
 from src.core.scheduler import BotScheduler, validate_strategy_selection
 from src.feed.candle_store import CandleStore
@@ -59,52 +57,6 @@ DEFAULT_EPICS = [
     "CS.D.EURUSD.TODAY.IP",  # EUR/USD
     "CS.D.GBPUSD.TODAY.IP",  # GBP/USD
 ]
-
-
-async def analyze_once(epics: list[str] | None = None) -> None:
-    """Run a single analysis pass and display results.
-
-    Useful for testing the indicator pipeline without trading.
-    """
-    settings = get_settings()
-    target_epics = epics or DEFAULT_EPICS
-    buffer = PriceBuffer(max_candles=100)
-
-    async with IGClient(settings) as client:
-        service = MarketDataService(client, buffer)
-
-        print(
-            f"\n{'Epic':<35} {'Score':>6} {'Dir':>7} {'R²':>5} {'ROC':>6} {'Spread':>7}"
-        )
-        print("-" * 75)
-
-        # Phase 1 — fetch every epic's candles at once; results stay in the
-        # buffer. Errors are captured per epic so one failure doesn't abort all.
-        errors = await asyncio.gather(
-            *[service.fetch_candles(epic, "MINUTE", 50) for epic in target_epics],
-            return_exceptions=True,
-        )
-
-        # Phase 2 — pure CPU: compute and print signals in table order.
-        for epic, result in zip(target_epics, errors):
-            if isinstance(result, BaseException):
-                print(f"  {epic:<33} {'ERROR':>6} — {result}")
-                continue
-            buf = buffer.get(epic)
-            if buf and len(buf) >= 20:
-                sig = compute_signal(epic, buf)
-                if sig:
-                    print(
-                        f"  {epic:<33} {sig.score:>6.2f} "
-                        f"{sig.direction:>7} {sig.regression.r_squared:>5.2f} "
-                        f"{sig.roc:>6.2f} {sig.spread:>7.2f}"
-                    )
-                else:
-                    print(f"  {epic:<33} {'N/A':>6} {'—':>7}")
-            else:
-                print(f"  {epic:<33} {'NO DATA':>6}")
-
-        print()
 
 
 #: Delay between IG reconnection attempts while the dashboard stays up (web mode).
@@ -366,12 +318,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="IG Trading Bot")
     parser.add_argument("--web", action="store_true", help="Start web dashboard")
     parser.add_argument(
-        "--analyze-only",
-        action="store_true",
-        help="Run a single analysis pass and exit",
-    )
-    parser.add_argument("--epics", nargs="*", help="Override default epics list")
-    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -395,10 +341,7 @@ def main() -> None:
         file_level=args.log_file_level,
     )
 
-    if args.analyze_only:
-        asyncio.run(analyze_once(args.epics))
-    else:
-        asyncio.run(run_bot(with_web=args.web, log_buffer=log_buffer))
+    asyncio.run(run_bot(with_web=args.web, log_buffer=log_buffer))
 
 
 if __name__ == "__main__":

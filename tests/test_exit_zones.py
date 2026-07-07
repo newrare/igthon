@@ -133,6 +133,24 @@ class TestBreakevenLock:
         assert ctx.level_zero < new_stop < ctx.current_bid
         assert new_stop > ctx.level_follower
 
+    def test_floor_never_pins_the_stop_at_or_above_the_bid(self):
+        # Regression: a flat plateau hugging break-even has zero adverse-tick-noise,
+        # so the persistence gate opens — but the ``level_zero + spread`` sliver-lock
+        # floor then lands ABOVE a bid sitting within a spread of break-even.
+        # Returning it would let the close profile's software backstop close the
+        # trade at ~break-even on the next tick (the "everything exits at 0 €" pin).
+        # The lock must hold instead.
+        buf = _buffer([7999.6, 7999.8] + [8000.3] * 20, spread=0.5)
+        ctx = _ctx(
+            buf,
+            current_bid=8000.3,  # in the band, only 0.3 above break-even
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        # floor = level_zero + spread = 8000.5 > current_bid 8000.3 → would pin.
+        assert BreakevenLockStop().propose(ctx) is None
+
     def test_holds_while_swing_low_has_not_cleared_break_even(self):
         # A recent dip back to/under break-even inside the window → swing_low is
         # not clear of break-even (net of noise) → the move has not held → hold.
@@ -259,6 +277,26 @@ class TestTrailingRatchet:
         # swing_low over the last 10 closes = 8050 → floor = 8000 + 0.6 × 50 = 8030.
         assert new_stop == pytest.approx(8030.0)
         assert new_stop < ctx.level_margin  # the floor may sit below the margin
+
+    def test_sharp_drop_holds_the_stop(self):
+        # Bid ran up then fell hard from its recent high. Absent the guard the
+        # lagging lock floor / chandelier would still step the stop up; the
+        # sharp-drop guard holds it this tick instead. Disabling the guard
+        # (window 0) makes the same raise reappear, proving it is the cause.
+        buf = _buffer([8000.0 + i for i in range(60)])  # last closes ≈ 8059
+        atr_v = atr(list(buf.candles), 14)
+        bid = 8050.0  # several ATR below the recent high, still above the floor
+        ctx = _ctx(
+            buf,
+            current_bid=bid,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert 8059.0 - bid >= 2.0 * atr_v  # precondition: this is a sharp drop
+        assert TrailingRatchetStop().propose(ctx) is None
+        raised = TrailingRatchetStop(drop_guard_window=0).propose(ctx)
+        assert raised is not None and raised > ctx.level_follower
 
     def test_wider_width_pushes_stop_further_below_bid(self):
         buf = _buffer([8000.0 + i for i in range(60)])

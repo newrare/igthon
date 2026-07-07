@@ -524,7 +524,6 @@ document.addEventListener('keydown', function(e) {
         if (chartOpen) { closeChartModal(); return; }
         if (document.getElementById('buy-confirm-modal').style.display !== 'none') closeBuyConfirmModal(false);
         if (document.getElementById('close-confirm-modal').style.display !== 'none') closeCloseConfirmModal(false);
-        if (document.getElementById('strategy-confirm-modal').style.display !== 'none') closeStrategyConfirmModal(false);
         if (document.getElementById('epics-modal').style.display !== 'none') closeEpicsModal();
         if (document.getElementById('positions-modal').style.display !== 'none') closePositionsModal();
         if (document.getElementById('closed-modal').style.display !== 'none') closeClosedModal();

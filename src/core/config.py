@@ -118,11 +118,7 @@ class Settings(BaseSettings):
     # indicator buffer when the candle table has no recent history for an epic.
     streaming_enabled: bool = True  # master switch; False = legacy polling path
     streaming_resolution: str = "1MINUTE"  # Lightstreamer CHART scale
-    streaming_bootstrap_points: int = 50  # /prices fallback seed size (>= sma_slow)
     streaming_max_epics: int = 40  # IG hard cap: 40 subscriptions per connection
-    # Recent window (minutes) read from the candle table to rehydrate the buffer
-    # on startup — wide enough to cover the longest indicator lookback.
-    streaming_rehydrate_window_minutes: int = 90
     streaming_reconnect_max_backoff_seconds: int = 60
     # Watchdog: an open position's epic must always have a live feed. If its most
     # recent streamed candle is older than this (or it has none), the scheduler
@@ -185,9 +181,16 @@ class Settings(BaseSettings):
 
     # Position management
     # Minutes before an epic's own market close to force-close a position on it.
-    # Applied to the per-epic Epic.market_close_utc when known (IG openingHours);
-    # falls back to the execution layer's default close hour otherwise.
+    # Applied to the per-epic Epic.market_close_utc when known (IG openingHours).
+    # When the close time is unknown there is no time-based force-close at all
+    # (no hard global fallback) — the position rides its broker-side stop.
     strategy_close_margin_minutes: int = 5
+    # Do not OPEN a new position when the epic's own market closes within this
+    # many minutes (on top of ``strategy_close_margin_minutes``). Prevents opening
+    # a trade the per-epic close rule would force-close almost immediately —
+    # paying the spread for nothing. Only applies to epics whose close time is
+    # known; a 24h market (unknown close) is never blocked.
+    strategy_open_close_buffer_minutes: int = 60
     # Safety margin added on top of IG's minimum stop distance when placing an
     # order. IG rejects a stop that sits at/inside its minimum-distance rule, and
     # the price drifts between the market snapshot and the order landing, so a

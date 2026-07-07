@@ -64,6 +64,33 @@ class TestConversionRate:
         instrument = {"currencies": [{"code": "EUR", "baseExchangeRate": 1.0}]}
         assert conversion_rate(instrument, "EUR") == 1.0
 
+    def test_placeholder_exchange_rate_inverts_base(self):
+        # Real London Cocoa payload: exchangeRate is a 1.0 placeholder while the
+        # true GBP->EUR rate is the reciprocal of baseExchangeRate. Trusting the
+        # 1.0 under-states the euro risk by the whole conversion factor.
+        instrument = {
+            "currencies": [
+                {"code": "GBP", "baseExchangeRate": 0.8540074, "exchangeRate": 1.0}
+            ]
+        }
+        assert conversion_rate(instrument, "GBP") == pytest.approx(1.0 / 0.8540074)
+
+    def test_eur_one_is_not_a_placeholder(self):
+        # A 1.0 rate on the account currency itself is a genuine 1:1, not a
+        # placeholder — it must be kept even when baseExchangeRate is present.
+        instrument = {
+            "currencies": [
+                {"code": "EUR", "baseExchangeRate": 2.0, "exchangeRate": 1.0}
+            ]
+        }
+        assert conversion_rate(instrument, "EUR") == 1.0
+
+    def test_placeholder_without_base_keeps_one(self):
+        # No baseExchangeRate to recover the real rate: fall back to 1.0 rather
+        # than crash — the caller's euro_per_point guard flags the 0-contract case.
+        instrument = {"currencies": [{"code": "GBP", "exchangeRate": 1.0}]}
+        assert conversion_rate(instrument, "GBP") == 1.0
+
 
 class TestEuroPerPoint:
     """euro_per_point reproduces the broker's realized P&L exactly.

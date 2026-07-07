@@ -134,7 +134,20 @@ def breakeven_lock_level(ctx: StopContext, params: BreakevenLockParams) -> float
     if swing_low - noise <= ctx.level_zero:
         return None
     target = ctx.level_zero + params.lock_fraction * (swing_low - ctx.level_zero)
-    return max(target, ctx.level_zero + ctx.spread)
+    level = max(target, ctx.level_zero + ctx.spread)
+    # Never return a lock at or above the live bid. The close profile's software
+    # backstop closes the position as soon as ``bid <= follower`` (see
+    # :meth:`~src.exit.close_zoneprofit.CloseZoneProfit.evaluate`), so a lock placed
+    # at/above the current bid forces an immediate exit at ~break-even — exactly the
+    # "everything exits at 0 €" pin this module exists to avoid. It slips through on
+    # a flat/monotone plateau hugging break-even, where ``adverse_tick_noise`` is 0
+    # (it only measures down-moves): the noise cushion in the guard above vanishes
+    # and the ``level_zero + spread`` floor can rise above a bid sitting just inside
+    # a spread of break-even. When there is no room to lock safely below the bid,
+    # hold (the previous, lower follower still protects the position).
+    if level >= ctx.current_bid:
+        return None
+    return level
 
 
 class StopUpdater(ABC):

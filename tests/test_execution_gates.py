@@ -35,3 +35,12 @@ class TestOpenGates:
     def test_duplicate_epic_blocks(self):
         allowed, reason = _gate(epic_already_open=True)
         assert not allowed and "already open" in reason
+
+    def test_closes_soon_blocks(self):
+        allowed, reason = _gate(closes_soon=True)
+        assert not allowed and "closes soon" in reason
+
+    def test_closes_soon_defaults_to_allowed(self):
+        # Omitting ``closes_soon`` (e.g. the simulator) must not block.
+        allowed, reason = _gate()
+        assert allowed is True and reason == "OK"

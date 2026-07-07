@@ -139,7 +139,7 @@ class TestManagePosition:
         # Never a close-hour so the profit-zone trailing branch is exercised. The
         # bid is far above the (open-frozen) margin and the tail is rising, so the
         # profit-gated profile ratchets the stop up below the bid.
-        svc, client, db = _service(close_profile=_profile(), hour_close=99)
+        svc, client, db = _service(close_profile=_profile())
         buf = _buffer_rising()  # rising last-3 bids → momentum confirmed
         bid = buf.last.bid_close
         pos = Position(
@@ -163,7 +163,7 @@ class TestManagePosition:
 
     async def test_holds_below_entry(self):
         # Below break-even (underwater zone) → hold, stop untouched.
-        svc, client, _ = _service(close_profile=_profile(), hour_close=99)
+        svc, client, _ = _service(close_profile=_profile())
         buf = _buffer_atr2()
         pos = Position(
             epic="X",
@@ -181,8 +181,9 @@ class TestManagePosition:
         client.put.assert_not_awaited()
 
     async def test_end_of_day_closes_via_profile(self):
-        # hour_close 0 → always a close-hour → profile returns CLOSE(end_of_day).
-        svc, client, _ = _service(close_profile=_profile(), hour_close=0)
+        # At the epic's close hour → profile returns CLOSE(end_of_day).
+        svc, client, _ = _service(close_profile=_profile())
+        svc._is_epic_close_hour = AsyncMock(return_value=True)
         buf = _buffer_atr2()
         pos = Position(
             epic="X",
@@ -205,7 +206,7 @@ class TestManagePosition:
 
     async def test_without_profile_falls_back_to_check_and_close(self):
         # No close profile wired → legacy check_and_close path (no IG put here).
-        svc, client, _ = _service(close_profile=None, hour_close=99)
+        svc, client, _ = _service(close_profile=None)
         buf = _buffer_atr2()
         pos = Position(
             epic="X",
@@ -221,17 +222,13 @@ class TestManagePosition:
 
 
 class TestPerEpicCloseHour:
-    """The per-epic close gate: epic-specific close time, else global fallback."""
+    """The per-epic close gate: driven solely by the epic's own close time."""
 
-    async def test_falls_back_to_global_hour_close_when_unknown(self):
-        # No per-epic close time -> global hour_close governs.
-        svc, _, db = _service(hour_close=0)
+    async def test_no_force_close_when_close_time_unknown(self):
+        # Unknown per-epic close time -> NO hard fallback: never a close-hour.
+        svc, _, db = _service()
         db.scalar = AsyncMock(return_value=None)  # unknown -> None
-        assert await svc._is_epic_close_hour("X") is True  # now.hour >= 0 always
-
-        svc2, _, db2 = _service(hour_close=99)
-        db2.scalar = AsyncMock(return_value=None)
-        assert await svc2._is_epic_close_hour("X") is False  # now.hour >= 99 never
+        assert await svc._is_epic_close_hour("X") is False
 
     async def test_uses_per_epic_close_minus_margin(self, monkeypatch):
         from datetime import time
@@ -252,3 +249,34 @@ class TestPerEpicCloseHour:
         # now 15:28 < 16:00 - 5min (15:55) -> hold
         db.scalar = AsyncMock(return_value=time(16, 0))
         assert await svc._is_epic_close_hour("X") is False
+
+
+class TestPreOpenCloseSoonGate:
+    """The pre-open gate: block opening when the epic's market closes soon."""
+
+    async def test_unknown_close_time_never_blocks(self):
+        # 24h market (or a market we could not open anyway) -> allowed.
+        svc, _, db = _service()
+        db.scalar = AsyncMock(return_value=None)
+        assert await svc._is_epic_close_soon("X") is False
+
+    async def test_blocks_within_close_margin_plus_buffer(self, monkeypatch):
+        from datetime import time
+
+        import src.execution.trading as trading_mod
+
+        class _FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 6, 26, 15, 0, tzinfo=tz)
+
+        monkeypatch.setattr(trading_mod, "datetime", _FrozenDT)
+
+        # margin 5 + buffer 60 = block when the market closes within 65 min.
+        svc, _, db = _service(close_margin_minutes=5, open_close_buffer_minutes=60)
+        # now 15:00, close 15:30 -> 30 min <= 65 -> block.
+        db.scalar = AsyncMock(return_value=time(15, 30))
+        assert await svc._is_epic_close_soon("X") is True
+        # now 15:00, close 16:30 -> 90 min > 65 -> allow.
+        db.scalar = AsyncMock(return_value=time(16, 30))
+        assert await svc._is_epic_close_soon("X") is False

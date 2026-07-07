@@ -7,11 +7,8 @@ import pytest
 from src.core.indicators import (
     adverse_tick_noise,
     atr,
-    compute_levels,
     linear_regression,
-    position_in_range,
     rate_of_change,
-    sma,
 )
 from src.feed.price_buffer import Candle
 
@@ -137,23 +134,6 @@ class TestLinearRegression:
         assert result.slope == 0.0
 
 
-class TestSMA:
-    """Tests for Simple Moving Average."""
-
-    def test_basic_sma(self):
-        values = [10.0, 20.0, 30.0, 40.0, 50.0]
-        assert sma(values, 3) == pytest.approx(40.0)  # (30+40+50)/3
-        assert sma(values, 5) == pytest.approx(30.0)  # (10+20+30+40+50)/5
-
-    def test_insufficient_data(self):
-        values = [10.0, 20.0]
-        assert sma(values, 5) == 0.0
-
-    def test_single_period(self):
-        values = [10.0, 20.0, 30.0]
-        assert sma(values, 1) == pytest.approx(30.0)
-
-
 class TestROC:
     """Tests for Rate of Change."""
 
@@ -172,57 +152,3 @@ class TestROC:
         values = [100.0, 110.0]
         roc = rate_of_change(values, 5)
         assert roc == 0.0
-
-
-class TestPositionInRange:
-    """Tests for position_in_range."""
-
-    def test_mid_range(self):
-        assert position_in_range(50.0, 100.0, 0.0) == pytest.approx(50.0)
-
-    def test_at_low(self):
-        assert position_in_range(0.0, 100.0, 0.0) == pytest.approx(0.0)
-
-    def test_at_high(self):
-        assert position_in_range(100.0, 100.0, 0.0) == pytest.approx(100.0)
-
-    def test_same_high_low(self):
-        assert position_in_range(50.0, 50.0, 50.0) == pytest.approx(50.0)
-
-
-class TestComputeLevels:
-    """Tests for trading level calculations."""
-
-    def test_spread_tactic(self):
-        levels = compute_levels(
-            bid=100.0,
-            offer=101.0,
-            high=110.0,
-            low=90.0,
-            bids=[95.0, 98.0, 100.0],
-            tactic="spread",
-        )
-        # Spread = 1.0
-        assert levels.spread == pytest.approx(1.0)
-        assert levels.level_win > levels.bid
-        assert levels.level_loose < levels.bid
-        assert levels.level_security < levels.level_loose
-        assert levels.stop_distance > 0
-
-    def test_point_tactic(self):
-        levels = compute_levels(
-            bid=100.0,
-            offer=101.0,
-            high=110.0,
-            low=90.0,
-            bids=[100.0],
-            follower_mult=3,
-            win_mult=3,
-            loose_mult=8,
-            security_mult=5,
-            tactic="point",
-        )
-        # With point tactic, base = 1.0
-        assert levels.level_follower == pytest.approx(97.0)  # 100 - 3*1
-        assert levels.level_win == pytest.approx(104.0)  # 100 + 1 + 3*1
-        assert levels.stop_distance == pytest.approx(14)  # ceil(1 + 8 + 5)

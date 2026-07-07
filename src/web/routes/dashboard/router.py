@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -260,21 +259,56 @@ def _trade_overlay(p: Position) -> dict:
             level = entry.get("level")
             if when is None or not level:
                 continue
-            points.append({"t": when, "level": float(level)})
+            point = {"t": when, "level": float(level)}
+            # Level actually posted at the broker for this ratchet — one spread
+            # below the software follower (see TradingService._broker_stop_level).
+            # Kept internal here; the follower line uses ``level`` and the broker
+            # ("Loose") line reads ``broker`` (falling back to ``level`` for legacy
+            # points recorded before the two stops were decoupled).
+            broker = entry.get("broker")
+            if broker:
+                point["broker"] = float(broker)
+            points.append(point)
         return points or None
 
-    # Entry marker sits on the BID at open. A long is filled on the offer, so the
-    # bid at that instant is the offer minus the spread; ``level_zero`` is exactly
-    # that open offer and ``pip_spread`` the spread, so ``level_zero - pip_spread``
-    # reconstructs the open bid (falls back to the recorded fill). The break-even
-    # is then ``level_zero`` itself — one spread above the bid, as it must be for a
-    # long (the bid has to climb back through the spread to reach flat).
+    # Entry/break-even/margin/exit are drawn on the BID curve the chart plots, so
+    # they differ by direction:
+    #   - LONG: filled on the offer, so the open bid is ``level_zero - spread`` and
+    #     break-even is ``level_zero`` itself (one spread above the bid — the bid
+    #     must climb back through the spread to reach flat).
+    #   - SHORT: sold at the bid, so the entry marker is ``level_open`` (the fill).
+    #     The close engine watches the offer (buy-to-close), so break-even, margin
+    #     and the exit fill sit one spread BELOW their stored (offer) levels when
+    #     mapped onto the bid curve.
     zero = _level("level_zero")
     spread = _num("pip_spread")
-    if zero is not None and spread is not None:
-        open_bid: float | None = zero - spread
+    level_open_v = _level("level_open")
+    close_v = _level("level_close")
+    margin_v = _level("level_margin")
+    direction = getattr(p, "direction", "BUY") or "BUY"
+
+    have_spread = spread is not None
+    if direction == "SELL":
+        open_bid: float | None = level_open_v
+        zero_line = (zero - spread) if (zero is not None and have_spread) else zero
+        margin_line = (
+            (margin_v - spread)
+            if (margin_v is not None and spread is not None)
+            else margin_v
+        )
+        close_line = (
+            (close_v - spread)
+            if (close_v is not None and spread is not None)
+            else close_v
+        )
     else:
-        open_bid = _level("level_open")
+        if zero is not None and spread is not None:
+            open_bid = zero - spread
+        else:
+            open_bid = level_open_v
+        zero_line = zero
+        margin_line = margin_v
+        close_line = close_v
 
     # Two distinct protective-stop lines for the chart:
     #   - the FOLLOWER stop (``level_follower`` + its ratchet history): the
@@ -284,33 +318,41 @@ def _trade_overlay(p: Position) -> dict:
     #   - the LOOSE stop (``level_stop`` + its pushed updates): the protective
     #     stop actually resting at the broker, the safety net that secures a close
     #     if price gaps between two bid readings.
-    # They diverge at open whenever IG's minimum-stop-distance rule widens the
-    # broker (loose) stop past the (tighter) follower — so a close triggered on
-    # the follower looks, on the broker line alone, as if the stop was never
-    # touched. ``stop_history`` is seeded with the follower and every ratchet is
-    # also pushed to IG, so the loose trajectory is reconstructed as the broker's
-    # initial level followed by those same ratchet points.
-    follower_stops = _stops()
+    # They diverge because the broker stop is deliberately posted one spread below
+    # the software follower (see TradingService._broker_stop_level), so the app
+    # closes first and the broker order is a pure safety net — and, at open, also
+    # whenever IG's minimum-stop-distance rule widened the broker stop. The loose
+    # trajectory is the broker's initial level (index 0, where the two coincide)
+    # followed by the level actually pushed to IG at each ratchet (the per-point
+    # ``broker``); legacy points without it fall back to the follower level.
+    raw_stops = _stops()
+    # Follower (application-side) line: strip the internal per-point broker level
+    # so the software-stop trajectory stays {t, level}.
+    follower_stops = (
+        [{"t": s["t"], "level": s["level"]} for s in raw_stops] if raw_stops else None
+    )
     loose_initial = _level("level_stop")
-    if not follower_stops:
+    if not raw_stops:
         loose_stops = None
-    elif loose_initial is None:
-        loose_stops = follower_stops
     else:
-        loose_stops = [
-            {"t": follower_stops[0]["t"], "level": loose_initial},
-            *follower_stops[1:],
-        ]
+        loose_stops = []
+        for i, s in enumerate(raw_stops):
+            if i == 0 and loose_initial is not None:
+                level = loose_initial
+            else:
+                level = s.get("broker", s["level"])
+            loose_stops.append({"t": s["t"], "level": level})
 
     return {
         "id": p.id,
-        "open": _level("level_open"),
+        "direction": direction,
+        "open": level_open_v,
         "openBid": open_bid,
-        "zero": zero,
+        "zero": zero_line,
         # Margin level frozen at open (break-even + noise margin): the boundary
         # between the break-even band (zone 2) and real profit (zone 3). Drawn as
         # its own reference line so the three zones are visible on the chart.
-        "margin": _level("level_margin"),
+        "margin": margin_line,
         # Loose stop (resting at the broker): the initial clamped level (never
         # lowered) and, when a ratchet history exists, the stepped path of every
         # level later pushed to IG.
@@ -324,7 +366,7 @@ def _trade_overlay(p: Position) -> dict:
         "stopFollower": _level("level_follower"),
         "stopsFollower": follower_stops,
         "target": _level("level_win"),
-        "close": _level("level_close"),
+        "close": close_line,
         # Close reason — lets the chart flag an *estimated* exit (the position
         # vanished from IG and the close level/time were derived, not a captured
         # fill) so it is not read as a real stop/limit execution.
@@ -679,6 +721,8 @@ async def close_position_manual(request: Request, position_id: int) -> JSONRespo
     """Close an open position manually from the dashboard."""
     api_queue = getattr(request.app.state, "api_queue", None)
     session_factory = request.app.state.session_factory
+    scheduler = getattr(request.app.state, "scheduler", None)
+    settings = request.app.state.settings
 
     if not api_queue or not session_factory:
         return JSONResponse({"error": "Trading not available"}, status_code=503)
@@ -690,32 +734,14 @@ async def close_position_manual(request: Request, position_id: int) -> JSONRespo
         if position.state != PositionState.OPEN:
             return JSONResponse({"error": "Position is not open"}, status_code=400)
 
-        deal_id = position.deal_id
-        if not deal_id:
-            try:
-                positions_data = await api_queue.get(
-                    "/positions",
-                    version=2,
-                    priority=Priority.URGENT,
-                    label=f"manual close {position.epic}: resolve deal_id",
-                )
-                for entry in positions_data.get("positions", []):
-                    if entry.get("market", {}).get("epic") == position.epic:
-                        deal_id = entry.get("position", {}).get("dealId")
-                        if deal_id:
-                            position.deal_id = deal_id
-                            await session.commit()
-                        break
-            except Exception as exc:
-                logger.warning(
-                    "Could not resolve dealId for %s: %s", position.epic, exc
-                )
-
-        if not deal_id:
-            return JSONResponse(
-                {"error": "No deal ID found for this position"}, status_code=400
-            )
-
+        # Delegate the whole close to TradingService rather than reimplementing it.
+        # The old inline code hard-coded ``direction="SELL"`` and a long-only
+        # ``move = close - open``, so it could neither close a recovery SELL (IG
+        # rejects a SELL to close a SELL) nor record a short's P&L with the right
+        # sign. ``_close_position`` (via ``close_manually``) mirrors the direction
+        # (BUY to close a SELL), mirrors the P&L, resolves a missing dealId,
+        # prefers IG's authoritative confirm (fill level + realized profit) and
+        # handles the phantom case — all shared with the automated close path.
         try:
             market_data = await api_queue.get(
                 f"/markets/{position.epic}",
@@ -723,75 +749,33 @@ async def close_position_manual(request: Request, position_id: int) -> JSONRespo
                 priority=Priority.URGENT,
                 label=f"manual close {position.epic}: market",
             )
-            close_level = float(market_data.get("snapshot", {}).get("bid", 0))
         except Exception as exc:
             return JSONResponse(
                 {"error": f"Failed to fetch market price: {exc}"}, status_code=500
             )
 
-        close_payload = {
-            "dealId": deal_id,
-            "direction": "SELL",
-            "size": position.quantity or 1,
-            "orderType": "MARKET",
-            "timeInForce": "EXECUTE_AND_ELIMINATE",
-            "forceOpen": False,
-        }
+        # Fallback close level only (the IG confirm inside _close_position
+        # overrides it with the real fill when available): a short is bought back
+        # at the offer, a long sold at the bid.
+        snapshot = market_data.get("snapshot", {})
+        price_field = "offer" if position.direction == "SELL" else "bid"
+        close_level = float(snapshot.get(price_field, 0) or 0)
+
+        config = TradeConfig.from_settings(settings)
+        close_profile = scheduler.close_profile if scheduler is not None else None
+        trading = TradingService(
+            api_queue, session, config, close_profile=close_profile
+        )
         try:
-            close_result = await api_queue.delete(
-                "/positions/otc",
-                close_payload,
-                version=1,
-                priority=Priority.URGENT,
-                label=f"manual close {position.epic}: order",
-            )
+            closed = await trading.close_manually(position, close_level)
         except Exception as exc:
             logger.error("Manual close failed for %s: %s", position.epic, exc)
             return JSONResponse({"error": str(exc)}, status_code=500)
+        if not closed:
+            return JSONResponse({"error": "Close rejected by IG"}, status_code=500)
 
-        # Prefer IG's authoritative fill level + realized profit from the close
-        # confirmation; fall back to the observed bid and euro_per_point.
-        deal_reference = close_result.get("dealReference")
-        ig_profit: float | None = None
-        if deal_reference:
-            try:
-                confirm = await api_queue.get(
-                    f"/confirms/{deal_reference}",
-                    version=1,
-                    priority=Priority.URGENT,
-                    label=f"manual close {position.epic}: confirm",
-                )
-                if confirm.get("level") is not None:
-                    close_level = float(confirm["level"])
-                if confirm.get("profit") is not None and confirm.get(
-                    "profitCurrency"
-                ) in (None, "", "EUR", "E", "€"):
-                    ig_profit = float(confirm["profit"])
-            except Exception as exc:
-                logger.debug("Close confirm unavailable for %s: %s", position.epic, exc)
-
-        now = datetime.now(UTC)
-        move = close_level - float(position.level_open or 0)
-        if position.euro_per_point is not None and float(position.euro_per_point) != 0:
-            euro_pnl = move * float(position.euro_per_point)
-        else:
-            euro_per_pip = (
-                float(position.euro_stop or 1)
-                / float(position.size or 1)
-                / float(position.quantity or 1)
-            )
-            euro_pnl = move * (position.quantity or 1) * euro_per_pip
-        if ig_profit is not None:
-            euro_pnl = ig_profit
-
-        position.state = PositionState.CLOSE
-        position.time_close = now.time()
-        position.level_close = Decimal(str(round(close_level, 5)))
-        position.reason_close = "manual"
-        position.euro = Decimal(str(round(euro_pnl, 3)))
-        position.win = 1 if euro_pnl > 0 else 0
-        await session.commit()
-
+        euro_pnl = float(position.euro or 0)
+        close_level = float(position.level_close or close_level)
         logger.info(
             "Manual position closed: %s level=%.3f P&L=%.2f€",
             position.epic,

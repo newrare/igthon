@@ -16,6 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.scheduler import BotScheduler, validate_strategy_selection
+from src.entry.open_ranking import OpenRanking
 from src.feed.price_buffer import Candle, PriceBuffer
 from src.models.database import Base
 from src.models.job_preference import JobPreference
@@ -391,6 +392,53 @@ class TestTradedTodayEpics:
         assert traded == {"A", "B"}
 
 
+class TestRollingParticipationGate:
+    """The rolling ranker refuses to crown a winner from a thin, half-cold pool.
+
+    Guards against "false tournaments" (e.g. just after a mid-session restart):
+    a winner is only declared once more than ``min_participation_ratio`` of the
+    livestreamed tradable universe has warmed up.
+    """
+
+    @staticmethod
+    def _warm_up(scheduler: BotScheduler, epic: str, count: int) -> None:
+        """Push ``count`` monotonically-stamped candles onto ``epic``'s buffer."""
+        base = datetime.now(UTC) - timedelta(minutes=count)
+        for i in range(count):
+            scheduler._buffer.add_candle(epic, _candle(base + timedelta(minutes=i)))
+
+    def _ranker_scheduler(self, session_factory):
+        streaming = MagicMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        scheduler._strategy = OpenRanking()
+        scheduler._tradable_epics = [f"E{i}" for i in range(10)]
+        # Spy on scoring: it must run only once the participation gate passes.
+        scheduler._strategy.evaluate = MagicMock(return_value=None)
+        return scheduler
+
+    async def test_thin_pool_skips_tournament(self, session_factory):
+        scheduler = self._ranker_scheduler(session_factory)
+        warmup = scheduler._strategy.warmup
+        # Only 4 of 10 warmed up (40% <= 50%) — the tournament must be skipped.
+        for i in range(4):
+            self._warm_up(scheduler, f"E{i}", warmup)
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_full_pool_runs_tournament(self, session_factory):
+        scheduler = self._ranker_scheduler(session_factory)
+        warmup = scheduler._strategy.warmup
+        # 6 of 10 warmed up (60% > 50%) — scoring proceeds over the ready epics.
+        for i in range(6):
+            self._warm_up(scheduler, f"E{i}", warmup)
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 6
+
+
 def _streaming_scheduler(session_factory, streaming):
     """Scheduler wired with a real PriceBuffer and the given streaming stub."""
     settings = MagicMock()
@@ -483,6 +531,44 @@ class TestOpenEpicFeedWatchdog:
         await scheduler._ensure_open_epics_streamed()
 
         streaming.resubscribe.assert_not_awaited()
+
+
+class TestStreamingHealthCheck:
+    """Always-on 24/7 watchdog: reconnect a dead session, else repair per-epic feeds."""
+
+    async def test_forces_reconnect_when_session_down(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = False
+        streaming.ensure_connected = AsyncMock()
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+
+        await scheduler._streaming_health_check()
+
+        streaming.ensure_connected.assert_awaited_once()
+        # Per-epic repair is skipped while the session is down.
+        streaming.resubscribe.assert_not_awaited()
+
+    async def test_repairs_stale_feed_when_connected(self, session_factory):
+        streaming = MagicMock()
+        streaming.is_connected = True
+        streaming.subscribed_epics = ["A"]
+        streaming.ensure_connected = AsyncMock()
+        streaming.resubscribe = AsyncMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        await _add_open(session_factory, "A")
+        stale = datetime.now(UTC) - timedelta(seconds=600)
+        scheduler._buffer.add_candle("A", _candle(stale))
+
+        await scheduler._streaming_health_check()
+
+        # Session is up: no reconnect, but the stalled open-epic feed is resubscribed.
+        streaming.ensure_connected.assert_not_awaited()
+        streaming.resubscribe.assert_awaited_once_with("A")
+
+    async def test_noop_when_streaming_disabled(self, session_factory):
+        scheduler = _make_scheduler(session_factory)  # streaming=None
+        await scheduler._streaming_health_check()  # must not raise
 
 
 def _market(epic: str, status: str = "TRADEABLE") -> SimpleNamespace:

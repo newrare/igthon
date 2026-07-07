@@ -46,11 +46,12 @@ CLOSE_ZONEPROFIT=trailing_ratchet  # zone above the margin
 
 Registered in [src/entry/\_\_init\_\_.py](../../src/entry/__init__.py):
 
-| Name              | File                           | Doc                                      | Style                                   |
-| ----------------- | ------------------------------ | ---------------------------------------- | --------------------------------------- |
-| `open_donchian`   | `src/entry/open_donchian.py`   | [open_donchian.md](open_donchian.md)     | Breakout gated by trend efficiency      |
-| `open_projection` | `src/entry/open_projection.py` | [open_projection.md](open_projection.md) | Breakout + multi-model projection gate  |
-| `open_ranking`    | `src/entry/open_ranking.py`    | [open_ranking.md](open_ranking.md)       | Cross-epic ranker, one rolling position |
+| Name              | File                           | Doc                                      | Style                                      |
+| ----------------- | ------------------------------ | ---------------------------------------- | ------------------------------------------ |
+| `open_donchian`   | `src/entry/open_donchian.py`   | [open_donchian.md](open_donchian.md)     | Breakout gated by trend efficiency         |
+| `open_projection` | `src/entry/open_projection.py` | [open_projection.md](open_projection.md) | Breakout + multi-model projection gate     |
+| `open_ranking`    | `src/entry/open_ranking.py`    | [open_ranking.md](open_ranking.md)       | Cross-epic ranker, one rolling position    |
+| `open_testing`    | `src/entry/open_testing.py`    | [open_testing.md](open_testing.md)       | Diagnostic: open max markets/day at random |
 
 ## Available stop-distance policies
 

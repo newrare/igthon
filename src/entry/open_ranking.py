@@ -82,6 +82,10 @@ class OpenRanking(EntryStrategy):
     concurrent_positions = 1  # keep a single rolling position open all day
     open_after_minutes = 60  # ≈ one hour of livestream warm-up before first open
     wallet_reserve = 0.10  # keep 10% of available funds free
+    # Only crown a winner once more than half the livestreamed tradable universe
+    # is warmed up — avoids opening the least-bad of a tiny pool right after a
+    # mid-session restart (with ~40 epics, 0.5 means > 20 must be ready).
+    min_participation_ratio = 0.5
 
     # Component windows.
     projection_horizon: int = 60  # candles ahead each projection model extends

@@ -70,6 +70,13 @@ class EntryStrategy(ABC):
     # rather than a wall clock). Kept for reference / the simulator's own gating.
     open_after_minutes: int = 60
     wallet_reserve: float = 0.10  # fraction of available funds kept free
+    # Minimum fraction of the livestreamed tradable universe that must be
+    # warmed up (``len(buf) >= warmup``) before a winner is declared. Guards
+    # against "false tournaments" — e.g. just after a mid-session restart only a
+    # handful of epics have rebuilt enough history, so the ranker would crown the
+    # least-bad of a tiny pool instead of the best of the day. ``0.5`` = strictly
+    # more than half the universe must be ready to participate.
+    min_participation_ratio: float = 0.5
 
     @property
     @abstractmethod

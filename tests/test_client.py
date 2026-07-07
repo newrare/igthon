@@ -80,6 +80,45 @@ async def test_client_login(settings):
         assert client._session.is_authenticated
 
 
+@pytest.mark.asyncio
+async def test_headers_built_after_auth_refresh(settings):
+    """Regression: the bearer must be read AFTER _ensure_auth() refreshes it.
+
+    IG v3 tokens live ~60s. Building the header before the refresh sent a dead
+    bearer on the expiry edge → 401, which the APIQueue classifies as a
+    non-retryable client error and drops for a non-GET (an order). The header is
+    now built inside _request_context, after the refresh has run.
+    """
+    client = IGClient(settings)
+
+    captured: dict = {}
+
+    async def fake_post(url, json=None, headers=None):
+        captured.update(headers or {})
+        resp = MagicMock()
+        resp.is_error = False
+        resp.json.return_value = {"ok": True}
+        return resp
+
+    http = MagicMock()
+    http.post = AsyncMock(side_effect=fake_post)
+    client._http = http
+
+    # Session carries a STALE bearer until ensure_valid_token() "refreshes" it.
+    session = MagicMock()
+    session.auth_headers = {"Authorization": "Bearer STALE"}
+
+    async def refresh(_http):
+        session.auth_headers = {"Authorization": "Bearer FRESH"}
+
+    session.ensure_valid_token = AsyncMock(side_effect=refresh)
+    client._session = session
+
+    await client.post("/positions/otc", {"epic": "X"}, version=2)
+
+    assert captured["Authorization"] == "Bearer FRESH"
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_client_get(settings):

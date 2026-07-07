@@ -44,7 +44,7 @@ async def list_positions(
                     "epic_name": p.epic_name,
                     "date": p.date.isoformat() if p.date else None,
                     "state": p.state.value if p.state else None,
-                    "direction": "BUY",
+                    "direction": p.direction,
                     "level_open": float(p.level_open) if p.level_open else None,
                     "level_close": float(p.level_close) if p.level_close else None,
                     "euro": float(p.euro) if p.euro is not None else None,

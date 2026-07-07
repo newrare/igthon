@@ -61,10 +61,11 @@ RECONCILE_GRACE_SECONDS = 60.0
 CONFIRM_MAX_ATTEMPTS = 4
 CONFIRM_RETRY_DELAY_SECONDS = 0.4
 
-# Fallback market-close hour (UTC) used only when an epic exposes no per-epic
-# close time (``Epic.market_close_utc``). Positions are normally closed just
-# before each epic's own market close; this is the catch-all for the rare epic
-# with no known schedule (and the global end-of-day safety sweep).
+# Wall-clock market-close hour (UTC) used ONLY by the backtest simulator, which
+# has no live ``marketStatus`` to read and no per-epic ``Epic.market_close_utc``
+# to consult. The LIVE close path never uses it: it is driven solely by each
+# epic's own market close (see :meth:`TradingService._is_epic_close_hour`), with
+# no hard global fallback.
 DEFAULT_MARKET_CLOSE_HOUR_UTC = 17
 
 # Re-exported for backward compatibility: these pure close helpers now live in
@@ -84,12 +85,17 @@ __all__ = [
 class TradeConfig:
     """Trading configuration parameters."""
 
-    # Fallback close hour (UTC); overridden per-epic by Epic.market_close_utc.
+    # Wall-clock close hour (UTC) — used ONLY by the backtest simulator (no live
+    # marketStatus / per-epic close). The live close path ignores it.
     hour_close: int = DEFAULT_MARKET_CLOSE_HOUR_UTC
     # Minutes before a market's own close at which an open position on it is
-    # force-closed (per-epic close rule). Applied to Epic.market_close_utc when
-    # known; otherwise ``hour_close`` is the fallback.
+    # force-closed (per-epic close rule, applied to Epic.market_close_utc). When
+    # the close time is unknown, no time-based force-close happens at all.
     close_margin_minutes: int = 5
+    # Do not open a new position when the epic's own market closes within this
+    # many minutes (added on top of ``close_margin_minutes``). Only applies when
+    # the epic's close time is known.
+    open_close_buffer_minutes: int = 60
     # Fraction added on top of IG's minimum stop distance when clamping an order's
     # protective stop, so a fast-moving market can't push the stop back under
     # IG's floor between the market snapshot and the order ("Stop trop près").
@@ -105,6 +111,9 @@ class TradeConfig:
         """Build TradeConfig from application Settings."""
         return cls(
             close_margin_minutes=settings.strategy_close_margin_minutes,
+            open_close_buffer_minutes=getattr(
+                settings, "strategy_open_close_buffer_minutes", 60
+            ),
             stop_min_distance_margin=getattr(
                 settings, "strategy_stop_min_distance_margin", 0.15
             ),
@@ -160,56 +169,71 @@ class TradingService:
             return None
         return result if isinstance(result, time) else None
 
+    async def _epic_minutes_to_close(self, epic: str) -> float | None:
+        """Minutes from now until the epic's own market close (UTC), or None.
+
+        Returns None when the epic exposes no close time (a 24h market such as
+        forex, or a market currently closed for which IG returns no
+        ``openingHours``). Callers apply no time-based rule at all on None — there
+        is deliberately no hard global fallback.
+        """
+        close_t = await self._epic_close_utc(epic)
+        if close_t is None:
+            return None
+        now = datetime.now(UTC)
+        close_dt = datetime.combine(now.date(), close_t, tzinfo=UTC)
+        return (close_dt - now).total_seconds() / 60.0
+
     async def _is_epic_close_hour(self, epic: str) -> bool:
         """True when a position on ``epic`` should be force-closed for the day.
 
-        Uses the epic's own market close (``Epic.market_close_utc``) minus the
-        configured margin when known, so the position is closed just before that
-        market actually closes. Falls back to the global ``hour_close`` (UTC) when
-        the per-epic close time is unknown (e.g. IG exposes no openingHours).
+        Driven solely by the epic's own market close (``Epic.market_close_utc``)
+        minus the configured margin, so the position is closed just before that
+        market actually closes. When the close time is unknown there is NO hard
+        fallback: the position is left to its broker-side stop rather than
+        force-closed on a guessed global hour.
         """
-        now = datetime.now(UTC)
-        close_t = await self._epic_close_utc(epic)
-        if close_t is not None:
-            close_dt = datetime.combine(now.date(), close_t, tzinfo=UTC)
-            margin = timedelta(minutes=self._config.close_margin_minutes)
-            return now >= close_dt - margin
-        return now.hour >= self._config.hour_close
+        minutes = await self._epic_minutes_to_close(epic)
+        if minutes is None:
+            return False
+        return minutes <= self._config.close_margin_minutes
 
-    async def can_open_position(self, signal: TradingSignal) -> tuple[bool, str]:
-        """Run all pre-open checks. Returns (allowed, reason).
+    async def _is_epic_close_soon(self, epic: str) -> bool:
+        """True when the epic's market closes within the pre-open buffer.
 
-        Checks:
-        1. Signal direction is BUY
-        2. No duplicate epic open
-        3. Market is TRADEABLE (checked during open_position)
-
-        Note: there is no wall-clock trading-hours gate live — the real
-        "is the market open?" signal is the per-epic ``marketStatus ==
-        TRADEABLE`` check (hourly tradable filter + re-check in
-        :meth:`open_position`), so ``in_trading_hours`` is always satisfied
-        here. The simulator keeps its own hour gate (no live status to read).
+        Guards the open side: a position opened just before the per-epic close
+        rule fires would be force-closed almost immediately, paying the spread
+        for nothing. Blocks when the market closes within
+        ``close_margin_minutes + open_close_buffer_minutes``. An unknown close
+        time (24h market, or a market we could not open anyway) never blocks.
         """
-        return evaluate_open_gates(
-            epic=signal.epic,
-            direction=signal.direction,
-            in_trading_hours=True,
-            epic_already_open=await self._is_epic_open(signal.epic),
+        minutes = await self._epic_minutes_to_close(epic)
+        if minutes is None:
+            return False
+        threshold = (
+            self._config.close_margin_minutes + self._config.open_close_buffer_minutes
         )
+        return minutes <= threshold
 
     async def can_open_intent(self, intent: EntryIntent) -> tuple[bool, str]:
         """Pre-open gates for a decoupled :class:`EntryIntent`.
 
-        Same pre-open rules as :meth:`can_open_position`, but driven by an
-        exit-agnostic entry intent rather than a signal carrying levels. As there,
-        the live market-open gate is the per-epic ``marketStatus == TRADEABLE``
-        check, not a wall-clock window, so ``in_trading_hours`` is always True.
+        The live market-open gate is the per-epic ``marketStatus == TRADEABLE``
+        check (hourly tradable filter + re-check in :meth:`open_position`), not a
+        wall-clock window, so ``in_trading_hours`` is always True. The simulator
+        keeps its own hour gate (no live status to read).
+
+        A ``closes_soon`` gate additionally rejects the open when the epic's own
+        market closes within ``open_close_buffer_minutes`` (see
+        :meth:`_is_epic_close_soon`), so we never open a trade the per-epic close
+        rule would force-close almost immediately.
         """
         return evaluate_open_gates(
             epic=intent.epic,
             direction=intent.direction,
             in_trading_hours=True,
             epic_already_open=await self._is_epic_open(intent.epic),
+            closes_soon=await self._is_epic_close_soon(intent.epic),
         )
 
     async def open_from_intent(
@@ -290,6 +314,29 @@ class TradingService:
             await self._db.commit()
         return position
 
+    @staticmethod
+    def _rule_to_price_distance(
+        rule: dict,
+        default: float,
+        *,
+        reference_price: float,
+        scaling_factor: float,
+    ) -> float:
+        """Convert an IG dealing-rule distance to a price distance.
+
+        IG expresses a stop/limit distance either as a PERCENTAGE of the price or
+        in POINTS (1 point = 1/scalingFactor in price). Both open paths need the
+        same conversion, keyed off the entry reference price (the bid for a long,
+        the sell level for a short).
+        """
+        raw = rule.get("value")
+        if raw is None:
+            return default
+        value = float(raw)
+        if rule.get("unit") == "PERCENTAGE":
+            return value * reference_price / 100
+        return value / scaling_factor
+
     async def open_position(
         self, signal: TradingSignal, quantity_multiplier: int = 1
     ) -> Position | None:
@@ -348,18 +395,18 @@ class TradingService:
             float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
         )
 
-        def _rule_to_price_distance(rule: dict, default: float) -> float:
-            raw = rule.get("value")
-            if raw is None:
-                return default
-            value = float(raw)
-            if rule.get("unit") == "PERCENTAGE":
-                return value * levels.bid / 100
-            # POINTS (the IG default): scale points back to a price distance.
-            return value / scaling_factor
-
-        min_stop_price = _rule_to_price_distance(min_stop_rule, 0.0)
-        max_stop_price = _rule_to_price_distance(max_stop_rule, float("inf"))
+        min_stop_price = self._rule_to_price_distance(
+            min_stop_rule,
+            0.0,
+            reference_price=levels.bid,
+            scaling_factor=scaling_factor,
+        )
+        max_stop_price = self._rule_to_price_distance(
+            max_stop_rule,
+            float("inf"),
+            reference_price=levels.bid,
+            scaling_factor=scaling_factor,
+        )
 
         # Pad IG's minimum-distance floor by a safety margin. IG rejects a stop
         # at/inside its minimum, and the price drifts between this snapshot and
@@ -631,17 +678,18 @@ class TradingService:
             float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
         )
 
-        def _rule_to_price_distance(rule: dict, default: float) -> float:
-            raw = rule.get("value")
-            if raw is None:
-                return default
-            value = float(raw)
-            if rule.get("unit") == "PERCENTAGE":
-                return value * entry_level / 100
-            return value / scaling_factor
-
-        min_stop_price = _rule_to_price_distance(min_stop_rule, 0.0)
-        max_stop_price = _rule_to_price_distance(max_stop_rule, float("inf"))
+        min_stop_price = self._rule_to_price_distance(
+            min_stop_rule,
+            0.0,
+            reference_price=entry_level,
+            scaling_factor=scaling_factor,
+        )
+        max_stop_price = self._rule_to_price_distance(
+            max_stop_rule,
+            float("inf"),
+            reference_price=entry_level,
+            scaling_factor=scaling_factor,
+        )
         min_stop_price *= 1 + self._config.stop_min_distance_margin
 
         # A short's stop sits ABOVE the entry; the distance is positive upward.
@@ -863,24 +911,36 @@ class TradingService:
             move = -move
         if position.euro_per_point is not None and float(position.euro_per_point) != 0:
             return move * float(position.euro_per_point)
-        euro_per_pip = (
-            float(position.euro_stop or 1)
-            / float(position.size or 1)
-            / float(position.quantity or 1)
-        )
-        return move * (position.quantity or 1) * euro_per_pip
+        # Legacy fallback (rows opened before euro_per_point existed): reconstruct
+        # the euro value of one unit of PRICE movement from the euro risk and the
+        # PRICE distance to the stop. The old formula divided ``euro_stop`` by
+        # ``size`` — a POINT distance (price × scalingFactor) — then multiplied by
+        # a PRICE move, mixing units and understating the P&L by a factor of
+        # scalingFactor (10^4 on forex). The stop levels are in price, so
+        # ``euro_stop / |open - stop|`` is scalingFactor-independent.
+        stop_distance = abs(open_level - float(position.level_loose or 0))
+        if stop_distance > 0:
+            return move * float(position.euro_stop or 0) / stop_distance
+        return 0.0
 
     async def _fetch_close_result(
         self, deal_reference: str | None, epic: str
-    ) -> tuple[float | None, float | None]:
-        """Return ``(fill_level, realized_profit_eur)`` from a close confirmation.
+    ) -> tuple[float | None, float | None, bool]:
+        """Return ``(fill_level, realized_profit_eur, rejected)`` from a close confirm.
 
-        Either element is ``None`` when the confirmation is missing or omits
-        that field. The confirmation's ``profit`` is already in the account
+        ``rejected`` is True only when IG's confirmation carries an explicit
+        non-``ACCEPTED`` ``dealStatus`` (e.g. a ``MARKET_CLOSED`` refusal on an
+        ``EDITS_ONLY`` market): the close did NOT happen and the position is
+        still live at the broker. A *missing* confirmation (network hiccup) is
+        NOT a rejection — ``rejected`` stays False so the caller falls back to
+        its observed level and reconcile repairs it later.
+
+        ``fill_level`` / ``profit`` are ``None`` when the confirmation is missing
+        or omits them. The confirmation's ``profit`` is already in the account
         currency; it is only trusted when ``profitCurrency`` confirms EUR.
         """
         if not deal_reference:
-            return None, None
+            return None, None, False
         try:
             confirm = await self._client.get(
                 f"/confirms/{deal_reference}",
@@ -890,7 +950,22 @@ class TradingService:
             )
         except Exception as exc:
             logger.debug("Could not fetch close confirmation for %s: %s", epic, exc)
-            return None, None
+            return None, None, False
+
+        # IG accepts the DELETE (200 + dealReference) but reports a market-closed
+        # refusal only here, as dealStatus=REJECTED. Recording it as a successful
+        # close leaves the position live at IG while the DB thinks it is gone —
+        # the next open reuses/duplicates the dealId and the weekend-held deal's
+        # real P&L lands on the wrong row. Surface the rejection so the caller
+        # keeps the position OPEN and retries when the market reopens.
+        status = confirm.get("dealStatus")
+        if status is not None and status != "ACCEPTED":
+            logger.warning(
+                "IG rejected close of %s: %s — position left OPEN for retry",
+                epic,
+                confirm.get("reason", "UNKNOWN"),
+            )
+            return None, None, True
 
         level = confirm.get("level")
         fill_level = float(level) if level is not None else None
@@ -902,7 +977,7 @@ class TradingService:
             if profit is not None and profit_ccy in (None, "", "EUR", "E", "€")
             else None
         )
-        return fill_level, ig_profit
+        return fill_level, ig_profit, False
 
     async def reconcile_realized_pnl(self, day: date | None = None) -> int:
         """Overwrite a day's realized P&L with IG's authoritative figures.
@@ -1009,12 +1084,16 @@ class TradingService:
             position.level_close = Decimal(str(round(close_level, 5)))
         else:
             # IG omitted the close level: keep it consistent with the
-            # authoritative P&L instead of leaving a stale value, since
-            # close = open + pnl / euro_per_point.
+            # authoritative P&L instead of leaving a stale value. For a long
+            # ``pnl = (close - open) × epp`` → ``close = open + pnl/epp``; for a
+            # short ``pnl = (open - close) × epp`` → ``close = open - pnl/epp``.
             base_open = float(position.level_open or 0)
             epp = float(position.euro_per_point or 0)
             if base_open and epp:
-                position.level_close = Decimal(str(round(base_open + pnl / epp, 5)))
+                delta = pnl / epp
+                if position.direction == "SELL":
+                    delta = -delta
+                position.level_close = Decimal(str(round(base_open + delta, 5)))
         open_time = _parse_ig_utc_time(txn.get("openDateUtc"))
         close_time = _parse_ig_utc_time(txn.get("dateUtc"))
         if open_time is not None:
@@ -1190,11 +1269,31 @@ class TradingService:
                 #     and the epic-level fallback above binds it on a later tick.
                 #     Past the window with still no match, it was never genuinely
                 #     opened -> mark never_opened (excluded from stats).
+                # The monitor loop runs in a separate session and may have
+                # authoritatively closed this position (stop / win / EOD) during
+                # the awaited GET /positions above. Re-read from the DB before
+                # reconciling so a real close is never overwritten with a stale
+                # ``closed_externally`` estimate and perimed P&L. (#6)
+                try:
+                    await self._db.refresh(position)
+                except Exception:
+                    continue  # row vanished under us (deleted) — nothing to do
+                if position.state != PositionState.OPEN:
+                    continue
                 if position.deal_id is None:
                     if self._opened_within(position, RECONCILE_GRACE_SECONDS):
                         continue  # too fresh — let a later sync bind it
                     self._mark_never_opened(position)
                 else:
+                    # Never trust a single bulk-list miss for a dealId-bound
+                    # position: confirm authoritatively with a targeted
+                    # GET /positions/{dealId} and reconcile only on a definitive
+                    # 404 (see _ig_position_gone). A transient omission — observed
+                    # right after a streaming reconnect rotated the session tokens
+                    # — otherwise closed a still-open position as a phantom, which
+                    # the known_deal_ids adoption guard then made permanent.
+                    if not await self._ig_position_gone(position):
+                        continue  # still open / uncertain — retry on a later sync
                     self._reconcile_vanished(position)
                 dirty = True
                 continue
@@ -1387,12 +1486,14 @@ class TradingService:
         computed by the most recent sync (stored in ``euro``). This estimate is
         later overwritten by ``reconcile_realized_pnl`` with IG's true figure.
 
-        ``level_close`` must stay consistent with that ``euro``: since
-        ``P&L = (close - open) * euro_per_point``, we back the close level out of
-        the P&L (``close = open + euro / epp``) rather than defaulting it to the
-        open level — that default left ``level_close == level_open`` while ``euro``
-        showed a real loss, which read as "closed at break-even for −89€" on the
-        chart. Only derived when no genuine close fill was ever captured.
+        ``level_close`` must stay consistent with that ``euro``. For a long
+        ``P&L = (close - open) × epp`` → ``close = open + euro/epp``; for a short
+        ``P&L = (open - close) × epp`` → ``close = open - euro/epp``. Backing the
+        close level out this way (rather than defaulting to the open level) avoids
+        ``level_close == level_open`` while ``euro`` shows a real loss, which read
+        as "closed at break-even for −89€" on the chart. A short stopped out
+        *above* its entry must show ``level_close`` above the entry, not below.
+        Only derived when no genuine close fill was ever captured.
         """
         now = datetime.now(UTC)
         open_level = float(position.level_open or 0)
@@ -1406,7 +1507,10 @@ class TradingService:
         position.time_close = now.time()
         if position.level_close is None:
             if position.euro is not None and epp:
-                close_level = open_level + euro_pnl / epp
+                delta = euro_pnl / epp
+                if position.direction == "SELL":
+                    delta = -delta
+                close_level = open_level + delta
             else:
                 close_level = open_level
             position.level_close = Decimal(str(round(close_level, 5)))
@@ -1419,6 +1523,64 @@ class TradingService:
             position.epic,
             euro_pnl,
         )
+
+    async def _ig_position_gone(self, position: Position) -> bool:
+        """Authoritatively confirm a position is no longer open at IG.
+
+        A position bound to a ``deal_id`` can drop out of the bulk
+        ``GET /positions`` list transiently: that list is eventually consistent
+        and has been observed to omit a still-open position right after a
+        streaming reconnect rotated the session tokens. The old code reconciled
+        on that single miss, writing the position off as a phantom
+        ``closed_externally`` while it was still live at the broker — and, once
+        its ``deal_id`` sat in ``known_deal_ids``, it was never re-adopted, so the
+        real position then ran untracked.
+
+        This probes the single-position endpoint ``GET /positions/{dealId}`` and
+        trusts **only** a definitive ``404`` (IG says the deal is not open). Any
+        other outcome — the position still returned (``200``), a network error, a
+        ``5xx``, or any non-404 status — is treated as *uncertain*: return
+        ``False`` so the caller leaves the position OPEN and a later sync decides.
+        Uncertainty must never close a live position.
+
+        Reaching this path already means the bulk list held no entry for the epic
+        under *any* handle (dealId, dealReference, or epic-level fallback), so a
+        rotated dealId cannot be the cause of the miss — the targeted 404 is a
+        genuine confirmation, not a stale-id artifact.
+        """
+        if not position.deal_id:
+            return False
+        try:
+            await self._client.get(
+                f"/positions/{position.deal_id}",
+                version=2,
+                priority=Priority.HIGH,
+                label=f"confirm vanished {position.epic}",
+            )
+        except IGAPIError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 404:
+                return True  # IG confirms the deal is not open — safe to reconcile
+            logger.warning(
+                "Vanished-confirm for %s inconclusive (HTTP %s) — keeping OPEN",
+                position.epic,
+                status,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 — network/timeout is transient
+            logger.warning(
+                "Vanished-confirm for %s errored (%s) — keeping OPEN",
+                position.epic,
+                exc,
+            )
+            return False
+        # 200: the position is still open at IG — the bulk-list miss was transient.
+        logger.info(
+            "Position %s still open at IG on targeted re-fetch — transient "
+            "bulk /positions miss, not reconciling",
+            position.epic,
+        )
+        return False
 
     def _opened_within(self, position: Position, seconds: float) -> bool:
         """Whether ``position`` was opened less than ``seconds`` ago (UTC).
@@ -1489,6 +1651,16 @@ class TradingService:
             profile = self._close_profile
 
         if profile is None or buf is None or buf.last is None:
+            # ``check_and_close`` implements long-only close maths (``loose`` fires
+            # on ``bid <= stop``). A recovery SELL must NEVER fall into it: a
+            # short's stop sits ABOVE the price, so that test is true on almost
+            # every tick and would close the short at market — e.g. on the first
+            # monitor tick after a restart, before the epic's price buffer is
+            # streamed (``buf is None``). Without a buffer the mirrored short
+            # profile cannot run either, so hold and rely on the broker-side stop
+            # pushed at open.
+            if position.direction == "SELL":
+                return False
             return await self.check_and_close(position, current_bid, buf)
 
         decision = profile.evaluate(
@@ -1516,15 +1688,22 @@ class TradingService:
                 position.direction, new_stop, current
             ):
                 return False
+            # The broker stop rests one spread beyond the software follower (live
+            # spread at push time), so the app-side stop is hit first between two
+            # bid polls and the broker order only fires as a deeper safety net.
+            broker_stop = self._broker_stop_level(
+                position.direction, new_stop, float(buf.last.spread or 0)
+            )
             position.level_follower = Decimal(str(round(new_stop, 5)))
             position.stop_update = (position.stop_update or 0) + 1
-            self._append_stop_history(position, new_stop)
-            await self._push_stop_to_ig(position, new_stop)
+            self._append_stop_history(position, new_stop, broker_stop)
+            await self._push_stop_to_ig(position, broker_stop)
             await self._db.commit()
             logger.debug(
-                "Trailing stop for %s -> %.3f (profile=%s)",
+                "Trailing stop for %s -> %.3f (broker %.3f, profile=%s)",
                 position.epic,
-                decision.new_stop_level,
+                new_stop,
+                broker_stop,
                 profile.name,
             )
         return False
@@ -1621,29 +1800,65 @@ class TradingService:
         # drop the 4th/5th digit on forex (e.g. 1.62413 → 1.624) and let the next
         # tick's guard compare against a stop up to ~5 points below the real one,
         # which then reads as the follower stepping *down* on the chart.
+        # The broker stop rests one spread beyond the software follower (live
+        # spread at push time), so the app-side stop is hit first between two bid
+        # polls and the broker order only fires as a deeper safety net.
+        broker_stop = self._broker_stop_level(
+            position.direction, new_stop, float(buf.last.spread or 0)
+        )
         position.level_follower = Decimal(str(round(new_stop, 5)))
         position.stop_update = (position.stop_update or 0) + 1
-        self._append_stop_history(position, new_stop)
-        await self._push_stop_to_ig(position, new_stop)
+        self._append_stop_history(position, new_stop, broker_stop)
+        await self._push_stop_to_ig(position, broker_stop)
         await self._db.commit()
         logger.debug(
-            "Trailing stop for %s -> %.3f (ATR=%.3f)",
+            "Trailing stop for %s -> %.3f (broker %.3f, ATR=%.3f)",
             position.epic,
             new_stop,
+            broker_stop,
             atr_value,
         )
 
     @staticmethod
-    def _append_stop_history(position: Position, level: float) -> None:
+    def _append_stop_history(
+        position: Position, level: float, broker_level: float | None = None
+    ) -> None:
         """Record a timestamped point on the stop's trajectory.
 
         Appended on every ratchet (and seeded with the initial stop at open) so
         the chart can draw the stop's real stepped path rather than a single
         flat line at the frozen initial level. A fresh list is assigned (not an
         in-place append) so the ORM detects the change on the plain JSON column.
+
+        ``level`` is the software follower the close profile enforces. When
+        ``broker_level`` is given it is the level actually posted at IG — one
+        spread beyond the follower (see :meth:`_broker_stop_level`) — recorded
+        per point so the chart's broker ("Loose") line reflects the real pushed
+        level rather than the software follower.
         """
         point = {"t": datetime.now(UTC).isoformat(), "level": round(level, 5)}
+        if broker_level is not None:
+            point["broker"] = round(broker_level, 5)
         position.stop_history = [*(position.stop_history or []), point]
+
+    @staticmethod
+    def _broker_stop_level(
+        direction: str | None, software_stop: float, spread: float
+    ) -> float:
+        """Broker stop level: one spread beyond the software follower.
+
+        The software follower (``level_follower``) is the level the close profile
+        decides a close on between two bid polls. The stop actually posted at IG
+        is placed a full spread further from price — BELOW for a long, ABOVE for a
+        short — so in normal operation the app-side stop is reached first and the
+        broker order only ever fires as a deeper safety net when the bot misses
+        the touch (e.g. ticks dropped from the livestream between two readings).
+        Both ratchet together: each follower raise pushes a matching broker level
+        a spread below (a short's a spread above).
+        """
+        if direction == "SELL":
+            return software_stop + spread
+        return software_stop - spread
 
     def _clamp_trailing_distance(
         self, raw_distance: float, position: Position, spread: float
@@ -1669,7 +1884,12 @@ class TradingService:
             return
 
         payload = {
-            "stopLevel": round(stop_level, 3),
+            # 5 dp, matching the open order (``round(stop_level, 5)``) and the
+            # persisted ``level_follower``. Rounding to 3 dp on a 5-dp forex price
+            # could shift the broker stop up to ~5 points from the software
+            # follower — even to the wrong side of the bid, so IG rejects the PUT
+            # and the swallowed warning leaves a stale broker stop behind.
+            "stopLevel": round(stop_level, 5),
             "trailingStop": False,
         }
         try:
@@ -1678,7 +1898,7 @@ class TradingService:
                 payload,
                 version=2,
                 priority=Priority.URGENT,
-                label=f"trail {position.epic}: stop->{stop_level:.3f}",
+                label=f"trail {position.epic}: stop->{stop_level:.5f}",
             )
         except IGAPIError as exc:
             logger.warning("Failed to update IG stop for %s: %s", position.epic, exc)
@@ -1706,6 +1926,17 @@ class TradingService:
                     await self._db.commit()
                 return deal_id
         return None
+
+    async def close_manually(self, position: Position, close_level: float) -> bool:
+        """Force-close ``position`` now at ``close_level`` (dashboard manual close).
+
+        Public entry point to the shared close path so callers outside this
+        service (the dashboard route) delegate here instead of reimplementing the
+        direction mirror (BUY to close a recovery SELL), the short-aware P&L sign,
+        dealId resolution and the IG confirm — all of which live in
+        :meth:`_close_position`. ``reason_close`` is stamped ``"manual"``.
+        """
+        return await self._close_position(position, close_level, "manual")
 
     async def _close_position(
         self, position: Position, close_level: float, reason: str
@@ -1807,9 +2038,15 @@ class TradingService:
         # the realized profit in the account currency — both authoritative,
         # unlike our observed bid. Falls back to the observed level / computed
         # P&L when the confirmation is unavailable.
-        fill_level, ig_profit = await self._fetch_close_result(
+        fill_level, ig_profit, rejected = await self._fetch_close_result(
             result.get("dealReference"), position.epic
         )
+        if rejected:
+            # IG refused the close (e.g. market closed / EDITS_ONLY). The
+            # position is still live at the broker — do NOT fabricate a close, or
+            # a duplicate open plus mis-attributed P&L follows on the next sync.
+            # Leave it OPEN so the close retries once the market is tradeable.
+            return False
         if fill_level is not None:
             close_level = fill_level
 

@@ -270,6 +270,33 @@ class IGStreamingClient:
         logger.warning("Streaming: force-resubscribed stalled epic %s", epic)
         return True
 
+    async def ensure_connected(self, *, force: bool = False) -> bool:
+        """Watchdog entry point: reconnect the session if it is down (or ``force``).
+
+        Reconnection is normally driven by the Lightstreamer status callback
+        (:meth:`handle_status`), but only for the specific ``_RECONNECT_STATUSES``.
+        A client that resumes from laptop sleep or a network change can sit in a
+        state that never triggers that path (e.g. ``DISCONNECTED:TRYING-RECOVERY``
+        the library never resolves), leaving the feed dark. A periodic watchdog
+        calls this to recover proactively rather than waiting on the library.
+
+        Idempotent and cheap to poll: a no-op when already connected (unless
+        ``force``), when the client was never started, or when a reconnect is
+        already in flight — the ``_reconnecting`` guard coalesces with the
+        callback path and any concurrent call. Otherwise it drives the same
+        teardown + reconnect + re-subscribe path as the status listener. Returns
+        whether the session is connected afterwards.
+        """
+        if not self._started:
+            return False
+        if self.is_connected and not force:
+            return True
+        if self._reconnecting:
+            return False  # a reconnect is already running — let it finish
+        self._reconnecting = True
+        await self._reconnect()
+        return self.is_connected
+
     # ------------------------------------------------------------------ internals
 
     async def _connect(self) -> None:

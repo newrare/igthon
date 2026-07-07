@@ -127,6 +127,16 @@ class TestRecoveryShortProfile:
         assert decision.action == ACTION_CLOSE
         assert decision.reason == "stop"
 
+    def test_backstop_fires_during_atr_warmup(self):
+        # Regression (#9): fewer than atr_period candles -> atr()==0. The short
+        # backstop must still fire when the offer has reached the stop; the old
+        # ordering ran the atr<=0 HOLD guard first and disabled it after a restart.
+        buf = _falling_buffer([105.0, 105.0, 105.0])  # 3 candles << atr_period
+        pos = Position(direction="SELL", level_follower=Decimal("105"))
+        decision = self._profile().evaluate(pos, 105.0, buf, is_close_hour=False)
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "stop"
+
     def test_ratchets_down_in_deep_profit_with_falling_momentum(self):
         # Price has fallen far below entry (deep short profit) with the last two
         # bids falling -> the stop ratchets down below the current follower.

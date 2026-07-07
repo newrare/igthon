@@ -38,6 +38,15 @@ ACTION_CLOSE = "CLOSE"
 ACTION_UPDATE_STOP = "UPDATE_STOP"
 
 
+def noise_margin(noise_k: float, atr_value: float, spread: float) -> float:
+    """Smallest move that counts as real profit rather than bid/offer churn.
+
+    ``max(noise_k × ATR, 2 × spread)`` — the break-even→profit boundary. Shared by
+    the long close profile and the mirrored short profile so both size it the same.
+    """
+    return max(noise_k * atr_value, spread * 2.0)
+
+
 @dataclass(slots=True)
 class OpenPlan:
     """What the close profile decides at the moment a position is opened.
