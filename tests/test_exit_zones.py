@@ -13,8 +13,10 @@ import pytest
 from src.core.indicators import atr
 from src.exit.zones import (
     BreakevenBandStop,
+    BreakevenHalfStop,
     BreakevenLockParams,
     BreakevenLockStop,
+    BreakevenSafeStop,
     StopContext,
     StopZone,
     TrailingRatchetStop,
@@ -190,6 +192,246 @@ class TestBreakevenLock:
         assert BreakevenLockStop().propose(ctx) is None
 
 
+class TestBreakevenSafe:
+    # ``breakeven_safe`` raises the stop ONCE, after two consecutive rising ticks,
+    # to the lower of the +10 € and +3 % (of the recent price range) references.
+    # Its ctx needs a real euro-per-point, so these tests build the context
+    # directly rather than via the shared ``_ctx``.
+
+    def _ctx_eur(
+        self,
+        buf,
+        *,
+        current_bid,
+        level_zero,
+        level_margin,
+        level_follower,
+        euro_per_point,
+    ):
+        return StopContext(
+            current_bid=current_bid,
+            level_open=level_zero,
+            level_zero=level_zero,
+            level_margin=level_margin,
+            level_follower=level_follower,
+            atr_value=atr(list(buf.candles), 14),
+            spread=buf.last.spread,
+            euro_per_point=euro_per_point,
+            buf=buf,
+        )
+
+    def test_locks_the_euro_reference_when_it_is_the_lower(self):
+        # Wide range → +3 % is far (≈ +30 pts); euro_per_point = 2 → +10 € = 5 pts.
+        # The lower reference (the euro lock at 8005) is taken. The early 7000 close
+        # stretches the buffer range to ~1006 pts so +3 % lands at ~8030, above it.
+        buf = _buffer([7000.0, 8003.0, 8004.0, 8005.0, 8006.0])  # rising tail
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8008.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=2.0,
+        )
+        new_stop = BreakevenSafeStop().propose(ctx)
+        assert new_stop == pytest.approx(8005.0)  # 8000 + 10 € / 2 €·pt
+        assert ctx.level_zero < new_stop < ctx.current_bid
+
+    def test_locks_the_three_percent_reference_when_it_is_the_lower(self):
+        # Tight range → +3 % is tiny; euro_per_point = 2 → +10 € = 5 pts is higher.
+        # Range = (8006.1 high) − (8002.9 low) = 3.2 → +3 % = 8000 + 0.096 = 8000.096.
+        buf = _buffer([8003.0, 8004.0, 8005.0, 8006.0])  # rising tail, ~3.2 pt range
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8008.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=2.0,
+        )
+        new_stop = BreakevenSafeStop().propose(ctx)
+        assert new_stop == pytest.approx(8000.096)  # 8000 + 0.03 × 3.2
+        assert ctx.level_zero < new_stop < ctx.current_bid
+
+    def test_uses_the_range_reference_when_euro_per_point_is_missing(self):
+        # No euro-per-point → the euro reference drops out, only +3 % remains.
+        buf = _buffer([8003.0, 8004.0, 8005.0, 8006.0])
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8008.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=0.0,
+        )
+        new_stop = BreakevenSafeStop().propose(ctx)
+        assert new_stop == pytest.approx(8000.096)  # 8000 + 0.03 × 3.2
+
+    def test_holds_without_a_rising_streak(self):
+        # Last move is down → the two-rising-tick gate never opens.
+        buf = _buffer([8005.0, 8006.0, 8007.0, 8006.5])
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8006.5,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=2.0,
+        )
+        assert BreakevenSafeStop().propose(ctx) is None
+
+    def test_holds_when_the_last_bar_is_bearish(self):
+        # Close-to-close streak rises (8003 < 8004 < 8006) so the streak gate opens,
+        # but the last bar gapped up and faded: it opens at 8007 and closes at 8006
+        # (a down bar) while still beating the prior close. Do not raise into that
+        # reversal — hold and wait for the push to resume.
+        buf = EpicBuffer(epic="TEST.EPIC", max_candles=10)
+        spread = 0.5
+        for i, (bid_open, bid_close) in enumerate(
+            [(8002.0, 8003.0), (8003.0, 8004.0), (8007.0, 8006.0)]
+        ):
+            high = max(bid_open, bid_close) + 0.1
+            low = min(bid_open, bid_close) - 0.1
+            buf.add(
+                Candle(
+                    timestamp=_START + timedelta(minutes=i),
+                    bid_open=bid_open,
+                    bid_close=bid_close,
+                    bid_high=high,
+                    bid_low=low,
+                    offer_open=bid_open + spread,
+                    offer_close=bid_close + spread,
+                    offer_high=high + spread,
+                    offer_low=low + spread,
+                )
+            )
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8006.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=2.0,
+        )
+        assert BreakevenSafeStop().propose(ctx) is None
+
+    def test_holds_with_too_few_ticks(self):
+        # A single close cannot form a two-tick rising streak.
+        buf = _buffer([8006.0])
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8006.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=2.0,
+        )
+        assert BreakevenSafeStop().propose(ctx) is None
+
+    def test_holds_when_the_lock_would_reach_the_bid(self):
+        # Wide range → euro lock is the lower reference at 8005, but the bid sits at
+        # 8004 (< 8005), so locking there would force an immediate exit → hold.
+        buf = _buffer([7000.0, 8003.0, 8004.0, 8005.0, 8006.0])
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8004.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            euro_per_point=2.0,
+        )
+        assert BreakevenSafeStop().propose(ctx) is None
+
+    def test_raises_only_once_while_in_the_margin_zone(self):
+        # Follower already above break-even → the single raise has been done (or the
+        # profit zone moved it); hold for the rest of the zone, never raise again.
+        buf = _buffer([7000.0, 8003.0, 8004.0, 8005.0, 8006.0])
+        ctx = self._ctx_eur(
+            buf,
+            current_bid=8008.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8005.0,  # already above break-even
+            euro_per_point=2.0,
+        )
+        assert BreakevenSafeStop().propose(ctx) is None
+
+
+class TestBreakevenHalf:
+    # ``breakeven_half`` raises the stop ONCE, to a support line a quarter of the
+    # way from break-even up to the margin level, after two consecutive rising
+    # ticks whose closes both clear the margin line. It then holds that stop.
+
+    def test_locks_the_quarter_support_after_two_ticks_above_margin(self):
+        # level_zero=8000, level_margin=8010 → support at 8000 + 0.25×10 = 8002.5.
+        # The tail 8011 < 8012 < 8013 is two rising ticks above the 8010 margin;
+        # the bid has since pulled back into the band at 8005 (> support).
+        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        new_stop = BreakevenHalfStop().propose(ctx)
+        assert new_stop == pytest.approx(8002.5)
+        assert ctx.level_zero < new_stop < ctx.current_bid
+
+    def test_holds_without_two_ticks_above_the_margin(self):
+        # The rise stays inside the band (8009 never clears the 8010 margin), so the
+        # above-margin streak gate never opens.
+        buf = _buffer([8005.0, 8006.0, 8007.0, 8008.0, 8009.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8009.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert BreakevenHalfStop().propose(ctx) is None
+
+    def test_holds_when_only_one_tick_clears_the_margin(self):
+        # A single close above the margin (8011) is not two consecutive up-ticks
+        # above it — the gate needs the whole streak above the line.
+        buf = _buffer([8005.0, 8008.0, 8011.0, 8008.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8008.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert BreakevenHalfStop().propose(ctx) is None
+
+    def test_holds_when_the_support_would_reach_the_bid(self):
+        # The streak above the margin has fired, but the bid has pulled all the way
+        # back to 8002 (< the 8002.5 support), so locking there would force an
+        # immediate exit → hold.
+        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8002.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert BreakevenHalfStop().propose(ctx) is None
+
+    def test_raises_only_once_while_in_the_margin_zone(self):
+        # Follower already above break-even → the single raise has been done (or the
+        # profit zone moved it); hold for the rest of the zone, never raise again.
+        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8002.5,  # already above break-even
+        )
+        assert BreakevenHalfStop().propose(ctx) is None
+
+
 class TestTrailingRatchet:
     def test_rising_bids_far_in_profit_ratchets_up(self):
         # Chandelier clear of the margin and above the lock floor → it governs.
@@ -200,7 +442,7 @@ class TestTrailingRatchet:
             buf,
             current_bid=bid,
             level_zero=8000.0,
-            level_margin=8000.0 + max(0.5 * atr_v, buf.last.spread * 2.0),
+            level_margin=8000.0 + 1.5 * atr_v,
             level_follower=8000.0 - 2.5 * atr_v,
         )
         new_stop = TrailingRatchetStop().propose(ctx)
@@ -305,7 +547,7 @@ class TestTrailingRatchet:
         kw = dict(
             current_bid=bid,
             level_zero=8000.0,
-            level_margin=8000.0 + max(0.5 * atr_v, buf.last.spread * 2.0),
+            level_margin=8000.0 + 1.5 * atr_v,
             level_follower=8000.0 - 2.5 * atr_v,
         )
         # Floor disabled so the comparison isolates the chandelier width.

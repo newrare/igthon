@@ -65,7 +65,7 @@ class CloseZoneProfit(CloseProfile):
     name = "close_zoneprofit"
 
     atr_period: int = 14
-    noise_k: float = 0.5  # noise margin = max(noise_k × ATR, 2 × spread)
+    noise_k: float = 1.5  # noise margin = noise_k × ATR (spread is not a factor)
 
     # Initial-stop placement (swappable via STOP_STRATEGY). Defaults to the
     # support distance so ``CloseZoneProfit()`` keeps its historical
@@ -98,9 +98,9 @@ class CloseZoneProfit(CloseProfile):
             ),
         )
 
-    def _noise_margin(self, atr_value: float, spread: float) -> float:
+    def _noise_margin(self, atr_value: float) -> float:
         """Noise margin (see :func:`~src.exit.base.noise_margin`)."""
-        return noise_margin(self.noise_k, atr_value, spread)
+        return noise_margin(self.noise_k, atr_value)
 
     def initial_plan(
         self, *, entry_level: float, direction: str, buf: EpicBuffer
@@ -126,7 +126,7 @@ class CloseZoneProfit(CloseProfile):
             stop_level=stop_level,
             level_zero=level_zero,
             target_level=0.0,
-            level_margin=level_zero + self._noise_margin(atr_value, spread),
+            level_margin=level_zero + self._noise_margin(atr_value),
             profile=self.name,
         )
 
@@ -162,7 +162,7 @@ class CloseZoneProfit(CloseProfile):
         # per-tick computation for positions opened before it was persisted.
         level_margin = float(getattr(position, "level_margin", 0) or 0)
         if level_margin <= 0:
-            level_margin = level_zero + self._noise_margin(atr_value, spread)
+            level_margin = level_zero + self._noise_margin(atr_value)
 
         ctx = StopContext(
             current_bid=current_bid,

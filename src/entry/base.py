@@ -65,6 +65,13 @@ class EntryStrategy(ABC):
     #: as constants in the strategy class, and the strategy is chosen at runtime
     #: from the dashboard.
     concurrent_positions: int = 1  # target number of open positions to hold
+    # Wallet-bounded selection. When False (default) the selector holds exactly
+    # ``concurrent_positions`` open positions. When True the fixed count target is
+    # dropped: the selector keeps opening the best-ranked affordable epics until
+    # the spendable balance (available funds minus ``wallet_reserve``) can no
+    # longer cover another margin. ``concurrent_positions`` then serves only as a
+    # conservative fallback cap for the pass when the balance cannot be read.
+    wallet_bounded: bool = False
     # Legacy warm-up delay: no longer enforced live (the per-epic ``warmup``
     # candle count is the warm-up, and live opens are gated by ``marketStatus``
     # rather than a wall clock). Kept for reference / the simulator's own gating.

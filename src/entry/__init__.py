@@ -19,6 +19,7 @@ from src.entry.base import EntryIntent, EntryStrategy
 from src.entry.open_donchian import OpenDonchian
 from src.entry.open_projection import OpenProjection
 from src.entry.open_ranking import OpenRanking
+from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_testing import OpenTesting
 
 #: Name → class map. Keys are the valid ``OPEN_STRATEGY`` values.
@@ -26,6 +27,7 @@ ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenDonchian.name: OpenDonchian,
     OpenProjection.name: OpenProjection,
     OpenRanking.name: OpenRanking,
+    OpenSafeRanking.name: OpenSafeRanking,
     OpenTesting.name: OpenTesting,
 }
 
@@ -50,6 +52,7 @@ __all__ = [
     "OpenDonchian",
     "OpenProjection",
     "OpenRanking",
+    "OpenSafeRanking",
     "OpenTesting",
     "EntryIntent",
     "EntryStrategy",

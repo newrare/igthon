@@ -16,7 +16,9 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.scheduler import BotScheduler, validate_strategy_selection
+from src.entry.base import EntryIntent
 from src.entry.open_ranking import OpenRanking
+from src.entry.open_saferanking import OpenSafeRanking
 from src.feed.price_buffer import Candle, PriceBuffer
 from src.models.database import Base
 from src.models.job_preference import JobPreference
@@ -437,6 +439,99 @@ class TestRollingParticipationGate:
         await scheduler._select_and_open()
 
         assert scheduler._strategy.evaluate.call_count == 6
+
+
+class TestWalletBoundedRollingSelect:
+    """A wallet-bounded ranker (``open_saferanking``) opens epics until the
+    spendable balance can no longer cover another margin, rather than holding a
+    single rolling position.
+    """
+
+    def _ranker_scheduler(self, session_factory, monkeypatch, available, *, margin):
+        """Scheduler with a warmed-up wallet-bounded ranker and stubbed opens.
+
+        Every epic scores a BUY (descending so the order is deterministic) and
+        costs ``margin`` euros; ``available`` is what the account reports (or
+        ``None`` when unreadable). Returns ``(scheduler, opened)`` where ``opened``
+        collects the epics the (stubbed) open path accepted.
+        """
+        streaming = MagicMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        scheduler._strategy = OpenSafeRanking()
+        # Skip building a real close profile from the MagicMock settings.
+        scheduler._close_profile_obj = MagicMock()
+        epics = [f"E{i}" for i in range(5)]
+        scheduler._tradable_epics = epics
+
+        # Warm every epic so the participation gate passes.
+        warmup = scheduler._strategy.warmup
+        base = datetime.now(UTC) - timedelta(minutes=warmup)
+        for e in epics:
+            for i in range(warmup):
+                scheduler._buffer.add_candle(e, _candle(base + timedelta(minutes=i)))
+
+        # Deterministic descending ranking: E0 > E1 > ... so opens follow order.
+        scores = {e: float(len(epics) - i) for i, e in enumerate(epics)}
+        scheduler._strategy.evaluate = MagicMock(
+            side_effect=lambda epic, buf: EntryIntent(
+                epic=epic, direction="BUY", score=scores[epic]
+            )
+        )
+
+        scheduler._tradable_markets = [
+            SimpleNamespace(epic=e, funds_needed=margin) for e in epics
+        ]
+        scheduler._account_available_funds = AsyncMock(return_value=available)
+
+        # Stub the guarded open so nothing touches IG; record what was opened.
+        opened: list[str] = []
+
+        async def _open(trading, intent, buf):
+            opened.append(intent.epic)
+            position = Position(
+                epic=intent.epic,
+                epic_name=intent.epic,
+                date=date.today(),
+                state=PositionState.OPEN,
+                level_open=1.0,
+            )
+            return position, None
+
+        scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
+
+        # Let every intent through the shared risk gates.
+        trading_stub = MagicMock()
+        trading_stub.can_open_intent = AsyncMock(return_value=(True, None))
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        return scheduler, opened
+
+    async def test_opens_until_wallet_is_exhausted(
+        self, session_factory, monkeypatch
+    ):
+        # 450€ spendable (500 − 10% reserve) at 100€/margin → exactly 4 opens,
+        # not the single position a count-bounded ranker would hold.
+        scheduler, opened = self._ranker_scheduler(
+            session_factory, monkeypatch, available=500.0, margin=100.0
+        )
+
+        await scheduler._select_and_open()
+
+        assert opened == ["E0", "E1", "E2", "E3"]
+
+    async def test_unknown_balance_falls_back_to_count_cap(
+        self, session_factory, monkeypatch
+    ):
+        # Balance unreadable → cannot size the wallet, so fall back to the count
+        # target (concurrent_positions = 1): a hiccup must not dump the ranking.
+        scheduler, opened = self._ranker_scheduler(
+            session_factory, monkeypatch, available=None, margin=100.0
+        )
+
+        await scheduler._select_and_open()
+
+        assert opened == ["E0"]
 
 
 def _streaming_scheduler(session_factory, streaming):

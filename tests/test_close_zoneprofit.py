@@ -144,7 +144,7 @@ class TestEvaluateZones:
         buf = _buffer([8000.0 + i for i in range(40)])
         atr_v = atr(list(buf.candles), 14)
         level_zero = 8000.0
-        margin = level_zero + max(0.5 * atr_v, buf.last.spread * 2.0)
+        margin = level_zero + 1.5 * atr_v
         pos = _position(
             level_open=level_zero,
             level_zero=level_zero,

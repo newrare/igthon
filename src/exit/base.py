@@ -38,13 +38,16 @@ ACTION_CLOSE = "CLOSE"
 ACTION_UPDATE_STOP = "UPDATE_STOP"
 
 
-def noise_margin(noise_k: float, atr_value: float, spread: float) -> float:
-    """Smallest move that counts as real profit rather than bid/offer churn.
+def noise_margin(noise_k: float, atr_value: float) -> float:
+    """Smallest move that counts as real profit rather than bid churn.
 
-    ``max(noise_k × ATR, 2 × spread)`` — the break-even→profit boundary. Shared by
-    the long close profile and the mirrored short profile so both size it the same.
+    ``noise_k × ATR`` — the break-even→profit boundary. Sized purely on the bid's
+    own movement/noise (ATR); the bid/offer spread is deliberately **not** a
+    factor, so a wide-spread instrument does not get an inflated margin band.
+    Shared by the long close profile and the mirrored short profile so both size
+    it the same.
     """
-    return max(noise_k * atr_value, spread * 2.0)
+    return noise_k * atr_value
 
 
 @dataclass(slots=True)

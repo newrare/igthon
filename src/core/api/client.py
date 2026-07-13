@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -58,6 +60,19 @@ _IG_ERROR_HINTS: dict[str, str] = {
 }
 
 
+# IG error codes that are more or less expected (quota/rate-limit noise). They
+# are logged at WARNING by default and only escalated to ERROR when the same
+# code recurs several times within a short window — i.e. a genuine sustained
+# problem rather than the occasional throttle we already handle via the guard.
+_SOFT_ERROR_CODES: frozenset[str] = frozenset(
+    {"error.public-api.exceeded-api-key-allowance"}
+)
+# Escalate a soft error to ERROR once it is seen this many times within the window.
+_SOFT_ERROR_ESCALATE_THRESHOLD: int = 3
+# Rolling window (seconds) over which repeated soft errors are counted.
+_SOFT_ERROR_WINDOW_SECONDS: float = 120.0
+
+
 class IGClient:
     """Async HTTP client for the IG REST API.
 
@@ -80,6 +95,9 @@ class IGClient:
         self._http: httpx.AsyncClient | None = None
         self._error_log = error_log
         self._guard = guard
+        # Monotonic timestamps of recent soft (expected) errors, per IG error
+        # code, used to escalate the log level when they recur within a window.
+        self._soft_error_times: dict[str, deque[float]] = {}
 
     async def __aenter__(self) -> IGClient:
         self._http = httpx.AsyncClient(timeout=30.0)
@@ -118,6 +136,29 @@ class IGClient:
         """Ensure the token is valid before making a request."""
         await self._session.ensure_valid_token(self.http)
 
+    def _error_log_level(self, ig_error_code: str) -> int:
+        """Pick the log level for an IG API error.
+
+        Soft (expected) codes such as the API-key quota error are demoted to
+        WARNING; they are only raised back to ERROR when the same code recurs
+        ``_SOFT_ERROR_ESCALATE_THRESHOLD`` times within
+        ``_SOFT_ERROR_WINDOW_SECONDS`` — signalling a sustained problem rather
+        than the occasional throttle the guard already absorbs.
+        """
+        if ig_error_code not in _SOFT_ERROR_CODES:
+            return logging.ERROR
+
+        now = time.monotonic()
+        recent = self._soft_error_times.setdefault(ig_error_code, deque())
+        cutoff = now - _SOFT_ERROR_WINDOW_SECONDS
+        while recent and recent[0] < cutoff:
+            recent.popleft()
+        recent.append(now)
+
+        if len(recent) >= _SOFT_ERROR_ESCALATE_THRESHOLD:
+            return logging.ERROR
+        return logging.WARNING
+
     def _raise_for_status(
         self,
         response: httpx.Response,
@@ -125,6 +166,7 @@ class IGClient:
         url: str,
         *,
         suppress_error_logging: bool = False,
+        expect_not_found: bool = False,
     ) -> None:
         """Log IG API error details from response body before raising.
 
@@ -136,6 +178,13 @@ class IGClient:
         not logged, recorded in the sidecar, or reported to the guard. Callers
         use this for expected, probed failures (e.g. batch bisection) that would
         otherwise pollute the logs and falsely trip the quota guard.
+
+        When ``expect_not_found`` is set a ``404`` is a legitimate outcome the
+        caller handles itself (e.g. polling ``/confirms/{ref}`` for a deal not yet
+        resolvable, or already gone because the market closed). It is still raised
+        so the caller's retry loop drives it, but logged at WARNING — not ERROR —
+        and kept out of the persistent error log / guard, mirroring how the
+        APIQueue already treats the same case on its side.
         """
         if not response.is_error:
             return
@@ -153,8 +202,19 @@ class IGClient:
         if hint:
             detail = f"{ig_error_code} ({hint})"
 
-        if not suppress_error_logging:
-            logger.error(
+        expected_missing = expect_not_found and response.status_code == 404
+
+        if expected_missing and not suppress_error_logging:
+            logger.warning(
+                "%s %s → HTTP %d%s (expected — handled by caller)",
+                method,
+                url,
+                response.status_code,
+                f" — {detail}" if detail else "",
+            )
+        elif not suppress_error_logging:
+            logger.log(
+                self._error_log_level(ig_error_code),
                 "%s %s → HTTP %d%s",
                 method,
                 url,
@@ -211,6 +271,7 @@ class IGClient:
         *,
         version: int = 1,
         suppress_error_logging: bool = False,
+        expect_not_found: bool = False,
     ) -> dict:
         """Perform a GET request to the IG API.
 
@@ -220,6 +281,9 @@ class IGClient:
             suppress_error_logging: When True, an error response is still raised
                 but not logged/recorded/reported to the guard. Use for expected,
                 probed failures (e.g. batch bisection).
+            expect_not_found: When True, a ``404`` is a legitimate outcome the
+                caller handles itself — it is logged at WARNING instead of ERROR
+                and kept out of the persistent error log / guard.
 
         Returns:
             Parsed JSON response as a dictionary.
@@ -230,6 +294,7 @@ class IGClient:
             endpoint,
             version=version,
             suppress_error_logging=suppress_error_logging,
+            expect_not_found=expect_not_found,
         )
 
     async def post(self, endpoint: str, payload: dict, *, version: int = 1) -> dict:
@@ -270,6 +335,7 @@ class IGClient:
         version: int,
         payload: dict | None = None,
         suppress_error_logging: bool = False,
+        expect_not_found: bool = False,
         extra_headers: dict[str, str] | None = None,
     ) -> dict:
         """Shared request path for every verb: auth refresh → headers → call → raise.
@@ -301,6 +367,10 @@ class IGClient:
             else:
                 response = await caller(url, json=payload, headers=headers)
         self._raise_for_status(
-            response, label, url, suppress_error_logging=suppress_error_logging
+            response,
+            label,
+            url,
+            suppress_error_logging=suppress_error_logging,
+            expect_not_found=expect_not_found,
         )
         return response.json()

@@ -17,7 +17,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.api.client import IGAPIError, IGClient
-from src.core.api_queue import APIQueue, Priority
+from src.core.api_queue import (
+    MARKET_ORDER_NOT_SUPPORTED_CODE,
+    APIQueue,
+    Priority,
+)
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal, atr
 from src.entry.base import EntryIntent
 from src.execution.gates import evaluate_open_gates
@@ -51,6 +55,11 @@ logger = logging.getLogger(__name__)
 # it, an unbound-and-absent row was never genuinely opened (see
 # ``_mark_never_opened``). Comfortably covers a few 20s sync cycles.
 RECONCILE_GRACE_SECONDS = 60.0
+
+# ``MARKET_ORDER_NOT_SUPPORTED_CODE`` (imported from api_queue): the IG code for
+# an epic that rejects ``orderType: "MARKET"`` (typically forwards). The metadata
+# does not always flag it up front, so a MARKET order can bounce at deal time —
+# the open path then retries as a marketable LIMIT priced through the touch.
 
 # Deal-confirmation polling. IG resolves a dealReference asynchronously, so
 # ``GET /confirms/{ref}`` can 404 for a short window right after the order POST.
@@ -100,6 +109,13 @@ class TradeConfig:
     # protective stop, so a fast-moving market can't push the stop back under
     # IG's floor between the market snapshot and the order ("Stop trop près").
     stop_min_distance_margin: float = 0.15
+    # Slippage buffer (fraction of price) applied when an open falls back from a
+    # MARKET order to a marketable LIMIT on an epic that rejects MARKET orders.
+    # The limit is priced this far THROUGH the current touch (above the ask for a
+    # BUY, below the bid for a SELL) so ``EXECUTE_AND_ELIMINATE`` fills the whole
+    # size at the best available price; the buffer only caps acceptable slippage,
+    # it is never the fill price. Default 0.2%.
+    market_order_limit_slippage: float = 0.002
     # Trailing stop (ATR-based adaptive follower)
     atr_period: int = 14
     atr_k_pre: float = 2.5
@@ -116,6 +132,9 @@ class TradeConfig:
             ),
             stop_min_distance_margin=getattr(
                 settings, "strategy_stop_min_distance_margin", 0.15
+            ),
+            market_order_limit_slippage=getattr(
+                settings, "strategy_market_order_limit_slippage", 0.002
             ),
             atr_period=settings.strategy_atr_period,
             atr_k_pre=settings.strategy_atr_k_pre,
@@ -148,6 +167,14 @@ class TradingService:
         # close profile is long-only; a short is routed here by ``manage_position``
         # regardless of the configured long profile.
         self._recovery_short_profile: RecoveryShortProfile | None = None
+        # Epics that bounced a MARKET order with
+        # ``MARKET_ORDER_NOT_SUPPORTED_CODE`` at deal time even though their
+        # metadata did not flag it. IG's ``marketOrderPreference`` is an unreliable
+        # hint for these (typically forwards), so once an epic proves it we open it
+        # with a marketable LIMIT directly — the doomed MARKET (and its ERROR-level
+        # queue log / persistent error entry) then happens at most once per epic
+        # per process instead of on every scan.
+        self._market_order_unsupported: set[str] = set()
 
     async def _is_epic_open(self, epic: str) -> bool:
         """Check if a position is already open for this epic."""
@@ -337,6 +364,156 @@ class TradingService:
             return value * reference_price / 100
         return value / scaling_factor
 
+    @staticmethod
+    def _supports_market_orders(instrument: dict) -> bool:
+        """Whether the epic accepts ``orderType: "MARKET"`` orders.
+
+        IG's instrument metadata exposes ``marketOrderPreference`` with three
+        values: ``AVAILABLE_DEFAULT_ON`` / ``AVAILABLE_DEFAULT_OFF`` (market
+        orders allowed) and ``NOT_AVAILABLE`` (only working/limit orders). An
+        epic set to ``NOT_AVAILABLE`` bounces a ``orderType: "MARKET"`` POST with
+        ``error.trading.otc.market-orders.not-supported-for-epic``. Checking this
+        up front lets both open paths open with a marketable LIMIT directly
+        instead of sending a doomed MARKET first.
+
+        A missing field is treated as supported — most epics allow market orders
+        and IG omits the field on some markets. This is only a hint, not a
+        guarantee: an epic that passes here can still reject MARKET at deal time,
+        in which case the POST helper falls back to a marketable LIMIT (see
+        :meth:`_post_open_order`). Either way the epic is never dropped.
+        """
+        return instrument.get("marketOrderPreference") != "NOT_AVAILABLE"
+
+    def _to_marketable_limit(self, payload: dict, reference_price: float) -> dict:
+        """Convert a MARKET open payload into a marketable LIMIT payload.
+
+        Priced ``market_order_limit_slippage`` THROUGH the current touch — above
+        the ask for a BUY, below the bid for a SELL — with
+        ``timeInForce=EXECUTE_AND_ELIMINATE``: IG fills the whole size at the best
+        available price up to ``level`` and cancels any unfilled remainder, so the
+        limit behaves like a market order and only caps acceptable slippage (it is
+        never the fill price). ``stopLevel`` / ``forceOpen`` carry over unchanged.
+        """
+        slippage = max(self._config.market_order_limit_slippage, 0.0)
+        if payload["direction"] == "BUY":
+            level = reference_price * (1 + slippage)
+        else:
+            level = reference_price * (1 - slippage)
+        limit_payload = dict(payload)
+        limit_payload["orderType"] = "LIMIT"
+        limit_payload["level"] = round(level, 5)
+        limit_payload["timeInForce"] = "EXECUTE_AND_ELIMINATE"
+        return limit_payload
+
+    async def _post_open_order(
+        self, order_payload: dict, epic: str, label: str, reference_price: float
+    ) -> dict | None:
+        """POST an open order, falling back to a marketable LIMIT on rejection.
+
+        When the epic rejects ``orderType: "MARKET"`` at deal time
+        (``MARKET_ORDER_NOT_SUPPORTED_CODE``) the same order is retried once as a
+        marketable LIMIT (see :meth:`_to_marketable_limit`). Any other error — and
+        any failure of the LIMIT retry — logs and returns ``None`` so the caller
+        aborts the open cleanly. A payload already sent as LIMIT is not retried.
+        """
+        # A MARKET order may bounce with ``MARKET_ORDER_NOT_SUPPORTED_CODE`` — an
+        # outcome this method recovers from — so flag it as expected on the queue:
+        # that abandonment is logged at WARNING, not ERROR, and stays out of the
+        # persistent error log. Any OTHER failure is still a real error.
+        is_market = order_payload.get("orderType") == "MARKET"
+        try:
+            return await self._client.post(
+                "/positions/otc",
+                order_payload,
+                version=2,
+                priority=Priority.URGENT,
+                label=label,
+                expect_market_order_rejection=is_market,
+            )
+        except IGAPIError as exc:
+            not_supported = (
+                getattr(exc, "ig_error_code", "") == MARKET_ORDER_NOT_SUPPORTED_CODE
+            )
+            if not not_supported or not is_market:
+                logger.error("Failed to open position for %s: %s", epic, exc)
+                return None
+        except Exception as exc:
+            logger.error("Failed to open position for %s: %s", epic, exc)
+            return None
+
+        # MARKET rejected as unsupported — remember the epic so future opens skip
+        # straight to LIMIT (no repeated doomed MARKET), then retry once now.
+        self._market_order_unsupported.add(epic)
+        limit_payload = self._to_marketable_limit(order_payload, reference_price)
+        logger.info(
+            "%s rejects MARKET orders — retrying as marketable LIMIT at %.5f",
+            epic,
+            limit_payload["level"],
+        )
+        try:
+            return await self._client.post(
+                "/positions/otc",
+                limit_payload,
+                version=2,
+                priority=Priority.URGENT,
+                label=f"{label} (limit)",
+            )
+        except Exception as exc:
+            logger.error("LIMIT fallback failed for %s: %s", epic, exc)
+            return None
+
+    async def _delete_close_order(
+        self, close_payload: dict, epic: str, label: str, reference_price: float
+    ) -> dict:
+        """DELETE a close order, falling back to a marketable LIMIT on rejection.
+
+        Mirrors :meth:`_post_open_order` for the close side: an epic that rejects
+        ``orderType: "MARKET"`` at deal time (``MARKET_ORDER_NOT_SUPPORTED_CODE``,
+        typically forwards) is retried once as a marketable LIMIT priced through
+        the touch (see :meth:`_to_marketable_limit`) and remembered in
+        ``_market_order_unsupported`` so future orders skip straight to LIMIT. Any
+        other error is re-raised so the caller keeps its 404/phantom handling. A
+        payload already sent as LIMIT is not retried.
+        """
+        # A MARKET close may bounce with ``MARKET_ORDER_NOT_SUPPORTED_CODE`` — an
+        # outcome this method recovers from — so flag it as expected on the queue:
+        # that abandonment is logged at WARNING, not ERROR. Any OTHER failure is a
+        # real error and is re-raised.
+        is_market = close_payload.get("orderType") == "MARKET"
+        try:
+            return await self._client.delete(
+                "/positions/otc",
+                close_payload,
+                version=1,
+                priority=Priority.URGENT,
+                label=label,
+                expect_market_order_rejection=is_market,
+            )
+        except IGAPIError as exc:
+            not_supported = (
+                is_market
+                and getattr(exc, "ig_error_code", "") == MARKET_ORDER_NOT_SUPPORTED_CODE
+            )
+            if not not_supported:
+                raise
+
+        # MARKET rejected as unsupported — remember the epic so future closes (and
+        # opens) skip straight to LIMIT, then retry once now as a marketable LIMIT.
+        self._market_order_unsupported.add(epic)
+        limit_payload = self._to_marketable_limit(close_payload, reference_price)
+        logger.info(
+            "%s rejects MARKET orders — retrying close as marketable LIMIT at %.5f",
+            epic,
+            limit_payload["level"],
+        )
+        return await self._client.delete(
+            "/positions/otc",
+            limit_payload,
+            version=1,
+            priority=Priority.URGENT,
+            label=f"{label} (limit)",
+        )
+
     async def open_position(
         self, signal: TradingSignal, quantity_multiplier: int = 1
     ) -> Position | None:
@@ -378,6 +555,24 @@ class TradingService:
                 "Market %s is not tradeable: %s", epic, snapshot.get("marketStatus")
             )
             return None
+
+        # Some epics (forwards, some futures) reject orderType=MARKET. When the
+        # instrument metadata flags it up front — or a past open already proved it
+        # (``_market_order_unsupported``) — we open with a marketable LIMIT
+        # directly; otherwise we send MARKET and fall back to LIMIT only if the
+        # broker bounces it (the metadata is not always reliable). Either way the
+        # epic stays tradable — the scanner keeps it in the list for diversity.
+        use_market_order = (
+            self._supports_market_orders(instrument)
+            and epic not in self._market_order_unsupported
+        )
+        if not use_market_order:
+            logger.info(
+                "Market %s does not support market orders "
+                "(marketOrderPreference=%s) — opening with a marketable LIMIT",
+                epic,
+                instrument.get("marketOrderPreference"),
+            )
 
         # 2. Validate the protective stop against the dealing rules.
         #
@@ -469,8 +664,24 @@ class TradingService:
         else:
             euro_risk = quantity * stop_price_distance
 
+        # The broker stop sits one spread BELOW the software follower (a long):
+        # the app-side stop (``level_follower == stop_level``) is reached first
+        # between two bid polls and the broker order only ever fires as a deeper
+        # safety net. This is the SAME offset applied on every later ratchet
+        # (see ``_broker_stop_level``); applying it here too keeps the bot in
+        # control of the exit from the open onward and right through the start
+        # zone — the underwater updater holds this stop untouched until
+        # break-even, so the spread cushion set here persists for the whole
+        # pre-break-even life. Pushing the broker stop FURTHER from price never
+        # violates IG's minimum-distance rule, and the euro risk is unchanged
+        # because the bot still closes at the (nearer) software ``stop_level``.
+        spread = max(float(levels.spread or 0.0), 0.0)
+        broker_stop = self._broker_stop_level("BUY", stop_level, spread)
+
         # 5. Send order with an absolute stop level (avoids any point/price
-        # unit conversion on the IG side).
+        # unit conversion on the IG side). A BUY fills at the ask, so the
+        # marketable-LIMIT fallback prices through ``levels.offer``.
+        reference_price = levels.offer
         order_payload = {
             "epic": epic,
             "expiry": expiry,
@@ -479,29 +690,26 @@ class TradingService:
             "orderType": "MARKET",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "stopLevel": round(stop_level, 5),
+            "stopLevel": round(broker_stop, 5),
             "forceOpen": True,
         }
+        if not use_market_order:
+            order_payload = self._to_marketable_limit(order_payload, reference_price)
 
         logger.info(
-            "Opening position: epic=%s, qty=%d, stop=%.5f (-%.5f), risk=%.2f€",
+            "Opening: epic=%s, qty=%d, stop=%.5f (broker %.5f, -%.5f), risk=%.2f€",
             epic,
             quantity,
             stop_level,
+            broker_stop,
             stop_price_distance,
             euro_risk,
         )
 
-        try:
-            result = await self._client.post(
-                "/positions/otc",
-                order_payload,
-                version=2,
-                priority=Priority.URGENT,
-                label=f"open {epic}: order",
-            )
-        except Exception as exc:
-            logger.error("Failed to open position for %s: %s", epic, exc)
+        result = await self._post_open_order(
+            order_payload, epic, f"open {epic}: order", reference_price
+        )
+        if result is None:
             return None
 
         deal_reference = result.get("dealReference")
@@ -538,9 +746,12 @@ class TradingService:
             level_zero=Decimal(str(round(levels.level_zero, 5))),
             level_follower=Decimal(str(round(follower_level, 5))),
             level_loose=Decimal(str(round(loose_level, 5))),
-            # The hard software stop tracks the level actually posted at the broker.
-            level_security=Decimal(str(round(stop_level, 5))),
-            level_stop=Decimal(str(round(stop_level, 5))),
+            # The hard software backstop and the chart's broker line track the
+            # level actually posted at IG — one spread below the software follower
+            # (see ``broker_stop`` above), so the broker line starts a spread
+            # under the follower line and the two ratchet together from there.
+            level_security=Decimal(str(round(broker_stop, 5))),
+            level_stop=Decimal(str(round(broker_stop, 5))),
             level_margin=Decimal(str(round(levels.level_margin, 5))),
             pip_spread=Decimal(str(round(levels.spread, 5))),
             quantity=quantity,
@@ -560,6 +771,7 @@ class TradingService:
                     {
                         "t": now.isoformat(),
                         "level": round(float(follower_level), 5),
+                        "broker": round(float(broker_stop), 5),
                     }
                 ]
                 if follower_level
@@ -671,6 +883,18 @@ class TradingService:
             )
             return None
 
+        use_market_order = (
+            self._supports_market_orders(instrument)
+            and epic not in self._market_order_unsupported
+        )
+        if not use_market_order:
+            logger.info(
+                "Recovery short — %s does not support market orders "
+                "(marketOrderPreference=%s) — opening with a marketable LIMIT",
+                epic,
+                instrument.get("marketOrderPreference"),
+            )
+
         min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
         max_stop_rule = dealing_rules.get("maxStopOrLimitDistance", {})
         min_deal_size = dealing_rules.get("minDealSize", {}).get("value", 1)
@@ -716,7 +940,18 @@ class TradingService:
         epp = euro_per_point(market_data, quantity, currency)
         euro_risk = stop_price_distance * epp if epp else quantity * stop_price_distance
 
-        # 3. Send the SELL order with an absolute stop level (above entry).
+        # The broker stop sits one spread ABOVE the software follower (a short):
+        # the app-side stop is reached first between two bid polls and the broker
+        # order only fires as a deeper safety net — the SAME offset applied on
+        # every later ratchet (see ``_broker_stop_level``), so the spread cushion
+        # holds from the open through the start zone.
+        spread = max(float(last.spread or 0.0), 0.0)
+        broker_stop = self._broker_stop_level("SELL", stop_level, spread)
+
+        # 3. Send the SELL order with an absolute stop level (above entry). A SELL
+        # fills at the bid, so the marketable-LIMIT fallback prices through the
+        # entry bid (``entry_level``).
+        reference_price = entry_level
         order_payload = {
             "epic": epic,
             "expiry": expiry,
@@ -725,27 +960,24 @@ class TradingService:
             "orderType": "MARKET",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "stopLevel": round(stop_level, 5),
+            "stopLevel": round(broker_stop, 5),
             "forceOpen": True,
         }
+        if not use_market_order:
+            order_payload = self._to_marketable_limit(order_payload, reference_price)
         logger.info(
-            "Recovery short: epic=%s, qty=%d, stop=%.5f (+%.5f), risk=%.2f€",
+            "Recovery: epic=%s, qty=%d, stop=%.5f (broker %.5f, +%.5f), risk=%.2f€",
             epic,
             quantity,
             stop_level,
+            broker_stop,
             stop_price_distance,
             euro_risk,
         )
-        try:
-            result = await self._client.post(
-                "/positions/otc",
-                order_payload,
-                version=2,
-                priority=Priority.URGENT,
-                label=f"recovery {epic}: order",
-            )
-        except Exception as exc:
-            logger.error("Failed to open recovery short for %s: %s", epic, exc)
+        result = await self._post_open_order(
+            order_payload, epic, f"recovery {epic}: order", reference_price
+        )
+        if result is None:
             return None
 
         deal_reference = result.get("dealReference")
@@ -771,15 +1003,23 @@ class TradingService:
             level_zero=Decimal(str(round(plan.level_zero, 5))),
             level_follower=Decimal(str(round(stop_level, 5))),
             level_loose=Decimal(str(round(stop_level, 5))),
-            level_security=Decimal(str(round(stop_level, 5))),
-            level_stop=Decimal(str(round(stop_level, 5))),
+            # Broker-side levels track the level actually posted at IG — one spread
+            # above the software follower for a short (see ``broker_stop`` above).
+            level_security=Decimal(str(round(broker_stop, 5))),
+            level_stop=Decimal(str(round(broker_stop, 5))),
             level_margin=Decimal(str(round(plan.level_margin, 5))),
             pip_spread=Decimal(str(round(last.spread, 5))),
             quantity=quantity,
             size=int(round(stop_price_distance * scaling_factor)),
             euro_stop=Decimal(str(round(euro_risk, 3))),
             euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
-            stop_history=[{"t": now.isoformat(), "level": round(float(stop_level), 5)}],
+            stop_history=[
+                {
+                    "t": now.isoformat(),
+                    "level": round(float(stop_level), 5),
+                    "broker": round(float(broker_stop), 5),
+                }
+            ],
         )
         self._db.add(position)
         await self._db.commit()
@@ -844,6 +1084,10 @@ class TradingService:
                     version=1,
                     priority=Priority.URGENT,
                     label=f"open {epic}: confirm ({attempt}/{CONFIRM_MAX_ATTEMPTS})",
+                    # A 404 here is expected (deal not resolvable yet, or already
+                    # gone because the broker closed the market) and handled by
+                    # this retry loop — the queue should warn, not error.
+                    expect_not_found=True,
                 )
             except IGAPIError as exc:
                 last_exc = exc
@@ -947,6 +1191,10 @@ class TradingService:
                 version=1,
                 priority=Priority.URGENT,
                 label=f"close {epic}: confirm",
+                # A 404 here is a legitimate outcome (the deal reference may not
+                # resolve if the broker already closed the market) that the caller
+                # handles by falling back — the queue should warn, not error.
+                expect_not_found=True,
             )
         except Exception as exc:
             logger.debug("Could not fetch close confirmation for %s: %s", epic, exc)
@@ -2014,13 +2262,26 @@ class TradingService:
             "forceOpen": False,
         }
 
+        # Some epics (forwards, some futures) reject orderType=MARKET. When the
+        # instrument already bounced a MARKET order before
+        # (``_market_order_unsupported``) we close with a marketable LIMIT
+        # directly; otherwise we send MARKET and fall back to LIMIT only if IG
+        # rejects it at deal time (mirrors the open path).
+        if position.epic in self._market_order_unsupported:
+            close_payload = self._to_marketable_limit(close_payload, close_level)
+            logger.info(
+                "%s known to reject MARKET orders — "
+                "closing with a marketable LIMIT at %.5f",
+                position.epic,
+                close_payload["level"],
+            )
+
         try:
-            result = await self._client.delete(
-                "/positions/otc",
+            result = await self._delete_close_order(
                 close_payload,
-                version=1,
-                priority=Priority.URGENT,
-                label=f"close {position.epic}: {reason}",
+                position.epic,
+                f"close {position.epic}: {reason}",
+                close_level,
             )
         except IGAPIError as exc:
             if exc.response.status_code == 404:

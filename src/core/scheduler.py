@@ -1580,19 +1580,25 @@ class BotScheduler:
         Active only for a cross-epic ranker entry (``cross_epic_selection``, e.g.
         ``open_ranking``); a no-op otherwise. The selection knobs are
         constants on the strategy class (``concurrent_positions``,
-        ``wallet_reserve``), not settings. The goal is to
-        stay in the market all day: hold ``concurrent_positions`` open positions
-        (default 1, a single rolling position) and re-fill a slot as soon as one
-        closes — win or loss.
+        ``wallet_bounded``, ``wallet_reserve``), not settings. The goal is to
+        stay in the market all day and re-fill as soon as a position closes —
+        win or loss. Two modes, chosen by the strategy's ``wallet_bounded`` flag:
+
+        - **count-bounded** (default): hold exactly ``concurrent_positions`` open
+          positions (default 1, a single rolling position);
+        - **wallet-bounded** (``open_saferanking``): no fixed count — keep opening
+          the best-ranked affordable epics until the spendable balance can no
+          longer cover another margin.
 
         Each invocation:
 
-        1. returns early when the target position count is already met (the cheap
-           steady state while a position is running);
+        1. count-bounded only — returns early when the target position count is
+           already met (the cheap steady state while positions are running);
         2. otherwise scores every tradable epic, ranks the BUY candidates by score
            and opens the best ones that pass the shared open gates **and** the
            wallet check (available balance minus ``wallet_reserve`` must cover the
-           epic's margin) until the target is reached.
+           epic's margin), until the count target is reached (count-bounded) or
+           the wallet is exhausted (wallet-bounded).
 
         There is no wall-clock warm-up: an epic may be opened as soon as its
         market is open (it is in ``_tradable_epics``, filtered to ``TRADEABLE``)
@@ -1624,8 +1630,14 @@ class BotScheduler:
                     )
                 ) or 0
                 target = max(int(strategy.concurrent_positions), 1)
+                wallet_bounded = getattr(strategy, "wallet_bounded", False)
                 slots = target - int(open_count)
-                if slots <= 0:
+                # A count-bounded ranker holds exactly ``concurrent_positions``
+                # open and returns cheaply once the target is met. A wallet-bounded
+                # ranker has no fixed target — it keeps opening until the wallet
+                # runs dry — so it never short-circuits here; the wallet gate below
+                # is its only limit (``slots`` is re-derived once funds are known).
+                if not wallet_bounded and slots <= 0:
                     logger.debug(
                         "Rolling select: target met (%d/%d open) — holding",
                         open_count,
@@ -1690,6 +1702,19 @@ class BotScheduler:
                 spendable = (
                     available * (1.0 - reserve) if available is not None else None
                 )
+                if wallet_bounded:
+                    # Drop the fixed count cap: allow opening every ranked epic and
+                    # let the per-epic wallet gate below stop once the spendable
+                    # balance is exhausted. If the balance is unreadable we cannot
+                    # size the wallet, so fall back to the count target — an API
+                    # hiccup must never dump orders across the whole ranking.
+                    slots = (
+                        len(ranked)
+                        if spendable is not None
+                        else max(target - int(open_count), 0)
+                    )
+                    if slots <= 0:
+                        return
                 funds_map = {
                     m.epic: m.funds_needed
                     for m in self._tradable_markets

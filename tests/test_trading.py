@@ -11,6 +11,7 @@ from src.core.api.client import IGAPIError
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal
 from src.execution.trading import (
     CONFIRM_MAX_ATTEMPTS,
+    MARKET_ORDER_NOT_SUPPORTED_CODE,
     TradeConfig,
     TradingService,
 )
@@ -557,6 +558,83 @@ class TestCloseRejectedByBroker:
         assert float(pos.euro) == pytest.approx(4247.01)
 
 
+def _close_pos(**overrides) -> Position:
+    """An OPEN long with a dealId, ready to be closed."""
+    base = dict(
+        epic="EN.D.ICENG.FWS9.IP",
+        deal_id="DEALX",
+        direction="BUY",
+        state=PositionState.OPEN,
+        quantity=1,
+        level_open=Decimal("100.0"),
+        euro_stop=Decimal("400"),
+        euro_per_point=Decimal("11.6"),
+    )
+    base.update(overrides)
+    return Position(**base)
+
+
+def _accepted_confirm() -> dict:
+    return {
+        "dealStatus": "ACCEPTED",
+        "level": 99.8,
+        "profit": 12.0,
+        "profitCurrency": "EUR",
+    }
+
+
+class TestCloseMarketOrderFallback:
+    """Mirror of the open path: an epic that rejects orderType=MARKET
+    (``market-orders.not-supported-for-epic``, typically forwards) must close via
+    a marketable LIMIT instead of failing the close and leaving the position
+    unprotected."""
+
+    async def test_falls_back_to_limit_when_market_rejected_at_deal_time(self):
+        svc, client, _ = _trailing_service()
+        client.delete = AsyncMock(
+            side_effect=[
+                _ig_error(400, MARKET_ORDER_NOT_SUPPORTED_CODE),
+                {"dealReference": "REF1"},
+            ]
+        )
+        client.get = AsyncMock(return_value=_accepted_confirm())
+
+        result = await svc._close_position(_close_pos(), 100.0, "stop")
+
+        assert result is True
+        assert client.delete.await_count == 2
+        first = client.delete.await_args_list[0].args[1]
+        second = client.delete.await_args_list[1].args[1]
+        assert first["orderType"] == "MARKET"
+        assert second["orderType"] == "LIMIT"
+        # Closing a long is a SELL -> priced BELOW the touch by the slippage.
+        assert second["level"] == pytest.approx(99.8)
+        assert "EN.D.ICENG.FWS9.IP" in svc._market_order_unsupported
+
+    async def test_known_bad_epic_closes_with_limit_directly(self):
+        svc, client, _ = _trailing_service()
+        svc._market_order_unsupported.add("EN.D.ICENG.FWS9.IP")
+        client.delete = AsyncMock(return_value={"dealReference": "REF1"})
+        client.get = AsyncMock(return_value=_accepted_confirm())
+
+        result = await svc._close_position(_close_pos(), 100.0, "stop")
+
+        assert result is True
+        client.delete.assert_awaited_once()
+        assert client.delete.await_args.args[1]["orderType"] == "LIMIT"
+
+    async def test_unrelated_broker_error_aborts_without_retry(self):
+        svc, client, _ = _trailing_service()
+        client.delete = AsyncMock(
+            side_effect=_ig_error(400, "error.trading.some-other")
+        )
+
+        result = await svc._close_position(_close_pos(), 100.0, "stop")
+
+        assert result is False
+        client.delete.assert_awaited_once()
+
+
 def _open_signal(*, bid: float, level_security: float) -> TradingSignal:
     """Minimal BUY signal for open_position; only epic/levels are read."""
     spread = 0.0003
@@ -641,12 +719,128 @@ class TestOpenPosition:
         payload = client.post.await_args.args[1]
         # Absolute level, NOT a point distance.
         assert "stopDistance" not in payload
-        assert payload["stopLevel"] == pytest.approx(1.20550)
-        # Recorded stop is a real price just below entry — never negative.
-        assert float(pos.level_stop) == pytest.approx(1.20550)
+        # Broker stop posted one spread (0.0003) BELOW the software stop, so the
+        # app-side follower is hit first and the broker order is a safety net.
+        assert payload["stopLevel"] == pytest.approx(1.20520)  # 1.20550 - 0.0003
+        # Recorded broker line is a real price just below entry — never negative.
+        assert float(pos.level_stop) == pytest.approx(1.20520)
         assert float(pos.level_stop) > 0
         # size is the distance expressed in IG points (0.0045 * 10000).
         assert pos.size == 45
+
+    async def test_opens_marketable_limit_when_metadata_flags_no_market_orders(self):
+        """An epic advertising marketOrderPreference=NOT_AVAILABLE (forwards, some
+        futures) opens with a marketable LIMIT directly — no doomed MARKET first.
+        The limit is priced a slippage buffer above the ask (a BUY fills at the
+        offer) with timeInForce=EXECUTE_AND_ELIMINATE."""
+        svc, client, _ = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        market = _open_market()
+        market["instrument"]["marketOrderPreference"] = "NOT_AVAILABLE"
+        client.get.side_effect = [
+            market,
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        client.post.assert_awaited_once()
+        payload = client.post.await_args.args[1]
+        assert payload["orderType"] == "LIMIT"
+        assert payload["timeInForce"] == "EXECUTE_AND_ELIMINATE"
+        # offer (1.21030) priced 0.2% through the touch: 1.21030 * 1.002.
+        assert payload["level"] == pytest.approx(1.21272)
+        # The protective stop carries over unchanged.
+        assert payload["stopLevel"] == pytest.approx(1.20520)
+
+    async def test_falls_back_to_limit_when_market_rejected_at_deal_time(self):
+        """Metadata says market orders are fine, but IG still bounces the MARKET
+        POST with market-orders.not-supported-for-epic. The order is retried once
+        as a marketable LIMIT."""
+        svc, client, _ = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        client.get.side_effect = [
+            _open_market(),  # no marketOrderPreference -> treated as supported
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(
+            side_effect=[
+                _ig_error(400, MARKET_ORDER_NOT_SUPPORTED_CODE),
+                {"dealReference": "REF1"},
+            ]
+        )
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        assert client.post.await_count == 2
+        first = client.post.await_args_list[0].args[1]
+        second = client.post.await_args_list[1].args[1]
+        assert first["orderType"] == "MARKET"
+        assert second["orderType"] == "LIMIT"
+        assert second["level"] == pytest.approx(1.21272)
+
+    async def test_remembers_epic_and_skips_market_on_next_open(self):
+        """After a MARKET rejection, a later open on the same epic goes straight to
+        a marketable LIMIT — no repeated doomed MARKET attempt."""
+        svc, client, _ = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+
+        # First open: MARKET bounces, fallback to LIMIT succeeds.
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(
+            side_effect=[
+                _ig_error(400, MARKET_ORDER_NOT_SUPPORTED_CODE),
+                {"dealReference": "REF1"},
+            ]
+        )
+        assert await svc.open_position(signal) is not None
+        assert "CS.D.AUDNZD.CFD.IP" in svc._market_order_unsupported
+
+        # Second open: the epic is known-bad, so only a single LIMIT POST fires.
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALY", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF2"})
+        assert await svc.open_position(signal) is not None
+        client.post.assert_awaited_once()
+        assert client.post.await_args.args[1]["orderType"] == "LIMIT"
+
+    async def test_does_not_retry_on_unrelated_broker_error(self):
+        """A rejection other than market-orders-not-supported aborts the open
+        without a LIMIT retry."""
+        svc, client, _ = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        client.get.side_effect = [_open_market()]
+        client.post = AsyncMock(side_effect=_ig_error(400, "error.trading.some-other"))
+
+        pos = await svc.open_position(signal)
+
+        assert pos is None
+        client.post.assert_awaited_once()
+
+    async def test_opens_when_market_order_preference_available(self):
+        """AVAILABLE_DEFAULT_ON must not trip the market-order guard."""
+        svc, client, _ = _open_service()
+        signal = _open_signal(bid=1.21000, level_security=1.20550)
+        market = _open_market()
+        market["instrument"]["marketOrderPreference"] = "AVAILABLE_DEFAULT_ON"
+        client.get.side_effect = [
+            market,
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        client.post.assert_awaited_once()
 
     async def test_clamps_stop_out_to_minimum_distance(self):
         svc, client, _ = _open_service()
@@ -664,9 +858,10 @@ class TestOpenPosition:
 
         assert pos is not None
         payload = client.post.await_args.args[1]
-        # Clamped to the 8-point minimum: 1.21000 - 0.0008.
-        assert payload["stopLevel"] == pytest.approx(1.20920)
-        assert float(pos.level_stop) == pytest.approx(1.20920)
+        # Clamped to the 8-point minimum (1.21000 - 0.0008 = 1.20920), then the
+        # broker stop posted a further spread (0.0003) below.
+        assert payload["stopLevel"] == pytest.approx(1.20890)  # 1.20920 - 0.0003
+        assert float(pos.level_stop) == pytest.approx(1.20890)
 
     async def test_stop_min_distance_margin_pads_the_floor(self):
         """The order stop is padded past IG's bare minimum by the safety margin,
@@ -686,9 +881,9 @@ class TestOpenPosition:
 
         assert pos is not None
         payload = client.post.await_args.args[1]
-        # 1.21000 - 0.0008 * 1.15 = 1.20908.
-        assert payload["stopLevel"] == pytest.approx(1.20908)
-        assert float(pos.level_stop) == pytest.approx(1.20908)
+        # 1.21000 - 0.0008 * 1.15 = 1.20908 (software stop), broker a spread below.
+        assert payload["stopLevel"] == pytest.approx(1.20878)  # 1.20908 - 0.0003
+        assert float(pos.level_stop) == pytest.approx(1.20878)
 
     async def test_clamp_realigns_decoupled_software_stop(self):
         """Decoupled path: the close profile sets ONE stop
@@ -738,14 +933,17 @@ class TestOpenPosition:
         pos = await svc.open_position(signal)
 
         assert pos is not None
-        # Broker stop widened to the 8-point minimum...
-        assert float(pos.level_stop) == pytest.approx(1.20920)
-        # ...and every software stop level followed it (none tighter than broker).
+        # Software stop widened to the 8-point minimum (1.20920); the broker line
+        # rests one spread (0.0003) below it, the deeper safety net.
+        assert float(pos.level_stop) == pytest.approx(1.20890)  # 1.20920 - 0.0003
+        assert float(pos.level_security) == pytest.approx(1.20890)
+        # ...and every SOFTWARE stop level followed the clamp (none tighter).
         assert float(pos.level_follower) == pytest.approx(1.20920)
         assert float(pos.level_loose) == pytest.approx(1.20920)
-        assert float(pos.level_security) == pytest.approx(1.20920)
         # The seeded stop trajectory uses the realigned follower, not the tight one.
         assert pos.stop_history[0]["level"] == pytest.approx(1.20920)
+        # ...and carries the matching broker point a spread below.
+        assert pos.stop_history[0]["broker"] == pytest.approx(1.20890)
 
     async def test_legacy_distinct_levels_not_collapsed_by_clamp(self):
         """A legacy strategy with an intentionally tighter follower/loose keeps
@@ -765,7 +963,8 @@ class TestOpenPosition:
         pos = await svc.open_position(signal)
 
         assert pos is not None
-        assert float(pos.level_stop) == pytest.approx(1.20920)
+        # Broker line is the clamped stop (1.20920) minus one spread (0.0003).
+        assert float(pos.level_stop) == pytest.approx(1.20890)
         # Distinct legacy levels preserved (not folded to the broker stop).
         assert float(pos.level_follower) == pytest.approx(1.20900)  # bid - 0.001
         assert float(pos.level_loose) == pytest.approx(1.20700)  # bid - 0.003

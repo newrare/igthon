@@ -1,5 +1,6 @@
 """Tests for the IG API client and session management."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -188,6 +189,80 @@ async def test_get_suppress_error_logging_skips_guard_and_log(settings):
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_expect_not_found_404_warns_and_skips_guard_and_log(settings, caplog):
+    """An expected 404 (expect_not_found) still raises but logs at WARNING and is
+    kept out of the persistent error log / guard — mirroring the APIQueue side."""
+    respx.post("https://demo-api.ig.com/gateway/deal/session").mock(
+        return_value=Response(
+            200,
+            json={
+                "oauthToken": {
+                    "access_token": "test_access",
+                    "refresh_token": "test_refresh",
+                    "token_type": "Bearer",
+                    "scope": "profile",
+                    "expires_in": "1800",
+                },
+            },
+        )
+    )
+    respx.get("https://demo-api.ig.com/gateway/deal/confirms/REF").mock(
+        return_value=Response(404, json={"errorCode": "error.service.execution.find"})
+    )
+
+    error_log = MagicMock()
+    guard = MagicMock()
+    guard.pre_request = AsyncMock()
+    async with IGClient(settings, error_log=error_log, guard=guard) as client:
+        with caplog.at_level(logging.WARNING, logger="src.core.api.client"):
+            with pytest.raises(IGAPIError):
+                await client.get("/confirms/REF", version=1, expect_not_found=True)
+
+    # Logged, but at WARNING — never ERROR.
+    records = [r for r in caplog.records if "/confirms/REF" in r.getMessage()]
+    assert records and all(r.levelno == logging.WARNING for r in records)
+    # Expected outcome: kept out of the persistent error log and away from the guard.
+    error_log.record.assert_not_called()
+    guard.on_ig_error.assert_not_called()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_expect_not_found_flag_only_downgrades_404(settings):
+    """expect_not_found only tolerates a 404 — any other status still errors and
+    is recorded/reported normally."""
+    respx.post("https://demo-api.ig.com/gateway/deal/session").mock(
+        return_value=Response(
+            200,
+            json={
+                "oauthToken": {
+                    "access_token": "test_access",
+                    "refresh_token": "test_refresh",
+                    "token_type": "Bearer",
+                    "scope": "profile",
+                    "expires_in": "1800",
+                },
+            },
+        )
+    )
+    respx.get("https://demo-api.ig.com/gateway/deal/confirms/REF").mock(
+        return_value=Response(500, json={"errorCode": "Transformation failure."})
+    )
+
+    error_log = MagicMock()
+    guard = MagicMock()
+    guard.pre_request = AsyncMock()
+    async with IGClient(settings, error_log=error_log, guard=guard) as client:
+        with pytest.raises(IGAPIError):
+            await client.get("/confirms/REF", version=1, expect_not_found=True)
+
+    # A 500 is a genuine error even with expect_not_found set.
+    error_log.record.assert_called_once()
+    guard.on_ig_error.assert_called_once()
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_login_captures_streaming_endpoint(settings):
     """The v3 login response endpoint + accountId are captured for streaming."""
     respx.post("https://demo-api.ig.com/gateway/deal/session").mock(
@@ -245,3 +320,26 @@ async def test_fetch_session_tokens_reads_headers(settings):
         cst, xst = await client.session.fetch_session_tokens(client.http)
         assert cst == "cst-value"
         assert xst == "xst-value"
+
+
+class TestSoftErrorLogLevel:
+    """The API-key quota error logs at WARNING until it recurs within the window."""
+
+    def test_unknown_code_is_error(self, settings):
+        client = IGClient(settings)
+        assert client._error_log_level("error.something.else") == logging.ERROR
+
+    def test_soft_code_starts_at_warning(self, settings):
+        client = IGClient(settings)
+        assert (
+            client._error_log_level("error.public-api.exceeded-api-key-allowance")
+            == logging.WARNING
+        )
+
+    def test_soft_code_escalates_after_threshold(self, settings):
+        client = IGClient(settings)
+        code = "error.public-api.exceeded-api-key-allowance"
+        # First two occurrences stay at WARNING, the third escalates to ERROR.
+        assert client._error_log_level(code) == logging.WARNING
+        assert client._error_log_level(code) == logging.WARNING
+        assert client._error_log_level(code) == logging.ERROR

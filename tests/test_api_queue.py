@@ -12,7 +12,12 @@ import pytest
 
 from src.core.api.client import IGAPIError
 from src.core.api_guard import APIGuard
-from src.core.api_queue import APIQueue, Priority, QueueStatus
+from src.core.api_queue import (
+    MARKET_ORDER_NOT_SUPPORTED_CODE,
+    APIQueue,
+    Priority,
+    QueueStatus,
+)
 
 
 def _ig_error(status_code: int, ig_error_code: str = "") -> IGAPIError:
@@ -54,7 +59,9 @@ async def test_urgent_priority_jumps_ahead_of_normal():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_get(endpoint, *, version=1, suppress_error_logging=False):
+    async def fake_get(
+        endpoint, *, version=1, suppress_error_logging=False, expect_not_found=False
+    ):
         order.append(endpoint)
         if endpoint == "/blocker":
             started.set()
@@ -237,6 +244,97 @@ async def test_abandoned_call_mirrored_to_durable_error_log(monkeypatch):
     assert e["ig_error_code"] == "validation.failed"
     assert e["label"] == "open X"
     assert "boom" in e["error"]
+
+
+@pytest.mark.asyncio
+async def test_expected_404_warns_and_stays_out_of_error_log(caplog):
+    """An expect_not_found 404 (confirm poll for a deal the broker already
+    closed) is a legitimate outcome: warn, don't error, keep it out of the log."""
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=_ig_error(404, "error.service.execution.find"))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with caplog.at_level("WARNING", logger="src.core.api_queue"):
+            with pytest.raises(IGAPIError):
+                await queue.get(
+                    "/confirms/REF",
+                    version=1,
+                    expect_not_found=True,
+                    label="open X: confirm",
+                )
+        # Expected 404 → not an actionable failure: excluded from the error log.
+        assert queue.errors() == []
+        # ...and logged at WARNING, never ERROR.
+        abandoned = [r for r in caplog.records if "ABANDONED" in r.getMessage()]
+        assert abandoned and all(r.levelname == "WARNING" for r in abandoned)
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_expected_404_flag_only_downgrades_404(caplog):
+    """expect_not_found only tolerates a 404 — any other error still errors and
+    is recorded, so a genuine failure on the same call is not silenced."""
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=_ig_error(403, "some.auth.failure"))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with pytest.raises(IGAPIError):
+            await queue.get("/confirms/REF", version=1, expect_not_found=True)
+        assert len(queue.errors()) == 1
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_expected_market_rejection_warns_and_stays_out_of_error_log(caplog):
+    """A MARKET-order rejection the caller recovers from (retry as LIMIT) is a
+    legitimate outcome when expect_market_order_rejection is set: warn, don't
+    error, keep it out of the persistent error log."""
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=_ig_error(400, MARKET_ORDER_NOT_SUPPORTED_CODE))
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with caplog.at_level("WARNING", logger="src.core.api_queue"):
+            with pytest.raises(IGAPIError):
+                await queue.post(
+                    "/positions/otc",
+                    {"orderType": "MARKET"},
+                    version=2,
+                    expect_market_order_rejection=True,
+                    label="open X: order",
+                )
+        assert queue.errors() == []
+        abandoned = [r for r in caplog.records if "ABANDONED" in r.getMessage()]
+        assert abandoned and all(r.levelname == "WARNING" for r in abandoned)
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_market_rejection_flag_only_downgrades_that_code(caplog):
+    """expect_market_order_rejection only tolerates the not-supported code — any
+    other rejection on the same POST still errors and is recorded."""
+    client = AsyncMock()
+    client.post = AsyncMock(
+        side_effect=_ig_error(400, "error.trading.otc.insufficient")
+    )
+    queue = _make_queue(client, max_attempts=3)
+    await queue.start()
+    try:
+        with pytest.raises(IGAPIError):
+            await queue.post(
+                "/positions/otc",
+                {"orderType": "MARKET"},
+                version=2,
+                expect_market_order_rejection=True,
+            )
+        assert len(queue.errors()) == 1
+    finally:
+        await queue.stop()
 
 
 @pytest.mark.asyncio

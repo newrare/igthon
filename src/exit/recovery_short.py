@@ -46,7 +46,7 @@ class RecoveryShortProfile(CloseProfile):
     name = "recovery_short"
 
     atr_period: int = 14
-    noise_k: float = 0.5  # noise margin = max(noise_k × ATR, 2 × spread)
+    noise_k: float = 1.5  # noise margin = noise_k × ATR (spread is not a factor)
 
     # Initial short stop placement. StopSupport returns ``offer + stop_atr_k×ATR``
     # (above the entry) for a SELL — the mirror of its support-anchored BUY stop.
@@ -70,9 +70,9 @@ class RecoveryShortProfile(CloseProfile):
         # Constants live on the class (like every stop updater); build from them.
         return cls()
 
-    def _noise_margin(self, atr_value: float, spread: float) -> float:
+    def _noise_margin(self, atr_value: float) -> float:
         """Noise margin below break-even (see :func:`~src.exit.base.noise_margin`)."""
-        return noise_margin(self.noise_k, atr_value, spread)
+        return noise_margin(self.noise_k, atr_value)
 
     def initial_plan(
         self, *, entry_level: float, direction: str, buf: EpicBuffer
@@ -85,9 +85,7 @@ class RecoveryShortProfile(CloseProfile):
         """
         if direction != "SELL":
             raise ValueError("RecoveryShortProfile manages SELL positions only")
-        last = buf.last
         atr_value = atr(list(buf.candles), self.atr_period)
-        spread = last.spread if last else 0.0
         stop_level = self.stop_distance.initial_stop(
             entry_level=entry_level, direction="SELL", buf=buf
         )
@@ -96,7 +94,7 @@ class RecoveryShortProfile(CloseProfile):
             stop_level=stop_level,
             level_zero=level_zero,
             target_level=0.0,
-            level_margin=level_zero - self._noise_margin(atr_value, spread),
+            level_margin=level_zero - self._noise_margin(atr_value),
             profile=self.name,
         )
 
@@ -148,7 +146,7 @@ class RecoveryShortProfile(CloseProfile):
         # per-tick computation for rows opened before it was persisted.
         level_margin = float(getattr(position, "level_margin", 0) or 0)
         if level_margin <= 0:
-            level_margin = level_zero - self._noise_margin(atr_value, spread)
+            level_margin = level_zero - self._noise_margin(atr_value)
 
         # Momentum confirmation: only ratchet when the last two bids are both
         # falling. A lone down-spike is ignored (mirror of the long ratchet).

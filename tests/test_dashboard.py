@@ -620,7 +620,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=21" in html
+        assert "/static/dashboard.js?v=25" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())

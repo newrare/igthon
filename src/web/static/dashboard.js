@@ -776,6 +776,8 @@ function _showChartEpic(epic) {
     titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
     lucide.createIcons();
     container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
+    const pnlEl = document.getElementById('chart-modal-pnl');
+    if (pnlEl) pnlEl.style.display = 'none';
     _updateChartNav();
 }
 
@@ -851,6 +853,31 @@ function _attachChartZoomListener(container) {
     container.on('plotly_relayout', _onChartRelayout);
 }
 
+// Paint the P&L badge overlaid on the chart: one entry per trade on the epic,
+// green/red by sign, tagged "en cours" while the position is open (running P&L)
+// or "validé" once it is closed (realised P&L). Hidden when no trade has a P&L.
+function _renderChartPnl(trades) {
+    const el = document.getElementById('chart-modal-pnl');
+    if (!el) return;
+    const parts = (trades || [])
+        .filter(function(t) { return typeof t.pnl === 'number' && isFinite(t.pnl); })
+        .map(function(t) {
+            const running = t.state === 'open';
+            const sign = t.pnl >= 0 ? '+' : '';
+            const color = t.pnl >= 0 ? '#4ade80' : '#ef4444';
+            const tag = running ? 'en cours' : 'validé';
+            return '<span style="color:' + color + ';font-weight:600;">P&amp;L '
+                + sign + t.pnl.toFixed(2) + ' €</span>'
+                + ' <span style="color:#94a3b8;">(' + tag + ')</span>';
+        });
+    if (parts.length) {
+        el.innerHTML = parts.join('<span style="color:#475569;"> · </span>');
+        el.style.display = 'block';
+    } else {
+        el.style.display = 'none';
+    }
+}
+
 // Fetch the whole-day curve for ``epic`` and (re)draw it. ``initial`` paints the
 // "Loading…"/error placeholders and uses Plotly.newPlot; a refresh keeps the
 // current chart visible and uses Plotly.react for a flicker-free in-place update.
@@ -871,6 +898,7 @@ async function _loadChart(epic, initial) {
             return;
         }
         const trades = data.trades || [];
+        _renderChartPnl(trades);
         const rawBids = candles.map(function(c) { return c.bid; });
         // Offer (ask) curve. A long is filled on the offer, so level_open/zero sit
         // on this curve, not the bid one; without it the entry marker floats a
@@ -896,7 +924,7 @@ async function _loadChart(epic, initial) {
                           Math.min.apply(null, rawNoiseBid));
         let hi = Math.max(Math.max.apply(null, rawBids), Math.max.apply(null, rawOffers));
         trades.forEach(function(t) {
-            ['open', 'openBid', 'zero', 'margin', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
+            ['open', 'openBid', 'zero', 'margin', 'profit10', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
                 const v = t[k];
                 if (typeof v === 'number' && isFinite(v)) {
                     if (v < lo) lo = v;
@@ -916,44 +944,88 @@ async function _loadChart(epic, initial) {
         });
         const range = hi - lo;
         const toPct = function(v) { return range === 0 ? 50 : (v - lo) / range * 100; };
-        const pctY = rawBids.map(toPct);
-        const pctYOffer = rawOffers.map(toPct);
+
+        // Candle timestamps as epoch ms (parsed in the browser's local tz; all
+        // values use the same convention so differences and round-trips are
+        // consistent regardless of which tz that is).
+        const candleMs = timestamps.map(function(t) { return new Date(t).getTime(); });
+        const _pad2 = function(n) { return String(n).padStart(2, '0'); };
+        const _msToParisNaive = function(ms) {
+            const d = new Date(ms);
+            return d.getFullYear() + '-' + _pad2(d.getMonth() + 1) + '-' + _pad2(d.getDate()) +
+                'T' + _pad2(d.getHours()) + ':' + _pad2(d.getMinutes()) + ':' + _pad2(d.getSeconds());
+        };
+
+        // Gaps in the 1-minute tick stream: the livestream records one bid per
+        // minute, so two consecutive candles more than ~1.5 min apart mean the
+        // bot/stream was offline and minutes are missing. Each such hole is (a)
+        // broken out of the curves — a null point is inserted so no straight line
+        // is drawn across a period with no data — and (b) shaded with a grey band
+        // so the outage is visible rather than silently interpolated.
+        const GAP_MS = 90 * 1000;  // > 1.5 × the 60 s expected cadence
+        const gapAfter = {};       // index i ⇒ a gap sits between candle i and i+1
+        const gapRects = [];       // shaded-band shapes, one per gap
+        for (let i = 1; i < candleMs.length; i++) {
+            if (candleMs[i] - candleMs[i - 1] > GAP_MS) {
+                gapAfter[i - 1] = true;
+                gapRects.push({
+                    type: 'rect', xref: 'x', yref: 'paper',
+                    x0: timestamps[i - 1], x1: timestamps[i], y0: 0, y1: 1,
+                    fillcolor: 'rgba(148,163,184,0.14)', line: { width: 0 },
+                    layer: 'below'
+                });
+            }
+        }
+
+        // Rebuild a trace's parallel (x, y, customdata) arrays with a null point
+        // inserted mid-gap, so Plotly breaks the line there (markers skip nulls).
+        function breakGaps(ys, cds) {
+            const x = [], y = [], cd = [];
+            for (let i = 0; i < ys.length; i++) {
+                x.push(timestamps[i]); y.push(ys[i]); cd.push(cds[i]);
+                if (gapAfter[i]) {
+                    x.push(_msToParisNaive((candleMs[i] + candleMs[i + 1]) / 2));
+                    y.push(null); cd.push(null);
+                }
+            }
+            return { x: x, y: y, customdata: cd };
+        }
+
+        const bidCurve = breakGaps(rawBids.map(toPct), rawBids);
+        const noiseCurve = breakGaps(rawNoiseBid.map(toPct), rawNoiseBid);
 
         const traces = [{
-            x: timestamps,
-            y: pctY,
-            customdata: rawBids,
+            x: bidCurve.x,
+            y: bidCurve.y,
+            customdata: bidCurve.customdata,
             type: 'scatter',
-            mode: 'lines',
+            // A bold round marker on every candle so each recorded tick is
+            // visible as a point on the orange bid curve, not just a line.
+            mode: 'lines+markers',
+            connectgaps: false,
             line: { color: '#E07B39', width: 1.5 },
+            marker: { color: '#E07B39', size: 5, symbol: 'circle' },
             name: 'Bid close',
-            hovertemplate: 'Bid: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
-        }, {
-            // Offer (ask): a faint dotted line one spread above the bid, so the
-            // bid/offer band (and the cost the long paid into it) is visible.
-            x: timestamps,
-            y: pctYOffer,
-            customdata: rawOffers,
-            type: 'scatter',
-            mode: 'lines',
-            line: { color: '#475569', width: 1, dash: 'dot' },
-            name: 'Offer close',
-            hovertemplate: 'Offer: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
+            // Hover shows the tick's reading time (HH:MM:SS) instead of the
+            // meaningless normalised %-of-range value, plus the bid price.
+            hovertemplate: '%{x|%H:%M:%S}<br>Bid: %{customdata:.4f}<extra></extra>'
         }, {
             // Noise-adjusted bid (bid − adverse tick-noise band): a dim orange line
             // just below the bid. When this trace — not the raw bid — clears the
             // Break-even / Margin lines is when the zone updaters stop reading the
             // move as churn, so it explains why a stop does (or does not) ratchet.
-            x: timestamps,
-            y: rawNoiseBid.map(toPct),
-            customdata: rawNoiseBid,
+            x: noiseCurve.x,
+            y: noiseCurve.y,
+            customdata: noiseCurve.customdata,
             type: 'scatter',
             mode: 'lines',
+            connectgaps: false,
             line: { color: 'rgba(224,123,57,0.4)', width: 1, dash: 'dot' },
             name: 'Bid − noise',
-            hovertemplate: 'Bid − noise: %{customdata:.4f}<br>%{y:.1f}<extra></extra>'
+            hovertemplate: '%{x|%H:%M:%S}<br>Bid − noise: %{customdata:.4f}<extra></extra>'
         }];
-        const shapes = [];
+        // Grey bands over the offline gaps sit under everything else.
+        const shapes = gapRects.slice();
         const annotations = [];
 
         // Horizontal reference line + right-anchored price label for one level.
@@ -976,16 +1048,6 @@ async function _loadChart(epic, initial) {
             });
         }
 
-        // Candle timestamps as epoch ms (parsed in the browser's local tz; all
-        // values use the same convention so differences and round-trips are
-        // consistent regardless of which tz that is).
-        const _candleMs = timestamps.map(function(t) { return new Date(t).getTime(); });
-        const _pad2 = function(n) { return String(n).padStart(2, '0'); };
-        const _msToParisNaive = function(ms) {
-            const d = new Date(ms);
-            return d.getFullYear() + '-' + _pad2(d.getMonth() + 1) + '-' + _pad2(d.getDate()) +
-                'T' + _pad2(d.getHours()) + ':' + _pad2(d.getMinutes()) + ':' + _pad2(d.getSeconds());
-        };
         // Time at which the bid curve crosses ``target``, nearest to ``refMs``.
         // Markers carry a real price (the open bid / the close fill), but the
         // recorded execution time can sit a candle off during a fast move, leaving
@@ -996,13 +1058,13 @@ async function _loadChart(epic, initial) {
         // across the chart. Returns null when no nearby crossing exists.
         const _SNAP_CAP_MS = 6 * 60 * 1000;
         function _snapMsToBid(target, refMs) {
-            if (typeof target !== 'number' || !isFinite(target) || _candleMs.length < 2) return null;
+            if (typeof target !== 'number' || !isFinite(target) || candleMs.length < 2) return null;
             let best = null, bestDist = Infinity;
             for (let i = 1; i < rawBids.length; i++) {
                 const a = rawBids[i - 1], b = rawBids[i];
                 if (target < Math.min(a, b) || target > Math.max(a, b)) continue;
                 const f = (b === a) ? 0 : (target - a) / (b - a);
-                const tCross = _candleMs[i - 1] + f * (_candleMs[i] - _candleMs[i - 1]);
+                const tCross = candleMs[i - 1] + f * (candleMs[i] - candleMs[i - 1]);
                 const dist = Math.abs(tCross - refMs);
                 if (dist < bestDist) { bestDist = dist; best = tCross; }
             }

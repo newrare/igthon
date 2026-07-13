@@ -103,6 +103,13 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     'style="display:none;">‹</button>'
                     '<div id="chart-paused-badge" style="display:none;">'
                     "⏸ Paused (zoomed) — double-click to resume</div>"
+                    # Running/realised P&L for the epic's trade(s), overlaid
+                    # top-left of the chart. Filled by _loadChart from the
+                    # trade's stored euro P&L + position state.
+                    '<div id="chart-modal-pnl" style="position:absolute;'
+                    "top:6px;left:10px;z-index:5;font-size:0.82rem;"
+                    "background:rgba(28,23,20,0.78);padding:3px 9px;"
+                    'border-radius:4px;display:none;"></div>'
                     '<div id="chart-container" style="height:100%;'
                     'min-height:420px;"></div>'
                     '<button id="chart-nav-next" class="chart-nav-btn chart-nav-next" '
@@ -393,6 +400,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=21"></script>
+<script src="/static/dashboard.js?v=26"></script>
 </body>
 </html>"""

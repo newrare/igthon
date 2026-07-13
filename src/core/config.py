@@ -197,6 +197,12 @@ class Settings(BaseSettings):
     # stop clamped exactly to the minimum is frequently rejected ("Stop trop
     # près"). Padding the floor by this fraction (0.15 = 15%) absorbs that drift.
     strategy_stop_min_distance_margin: float = 0.15
+    # Slippage buffer (fraction of price) used when an open falls back from a
+    # MARKET order to a marketable LIMIT on an epic that rejects MARKET orders
+    # (typically forwards). The limit is priced this far through the current touch
+    # so EXECUTE_AND_ELIMINATE fills the whole size at the best available price;
+    # the buffer only caps the acceptable slippage, never the fill price.
+    strategy_market_order_limit_slippage: float = 0.002
     # Loss-recovery — master switch (single boolean, the only .env knob here).
     # When True, a long that closes on the "trend-reversal at open" pattern (a
     # quick stop-out that never crossed break-even) immediately triggers a

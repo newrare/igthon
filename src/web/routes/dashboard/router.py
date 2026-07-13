@@ -320,11 +320,13 @@ def _trade_overlay(p: Position) -> dict:
     #     if price gaps between two bid readings.
     # They diverge because the broker stop is deliberately posted one spread below
     # the software follower (see TradingService._broker_stop_level), so the app
-    # closes first and the broker order is a pure safety net — and, at open, also
-    # whenever IG's minimum-stop-distance rule widened the broker stop. The loose
-    # trajectory is the broker's initial level (index 0, where the two coincide)
-    # followed by the level actually pushed to IG at each ratchet (the per-point
-    # ``broker``); legacy points without it fall back to the follower level.
+    # closes first and the broker order is a pure safety net — from the open
+    # onward (the offset is now applied at open too, not only on ratchets) and
+    # also whenever IG's minimum-stop-distance rule widened the broker stop. The
+    # loose trajectory is the broker's initial level (index 0, ``level_stop``,
+    # already a spread below the follower) followed by the level actually pushed
+    # to IG at each ratchet (the per-point ``broker``); legacy points without it
+    # fall back to the follower level.
     raw_stops = _stops()
     # Follower (application-side) line: strip the internal per-point broker level
     # so the software-stop trajectory stays {t, level}.
@@ -342,6 +344,17 @@ def _trade_overlay(p: Position) -> dict:
             else:
                 level = s.get("broker", s["level"])
             loose_stops.append({"t": s["t"], "level": level})
+
+    # ``profit10``: the bid level at which the trade's running P&L is +10 €,
+    # derived from the stored ``euro_per_point`` (10 € / €-per-point in price
+    # points away from break-even, in the profitable direction). Mapped onto the
+    # bid curve like the other levels. (The +3 % line is a purely visual offset
+    # from break-even and is computed client-side from the chart's range.)
+    epp = _num("euro_per_point")
+    profit10: float | None = None
+    if zero_line is not None and epp:
+        sign = -1.0 if direction == "SELL" else 1.0
+        profit10 = zero_line + sign * (10.0 / epp)
 
     return {
         "id": p.id,
@@ -366,6 +379,9 @@ def _trade_overlay(p: Position) -> dict:
         "stopFollower": _level("level_follower"),
         "stopsFollower": follower_stops,
         "target": _level("level_win"),
+        # Profit reference line above break-even: +10 € (euro-based), on the bid
+        # curve. The +3 % line is derived client-side from the chart range.
+        "profit10": profit10,
         "close": close_line,
         # Close reason — lets the chart flag an *estimated* exit (the position
         # vanished from IG and the close level/time were derived, not a captured
@@ -376,6 +392,9 @@ def _trade_overlay(p: Position) -> dict:
         # the latter when reconciliation has not stamped the broker time yet.
         "openTime": _ts(getattr(p, "time_open_broker", None) or p.time_open),
         "closeTime": _ts(getattr(p, "time_close_broker", None) or p.time_close),
+        # Position state ("open"/"close") so the chart labels the P&L as running
+        # ("en cours") for an open trade or realised ("validé") once closed.
+        "state": getattr(getattr(p, "state", None), "value", None),
         "pnl": _num("euro"),
     }
 

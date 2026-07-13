@@ -43,6 +43,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# IG rejects ``orderType: "MARKET"`` on epics that only accept working/limit
+# orders (typically forwards) with this error code. The caller (the open path)
+# recovers by retrying as a marketable LIMIT, so a queued call flagged
+# ``expect_market_order_rejection`` treats this specific abandonment as an
+# expected outcome — logged at WARNING and kept out of the persistent error log.
+MARKET_ORDER_NOT_SUPPORTED_CODE = (
+    "error.trading.otc.market-orders.not-supported-for-epic"
+)
+
 
 class Priority(IntEnum):
     """Call priority — lower value is served first by the worker."""
@@ -77,6 +86,14 @@ class QueuedCall:
     max_attempts: int = 3
     attempts: int = 0
     total_attempts: int = 0  # every execution including rate-limit hits
+    # A ``404`` on this call is a legitimate, expected outcome (the resource may
+    # not exist yet or may already be gone) that the caller handles itself — the
+    # queue logs it at WARNING and keeps it out of the persistent error log.
+    expect_not_found: bool = False
+    # A ``MARKET_ORDER_NOT_SUPPORTED_CODE`` rejection on this call is expected: the
+    # caller retries as a marketable LIMIT. Same handling as ``expect_not_found``
+    # (WARNING, no persistent error entry), but keyed on the IG error code.
+    expect_market_order_rejection: bool = False
     status: QueueStatus = QueueStatus.PENDING
     last_error: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -220,10 +237,24 @@ class APIQueue:
         suppress_error_logging: bool = False,
         priority: int = Priority.NORMAL,
         label: str | None = None,
+        expect_not_found: bool = False,
     ) -> dict:
-        """Queue a GET request and await its parsed JSON result."""
+        """Queue a GET request and await its parsed JSON result.
+
+        Set ``expect_not_found`` when a ``404`` is a legitimate outcome the caller
+        handles itself (e.g. polling ``/confirms/{ref}`` for a deal that may not
+        be resolvable yet, or that the broker already closed): the queue then logs
+        the ``404`` at WARNING and does not record it as a hard error.
+        """
         return await self._submit(
-            "GET", endpoint, None, version, suppress_error_logging, priority, label
+            "GET",
+            endpoint,
+            None,
+            version,
+            suppress_error_logging,
+            priority,
+            label,
+            expect_not_found,
         )
 
     async def post(
@@ -234,10 +265,24 @@ class APIQueue:
         version: int = 1,
         priority: int = Priority.NORMAL,
         label: str | None = None,
+        expect_market_order_rejection: bool = False,
     ) -> dict:
-        """Queue a POST request and await its parsed JSON result."""
+        """Queue a POST request and await its parsed JSON result.
+
+        Set ``expect_market_order_rejection`` when the caller will recover from a
+        ``MARKET_ORDER_NOT_SUPPORTED_CODE`` rejection (e.g. the open path retrying
+        as a marketable LIMIT): the queue then logs that specific abandonment at
+        WARNING and does not record it as a hard error.
+        """
         return await self._submit(
-            "POST", endpoint, payload, version, False, priority, label
+            "POST",
+            endpoint,
+            payload,
+            version,
+            False,
+            priority,
+            label,
+            expect_market_order_rejection=expect_market_order_rejection,
         )
 
     async def put(
@@ -262,10 +307,24 @@ class APIQueue:
         version: int = 1,
         priority: int = Priority.NORMAL,
         label: str | None = None,
+        expect_market_order_rejection: bool = False,
     ) -> dict:
-        """Queue a DELETE request and await its parsed JSON result."""
+        """Queue a DELETE request and await its parsed JSON result.
+
+        Set ``expect_market_order_rejection`` when the caller will recover from a
+        ``MARKET_ORDER_NOT_SUPPORTED_CODE`` rejection (e.g. the close path retrying
+        as a marketable LIMIT): the queue then logs that specific abandonment at
+        WARNING and does not record it as a hard error.
+        """
         return await self._submit(
-            "DELETE", endpoint, payload, version, False, priority, label
+            "DELETE",
+            endpoint,
+            payload,
+            version,
+            False,
+            priority,
+            label,
+            expect_market_order_rejection=expect_market_order_rejection,
         )
 
     def stats(self) -> APIQueueStats:
@@ -323,6 +382,8 @@ class APIQueue:
         suppress: bool,
         priority: int,
         label: str | None,
+        expect_not_found: bool = False,
+        expect_market_order_rejection: bool = False,
     ) -> asyncio.Future:
         """Build a QueuedCall, enqueue it, and return its result future."""
         seq = next(self._seq)
@@ -338,6 +399,8 @@ class APIQueue:
             label=label or f"{method} {endpoint}",
             future=future,
             max_attempts=self._max_attempts,
+            expect_not_found=expect_not_found,
+            expect_market_order_rejection=expect_market_order_rejection,
         )
         self._enqueued += 1
         self._enqueue(call)
@@ -400,6 +463,7 @@ class APIQueue:
                 call.endpoint,
                 version=call.version,
                 suppress_error_logging=call.suppress_error_logging,
+                expect_not_found=call.expect_not_found,
             )
         if call.method == "POST":
             return await self._client.post(
@@ -460,9 +524,25 @@ class APIQueue:
         call.last_error = str(exc)
         call.finished_at = datetime.now(UTC)
         self._failed += 1
-        # Probe calls (suppress_error_logging=True) are bisection probes — their
-        # failure is expected and handled by the caller, so debug-level is correct.
-        log_fn = logger.debug if call.suppress_error_logging else logger.error
+        # A 404 on an ``expect_not_found`` call is a legitimate outcome the caller
+        # handles itself (e.g. polling /confirms for a deal that isn't resolvable
+        # yet, or that the broker already closed): warn instead of error and keep
+        # it out of the persistent error log. Probe calls (suppress_error_logging)
+        # are bisection probes whose failure is expected too, so debug-level fits.
+        expected_missing = call.expect_not_found and status == 404
+        # A MARKET rejection the caller recovers from (retries as a marketable
+        # LIMIT) is expected too — same WARNING / no-error-record handling.
+        expected_rejection = (
+            call.expect_market_order_rejection
+            and ig_code == MARKET_ORDER_NOT_SUPPORTED_CODE
+        )
+        expected = expected_missing or expected_rejection
+        if call.suppress_error_logging:
+            log_fn = logger.debug
+        elif expected:
+            log_fn = logger.warning
+        else:
+            log_fn = logger.error
         log_fn(
             "APIQueue: task ABANDONED — %s [%s %s] after %d attempt(s): %s",
             call.label,
@@ -471,9 +551,10 @@ class APIQueue:
             call.attempts,
             exc,
         )
-        # Probes are expected bisection failures — keep them out of the debug
-        # error log so it only surfaces actionable, real failures.
-        if not call.suppress_error_logging:
+        # Probes and expected outcomes (404 lookups, recoverable MARKET rejections)
+        # are not actionable failures — keep them out of the error log so it only
+        # surfaces real failures.
+        if not call.suppress_error_logging and not expected:
             self._record_error(call, exc, status, ig_code)
         if not call.future.done():
             call.future.set_exception(exc)
