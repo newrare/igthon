@@ -1,21 +1,31 @@
 """Per-zone stop updaters — the *close* side split by where price sits.
 
 A position's stop is managed differently depending on where the live bid sits
-relative to two references frozen at open:
+relative to three references frozen at open:
 
 - ``level_zero`` — the break-even level (the entry offer for a BUY);
 - ``level_margin`` — break-even plus the epic's noise margin, the smallest move
-  that counts as real profit rather than bid/offer churn.
+  that counts as real profit rather than bid/offer churn. It is the **ceiling of
+  where the raised stop is parked**, not a zone boundary;
+- ``level_profit`` — the *profit trigger*, one further noise margin above the
+  margin line (``level_margin + noise_margin`` = ``2 × level_margin − level_zero``).
+  It is the boundary above which the stop trails progressively.
 
 That splits the price axis into three zones, each its own responsibility and its
 own :class:`StopUpdater` (so each can be reasoned about and unit-tested alone):
 
 - :class:`StopZone.UNDERWATER` — ``bid <= level_zero`` —
   :class:`~src.exit.zones.underwater.UnderwaterStop`;
-- :class:`StopZone.BREAKEVEN_BAND` — ``level_zero < bid <= level_margin`` —
-  :class:`~src.exit.zones.breakeven_band.BreakevenBandStop`;
-- :class:`StopZone.PROFIT` — ``bid > level_margin`` —
-  :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`.
+- :class:`StopZone.BREAKEVEN_BAND` — ``level_zero < bid <= level_profit`` —
+  :class:`~src.exit.zones.breakeven_band.BreakevenBandStop`. Spans from break-even
+  up to the profit trigger (i.e. *across* the margin line): the raised stop is
+  parked on a support inside the break-even→margin band, and this zone keeps
+  governing while the bid hovers just above the margin. Extending it past the
+  margin is what stops a bid from skipping a break-even→margin band that is often
+  thinner than a single live poll's move;
+- :class:`StopZone.PROFIT` — ``bid > level_profit`` —
+  :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`. Real, sustained
+  profit: the stop trails progressively above the margin line.
 
 A :class:`~src.exit.base.CloseProfile` composes the three updaters: on each tick
 it classifies the zone and delegates to the matching updater, which returns a new
@@ -41,14 +51,26 @@ class StopZone(Enum):
 
 
 def classify_zone(
-    current_bid: float, level_zero: float, level_margin: float
+    current_bid: float, level_zero: float, level_profit: float
 ) -> StopZone:
     """Classify the live bid into a :class:`StopZone`.
 
-    ``UNDERWATER`` at or below break-even, ``BREAKEVEN_BAND`` in the noise band
-    just above it, ``PROFIT`` once the bid clears the (open-frozen) margin level.
+    Three open-frozen references split the price axis (see the module docstring):
+    break-even (``level_zero``), the margin line, and the profit trigger
+    (``level_profit`` — one noise margin *above* the margin line):
+
+    - ``UNDERWATER`` at or below break-even;
+    - ``BREAKEVEN_BAND`` from break-even up to the profit trigger — the whole
+      region in which the stop is parked on a support inside the
+      break-even→margin band. Deliberately extends *past* the margin line so the
+      margin-zone updater still governs while the bid hovers just above the
+      margin (the band between break-even and margin is often thinner than a
+      single live poll's move, so gating the profit zone on the margin line alone
+      let the bid skip the band entirely);
+    - ``PROFIT`` once the bid clears the profit trigger — real, sustained profit,
+      where the stop trails progressively above the margin line.
     """
-    if current_bid > level_margin:
+    if current_bid > level_profit:
         return StopZone.PROFIT
     if current_bid > level_zero:
         return StopZone.BREAKEVEN_BAND

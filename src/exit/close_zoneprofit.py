@@ -9,24 +9,28 @@ decoupled responsibilities and wires them to the persisted position:
   defaults to the recency-weighted support distance), and freezes the break-even
   (``level_zero``) and margin (``level_zero + noise_margin``) references;
 - on every tick, it classifies the live bid into one of three zones
-  (see :mod:`src.exit.zones`) and delegates to the matching
-  :class:`~src.exit.zones.base.StopUpdater`:
+  (see :mod:`src.exit.zones`) using break-even and the *profit trigger*
+  (``level_margin + noise_margin``, a second symmetric band above the margin),
+  and delegates to the matching :class:`~src.exit.zones.base.StopUpdater`:
     * :class:`~src.exit.zones.underwater.UnderwaterStop` — at/under break-even;
-    * :class:`~src.exit.zones.breakeven_band.BreakevenBandStop` — noise band;
-    * :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop` — real profit.
+    * :class:`~src.exit.zones.breakeven_band.BreakevenBandStop` — break-even up to
+      the profit trigger (across the margin line);
+    * :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop` — above the
+      profit trigger (real profit).
 
 The close-only concerns it keeps for itself are the two hard triggers: the
 end-of-day force close and the software backstop aligned with the live stop.
 
 This composition preserves the previous ``close_zoneprofit`` behaviour exactly:
 the support-anchored initial stop, and the profit-gated ATR chandelier trailing
-that only engages once the bid clears the margin level (zones 1 and 2 hold the
-stop, zone 3 ratchets it up in steps).
+that only engages once the bid clears the profit trigger (zones 1 and 2 hold or
+lock the stop below the margin, zone 3 ratchets it up in steps above it).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from src.core.indicators import atr
 from src.exit.base import (
@@ -56,6 +60,45 @@ from src.exit.zones.underwater import UnderwaterStop
 from src.feed.price_buffer import EpicBuffer
 from src.stops import StopDistance, get_stop_distance
 from src.stops.stop_support import StopSupport
+
+
+def _opened_at(position) -> datetime | None:
+    """Reconstruct the position's open instant (UTC) from its persisted columns.
+
+    ``time_open`` is stored as a naive time-of-day captured from
+    ``datetime.now(UTC)`` at open (see ``src/execution/trading.py``), so it is
+    combined with ``date`` and stamped UTC to match the buffer's UTC-aware candle
+    timestamps. Returns ``None`` when either column is absent (e.g. a bare test
+    stub), which callers treat as "do not slice".
+    """
+    day = getattr(position, "date", None)
+    opened = getattr(position, "time_open", None)
+    if day is None or opened is None:
+        return None
+    return datetime.combine(day, opened, tzinfo=UTC)
+
+
+def _buffer_since(buf: EpicBuffer, opened_at: datetime | None) -> EpicBuffer:
+    """Return a view of ``buf`` holding only candles from ``opened_at`` onward.
+
+    The zone updaters read price *levels* (swing lows, rising streaks, recent
+    range) from the buffer and judge them against references frozen at open
+    (``level_zero`` / ``level_margin``). The live ``EpicBuffer`` is a rolling
+    window fed continuously by the market feed, so it also holds candles recorded
+    **before this position opened** — an intraday rally that happened to clear
+    where the margin was later frozen would arm a break-even lock retroactively,
+    even though nothing since the open ever approached it (observed live). Bounding
+    the buffer to the open removes that pre-entry history for every updater at once.
+
+    ``opened_at`` of ``None`` (columns absent) returns the buffer unchanged.
+    """
+    if opened_at is None:
+        return buf
+    sliced = EpicBuffer(epic=buf.epic, max_candles=buf.max_candles)
+    for candle in buf.candles:
+        if candle.timestamp >= opened_at:
+            sliced.add(candle)
+    return sliced
 
 
 @dataclass
@@ -164,6 +207,20 @@ class CloseZoneProfit(CloseProfile):
         if level_margin <= 0:
             level_margin = level_zero + self._noise_margin(atr_value)
 
+        # Profit trigger — one further noise margin above the margin line, i.e. a
+        # second symmetric band stacked on top of the first. Derived exactly from
+        # the two open-frozen references (so it is itself frozen at open, with no
+        # extra persisted column): it is the boundary the bid must clear to enter
+        # the profit-trailing zone. Below it (but above break-even) the margin-zone
+        # updater keeps parking the stop on a support inside break-even→margin.
+        level_profit = level_margin + (level_margin - level_zero)
+
+        # Bound the buffer the updaters scan to candles recorded from the open
+        # onward. ATR above intentionally keeps the full rolling history (a
+        # volatility estimate wants pre-open data and must stay warm right after
+        # open), but the stop-raising gates read price levels against references
+        # frozen at open, so pre-entry candles must not count (see
+        # ``_buffer_since``).
         ctx = StopContext(
             current_bid=current_bid,
             level_open=level_open,
@@ -173,10 +230,10 @@ class CloseZoneProfit(CloseProfile):
             atr_value=atr_value,
             spread=spread,
             euro_per_point=float(position.euro_per_point or 0),
-            buf=buf,
+            buf=_buffer_since(buf, _opened_at(position)),
         )
 
-        zone = classify_zone(current_bid, level_zero, level_margin)
+        zone = classify_zone(current_bid, level_zero, level_profit)
         if zone is StopZone.PROFIT:
             updater = self.trailing
         elif zone is StopZone.BREAKEVEN_BAND:

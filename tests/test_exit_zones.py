@@ -70,16 +70,24 @@ def _ctx(buf: EpicBuffer, *, current_bid, level_zero, level_margin, level_follow
 
 
 class TestClassifyZone:
+    # The third argument is the PROFIT TRIGGER (level_profit), one noise margin
+    # above the margin line — the boundary above which the profit zone governs.
+    # Here: break-even=100, margin=110 → profit trigger = 2×110 − 100 = 120.
+
     def test_at_or_below_break_even_is_underwater(self):
-        assert classify_zone(99.0, 100.0, 110.0) is StopZone.UNDERWATER
-        assert classify_zone(100.0, 100.0, 110.0) is StopZone.UNDERWATER
+        assert classify_zone(99.0, 100.0, 120.0) is StopZone.UNDERWATER
+        assert classify_zone(100.0, 100.0, 120.0) is StopZone.UNDERWATER
 
-    def test_between_break_even_and_margin_is_band(self):
-        assert classify_zone(105.0, 100.0, 110.0) is StopZone.BREAKEVEN_BAND
-        assert classify_zone(110.0, 100.0, 110.0) is StopZone.BREAKEVEN_BAND
+    def test_between_break_even_and_profit_trigger_is_band(self):
+        assert classify_zone(105.0, 100.0, 120.0) is StopZone.BREAKEVEN_BAND
+        # Above the MARGIN line (110) but below the profit trigger (120) is still
+        # the break-even band — this is what stops a bid hovering just above the
+        # margin from skipping the (thin) band into the profit zone.
+        assert classify_zone(115.0, 100.0, 120.0) is StopZone.BREAKEVEN_BAND
+        assert classify_zone(120.0, 100.0, 120.0) is StopZone.BREAKEVEN_BAND
 
-    def test_above_margin_is_profit(self):
-        assert classify_zone(110.1, 100.0, 110.0) is StopZone.PROFIT
+    def test_above_profit_trigger_is_profit(self):
+        assert classify_zone(120.1, 100.0, 120.0) is StopZone.PROFIT
 
 
 class TestHoldingZones:

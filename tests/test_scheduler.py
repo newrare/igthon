@@ -7,6 +7,7 @@ recording until it closes.
 """
 
 import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.core.scheduler import BotScheduler, validate_strategy_selection
 from src.entry.base import EntryIntent
+from src.entry.open_allincrease import OpenAllIncrease
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_saferanking import OpenSafeRanking
 from src.feed.price_buffer import Candle, PriceBuffer
@@ -507,9 +509,7 @@ class TestWalletBoundedRollingSelect:
         )
         return scheduler, opened
 
-    async def test_opens_until_wallet_is_exhausted(
-        self, session_factory, monkeypatch
-    ):
+    async def test_opens_until_wallet_is_exhausted(self, session_factory, monkeypatch):
         # 450€ spendable (500 − 10% reserve) at 100€/margin → exactly 4 opens,
         # not the single position a count-bounded ranker would hold.
         scheduler, opened = self._ranker_scheduler(
@@ -531,6 +531,200 @@ class TestWalletBoundedRollingSelect:
 
         await scheduler._select_and_open()
 
+        assert opened == ["E0"]
+
+    async def test_all_candidates_blocked_logs_wanted_to_open(
+        self, session_factory, monkeypatch, caplog
+    ):
+        # The tournament ranks 5 BUY candidates and has funds, but the base open
+        # gates reject every one: nothing opens. Instead of a silent no-op the
+        # selector must surface the "wanted to open but no candidate passed the
+        # base checks" decision and report the remaining openable pool for today.
+        scheduler, opened = self._ranker_scheduler(
+            session_factory, monkeypatch, available=500.0, margin=100.0
+        )
+        # Base/elementary open gate refuses every intent (e.g. market closed).
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService",
+            lambda *a, **k: SimpleNamespace(
+                can_open_intent=AsyncMock(return_value=(False, "market closed"))
+            ),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.core.scheduler"):
+            await scheduler._select_and_open()
+
+        assert opened == []
+        hits = [
+            r.getMessage()
+            for r in caplog.records
+            if "wanted to open but no candidate passed the base checks"
+            in r.getMessage()
+        ]
+        assert hits, "expected the 'wanted to open' warning"
+        # 5 warmed-up untraded epics, all base-gate-blocked, none opened → 5 ranked,
+        # 5 blocked by base gates, and all 5 still available to open today.
+        assert "5 ranked" in hits[0]
+        assert "5 blocked by base gates" in hits[0]
+        assert "5 epic(s) still available to open today" in hits[0]
+
+
+class TestMinutesSinceLastOpen:
+    """The open-cooldown clock: minutes since today's most recent open."""
+
+    async def test_none_when_nothing_opened_today(self, session_factory):
+        async with session_factory() as session:
+            assert await BotScheduler._minutes_since_last_open(session) is None
+
+    async def test_uses_latest_time_open_today(self, session_factory):
+        now = datetime.now(UTC)
+        async with session_factory() as session:
+            session.add_all(
+                [
+                    Position(
+                        epic="A",
+                        epic_name="A",
+                        date=date.today(),
+                        state=PositionState.CLOSE,
+                        time_open=(now - timedelta(minutes=30)).time(),
+                    ),
+                    Position(
+                        epic="B",
+                        epic_name="B",
+                        date=date.today(),
+                        state=PositionState.OPEN,
+                        time_open=(now - timedelta(minutes=5)).time(),
+                    ),
+                ]
+            )
+            await session.commit()
+        async with session_factory() as session:
+            mins = await BotScheduler._minutes_since_last_open(session)
+        # The most recent open (B, 5 min ago) drives the clock, not the older A.
+        assert mins is not None
+        assert 4.0 < mins < 6.0
+
+
+class TestOpenAllIncreaseSelection:
+    """The paced, re-openable wallet-bounded selection knobs, end-to-end.
+
+    Covers the three behaviours ``open_allincrease`` adds on top of the shared
+    rolling selector: same-day re-open (skip the ``_traded_today`` filter), a
+    ≥10-minute open cooldown, and one open per pass when a cooldown is set.
+    """
+
+    def _scheduler(
+        self, session_factory, monkeypatch, *, available=1000.0, margin=100.0
+    ):
+        streaming = MagicMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        scheduler._strategy = OpenAllIncrease()
+        scheduler._close_profile_obj = MagicMock()
+        epics = [f"E{i}" for i in range(5)]
+        scheduler._tradable_epics = epics
+
+        warmup = scheduler._strategy.warmup
+        base = datetime.now(UTC) - timedelta(minutes=warmup)
+        for e in epics:
+            for i in range(warmup):
+                scheduler._buffer.add_candle(e, _candle(base + timedelta(minutes=i)))
+
+        # Deterministic descending ranking: E0 > E1 > ... so opens follow order.
+        scores = {e: float(len(epics) - i) for i, e in enumerate(epics)}
+        scheduler._strategy.evaluate = MagicMock(
+            side_effect=lambda epic, buf: EntryIntent(
+                epic=epic, direction="BUY", score=scores[epic]
+            )
+        )
+        scheduler._tradable_markets = [
+            SimpleNamespace(epic=e, funds_needed=margin) for e in epics
+        ]
+        scheduler._account_available_funds = AsyncMock(return_value=available)
+
+        opened: list[str] = []
+
+        async def _open(trading, intent, buf):
+            opened.append(intent.epic)
+            position = Position(
+                epic=intent.epic,
+                epic_name=intent.epic,
+                date=date.today(),
+                state=PositionState.OPEN,
+                level_open=1.0,
+            )
+            return position, None
+
+        scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
+
+        trading_stub = MagicMock()
+        trading_stub.can_open_intent = AsyncMock(return_value=(True, None))
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        return scheduler, opened
+
+    async def test_opens_only_one_per_pass_despite_wallet_room(
+        self, session_factory, monkeypatch
+    ):
+        # Wallet covers all 5 (1000€ − 10% = 900€ at 100€/margin), but the 10-min
+        # cooldown caps the pass to a single open — the best-ranked epic.
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+        await scheduler._select_and_open()
+        assert opened == ["E0"]
+
+    async def test_cooldown_blocks_when_recent_open(self, session_factory, monkeypatch):
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+        # A position opened 3 min ago (< 10) — the whole pass must be skipped.
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="X",
+                    epic_name="X",
+                    date=date.today(),
+                    state=PositionState.OPEN,
+                    time_open=(datetime.now(UTC) - timedelta(minutes=3)).time(),
+                )
+            )
+            await session.commit()
+        await scheduler._select_and_open()
+        assert opened == []
+
+    async def test_cooldown_elapsed_allows_one_open(self, session_factory, monkeypatch):
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+        # Last open was 15 min ago (≥ 10) — the cooldown has elapsed, one opens.
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="X",
+                    epic_name="X",
+                    date=date.today(),
+                    state=PositionState.CLOSE,
+                    time_open=(datetime.now(UTC) - timedelta(minutes=15)).time(),
+                )
+            )
+            await session.commit()
+        await scheduler._select_and_open()
+        assert opened == ["E0"]
+
+    async def test_same_day_reopen_keeps_already_traded_epic(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+        # E0 already traded today and now closed, plus an old open (cooldown ok).
+        # allow_same_day_reopen means E0 stays a candidate and, being top-ranked,
+        # is re-opened — a diversity-filtered ranker would have skipped to E1.
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="E0",
+                    epic_name="E0",
+                    date=date.today(),
+                    state=PositionState.CLOSE,
+                    time_open=(datetime.now(UTC) - timedelta(minutes=20)).time(),
+                )
+            )
+            await session.commit()
+        await scheduler._select_and_open()
         assert opened == ["E0"]
 
 

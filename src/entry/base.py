@@ -84,6 +84,22 @@ class EntryStrategy(ABC):
     # least-bad of a tiny pool instead of the best of the day. ``0.5`` = strictly
     # more than half the universe must be ready to participate.
     min_participation_ratio: float = 0.5
+    # Same-day re-open policy. When False (default) the rolling selector opens
+    # each epic at most once per day (the ``_traded_today`` diversity rule): once
+    # a market has been used it is dropped from re-ranking so the portfolio
+    # rotates across markets. When True that filter is skipped — an epic becomes a
+    # candidate again as soon as it holds no open position, so the same rising
+    # curve can be opened several times in one day. Concurrent duplicate opens on
+    # a still-open epic are always blocked by the shared ``epic_already_open``
+    # gate, independently of this flag.
+    allow_same_day_reopen: bool = False
+    # Minimum minutes the rolling selector must wait between two opens. 0
+    # (default) means no cooldown — the wallet-bounded selector may open several
+    # positions in a single pass. When > 0 the selector opens at most one
+    # position per pass and only once at least this many minutes have elapsed
+    # since the most recent open, so positions are spaced out instead of fired in
+    # a burst.
+    open_cooldown_minutes: int = 0
 
     @property
     @abstractmethod

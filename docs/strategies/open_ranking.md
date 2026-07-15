@@ -79,6 +79,17 @@ same routine. Each invocation:
 A lock serialises the tick loop and the hourly backstop, and the open-count is
 re-checked inside it, so the target is never overshot.
 
+**Diagnostics when nothing opens.** A pass that ranked BUY candidates and had a
+free slot — i.e. it *wanted* to open — but took no position is otherwise a silent
+no-op. Two cases are logged instead:
+
+- no candidate scored at all (every warmed-up epic rejected, e.g. none rising):
+  `INFO … none of N warmed-up epic(s) qualifies to open (no rising trend)`;
+- candidates ranked but **every one failed the base/elementary open gates**
+  (market closed, closes soon, already open) or the wallet could not cover it:
+  `WARNING … wanted to open but no candidate passed the base checks — N ranked, G blocked by base gates, W by wallet; M epic(s) still available to open today`,
+  where `M` is the remaining untraded, warmed-up pool for the day.
+
 Epics are **not** excluded after being traded: when a position closes, the very
 next ranking may re-open the same epic if it is still the most promising.
 

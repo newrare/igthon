@@ -898,6 +898,7 @@ async function runCloseProfile() {{
         kpi("Stop moves", data.stop_updates, "#60a5fa") +
         kpi("Level zero", data.level_zero, "#a78bfa") +
         kpi("Level margin", data.level_margin, "#22d3ee") +
+        kpi("Level profit", (2 * data.level_margin - data.level_zero).toFixed(5), "#2dd4bf") +
         kpi("Close", data.close.time + " @ " + data.close.level, "#94a3b8");
 
     // Horizontal reference spanning open → end of curve, drawn at a constant y.
@@ -919,9 +920,13 @@ async function runCloseProfile() {{
           line: {{color: "#60a5fa", width: 1.6}}}},
         {{x: stopX, y: stopY, name: "Protective stop", mode: "lines",
           line: {{color: "#fb923c", width: 1.8, shape: "hv"}}}},
-        // Break-even (offer paid) and the margin above it (positive beyond noise).
+        // Break-even (offer paid), the margin above it (positive beyond noise),
+        // and the profit trigger one further noise margin up (2×margin − zero):
+        // the boundary above which the stop trails (CLOSE_ZONEPROFIT).
         hline(data.level_zero, "Level zero (break-even)", "#a78bfa"),
         hline(data.level_margin, "Level margin (zero + noise)", "#22d3ee"),
+        hline(2 * data.level_margin - data.level_zero,
+              "Level profit (trigger)", "#2dd4bf"),
         {{x: [ts[data.open.index]], y: [data.open.bid], name: "Open",
           mode: "markers", marker: {{color: "#4ade80", size: 12, symbol: "triangle-up"}}}},
         {{x: [ts[data.close.index]], y: [data.close.level], name: "Close",

@@ -379,7 +379,29 @@ class StrategySimulator:
         closed_today: list[SimulatedTrade] = []
         last_candles: list[Candle | None] = [None] * len(curves)
         used_today: set[int] = set()  # epics already opened today (diversity rule)
-        target = max(int(getattr(self._entry, "concurrent_positions", 1)), 1)
+
+        # Selection model knobs (see the scheduler's ``_select_and_open``):
+        #  - wallet_bounded: no fixed concurrent-count cap. The live wallet gate
+        #    (available funds − reserve) is its only limit, which the backtest
+        #    cannot model (the archive holds prices, not account balance / margin),
+        #    so the cap is lifted to the whole universe — "hold as many as
+        #    qualify". The score floor and the open cooldown become the effective
+        #    limiters, so the reported opens/day are an UPPER BOUND (the real
+        #    wallet reserve would cap concurrent positions further).
+        #  - open_cooldown_minutes: at most one open per cooldown window, so
+        #    positions are staggered instead of fired in a burst.
+        #  - allow_same_day_reopen: an epic re-enters the candidate pool as soon
+        #    as it holds no open position (the diversity ``used_today`` filter is
+        #    skipped), so the same market can be opened several times in one day.
+        wallet_bounded = getattr(self._entry, "wallet_bounded", False)
+        cooldown_min = int(getattr(self._entry, "open_cooldown_minutes", 0) or 0)
+        allow_reopen = getattr(self._entry, "allow_same_day_reopen", False)
+        target = (
+            len(curves)
+            if wallet_bounded
+            else max(int(getattr(self._entry, "concurrent_positions", 1)), 1)
+        )
+        last_open_ts: datetime | None = None
 
         events = sorted(
             (
@@ -407,7 +429,7 @@ class StrategySimulator:
                     result.trades.append(position)
 
             # 2. Refill free slots with the best-ranked eligible epics.
-            self._select_and_open(
+            last_open_ts = self._select_and_open(
                 ts,
                 day,
                 buffers,
@@ -417,6 +439,9 @@ class StrategySimulator:
                 used_today,
                 target,
                 result,
+                cooldown_min=cooldown_min,
+                allow_reopen=allow_reopen,
+                last_open_ts=last_open_ts,
             )
 
         # Force-close anything still open at the end of the day.
@@ -437,21 +462,43 @@ class StrategySimulator:
         used_today: set[int],
         target: int,
         result: SimulationResult,
-    ) -> None:
+        *,
+        cooldown_min: int = 0,
+        allow_reopen: bool = False,
+        last_open_ts: datetime | None = None,
+    ) -> datetime | None:
         """Score every eligible epic, rank by score, open the best into free slots.
 
         Mirror of the scheduler's rolling selector: candidates are epics that are
-        not already open, not used earlier today, and have enough buffered history
-        to score. They are ranked highest-score-first and opened (through the same
-        gates as ``_run_day_gated``) until the target position count is reached.
+        not already open, not used earlier today (unless ``allow_reopen``), and
+        have enough buffered history to score. They are ranked highest-score-first
+        and opened (through the same gates as ``_run_day_gated``) until the target
+        position count is reached.
+
+        ``cooldown_min`` (> 0) paces the opens: while less than that many minutes
+        have elapsed since ``last_open_ts`` the pass is a cheap no-op (no scoring),
+        and when it does open it takes at most one position — so positions are
+        staggered exactly as the live cooldown does. Returns the (possibly updated)
+        ``last_open_ts`` for the caller to carry to the next tick.
         """
         slots = target - len(open_positions)
         if slots <= 0:
-            return  # target met — a position is already running (cheap path)
+            return last_open_ts  # target met — cheap path
+
+        # Open cooldown: at most one open per window; skip scoring entirely while
+        # the window is still open (mirrors the scheduler's early return).
+        if (
+            cooldown_min > 0
+            and last_open_ts is not None
+            and (ts - last_open_ts).total_seconds() < cooldown_min * 60
+        ):
+            return last_open_ts
 
         ranked: list[tuple] = []
         for e, buf in enumerate(buffers):
-            if e in open_positions or e in used_today:
+            if e in open_positions:
+                continue
+            if not allow_reopen and e in used_today:
                 continue
             if len(buf) < self._entry.warmup:
                 continue
@@ -459,12 +506,15 @@ class StrategySimulator:
             if intent is not None and intent.direction == "BUY":
                 ranked.append((intent.score, e, intent))
         if not ranked:
-            return
+            return last_open_ts
         ranked.sort(key=lambda item: item[0], reverse=True)
         result.buy_signals += len(ranked)
 
+        # A paced strategy opens at most one position per cooldown window.
+        max_opens = 1 if cooldown_min > 0 else slots
+        opened = 0
         for _score, e, intent in ranked:
-            if slots <= 0:
+            if slots <= 0 or opened >= max_opens:
                 break
             candle = last_candles[e]
             if candle is None:
@@ -481,6 +531,9 @@ class StrategySimulator:
             ):
                 used_today.add(e)
                 slots -= 1
+                opened += 1
+                last_open_ts = ts
+        return last_open_ts
 
     # ------------------------------------------------------------------ #
     # Opening                                                             #

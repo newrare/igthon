@@ -356,16 +356,30 @@ def _trade_overlay(p: Position) -> dict:
         sign = -1.0 if direction == "SELL" else 1.0
         profit10 = zero_line + sign * (10.0 / epp)
 
+    # Profit trigger — one further noise margin above the margin line (a second
+    # symmetric band): the boundary above which the stop trails progressively
+    # (CLOSE_ZONEPROFIT). Below it, but above break-even, the stop is parked on a
+    # support inside the break-even→margin band (CLOSE_ZONEMARGE). Derived from the
+    # two frozen reference lines (2 × margin − break-even), so it needs no extra
+    # stored level and maps onto the bid curve exactly like them.
+    profit_trigger: float | None = None
+    if margin_line is not None and zero_line is not None:
+        profit_trigger = margin_line + (margin_line - zero_line)
+
     return {
         "id": p.id,
         "direction": direction,
         "open": level_open_v,
         "openBid": open_bid,
         "zero": zero_line,
-        # Margin level frozen at open (break-even + noise margin): the boundary
-        # between the break-even band (zone 2) and real profit (zone 3). Drawn as
-        # its own reference line so the three zones are visible on the chart.
+        # Margin level frozen at open (break-even + noise margin): the ceiling of
+        # where the raised stop is parked (the top of the break-even→margin band),
+        # NOT the zone boundary. Drawn as its own reference line.
         "margin": margin_line,
+        # Profit trigger frozen at open (one further noise margin above margin):
+        # the boundary between the break-even band (zone 2, CLOSE_ZONEMARGE) and
+        # real profit (zone 3, CLOSE_ZONEPROFIT). Above it the stop trails up.
+        "profitTrigger": profit_trigger,
         # Loose stop (resting at the broker): the initial clamped level (never
         # lowered) and, when a ratchet history exists, the stepped path of every
         # level later pushed to IG.

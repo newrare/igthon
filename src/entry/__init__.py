@@ -16,6 +16,7 @@ Adding an entry strategy:
 from __future__ import annotations
 
 from src.entry.base import EntryIntent, EntryStrategy
+from src.entry.open_allincrease import OpenAllIncrease
 from src.entry.open_donchian import OpenDonchian
 from src.entry.open_projection import OpenProjection
 from src.entry.open_ranking import OpenRanking
@@ -24,6 +25,7 @@ from src.entry.open_testing import OpenTesting
 
 #: Name → class map. Keys are the valid ``OPEN_STRATEGY`` values.
 ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
+    OpenAllIncrease.name: OpenAllIncrease,
     OpenDonchian.name: OpenDonchian,
     OpenProjection.name: OpenProjection,
     OpenRanking.name: OpenRanking,
@@ -49,6 +51,7 @@ def get_entry_strategy(name: str, settings) -> EntryStrategy:
 
 __all__ = [
     "ENTRY_STRATEGIES",
+    "OpenAllIncrease",
     "OpenDonchian",
     "OpenProjection",
     "OpenRanking",

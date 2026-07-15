@@ -147,7 +147,7 @@ class Settings(BaseSettings):
     # Each field is REQUIRED: a missing/empty or unknown value makes startup fail
     # with a clear "configure your .env" message (see
     # ``validate_strategy_selection`` in src/core/scheduler.py).
-    open_strategy: str = ""  # e.g. open_donchian / open_projection / open_ranking
+    open_strategy: str = ""  # e.g. open_ranking / open_saferanking / open_allincrease
     stop_strategy: str = ""  # e.g. stop_support / stop_atr
     close_zonestart: str = ""  # zone open→break-even   (e.g. hold)
     close_zonemarge: str = ""  # zone break-even→margin (e.g. hold)

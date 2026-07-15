@@ -117,10 +117,33 @@ the last `recent_trend_period` candles cuts the score toward `recent_bearish_mal
 when the market is sliding down into the open (see
 [§4 above](#4-pre-open-bearish-malus-safety-gate-before-opening)).
 
+### Trend gate (`require_uptrend`) — the only hard directional veto
+
+The soft components can only *rank* a falling market lower, but the ranker must
+open the best of the pool, so a penalty is not enough — the least-bad falling
+market still opens. Before any component is computed, a hard gate checks the trend
+on **two horizons**, and either one non-positive drops the epic
+(`evaluate → None`, never ranked):
+
+- **Whole-day slope** — the least-squares slope of the bid over the *full buffered
+  session* must be `> 0`. Catches a market "baissière depuis longtemps".
+- **Recent slope** — the slope over the last `recent_uptrend_period` (~20) candles
+  must be `> 0`. The **falling-knife guard**: a curve that climbed all morning but
+  has been sliding for ~20 min right into the open has a still-positive whole-day
+  slope, so only this check can veto it. Neither the pre-open malus (only
+  `recent_trend_period` ≈ 10 candles, and merely a soft multiplier) nor the
+  ≤60-candle shape/safety windows enforce it as a hard reject.
+
+Set `require_uptrend = False` to fall back to the pure geometric-mean ranking.
+
+When **no** warmed-up epic passes the gate (nothing is rising), the scheduler
+opens nothing and logs it at `INFO`:
+`Rolling select [open_saferanking]: none of N warmed-up epic(s) qualifies to open (no rising trend) — staying flat`.
+
 `evaluate` returns `None` only on structural grounds (too little history,
-non-positive bid, non-positive ATR), when fewer than `min_models_agree`
-projection models point up, or when the composite falls below the optional
-`min_score` floor.
+non-positive bid, non-positive ATR), when the whole-day **or recent** trend is not
+rising (`require_uptrend`), when fewer than `min_models_agree` projection models
+point up, or when the composite falls below the optional `min_score` floor.
 
 ## Rolling selection (scheduler)
 
@@ -161,6 +184,8 @@ All parameters are **constants in the strategy class**
 | `min_models_agree`       | `2`                                     | structural gate: models that must project up                                          |
 | `epsilon`                | `1e-3`                                  | per-component floor keeping the geo-mean rankable                                     |
 | `min_score`              | `0.0`                                   | composite floor (0 = always open the best)                                            |
+| `require_uptrend`        | `True`                                  | hard gate: whole-day **and** recent bid slope must be > 0 or the epic is dropped      |
+| `recent_uptrend_period`  | `20`                                    | candles (~20 min) for the recent-trend veto                                           |
 | `recent_trend_period`    | `10`                                    | candles (~10 min) of bid scanned before opening                                       |
 | `recent_drop_full_malus` | `0.003`                                 | relative decline over the window earning full malus                                   |
 | `recent_bearish_malus`   | `0.05`                                  | score multiplier floor at a clean steep drop (0 = off via `recent_drop_full_malus=0`) |

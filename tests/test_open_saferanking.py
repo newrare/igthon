@@ -70,6 +70,36 @@ def _up_then_recent_drop(
     return rise + drop
 
 
+def _trending_down(n: int = 90, start: float = 8100.0, step: float = 1.0) -> list[float]:
+    return [start - i * step for i in range(n)]
+
+
+def _down_then_recent_bounce(
+    n: int = 90, start: float = 8100.0, step: float = 1.0, recent: int = 10
+) -> list[float]:
+    # A clean day-long slide, then a sharp bounce over the final ``recent`` candles
+    # — the exact "baissière depuis longtemps but rebounds right before open" shape
+    # from the reported CC.D.CL.UEF.IP trade: the recent malus and the ≤60-candle
+    # windows are all fooled, only the whole-day slope stays negative.
+    fall = [start - i * step for i in range(n - recent)]
+    trough = fall[-1]
+    bounce = [trough + (j + 1) * step * 2 for j in range(recent)]
+    return fall + bounce
+
+
+def _up_then_long_decline(n: int = 90, start: float = 8000.0) -> list[float]:
+    # Climbs for the first two-thirds of the session (+2/candle), then slides
+    # steadily for the final third (~30 candles, −1/candle): net UP over the whole
+    # day but *falling for the last many minutes* right into the open — the exact
+    # CS.D.GBPCAD.CFD.IP shape. The whole-day slope stays positive, so only the
+    # recent-trend veto can reject it.
+    rise_n = 2 * n // 3
+    rise = [start + i * 2.0 for i in range(rise_n)]
+    peak = rise[-1]
+    decline = [peak - (j + 1) * 1.0 for j in range(n - rise_n)]
+    return rise + decline
+
+
 def _up_with_deep_pullback(n: int = 90, start: float = 8000.0) -> list[float]:
     # Same net rise as ``_trending_up`` but with a deep retracement mid-way: rises,
     # gives back most of the gain, then recovers. Net slope up, but a holder would
@@ -213,9 +243,11 @@ class TestEvaluate:
         assert up.score > chop.score
 
     def test_recent_drop_is_penalised_vs_clean_rise(self):
-        # The pre-open safety: a market that climbed all window but is sliding down
-        # over the last 10 minutes must score well below a still-clean rise.
-        strat = OpenSafeRanking(min_models_agree=0)
+        # The pre-open safety malus (isolated with require_uptrend=False, else the
+        # recent-trend veto would drop the rolling-over curve outright): a market
+        # that climbed all window but is sliding down over the last 10 minutes must
+        # score well below a still-clean rise.
+        strat = OpenSafeRanking(min_models_agree=0, require_uptrend=False)
         clean = strat.evaluate("TEST.EPIC", _buffer(_trending_up()))
         rolling_over = strat.evaluate("TEST.EPIC", _buffer(_up_then_recent_drop()))
         assert clean is not None and rolling_over is not None
@@ -224,13 +256,54 @@ class TestEvaluate:
     def test_recent_drop_malus_can_be_disabled(self):
         # With the full-malus threshold at 0 the guard is a no-op: the recent drop
         # no longer changes the score relative to the same curve scored normally.
-        guarded = OpenSafeRanking(min_models_agree=0)
-        disabled = OpenSafeRanking(min_models_agree=0, recent_drop_full_malus=0.0)
+        # require_uptrend=False isolates the malus from the recent-trend veto.
+        guarded = OpenSafeRanking(min_models_agree=0, require_uptrend=False)
+        disabled = OpenSafeRanking(
+            min_models_agree=0, require_uptrend=False, recent_drop_full_malus=0.0
+        )
         curve = _up_then_recent_drop()
         with_malus = guarded.evaluate("TEST.EPIC", _buffer(curve))
         without = disabled.evaluate("TEST.EPIC", _buffer(curve))
         assert with_malus is not None and without is not None
         assert with_malus.score < without.score
+
+    def test_daylong_downtrend_returns_none(self):
+        # The background-trend gate: a market falling over the whole session is
+        # never ranked, whatever its other components say.
+        strat = OpenSafeRanking(min_models_agree=0)
+        assert strat.evaluate("TEST.EPIC", _buffer(_trending_down())) is None
+
+    def test_downtrend_with_recent_bounce_returns_none(self):
+        # The reported regression: a day-long slide with a late bounce clears the
+        # recent malus and the short windows, but the whole-day slope is still
+        # negative, so require_uptrend drops it. This is the fix's core guarantee.
+        strat = OpenSafeRanking(min_models_agree=0)
+        assert strat.evaluate("TEST.EPIC", _buffer(_down_then_recent_bounce())) is None
+
+    def test_uptrend_gate_can_be_disabled(self):
+        # With require_uptrend=False the ranker falls back to the pure geometric
+        # mean and a downtrend with a late bounce is scored again — proving the
+        # gate is exactly what rejects the market above.
+        strat = OpenSafeRanking(min_models_agree=0, require_uptrend=False)
+        intent = strat.evaluate("TEST.EPIC", _buffer(_down_then_recent_bounce()))
+        assert intent is not None
+        assert intent.direction == "BUY"
+
+    def test_recent_downtrend_returns_none(self):
+        # The falling-knife guard: a market UP over the whole day but sliding for
+        # the last ~20 min into the open (the CS.D.GBPCAD.CFD.IP shape) is dropped
+        # by the recent-trend veto even though its whole-day slope stays positive.
+        strat = OpenSafeRanking(min_models_agree=0)
+        assert strat.evaluate("TEST.EPIC", _buffer(_up_then_long_decline())) is None
+
+    def test_recent_downtrend_gate_can_be_disabled(self):
+        # Turning the gate off scores the same net-up curve — proving the recent
+        # slope (not the whole-day slope or another structural check) is what
+        # rejects it above.
+        strat = OpenSafeRanking(min_models_agree=0, require_uptrend=False)
+        intent = strat.evaluate("TEST.EPIC", _buffer(_up_then_long_decline()))
+        assert intent is not None
+        assert intent.direction == "BUY"
 
     def test_clean_rise_outranks_rise_with_deep_pullback(self):
         # The robustness contract: a clean climb must outrank a rise that gave back

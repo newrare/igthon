@@ -1195,6 +1195,29 @@ class BotScheduler:
         )
         return set(rows.all())
 
+    @staticmethod
+    async def _minutes_since_last_open(session: AsyncSession) -> float | None:
+        """Minutes since the most recent position was opened today, or None.
+
+        Drives the per-strategy open cooldown (``open_cooldown_minutes``) in
+        :meth:`_select_and_open`: the rolling selector waits at least that many
+        minutes between two opens so it never fires a burst of positions at once.
+        Uses the latest ``time_open`` (stored in UTC) of any position dated today;
+        ``None`` means nothing has been opened today yet, so there is no cooldown
+        to enforce.
+        """
+        latest = await session.scalar(
+            select(func.max(Position.time_open)).where(
+                Position.date == date.today(),
+                Position.time_open.is_not(None),
+            )
+        )
+        if latest is None:
+            return None
+        now = datetime.now(UTC)
+        last_dt = datetime.combine(now.date(), latest, tzinfo=UTC)
+        return (now - last_dt).total_seconds() / 60.0
+
     async def _refresh_tradable_epics(self) -> None:
         """Filter ``_all_epics`` to those currently open and TRADEABLE.
 
@@ -1645,13 +1668,37 @@ class BotScheduler:
                     )
                     return  # target met — a position is already running
 
+                # Open cooldown: a strategy that spaces its opens out
+                # (``open_cooldown_minutes`` > 0) opens at most one position per
+                # pass and only once at least that many minutes have elapsed since
+                # the most recent open, so positions are not fired in a burst.
+                cooldown = int(getattr(strategy, "open_cooldown_minutes", 0) or 0)
+                if cooldown > 0:
+                    since = await self._minutes_since_last_open(session)
+                    if since is not None and since < cooldown:
+                        logger.debug(
+                            "Rolling select [%s]: open cooldown active "
+                            "(%.1f min since last open < %d min) — holding",
+                            strategy.name,
+                            since,
+                            cooldown,
+                        )
+                        return
+
                 # Diversity rule: an epic already *used* today (it had an opening,
                 # now open or closed) is dropped from the candidate set so the
                 # rolling position rotates across markets instead of re-opening the
                 # same epic the moment it closes. The shared ``epic_already_open``
                 # gate only blocks *concurrent* duplicates, not a same-day re-open.
-                traded_today = await self._traded_today_epics(session)
-                candidates = [e for e in epics if e not in traded_today]
+                # A strategy that explicitly allows same-day re-opens
+                # (``allow_same_day_reopen``) skips this filter: an epic is a
+                # candidate again as soon as it holds no open position, so the same
+                # rising market can be opened several times in one day.
+                if getattr(strategy, "allow_same_day_reopen", False):
+                    candidates = list(epics)
+                else:
+                    traded_today = await self._traded_today_epics(session)
+                    candidates = [e for e in epics if e not in traded_today]
                 if not candidates:
                     logger.debug("Rolling select: every epic already used today")
                     return
@@ -1685,15 +1732,34 @@ class BotScheduler:
                 # Score every epic with enough buffered history; keep BUY
                 # candidates, then rank by score (highest first).
                 ranked: list[tuple[EntryIntent, EpicBuffer]] = []
+                evaluated = 0
                 for epic in candidates:
                     buf = self._buffer.get(epic)
                     if not buf or len(buf) < strategy.warmup:
                         continue
+                    evaluated += 1
                     intent = strategy.evaluate(epic, buf)
                     if intent and intent.direction == "BUY":
                         ranked.append((intent, buf))
                 if not ranked:
-                    logger.debug("Rolling select: no scorable epic yet")
+                    if evaluated:
+                        # Epics were warmed up and scored, but every one was
+                        # rejected — e.g. none is in a genuine uptrend (the
+                        # ``require_uptrend`` gate) or none clears the score floor
+                        # (``min_score``, e.g. a rise too flat for open_allincrease).
+                        # The wallet has room and any open cooldown has elapsed
+                        # (both checked above), so make the "funds free but no
+                        # market qualifies" decision visible instead of a silent
+                        # no-op.
+                        logger.info(
+                            "Rolling select [%s]: none of %d warmed-up epic(s) "
+                            "qualifies to open (no market rising strongly enough) "
+                            "— staying flat",
+                            strategy.name,
+                            evaluated,
+                        )
+                    else:
+                        logger.debug("Rolling select: no scorable epic yet")
                     return
                 ranked.sort(key=lambda item: item[0].score, reverse=True)
 
@@ -1715,6 +1781,11 @@ class BotScheduler:
                     )
                     if slots <= 0:
                         return
+                # A cooldown strategy opens at most one position per pass (the
+                # cooldown gate above already ensured enough time has elapsed since
+                # the last open); the next open waits for the next cooldown window.
+                if cooldown > 0:
+                    slots = min(slots, 1)
                 funds_map = {
                     m.epic: m.funds_needed
                     for m in self._tradable_markets
@@ -1725,17 +1796,21 @@ class BotScheduler:
                     self._client, session, config, close_profile=self.close_profile
                 )
                 opened = 0
+                gate_blocked = 0  # candidates rejected by the base open gates
+                wallet_blocked = 0  # candidates the wallet could not cover
                 for intent, buf in ranked:
                     if opened >= slots:
                         break
                     allowed, reason = await trading.can_open_intent(intent)
                     if not allowed:
+                        gate_blocked += 1
                         logger.debug("Rolling select skip %s: %s", intent.epic, reason)
                         continue
                     # Wallet gate: only open while the available balance (minus the
                     # reserve) covers this epic's margin. Unknown margin -> allow.
                     need = funds_map.get(intent.epic)
                     if spendable is not None and need is not None and need > spendable:
+                        wallet_blocked += 1
                         logger.info(
                             "Rolling select skip %s: wallet %.0f€ < margin %.0f€",
                             intent.epic,
@@ -1764,6 +1839,26 @@ class BotScheduler:
 
                 if opened:
                     logger.info("Rolling select: opened %d position(s)", opened)
+                elif ranked:
+                    # The tournament produced ranked candidates and had a free slot
+                    # — it *wanted* to open — yet nothing was taken: every candidate
+                    # failed a base/elementary open gate (market closed, closes soon,
+                    # already open) or the wallet could not cover its margin. This is
+                    # otherwise a silent no-op, so surface it, and report how many
+                    # markets are still available to open on later today (untraded,
+                    # not open, warmed up = ``evaluated`` minus what this pass took).
+                    remaining = max(evaluated - opened, 0)
+                    logger.warning(
+                        "Rolling select [%s]: wanted to open but no candidate "
+                        "passed the base checks — %d ranked, %d blocked by base "
+                        "gates, %d by wallet; %d epic(s) still available to open "
+                        "today",
+                        strategy.name,
+                        len(ranked),
+                        gate_blocked,
+                        wallet_blocked,
+                        remaining,
+                    )
 
     async def _account_available_funds(self) -> float | None:
         """Live available balance (EUR) on the trading account, or None.

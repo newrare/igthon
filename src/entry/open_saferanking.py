@@ -62,10 +62,23 @@ multiplicatively to the composite score, so a candidate whose earlier strength i
 being undone by a fresh down-trend is dragged to the back of the ranking without
 touching the other dimensions.
 
+On top of everything above, a **trend gate** (``require_uptrend``) runs first and
+is the only *hard veto* on direction. The soft components can merely rank a
+falling market lower, but the ranker must open the best of the pool, so a penalty
+is not enough — the least-bad falling market still opens. The gate checks two
+horizons the components cannot: the least-squares slope of the bid over the
+*whole buffered session* **and** over the last ``recent_uptrend_period`` candles
+must both be strictly positive, else the epic is dropped outright. The first
+catches a session "baissière depuis longtemps"; the second is the falling-knife
+guard — a curve that climbed all morning but has been sliding for ~20 min right
+into the open is dropped even though its whole-day slope is still positive (the
+recent malus and the ≤60-candle windows cannot veto that).
+
 As in ``open_ranking``, :meth:`evaluate` returns ``None`` only on *structural*
-grounds (too little data, non-positive bid, no measurable volatility), when fewer
-than ``min_models_agree`` projection models point up, or when the composite falls
-below the optional ``min_score`` floor.
+grounds (too little data, non-positive bid, no measurable volatility), when the
+whole-day or recent trend is not rising (``require_uptrend``), when fewer than
+``min_models_agree`` projection models point up, or when the composite falls below
+the optional ``min_score`` floor.
 
 Documented in ``docs/strategies/open_saferanking.md``.
 """
@@ -202,6 +215,23 @@ class OpenSafeRanking(EntryStrategy):
     epsilon: float = 1e-3  # per-component floor keeping the geo-mean rankable
     min_score: float = 0.0  # composite floor; below it -> stay flat (0 = never)
 
+    # Trend gate (hard). The soft components can only *rank* a falling market
+    # lower; because the ranker must open the best of the pool, a soft penalty is
+    # not enough — the least-bad falling market still opens. This gate refuses to
+    # *rank* an epic that is not genuinely rising, on two horizons the components
+    # above cannot veto:
+    #   (a) whole-day slope — the session must be up overall ("pas baissière
+    #       depuis longtemps");
+    #   (b) recent slope over the last ``recent_uptrend_period`` candles — the
+    #       market must not have been sliding down for the last several minutes
+    #       right into the open, even when the day is net up. This is the
+    #       falling-knife guard: a curve that climbed all morning but has been
+    #       falling for ~20 min is dropped outright, not merely ranked lower.
+    # Either horizon failing drops the epic (``evaluate -> None``). Set False to
+    # fall back to the pure geometric-mean ranking.
+    require_uptrend: bool = True
+    recent_uptrend_period: int = 20  # candles (~20 min) for the recent-trend veto
+
     # Pre-open safety: penalise a market whose bid is *already sliding down* over
     # the last few minutes right before opening. Applied as a multiplicative malus
     # on the final composite score (not a geo-mean component), so a clear recent
@@ -246,6 +276,7 @@ class OpenSafeRanking(EntryStrategy):
                 self.drawdown_period,
                 self.atr_period,
                 self.recent_trend_period,
+                self.recent_uptrend_period,
             )
             + 1
         )
@@ -286,6 +317,26 @@ class OpenSafeRanking(EntryStrategy):
             return None
 
         bids = buf.bid_closes
+
+        # Trend gate: refuse to rank a market that is not genuinely rising, on two
+        # horizons the soft components below cannot enforce as a hard veto — the
+        # whole-day slope ("baissière depuis longtemps") *and* the recent slope
+        # over the last ``recent_uptrend_period`` candles ("baisse depuis ~20 min
+        # into the open"). Either one non-positive drops the epic outright.
+        if self.require_uptrend:
+            day_slope = linear_regression(bids).slope
+            recent_slope = linear_regression(
+                bids[-self.recent_uptrend_period :]
+            ).slope
+            if day_slope <= 0 or recent_slope <= 0:
+                logger.debug(
+                    "SafeRanking %s rejected: not rising "
+                    "(day slope %.5g, recent slope %.5g)",
+                    epic,
+                    day_slope,
+                    recent_slope,
+                )
+                return None
 
         # 1. Projection, breadth-scaled — weighted multi-model agreement scaled by
         #    the *fraction* of models that actually point up. Rewards unanimity,

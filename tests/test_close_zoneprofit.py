@@ -8,7 +8,7 @@ the break-even/margin references, and ``evaluate`` routing to the right zone —
 plus the two hard close triggers it keeps for itself.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -172,6 +172,117 @@ class TestEvaluateZones:
         )
         assert decision.action == ACTION_UPDATE_STOP
         assert decision.new_stop_level > pos.level_follower
+        assert decision.new_stop_level < bid
+
+    def test_bid_above_margin_below_profit_trigger_locks_the_marge_support(self):
+        # Regression (CS.D.CHFJPY.CFD.IP): the bid held just above the MARGIN line
+        # for many ticks then collapsed, yet the stop was never raised — because
+        # anything above the (thin) margin was classified PROFIT and the margin
+        # updater (breakeven_half) never ran. Now the break-even band extends up to
+        # the PROFIT TRIGGER (margin + one more noise margin), so a bid above the
+        # margin but below that trigger still routes to CLOSE_ZONEMARGE and locks
+        # the 25 % support inside the break-even→margin band.
+        #
+        # level_zero=8000, level_margin=8010 → profit trigger = 8020, and the
+        # breakeven_half support = 8000 + 0.25×(8010−8000) = 8002.5. The rising
+        # tail clears the 8010 margin so the one-shot lock arms.
+        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
+        buf = _buffer([8000.0 + i * 0.5 for i in range(30)])  # ends ≈ 8014.5
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        decision = prof.evaluate(pos, current_bid=8015.0, buf=buf, is_close_hour=False)
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == pytest.approx(8002.5)
+
+    def test_pre_entry_spike_above_margin_does_not_arm_the_lock(self):
+        # Regression (IX.D.HSTECH.FWM2.IP): the margin-zone lock (breakeven_half)
+        # armed on a pre-entry rally, not a post-open move. The live EpicBuffer is a
+        # rolling window fed continuously, so it still held candles from BEFORE the
+        # position opened; ``_rising_above_margin`` scans the whole buffer and found
+        # a rising streak clearing the (open-frozen) margin in that pre-entry
+        # history, raising the stop even though nothing after the open ever
+        # approached the margin. ``evaluate`` now bounds the buffer to the open.
+        #
+        # Candles 0-9 (09:00-09:09, before the open) spike above margin=8010;
+        # candles 10-29 (from 09:10 on) hover ~8004-8005, never near the margin. The
+        # position opened at 09:10, so only the flat post-open window must count.
+        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
+        pre_entry = [
+            8011.0,
+            8012.0,
+            8013.0,
+            8014.0,
+            8015.0,
+            8014.0,
+            8013.0,
+            8012.0,
+            8011.0,
+            8010.0,
+        ]
+        post_entry = [8004.0, 8005.0] * 10  # 20 candles, all well below margin
+        buf = _buffer(pre_entry + post_entry)
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+            date=date(2024, 1, 1),
+            time_open=time(9, 10),  # cuts the buffer at candle 10
+        )
+        decision = prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
+        assert decision.action == ACTION_HOLD
+
+    def test_pre_entry_spike_arms_the_lock_without_an_open_time(self):
+        # Companion to the regression above: the SAME buffer, but a position with no
+        # persisted open instant, so the buffer is not sliced. The pre-entry spike is
+        # then in scope and arms the lock (raise to the 25 % support = 8002.5). This
+        # documents exactly what the open-time slice suppresses.
+        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
+        pre_entry = [
+            8011.0,
+            8012.0,
+            8013.0,
+            8014.0,
+            8015.0,
+            8014.0,
+            8013.0,
+            8012.0,
+            8011.0,
+            8010.0,
+        ]
+        post_entry = [8004.0, 8005.0] * 10
+        buf = _buffer(pre_entry + post_entry)
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )  # no date / time_open -> no slice
+        decision = prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == pytest.approx(8002.5)
+
+    def test_bid_above_profit_trigger_enters_the_profit_zone(self):
+        # Same open levels; a bid above the profit trigger (8020) is real profit →
+        # the profit-trailing zone governs and ratchets the stop up above the
+        # margin, not the flat 25 % margin-zone support.
+        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
+        buf = _buffer([8000.0 + i for i in range(60)])  # strong rising trend
+        atr_v = atr(list(buf.candles), 14)
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8000.0 - 2.5 * atr_v,
+        )
+        bid = buf.last.bid_close  # far above the 8020 trigger
+        decision = prof.evaluate(pos, current_bid=bid, buf=buf, is_close_hour=False)
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level > 8010.0  # trailed above the margin
         assert decision.new_stop_level < bid
 
 

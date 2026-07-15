@@ -924,7 +924,7 @@ async function _loadChart(epic, initial) {
                           Math.min.apply(null, rawNoiseBid));
         let hi = Math.max(Math.max.apply(null, rawBids), Math.max.apply(null, rawOffers));
         trades.forEach(function(t) {
-            ['open', 'openBid', 'zero', 'margin', 'profit10', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
+            ['open', 'openBid', 'zero', 'margin', 'profitTrigger', 'profit10', 'stopLoose', 'stopFollower', 'target', 'close'].forEach(function(k) {
                 const v = t[k];
                 if (typeof v === 'number' && isFinite(v)) {
                     if (v < lo) lo = v;
@@ -1161,10 +1161,15 @@ async function _loadChart(epic, initial) {
             // is exactly the spread; the bid curve reaching it = break-even.
             addLevelLine(t.zero, '#cbd5e1', 'solid', 'Break-even');
             // Margin line = break-even + noise margin (frozen at open): the
-            // boundary between the break-even band (zone 2) and real profit
-            // (zone 3). Cyan, dashed, to sit visually between break-even and the
-            // profit trailing without being mistaken for a stop.
+            // CEILING of where the raised stop is parked (top of the
+            // break-even→margin band), NOT a zone boundary. Cyan, dashed, to sit
+            // visually between break-even and the profit trailing.
             addLevelLine(t.margin, '#22d3ee', 'dash', 'Margin');
+            // Profit trigger = margin + one more noise margin (frozen at open):
+            // the boundary between the break-even band (zone 2, CLOSE_ZONEMARGE)
+            // and real profit (zone 3, CLOSE_ZONEPROFIT). Above it the stop trails
+            // progressively. Teal, dashed, sitting just above the Margin line.
+            addLevelLine(t.profitTrigger, '#2dd4bf', 'dash', 'Profit');
             // Two protective stops, each its own line. Prefer the real stepped
             // path; fall back to a flat line at the scalar level for positions
             // opened before the history was captured.
