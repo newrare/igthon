@@ -64,6 +64,14 @@ class Position(Base):
     # is never parked between break-even and this level. See migration
     # b3c4d5e6f7a8.
     level_margin: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
+    # IG's minimum stop distance (price units, already padded by
+    # ``strategy_stop_min_distance_margin``) captured from the dealing rules at
+    # open. Bounds every later broker-stop ratchet so the level pushed to IG
+    # never sits inside IG's minimum-distance floor — a stop posted too close to
+    # the market is rejected ("Stop trop près") and the previous, far broker
+    # order silently stays live. NULL for adopted/legacy rows opened without this
+    # data: the ratchet then applies no clamp. See migration d3e4f5a6b7c8.
+    min_stop_distance: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     pip_spread: Mapped[Decimal | None] = mapped_column(Numeric(12, 5))
     reason_open: Mapped[str | None] = mapped_column(String(30))
     reason_close: Mapped[str | None] = mapped_column(String(30))
@@ -84,6 +92,12 @@ class Position(Base):
     # initial level (which never matched the live trailing stop at exit). See
     # migration f7a8b9c0d1e2.
     stop_history: Mapped[list | None] = mapped_column(JSON)
+    # Zone (see src/exit/zones) the live bid sat in when the user manually raised
+    # the stop from the dashboard chart buttons. While set, automatic per-zone
+    # ratcheting is suspended and the user-placed stop is held; it is cleared once
+    # the bid crosses into a different zone (auto management then resumes). NULL =
+    # no manual override active. See migration c2d3e4f5a6b7.
+    manual_stop_zone: Mapped[str | None] = mapped_column(String(20))
     euro: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro_stop: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     # Euros of realized/unrealized P&L per 1.0 of price movement for the whole

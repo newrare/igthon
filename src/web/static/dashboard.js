@@ -321,6 +321,36 @@ async function resyncWallet(btn) {
     }
 }
 
+// Daily History resync — rebuild the last 30 days of the Day summary table from
+// IG's authoritative realized P&L (GET /history/transactions per day). Awaited,
+// so it can take a few seconds while it walks each day that had trades.
+async function resyncDayHistory(btn) {
+    if (btn) { btn.classList.add('spinning'); btn.disabled = true; }
+    try {
+        const res  = await fetch('/api/day-history/resync', { method: 'POST' });
+        const data = await res.json().catch(function() { return {}; });
+        if (res.ok) {
+            const total = (typeof data.total === 'number')
+                ? data.total.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '€'
+                : '—';
+            showToast(
+                'Daily history resynced',
+                (data.days || 0) + ' day(s), ' + (data.updated || 0) + ' position(s) corrected · total ' + total,
+                'success'
+            );
+        } else {
+            showToast('Resync failed', data.error || 'Unknown error', 'error');
+        }
+    } catch (e) {
+        console.error('Daily history resync failed', e);
+        showToast('Resync failed', 'Network error', 'error');
+    } finally {
+        // The button lives in the static section header (not the polled
+        // fragment), so restore its state here once the request settles.
+        if (btn) { btn.classList.remove('spinning'); btn.disabled = false; }
+    }
+}
+
 async function clearQueueErrors() {
     try {
         await fetch('/api/queue/errors/clear', { method: 'POST' });
@@ -708,6 +738,13 @@ let _chartModalEpic = null;
 let _chartEpicList  = [];
 let _chartEpicIndex = -1;
 
+// The open trade currently shown (or null) and the chart's data-range bounds
+// [lo, hi] captured on the last paint. Together they let the right-edge stop
+// buttons map a %-of-scale back to an absolute price to POST.
+let _chartOpenTrade = null;
+let _chartLo    = 0;
+let _chartRange = 0;
+
 // True while the user has manually zoomed/panned the chart. The auto-refresh
 // repaints with Plotly.react and a fresh (auto-ranged) layout, which would snap
 // the view back to full-day; freezing the refresh while zoomed keeps the user's
@@ -772,6 +809,8 @@ function _showChartEpic(epic) {
     const titleEl   = document.getElementById('chart-modal-title');
     const container = document.getElementById('chart-container');
     _chartModalEpic = epic;
+    _chartOpenTrade = null;
+    _clearStopButtons();  // drop the previous epic's buttons until the new load
     _setChartZoomed(false);
     titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
     lucide.createIcons();
@@ -826,6 +865,93 @@ function _setChartZoomed(zoomed) {
     _chartZoomed = zoomed;
     const badge = document.getElementById('chart-paused-badge');
     if (badge) badge.style.display = zoomed ? 'block' : 'none';
+    // The stop buttons are aligned to the default (auto-ranged) y-axis; hide
+    // them while zoomed since a custom range would misplace them.
+    const strip = document.getElementById('chart-stop-buttons');
+    if (strip) strip.style.display = zoomed ? 'none' : '';
+}
+
+// ── Chart stop buttons (raise the stop from the right edge of the scale) ──────
+// A column of buttons every 5 % of the chart's price scale, shown only when the
+// epic has an OPEN position. Clicking one raises the software + broker stop to
+// the price at that mark (POST /api/positions/stop/{id}); the stop then holds
+// until the bid changes zone (server-side). The vertical placement mirrors the
+// Plotly layout (margins t:22 / b:50 and the yaxis range [-3, 103]) so each
+// button sits at the pixel of its price on the plotted scale.
+const _STOP_BTN_TOP = 22;
+const _STOP_BTN_BOTTOM = 50;
+const _STOP_BTN_AXIS_LO = -3;
+const _STOP_BTN_AXIS_HI = 103;
+
+function _clearStopButtons() {
+    const el = document.getElementById('chart-stop-buttons');
+    if (el) el.remove();
+}
+
+function _renderStopButtons(container, trade, lo, range) {
+    _clearStopButtons();
+    if (!trade || trade.state !== 'open') return;
+    if (!isFinite(lo) || !isFinite(range) || range <= 0) return;
+    const wrap = container.parentNode;
+    if (!wrap) return;
+    const H = container.clientHeight || container.offsetHeight || 0;
+    const plotH = Math.max(H - _STOP_BTN_TOP - _STOP_BTN_BOTTOM, 1);
+    const axisSpan = _STOP_BTN_AXIS_HI - _STOP_BTN_AXIS_LO;
+
+    const strip = document.createElement('div');
+    strip.id = 'chart-stop-buttons';
+    strip.style.display = _chartZoomed ? 'none' : '';
+    for (let p = 100; p >= 0; p -= 5) {
+        const price = lo + (p / 100) * range;
+        const frac  = 1 - (p - _STOP_BTN_AXIS_LO) / axisSpan;  // 0 = top of plot
+        const btn = document.createElement('button');
+        btn.className = 'chart-stop-btn';
+        btn.type = 'button';
+        btn.style.top = (_STOP_BTN_TOP + frac * plotH) + 'px';
+        btn.textContent = p + '%';
+        btn.title = 'Raise stop to ' + price.toFixed(5);
+        btn.onclick = function() { _raiseStop(trade, price, btn); };
+        strip.appendChild(btn);
+    }
+    wrap.appendChild(strip);
+}
+
+async function _raiseStop(trade, price, btn) {
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '…';
+    // Immediate acknowledgment: tell the user the request was taken into account
+    // and is going through the API queue, before the (queued) round-trip returns.
+    showToast('Stop raise requested', 'Sent to the API queue @ ' + price.toFixed(5), 'info');
+    try {
+        const res = await fetch('/api/positions/stop/' + trade.id, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ level: price }),
+        });
+        const data = await res.json().catch(function() { return {}; });
+        if (res.ok) {
+            const lvl = (typeof data.level === 'number') ? data.level.toFixed(5) : price.toFixed(5);
+            // ``detail`` is "ok" when IG confirmed the broker push; otherwise the
+            // software stop is set but the broker update was not confirmed.
+            const confirmed = !data.detail || data.detail === 'ok';
+            showToast(
+                'Stop raised',
+                'New stop @ ' + lvl + (confirmed ? '' : ' — ' + data.detail),
+                confirmed ? 'success' : 'warning'
+            );
+            // Repaint so the new Follower/Loose step shows immediately.
+            if (_chartModalEpic) _loadChart(_chartModalEpic, false);
+        } else {
+            showToast('Stop not raised', data.error || 'Rejected', 'error');
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+    } catch (e) {
+        showToast('Stop not raised', e.message, 'error');
+        btn.disabled = false;
+        btn.textContent = orig;
+    }
 }
 
 // Plotly relayout handler: a manual zoom/pan sets an explicit x-range (freeze);
@@ -898,6 +1024,9 @@ async function _loadChart(epic, initial) {
             return;
         }
         const trades = data.trades || [];
+        // Pre-open projection (break-even / margin / profit as if a BUY opened
+        // now). Present only on trade-less "global" charts; drawn very discreetly.
+        const projection = (!trades.length && data.projection) ? data.projection : null;
         _renderChartPnl(trades);
         const rawBids = candles.map(function(c) { return c.bid; });
         // Offer (ask) curve. A long is filled on the offer, so level_open/zero sit
@@ -942,8 +1071,24 @@ async function _loadChart(epic, initial) {
                 }
             });
         });
+        // Fold the projected levels in too so the discreet break-even / margin /
+        // profit lines stay inside the view (they sit at/above the current price).
+        if (projection) {
+            ['zero', 'margin', 'profitTrigger'].forEach(function(k) {
+                const v = projection[k];
+                if (typeof v === 'number' && isFinite(v)) {
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            });
+        }
         const range = hi - lo;
         const toPct = function(v) { return range === 0 ? 50 : (v - lo) / range * 100; };
+        // Remember the scale so the right-edge stop buttons can map a %-mark back
+        // to an absolute price, and the open trade they act on (if any).
+        _chartLo = lo;
+        _chartRange = range;
+        _chartOpenTrade = trades.find(function(t) { return t.state === 'open'; }) || null;
 
         // Candle timestamps as epoch ms (parsed in the browser's local tz; all
         // values use the same convention so differences and round-trips are
@@ -1028,10 +1173,29 @@ async function _loadChart(epic, initial) {
         const shapes = gapRects.slice();
         const annotations = [];
 
+        // Potential-loss suffix for a stop line: the euro P&L the OPEN trade
+        // ``t`` would realise if the bid reached ``level``. Mirrors the server's
+        // _euro_pnl — (level − open) × €/point for a long, the reverse for a short
+        // — so the figure matches the running P&L badge. Empty string unless the
+        // trade is open and its €/point is known (so closed/historical stop lines
+        // and pre-open charts carry no misleading loss figure).
+        function _euroSuffix(t, level) {
+            if (!t || t.state !== 'open') return '';
+            const epp = t.euroPerPoint;
+            if (typeof epp !== 'number' || !epp || typeof t.open !== 'number') return '';
+            if (typeof level !== 'number' || !isFinite(level)) return '';
+            const move = (t.direction === 'SELL') ? (t.open - level) : (level - t.open);
+            const pnl  = move * epp;
+            const sign = pnl >= 0 ? '+' : '−';
+            return '  (' + sign + Math.abs(pnl).toFixed(2) + ' €)';
+        }
+
         // Horizontal reference line + right-anchored price label for one level.
         // De-duplicated so trades sharing a level don't stack identical lines.
+        // ``euroTrade`` (optional): when given, the label also shows the euro P&L
+        // that trade would realise at ``value`` (used on the stop lines).
         const _seenLevels = {};
-        function addLevelLine(value, color, dash, label) {
+        function addLevelLine(value, color, dash, label, euroTrade) {
             if (typeof value !== 'number' || !isFinite(value)) return;
             const key = label + ':' + value.toFixed(4);
             if (_seenLevels[key]) return;
@@ -1043,8 +1207,27 @@ async function _loadChart(epic, initial) {
             });
             annotations.push({
                 xref: 'paper', x: 1, xanchor: 'right', yref: 'y', y: y, yanchor: 'bottom',
-                text: label + ' ' + value.toFixed(4), showarrow: false,
+                text: label + ' ' + value.toFixed(4) + _euroSuffix(euroTrade, value),
+                showarrow: false,
                 font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
+            });
+        }
+
+        // Discreet projected reference line for a pre-open chart: a faint, thin,
+        // dotted line + a small left-anchored "(proj.)" label. Shows where a level
+        // WOULD sit if a BUY opened now, without the visual weight of a real
+        // position's indicator. Never drawn once a trade exists on the epic.
+        function addProjectionLine(value, color, label) {
+            if (typeof value !== 'number' || !isFinite(value)) return;
+            const y = toPct(value);
+            shapes.push({
+                type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: y, y1: y,
+                line: { color: color, width: 1, dash: 'dot' }
+            });
+            annotations.push({
+                xref: 'paper', x: 0, xanchor: 'left', yref: 'y', y: y, yanchor: 'bottom',
+                text: label + ' (proj.)', showarrow: false,
+                font: { color: color, size: 9 }, bgcolor: 'rgba(28,23,20,0.45)'
             });
         }
 
@@ -1115,7 +1298,7 @@ async function _loadChart(epic, initial) {
         // flat line that only showed the frozen initial level and never matched
         // the live stop at exit once it had ratcheted up. Returns true when a
         // stepped line was drawn, false to let the caller fall back to a flat one.
-        function addStopStep(stops, closeTimeStr, color, label, dash) {
+        function addStopStep(stops, closeTimeStr, color, label, dash, euroTrade) {
             if (!Array.isArray(stops) || !stops.length) return false;
             const xs = [], ys = [];
             stops.forEach(function(pt) {
@@ -1140,7 +1323,8 @@ async function _loadChart(epic, initial) {
             annotations.push({
                 xref: 'paper', x: 1, xanchor: 'right', yref: 'y',
                 y: toPct(last), yanchor: 'bottom',
-                text: label + ' ' + last.toFixed(4), showarrow: false,
+                text: label + ' ' + last.toFixed(4) + _euroSuffix(euroTrade, last),
+                showarrow: false,
                 font: { color: color, size: 10 }, bgcolor: 'rgba(28,23,20,0.7)'
             });
             return true;
@@ -1180,23 +1364,38 @@ async function _loadChart(epic, initial) {
             //     broker (the gap-safety net). It can sit BELOW the follower (IG's
             //     min-distance rule widened it at open), which is why a close can
             //     fire on the follower while this line is still untouched.
-            if (!addStopStep(t.stopsFollower, t.closeTime, '#ef4444', 'Follower', 'solid')) {
-                addLevelLine(t.stopFollower, '#ef4444', 'solid', 'Follower');
+            // For an OPEN trade both stop lines also show the euro P&L the
+            // position would realise if the bid reached them (the potential loss
+            // the user watches); ``_euroSuffix`` is a no-op for closed trades.
+            if (!addStopStep(t.stopsFollower, t.closeTime, '#ef4444', 'Follower', 'solid', t)) {
+                addLevelLine(t.stopFollower, '#ef4444', 'solid', 'Follower', t);
             }
-            if (!addStopStep(t.stopsLoose, t.closeTime, '#a78bfa', 'Loose', 'dot')) {
-                addLevelLine(t.stopLoose, '#a78bfa', 'dot', 'Loose');
+            if (!addStopStep(t.stopsLoose, t.closeTime, '#a78bfa', 'Loose', 'dot', t)) {
+                addLevelLine(t.stopLoose, '#a78bfa', 'dot', 'Loose', t);
             }
             addEventMarker(t.openTime, t.openBid, '#E0B341', 'Entry', false);
             addEventMarker(t.closeTime, t.close, '#60a5fa', 'Exit',
                 !!_ESTIMATED_CLOSE[t.closeReason]);
         });
+
+        // Pre-open chart only: draw the discreet projected break-even / margin /
+        // profit lines. Faint, dotted, low-weight — a hint of the levels a fresh
+        // BUY would need to reach, never the bold indicators a real position gets.
+        if (projection) {
+            addProjectionLine(projection.zero, 'rgba(203,213,225,0.45)', 'Break-even');
+            addProjectionLine(projection.margin, 'rgba(34,211,238,0.45)', 'Margin');
+            addProjectionLine(projection.profitTrigger, 'rgba(45,212,191,0.45)', 'Profit');
+        }
         const xIsDate = true;
 
         const layout = {
             paper_bgcolor: '#1c1714',
             plot_bgcolor: '#1c1714',
             font: { color: '#94a3b8', size: 11 },
-            margin: { l: 55, r: 20, t: 22, b: 50 },
+            // Widen the right margin into a gutter for the stop buttons when the
+            // epic has an open position; the price-level labels (anchored at the
+            // plot's right edge) then sit just left of that gutter.
+            margin: { l: 55, r: _chartOpenTrade ? 52 : 20, t: 22, b: 50 },
             showlegend: false,
             shapes: shapes,
             annotations: annotations,
@@ -1225,6 +1424,8 @@ async function _loadChart(epic, initial) {
         } else {
             Plotly.react(container, traces, layout, config);
         }
+        // Right-edge stop buttons — only when this epic has an open position.
+        _renderStopButtons(container, _chartOpenTrade, lo, range);
     } catch(e) {
         // Only blank the chart on an initial-load failure; a transient refresh
         // error should leave the last good chart on screen.
@@ -1239,6 +1440,8 @@ function closeChartModal() {
     _chartModalEpic = null;
     _chartEpicList  = [];
     _chartEpicIndex = -1;
+    _chartOpenTrade = null;
+    _clearStopButtons();
     _setChartZoomed(false);
     document.getElementById('chart-modal').style.display = 'none';
     Plotly.purge(document.getElementById('chart-container'));

@@ -33,11 +33,12 @@ from src.exit.zones.breakeven_band import (
     BreakevenSafeStop,
 )
 from src.exit.zones.trailing_ratchet import TrailingRatchetStop
-from src.exit.zones.underwater import UnderwaterStop
+from src.exit.zones.underwater import UnderwaterStop, UnderwaterTrendCutStop
 
 #: Zone 1 (open → break-even). Name → class; keys are valid ``CLOSE_ZONESTART``.
 ZONESTART_UPDATERS: dict[str, type[StopUpdater]] = {
     UnderwaterStop.name: UnderwaterStop,
+    UnderwaterTrendCutStop.name: UnderwaterTrendCutStop,
 }
 
 #: Zone 2 (break-even → margin). Name → class; keys are valid ``CLOSE_ZONEMARGE``.
@@ -62,6 +63,7 @@ __all__ = [
     "classify_zone",
     "build_zone_updater",
     "UnderwaterStop",
+    "UnderwaterTrendCutStop",
     "BreakevenBandStop",
     "BreakevenLockStop",
     "BreakevenSafeStop",

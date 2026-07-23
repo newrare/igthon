@@ -377,6 +377,114 @@ class TestTrailingStop:
         assert pos.stop_history == seed
 
 
+class TestBrokerStopClamp:
+    """The broker stop never sits inside IG's minimum-distance floor (fix 2)."""
+
+    def test_buy_pulled_back_when_too_close(self):
+        svc = _service()
+        pos = Position(epic="X", direction="BUY", min_stop_distance=Decimal("1.0"))
+        # Desired broker 104.5 is only 0.5 below price 105 — inside the 1.0 floor.
+        clamped = svc._clamp_broker_stop_to_min_distance("BUY", 104.5, 105.0, pos)
+        assert clamped == pytest.approx(104.0)  # price - min_dist
+
+    def test_buy_left_alone_when_far_enough(self):
+        svc = _service()
+        pos = Position(epic="X", direction="BUY", min_stop_distance=Decimal("1.0"))
+        clamped = svc._clamp_broker_stop_to_min_distance("BUY", 103.0, 105.0, pos)
+        assert clamped == pytest.approx(103.0)
+
+    def test_sell_pushed_out_when_too_close(self):
+        svc = _service()
+        pos = Position(epic="X", direction="SELL", min_stop_distance=Decimal("1.0"))
+        # A short's stop sits above price; 105.5 is only 0.5 above -> pushed to 106.
+        clamped = svc._clamp_broker_stop_to_min_distance("SELL", 105.5, 105.0, pos)
+        assert clamped == pytest.approx(106.0)  # price + min_dist
+
+    def test_unknown_floor_is_noop(self):
+        svc = _service()
+        pos = Position(epic="X", direction="BUY", min_stop_distance=None)
+        clamped = svc._clamp_broker_stop_to_min_distance("BUY", 104.9, 105.0, pos)
+        assert clamped == pytest.approx(104.9)
+
+
+class TestBrokerStopTruth:
+    """The persisted broker stop / chart's Loose line reflects only what IG took."""
+
+    async def test_accepted_push_advances_persisted_broker(self):
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2(spread=1.0)  # pre-BE dist 5 -> follower 100
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            direction="BUY",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),
+            level_follower=None,
+            level_stop=Decimal("95"),  # last accepted broker
+            level_security=Decimal("95"),
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        # Broker accepted at 99 (follower 100 − spread 1): persisted levels and the
+        # Loose history point advance to the accepted level.
+        assert float(pos.level_follower) == pytest.approx(100.0)
+        assert float(pos.level_stop) == pytest.approx(99.0)
+        assert float(pos.level_security) == pytest.approx(99.0)
+        assert pos.stop_history[-1]["broker"] == pytest.approx(99.0)
+
+    async def test_rejected_push_keeps_last_accepted_broker(self):
+        svc, client, _ = _trailing_service()
+        client.put = AsyncMock(side_effect=_ig_error(400, "error.trailing.too-close"))
+        buf = _buffer_with_atr2(spread=1.0)
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            direction="BUY",
+            level_open=Decimal("100"),
+            level_zero=Decimal("110"),
+            level_follower=None,
+            level_stop=Decimal("95"),  # last accepted broker
+            level_security=Decimal("95"),
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        # Software follower still advances — it is the local guard.
+        assert float(pos.level_follower) == pytest.approx(100.0)
+        assert pos.stop_update == 1
+        # IG refused the broker move, so the persisted broker level and the Loose
+        # history point stay at the last accepted level (no phantom 99 stop).
+        assert float(pos.level_stop) == pytest.approx(95.0)
+        assert float(pos.level_security) == pytest.approx(95.0)
+        assert pos.stop_history[-1]["broker"] == pytest.approx(95.0)
+        assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
+
+    async def test_broker_clamped_to_floor_before_push(self):
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2(spread=1.0)  # post-BE dist 3 -> follower 102
+        pos = Position(
+            epic="X",
+            deal_id="DEAL1",
+            direction="BUY",
+            level_open=Decimal("100"),
+            level_zero=Decimal("101"),  # cleared at 105 -> post-BE regime
+            level_follower=Decimal("100"),
+            level_stop=Decimal("95"),
+            level_security=Decimal("95"),
+            min_stop_distance=Decimal("5.0"),  # floor = 105 − 5 = 100
+        )
+
+        await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+        # Raw broker 101 (follower 102 − spread 1) is only 4 below price 105, inside
+        # the 5.0 floor: pulled back to 100 (the deepest still-accepted level).
+        assert float(pos.level_follower) == pytest.approx(102.0)
+        payload = client.put.await_args.args[1]
+        assert payload["stopLevel"] == pytest.approx(100.0)
+        assert float(pos.level_stop) == pytest.approx(100.0)
+
+
 class _StubProfile:
     """Close profile that always proposes ``new_stop`` as a stop update."""
 
@@ -440,6 +548,129 @@ class TestManagePositionRatchet:
         assert closed is False
         assert float(pos.level_follower) == pytest.approx(1.62413)  # unchanged
         db.commit.assert_not_awaited()
+
+
+class _ZoneStubProfile:
+    """Close profile stub proposing a stop and reporting a fixed current zone."""
+
+    name = "zonestub"
+
+    def __init__(self, new_stop: float, zone) -> None:
+        self._new_stop = new_stop
+        self._zone = zone
+
+    def evaluate(self, position, current_bid, buf, *, is_close_hour):
+        from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
+
+        return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=self._new_stop)
+
+    def current_zone(self, position, current_bid, buf):
+        return self._zone
+
+
+class TestManagePositionManualHold:
+    """A manual stop override holds while the bid stays in its zone."""
+
+    def _svc(self, profile):
+        svc, client, db = _trailing_service()
+        svc._is_epic_close_hour = AsyncMock(return_value=False)
+        svc._close_profile = profile
+        return svc, client, db
+
+    async def test_hold_suppresses_auto_ratchet_in_same_zone(self):
+        from src.exit.zones import StopZone
+
+        # Auto would raise the stop, but the manual override was set in the zone
+        # the bid is still in — the raise is suppressed and the stop is held.
+        svc, _, db = self._svc(
+            _ZoneStubProfile(new_stop=1.62500, zone=StopZone.BREAKEVEN_BAND)
+        )
+        pos = Position(
+            epic="X",
+            deal_id="D",
+            direction="BUY",
+            level_follower=Decimal("1.62413"),
+            manual_stop_zone="breakeven_band",
+        )
+        closed = await svc.manage_position(
+            pos, current_bid=1.6260, buf=_buffer_with_atr2()
+        )
+        assert closed is False
+        assert float(pos.level_follower) == pytest.approx(1.62413)  # unchanged
+        assert pos.manual_stop_zone == "breakeven_band"  # still held
+        db.commit.assert_not_awaited()
+
+    async def test_zone_change_releases_hold_and_resumes_auto(self):
+        from src.exit.zones import StopZone
+
+        # The bid has crossed into a different zone: the override is cleared and
+        # the auto proposal (a higher stop) is applied normally.
+        svc, _, db = self._svc(
+            _ZoneStubProfile(new_stop=1.62500, zone=StopZone.PROFIT)
+        )
+        pos = Position(
+            epic="X",
+            deal_id="D",
+            direction="BUY",
+            level_follower=Decimal("1.62413"),
+            manual_stop_zone="breakeven_band",
+        )
+        closed = await svc.manage_position(
+            pos, current_bid=1.6280, buf=_buffer_with_atr2()
+        )
+        assert closed is False
+        assert pos.manual_stop_zone is None  # released
+        assert float(pos.level_follower) == pytest.approx(1.62500)  # auto applied
+        db.commit.assert_awaited()
+
+
+class TestRaiseStopManually:
+    """The dashboard chart buttons raise the stop and pin its zone."""
+
+    async def test_long_raise_sets_follower_broker_and_zone(self):
+        from src.exit.zones import StopZone
+
+        svc, client, db = _trailing_service()
+        buf = _buffer_with_atr2(close=105.0, spread=2.0)  # bid 105, live spread 2
+        pos = Position(
+            epic="X", deal_id="D", direction="BUY", level_follower=Decimal("95")
+        )
+        profile = _ZoneStubProfile(new_stop=0.0, zone=StopZone.BREAKEVEN_BAND)
+
+        ok, msg = await svc.raise_stop_manually(pos, 100.0, buf, profile=profile)
+
+        assert ok is True
+        assert float(pos.level_follower) == pytest.approx(100.0)
+        assert pos.manual_stop_zone == "breakeven_band"
+        # Broker stop pushed a spread (2) below the follower.
+        payload = client.put.await_args.args[1]
+        assert payload["stopLevel"] == pytest.approx(98.0)
+        assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
+        db.commit.assert_awaited()
+
+    async def test_long_rejects_stop_at_or_above_bid(self):
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2()  # bid 100
+        pos = Position(epic="X", deal_id="D", direction="BUY")
+
+        ok, msg = await svc.raise_stop_manually(pos, 101.0, buf, profile=None)
+
+        assert ok is False
+        assert "below the current bid" in msg
+        client.put.assert_not_awaited()
+
+    async def test_long_rejects_lowering_the_stop(self):
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2()  # bid 100
+        pos = Position(
+            epic="X", deal_id="D", direction="BUY", level_follower=Decimal("97")
+        )
+
+        ok, msg = await svc.raise_stop_manually(pos, 96.0, buf, profile=None)
+
+        assert ok is False
+        assert "raised" in msg
+        client.put.assert_not_awaited()
 
 
 class TestReconcileVanishedCloseLevel:

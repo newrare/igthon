@@ -802,6 +802,10 @@ class BotScheduler:
         """Manually generate today's P&L summary."""
         await self._daily_summary()
 
+    async def trigger_resync_day_history(self) -> dict:
+        """Manually rebuild the last 30 days of Day summaries from IG history."""
+        return await self._resync_day_history()
+
     async def trigger_weekly_summary(self) -> None:
         """Manually generate per-epic weekly summaries."""
         await self._weekly_summary()
@@ -2121,6 +2125,107 @@ class BotScheduler:
             f"Daily summary: {len(positions)} trades, P&L={euro_total:.2f}€"
         )
         await self._record_job_run("daily_summary")
+
+    async def _resync_day_history(self, days: int = 30) -> dict:
+        """Rebuild the last ``days`` days of the Day summary table from IG.
+
+        Unlike :meth:`_daily_summary` (today only), this re-reconciles every
+        past day that has closed positions — pulling each deal's authoritative
+        ``profitAndLoss`` from ``GET /history/transactions`` via
+        :meth:`TradingService.reconcile_realized_pnl` — and upserts its Day row
+        from the corrected figures. Powers the dashboard "Resync" button on the
+        Daily History section.
+
+        Only days that actually hold closed positions are queried, so a mostly
+        idle month costs a handful of API calls, not one per calendar day.
+
+        Returns a summary dict ``{"days", "updated", "total"}`` where ``days`` is
+        the number of days rebuilt, ``updated`` the count of positions whose P&L
+        was corrected, and ``total`` the summed euro P&L over those days.
+        """
+        today = date.today()
+        since = today - timedelta(days=days)
+        config = self._build_trade_config()
+        total_updated = 0
+        total_euro = 0.0
+        processed = 0
+
+        async with self._session_factory() as session:
+            trading = TradingService(self._client, session, config)
+            # Only reconcile days that actually have closed positions.
+            date_res = await session.execute(
+                select(Position.date)
+                .where(
+                    Position.date >= since,
+                    Position.state == PositionState.CLOSE,
+                )
+                .distinct()
+            )
+            dates = sorted({d for (d,) in date_res.all() if d is not None})
+
+            for day in dates:
+                try:
+                    total_updated += await trading.reconcile_realized_pnl(day)
+                except Exception as exc:
+                    logger.error("Day history resync failed for %s: %s", day, exc)
+                    continue
+
+                # Recompute the Day summary from the freshly reconciled positions.
+                pos_res = await session.execute(
+                    select(Position).where(
+                        Position.date == day,
+                        Position.state == PositionState.CLOSE,
+                    )
+                )
+                positions = [
+                    p
+                    for p in pos_res.scalars().all()
+                    if p.reason_close != "never_opened"
+                ]
+                euro_total = sum(float(p.euro or 0) for p in positions)
+                euro_list = (
+                    ",".join(f"{p.epic}:{p.euro}" for p in positions)
+                    if positions
+                    else ""
+                )
+
+                day_res = await session.execute(select(Day).where(Day.date == day))
+                day_record = day_res.scalar_one_or_none()
+                if day_record:
+                    # Past days are settled; leave today's state untouched so a
+                    # prior end-of-day run isn't reverted to OPEN.
+                    if day < today:
+                        day_record.state = DayState.CLOSE
+                    day_record.euro_total = Decimal(str(round(euro_total, 3)))
+                    day_record.euro_list = euro_list
+                else:
+                    session.add(
+                        Day(
+                            date=day,
+                            state=DayState.CLOSE if day < today else DayState.OPEN,
+                            euro_total=Decimal(str(round(euro_total, 3))),
+                            euro_list=euro_list,
+                        )
+                    )
+                await session.commit()
+                total_euro += euro_total
+                processed += 1
+
+        logger.info(
+            "Day history resync: %d day(s), %d position(s) corrected, total %.2f€",
+            processed,
+            total_updated,
+            total_euro,
+        )
+        self._recorder.info(
+            f"Day history resync: {processed} day(s), "
+            f"{total_updated} position(s) corrected, total {total_euro:.2f}€"
+        )
+        return {
+            "days": processed,
+            "updated": total_updated,
+            "total": round(total_euro, 2),
+        }
 
     async def _weekly_summary(self) -> None:
         """Generate per-epic direction summaries for the week."""

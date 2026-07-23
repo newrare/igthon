@@ -72,6 +72,15 @@ _SOFT_ERROR_ESCALATE_THRESHOLD: int = 3
 # Rolling window (seconds) over which repeated soft errors are counted.
 _SOFT_ERROR_WINDOW_SECONDS: float = 120.0
 
+# IG rejects ``orderType: "MARKET"`` on epics that only accept working/limit
+# orders (typically forwards) with this error code. The open/close paths recover
+# by retrying as a marketable LIMIT, so a call flagged
+# ``expect_market_order_rejection`` treats this specific rejection as an expected
+# outcome — logged at WARNING and kept out of the persistent error log / guard.
+MARKET_ORDER_NOT_SUPPORTED_CODE = (
+    "error.trading.otc.market-orders.not-supported-for-epic"
+)
+
 
 class IGClient:
     """Async HTTP client for the IG REST API.
@@ -167,6 +176,7 @@ class IGClient:
         *,
         suppress_error_logging: bool = False,
         expect_not_found: bool = False,
+        expect_market_order_rejection: bool = False,
     ) -> None:
         """Log IG API error details from response body before raising.
 
@@ -185,6 +195,12 @@ class IGClient:
         so the caller's retry loop drives it, but logged at WARNING — not ERROR —
         and kept out of the persistent error log / guard, mirroring how the
         APIQueue already treats the same case on its side.
+
+        When ``expect_market_order_rejection`` is set a
+        ``MARKET_ORDER_NOT_SUPPORTED_CODE`` rejection is a legitimate outcome the
+        caller recovers from (retrying as a marketable LIMIT). Same handling as
+        ``expect_not_found`` — still raised, but logged at WARNING and kept out of
+        the persistent error log / guard.
         """
         if not response.is_error:
             return
@@ -203,8 +219,13 @@ class IGClient:
             detail = f"{ig_error_code} ({hint})"
 
         expected_missing = expect_not_found and response.status_code == 404
+        expected_rejection = (
+            expect_market_order_rejection
+            and ig_error_code == MARKET_ORDER_NOT_SUPPORTED_CODE
+        )
+        expected = expected_missing or expected_rejection
 
-        if expected_missing and not suppress_error_logging:
+        if expected and not suppress_error_logging:
             logger.warning(
                 "%s %s → HTTP %d%s (expected — handled by caller)",
                 method,
@@ -297,10 +318,28 @@ class IGClient:
             expect_not_found=expect_not_found,
         )
 
-    async def post(self, endpoint: str, payload: dict, *, version: int = 1) -> dict:
-        """POST to the IG API (e.g. open a position). Returns the parsed JSON."""
+    async def post(
+        self,
+        endpoint: str,
+        payload: dict,
+        *,
+        version: int = 1,
+        expect_market_order_rejection: bool = False,
+    ) -> dict:
+        """POST to the IG API (e.g. open a position). Returns the parsed JSON.
+
+        Set ``expect_market_order_rejection`` when the caller recovers from a
+        ``MARKET_ORDER_NOT_SUPPORTED_CODE`` rejection (e.g. the open path retrying
+        as a marketable LIMIT): that specific error is then logged at WARNING and
+        kept out of the persistent error log / guard.
+        """
         return await self._send(
-            "post", "POST", endpoint, version=version, payload=payload
+            "post",
+            "POST",
+            endpoint,
+            version=version,
+            payload=payload,
+            expect_market_order_rejection=expect_market_order_rejection,
         )
 
     async def put(self, endpoint: str, payload: dict, *, version: int = 1) -> dict:
@@ -310,12 +349,22 @@ class IGClient:
         )
 
     async def delete(
-        self, endpoint: str, payload: dict | None = None, *, version: int = 1
+        self,
+        endpoint: str,
+        payload: dict | None = None,
+        *,
+        version: int = 1,
+        expect_market_order_rejection: bool = False,
     ) -> dict:
         """DELETE on the IG API (e.g. close a position). Returns the parsed JSON.
 
         IG does not reliably process DELETE bodies, so the officially supported
         workaround is a POST carrying the ``_method: DELETE`` header.
+
+        Set ``expect_market_order_rejection`` when the caller recovers from a
+        ``MARKET_ORDER_NOT_SUPPORTED_CODE`` rejection (e.g. the close path retrying
+        as a marketable LIMIT): that specific error is then logged at WARNING and
+        kept out of the persistent error log / guard.
         """
         return await self._send(
             "post",
@@ -324,6 +373,7 @@ class IGClient:
             version=version,
             payload=payload,
             extra_headers={"_method": "DELETE"},
+            expect_market_order_rejection=expect_market_order_rejection,
         )
 
     async def _send(
@@ -336,6 +386,7 @@ class IGClient:
         payload: dict | None = None,
         suppress_error_logging: bool = False,
         expect_not_found: bool = False,
+        expect_market_order_rejection: bool = False,
         extra_headers: dict[str, str] | None = None,
     ) -> dict:
         """Shared request path for every verb: auth refresh → headers → call → raise.
@@ -372,5 +423,6 @@ class IGClient:
             url,
             suppress_error_logging=suppress_error_logging,
             expect_not_found=expect_not_found,
+            expect_market_order_rejection=expect_market_order_rejection,
         )
         return response.json()

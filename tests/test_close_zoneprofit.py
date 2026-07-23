@@ -71,6 +71,43 @@ def _position(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
+class TestCurrentZone:
+    """``current_zone`` classifies the live bid using the open-frozen references.
+
+    Break-even=8000, margin=8010 → profit trigger = 2×8010 − 8000 = 8020.
+    Powers the dashboard manual stop-raise "hold" (which zone to pin to).
+    """
+
+    def _profile(self):
+        return get_close_profile(_settings())
+
+    def test_below_break_even_is_underwater(self):
+        from src.exit.zones import StopZone
+
+        pos = _position(level_zero=8000.0, level_margin=8010.0)
+        zone = self._profile().current_zone(pos, 7999.0, _buffer([8000.0] * 20))
+        assert zone is StopZone.UNDERWATER
+
+    def test_between_break_even_and_profit_is_breakeven_band(self):
+        from src.exit.zones import StopZone
+
+        pos = _position(level_zero=8000.0, level_margin=8010.0)
+        zone = self._profile().current_zone(pos, 8015.0, _buffer([8000.0] * 20))
+        assert zone is StopZone.BREAKEVEN_BAND
+
+    def test_above_profit_trigger_is_profit(self):
+        from src.exit.zones import StopZone
+
+        pos = _position(level_zero=8000.0, level_margin=8010.0)
+        zone = self._profile().current_zone(pos, 8025.0, _buffer([8000.0] * 20))
+        assert zone is StopZone.PROFIT
+
+    def test_no_candle_returns_none(self):
+        pos = _position(level_zero=8000.0, level_margin=8010.0)
+        empty = EpicBuffer(epic="TEST.EPIC", max_candles=10)
+        assert self._profile().current_zone(pos, 8025.0, empty) is None
+
+
 class TestComposition:
     def test_get_close_profile_builds_the_composer(self):
         prof = get_close_profile(_settings())

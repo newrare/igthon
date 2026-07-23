@@ -1,20 +1,25 @@
-"""Zone 1 updater — the bid is at or below break-even.
+"""Zone 1 updaters — the bid is at or below break-even.
 
-Current behaviour: **hold the initial protective stop untouched**. The stop
-posted at open is never lowered and never nudged while the trade is underwater;
-it is left to the broker to fill it if price falls that far. This preserves the
-profit-gated profile's rule of not touching the stop until the trade is genuinely
-in profit.
+Two updaters live here, selected by ``CLOSE_ZONESTART``:
 
-This is deliberately a clean extension point: an underwater-management scenario
-(e.g. steering the stop by the trend since open) would live here without
-touching the break-even-band or profit-trailing zones.
+- :class:`UnderwaterStop` (``hold``) — **hold the initial protective stop
+  untouched**. The stop posted at open is never lowered and never nudged while
+  the trade is underwater; it is left to the broker to fill it if price falls
+  that far. This preserves the profit-gated profile's rule of not touching the
+  stop until the trade is genuinely in profit.
+- :class:`UnderwaterTrendCutStop` (``trendcut``) — **tighten the stop toward
+  break-even once the move since open is a clean, confirmed adverse trend**, so a
+  trade that is demonstrably wrong is cut for a fraction of the planned risk
+  instead of riding the full initial stop down to ``-1R``. A choppy, directionless
+  drift leaves the wide initial stop in place (that stop's whole job is to survive
+  noise), so this only ever bites the monotone straight-to-stop losers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.core.indicators import efficiency_ratio, linear_regression
 from src.exit.zones.base import StopContext, StopUpdater
 
 
@@ -26,3 +31,84 @@ class UnderwaterStop(StopUpdater):
 
     def propose(self, ctx: StopContext) -> float | None:
         return None
+
+
+@dataclass
+class UnderwaterTrendCutStop(StopUpdater):
+    """Tighten the stop toward break-even on a clean, confirmed adverse trend.
+
+    While the bid is underwater (``bid <= level_zero``) the initial stop normally
+    holds untouched (:class:`UnderwaterStop`) and a trade that goes straight
+    against the entry rides it all the way down to the full planned risk. That
+    monotone straight-to-stop path is the single largest source of realised
+    losses — and it is exactly the case where holding the wide stop adds no value,
+    because the market is not oscillating around the entry, it is leaving it.
+
+    This updater cuts that path short. Once the move since open is a **clean,
+    directional down-trend** it raises the stop to a fraction of the initial risk
+    below break-even, so the loser is closed near ``-cut_fraction × R`` instead of
+    ``-1R``. Two independent gates keep it off ordinary noise:
+
+    - **direction** — the least-squares slope of the bid closes since open must be
+      negative (price is genuinely lower than it opened, not merely wobbling);
+    - **cleanliness** — the Kaufman efficiency ratio over the same window must be
+      at least :attr:`er_min`. A choppy, mean-reverting drift (``ER`` low) is left
+      on the wide initial stop, which exists precisely to survive that noise; only
+      a decisive one-way move (``ER`` high) is cut. A trade that first ran up and
+      then reversed scores a low ``ER`` here (small net move over a long path), so
+      it too keeps the wide stop rather than being knifed on the pull-back.
+
+    The tightened stop is placed at ``level_zero − cut_fraction × R`` (with ``R =
+    level_zero − initial_stop``), but never **above the live bid** — a broker stop
+    cannot sit through the market, so when the bid has already fallen past that
+    level the stop is parked one spread under the bid (an all-but-immediate cut).
+    The move is **up-only**: it never lowers the stop, and it does nothing once the
+    follower already sits at or above break-even (a prior excursion locked a level
+    there and its own backstop governs), so it can only ever *reduce* a loss.
+    """
+
+    name = "trendcut"
+
+    #: Minimum bid closes since open before a cut is considered — enough of a
+    #: window to trust the slope/ER read rather than react to the first few ticks.
+    min_ticks: int = 15
+    #: Minimum efficiency ratio of the since-open window that qualifies the move as
+    #: a clean one-way trend (below this the drift is treated as noise and held).
+    er_min: float = 0.5
+    #: Where the tightened stop sits, as a fraction of the initial risk below
+    #: break-even. ``0.5`` cuts the loser at roughly half the planned ``-1R``.
+    cut_fraction: float = 0.5
+
+    def propose(self, ctx: StopContext) -> float | None:
+        # Initial risk in price terms (break-even down to the initial stop). A
+        # follower at or above break-even means a prior excursion already locked a
+        # level there — nothing to tighten, its own backstop governs.
+        risk = ctx.level_zero - ctx.level_follower
+        if risk <= 0:
+            return None
+
+        closes = ctx.buf.bid_closes
+        if len(closes) < self.min_ticks + 1:
+            return None
+
+        # Direction gate: the move since open must genuinely be lower, not wobbling.
+        if linear_regression(closes).slope >= 0:
+            return None
+
+        # Cleanliness gate: only a decisive one-way move is cut; choppy drift keeps
+        # the wide initial stop that exists to survive exactly that noise.
+        if efficiency_ratio(closes, len(closes) - 1) < self.er_min:
+            return None
+
+        cut_level = ctx.level_zero - self.cut_fraction * risk
+        # Never sit the stop through the market: when the bid has already fallen
+        # past the cut level, park it one spread under the bid (all-but-immediate
+        # cut) rather than returning a level a broker stop could not hold.
+        target = min(cut_level, ctx.current_bid - ctx.spread)
+
+        # Up-only. The composer applies the returned level verbatim, so refusing to
+        # lower (or merely re-post) the stop is this updater's own responsibility.
+        if target <= ctx.level_follower:
+            return None
+
+        return target

@@ -237,7 +237,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=7">
+    <link rel="stylesheet" href="/static/style.css?v=9">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -309,6 +309,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <div class="section">
         <div class="section-header" data-sid="day">
             <span class="section-title"><i data-lucide="calendar-days" class="lc-icon"></i> Daily History</span>
+            <button class="section-action" title="Resync from IG realized P&amp;L (last 30 days)" onclick="event.stopPropagation(); resyncDayHistory(this)"><i data-lucide="refresh-cw" class="lc-icon"></i> Resync</button>
             <span class="section-refresh">updated <span id="refresh-day">—</span></span>
             <button class="section-toggle">&#8722;</button>
         </div>
@@ -400,6 +401,6 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=27"></script>
+<script src="/static/dashboard.js?v=31"></script>
 </body>
 </html>"""

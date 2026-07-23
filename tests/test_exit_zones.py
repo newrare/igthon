@@ -21,6 +21,7 @@ from src.exit.zones import (
     StopZone,
     TrailingRatchetStop,
     UnderwaterStop,
+    UnderwaterTrendCutStop,
     classify_zone,
 )
 from src.feed.price_buffer import Candle, EpicBuffer
@@ -112,6 +113,106 @@ class TestHoldingZones:
             level_follower=7950.0,
         )
         assert BreakevenBandStop().propose(ctx) is None
+
+
+class TestUnderwaterTrendCut:
+    # Initial risk R = level_zero - level_follower. With level_zero=8000 and
+    # level_follower=7950, R=50, so the default cut_fraction=0.5 tightens the stop
+    # to 8000 - 25 = 7975 (roughly -0.5R) once a clean adverse trend is confirmed.
+
+    def _falling_buffer(self) -> EpicBuffer:
+        # A clean, monotone downtrend since open: slope < 0 and ER ≈ 1.
+        return _buffer([8000.0 - i for i in range(20)])
+
+    def test_tightens_to_half_risk_on_a_clean_downtrend(self):
+        buf = self._falling_buffer()
+        ctx = _ctx(
+            buf,
+            current_bid=7980.0,  # underwater, still above the 7975 cut level
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        # Raised from 7950 to the -0.5R level (7975), below the live bid: it waits
+        # there and cuts the loser at half the planned risk if price keeps falling.
+        assert UnderwaterTrendCutStop().propose(ctx) == pytest.approx(7975.0)
+
+    def test_parks_under_the_bid_when_price_fell_past_the_cut_level(self):
+        buf = self._falling_buffer()
+        ctx = _ctx(
+            buf,
+            current_bid=7972.0,  # already below the 7975 cut level
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        # The stop cannot sit through the market, so it is parked one spread under
+        # the bid (all-but-immediate cut) rather than at the unreachable cut level.
+        result = UnderwaterTrendCutStop().propose(ctx)
+        assert result == pytest.approx(7972.0 - buf.last.spread)
+        assert result < ctx.current_bid
+
+    def test_holds_the_wide_stop_on_a_choppy_drift(self):
+        # A sawtooth that drifts down slightly: slope < 0 but ER is low (small net
+        # move over a long zigzag path) — noise, not a trend, so the stop holds.
+        closes = [8000.0 - 0.4 * i + (6.0 if i % 2 else -6.0) for i in range(20)]
+        buf = _buffer(closes)
+        ctx = _ctx(
+            buf,
+            current_bid=7985.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert UnderwaterTrendCutStop().propose(ctx) is None
+
+    def test_holds_when_the_move_is_not_downward(self):
+        buf = _buffer([7960.0 + i for i in range(20)])  # rising since open
+        ctx = _ctx(
+            buf,
+            current_bid=7995.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert UnderwaterTrendCutStop().propose(ctx) is None
+
+    def test_holds_with_too_few_ticks(self):
+        buf = _buffer([8000.0 - i for i in range(10)])  # < min_ticks + 1
+        ctx = _ctx(
+            buf,
+            current_bid=7980.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert UnderwaterTrendCutStop().propose(ctx) is None
+
+    def test_does_nothing_once_the_follower_is_at_break_even(self):
+        # A prior excursion already locked a level at/above break-even; there is no
+        # underwater risk left to tighten, so this updater stands aside.
+        buf = self._falling_buffer()
+        ctx = _ctx(
+            buf,
+            current_bid=7990.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8005.0,
+        )
+        assert UnderwaterTrendCutStop().propose(ctx) is None
+
+    def test_never_lowers_the_stop(self):
+        # Clean downtrend, but the cut level sits below the current follower — the
+        # up-only guard refuses to re-post a lower stop.
+        buf = self._falling_buffer()
+        ctx = _ctx(
+            buf,
+            current_bid=7980.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7990.0,
+        )
+        assert UnderwaterTrendCutStop().propose(ctx) is None
 
 
 class TestBreakevenLock:

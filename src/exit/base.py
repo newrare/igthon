@@ -118,3 +118,15 @@ class CloseProfile(ABC):
         self, position, current_bid: float, buf: EpicBuffer, *, is_close_hour: bool
     ) -> CloseDecision:
         """Decide what to do with an open position on this tick."""
+
+    def current_zone(self, position, current_bid: float, buf: EpicBuffer):
+        """Which price zone the live bid sits in, or ``None`` if not applicable.
+
+        Powers the dashboard's manual stop-raise "hold": the zone the bid is in
+        when the user places a stop is captured, and the automatic ratcheting is
+        held until the bid crosses into a different zone. Profiles that split the
+        price axis into zones (see :mod:`src.exit.zones`) override this; the base
+        returns ``None`` (no zone concept — the manual stop is set once and the
+        normal ratchet invariant takes over).
+        """
+        return None

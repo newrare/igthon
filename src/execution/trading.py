@@ -753,6 +753,9 @@ class TradingService:
             level_security=Decimal(str(round(broker_stop, 5))),
             level_stop=Decimal(str(round(broker_stop, 5))),
             level_margin=Decimal(str(round(levels.level_margin, 5))),
+            # Padded IG minimum stop distance (price), reused to clamp every
+            # later broker-stop ratchet so it is never rejected as too close.
+            min_stop_distance=Decimal(str(round(min_stop_price, 5))),
             pip_spread=Decimal(str(round(levels.spread, 5))),
             quantity=quantity,
             size=int(round(stop_price_distance * scaling_factor)),
@@ -1008,6 +1011,9 @@ class TradingService:
             level_security=Decimal(str(round(broker_stop, 5))),
             level_stop=Decimal(str(round(broker_stop, 5))),
             level_margin=Decimal(str(round(plan.level_margin, 5))),
+            # Padded IG minimum stop distance (price), reused to clamp every
+            # later broker-stop ratchet so it is never rejected as too close.
+            min_stop_distance=Decimal(str(round(min_stop_price, 5))),
             pip_spread=Decimal(str(round(last.spread, 5))),
             quantity=quantity,
             size=int(round(stop_price_distance * scaling_factor)),
@@ -1804,6 +1810,11 @@ class TradingService:
                 version=2,
                 priority=Priority.HIGH,
                 label=f"confirm vanished {position.epic}",
+                # A 404 here is the definitive, expected confirmation that the
+                # deal is gone (see below) — not a failure. Flag it so both the
+                # queue and the client log it at WARNING, not ERROR, and keep it
+                # out of the persistent error log / guard.
+                expect_not_found=True,
             )
         except IGAPIError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -1917,8 +1928,31 @@ class TradingService:
             buf,
             is_close_hour=await self._is_epic_close_hour(position.epic),
         )
+        # A hard close (backstop / end-of-day) is always honoured, even while a
+        # manual stop override is active — the user's placed stop IS the follower
+        # the backstop fires on.
         if decision.action == ACTION_CLOSE:
             return await self._close_position(position, current_bid, decision.reason)
+
+        # Manual stop override (dashboard chart buttons): while the bid stays in
+        # the zone the stop was raised in, hold it and suspend automatic
+        # ratcheting; resume automatic management the moment the bid crosses into
+        # a different zone. A missing/unclassifiable zone keeps holding (never
+        # clears on a transient blip), so the override only releases on a
+        # definite zone change.
+        manual_zone = getattr(position, "manual_stop_zone", None)
+        if manual_zone:
+            zone = profile.current_zone(position, current_bid, buf)
+            if zone is None or zone.value == manual_zone:
+                return False
+            position.manual_stop_zone = None
+            await self._db.commit()
+            logger.info(
+                "Manual stop hold released for %s (bid left zone %s) — auto resumes",
+                position.epic,
+                manual_zone,
+            )
+
         if (
             decision.action == ACTION_UPDATE_STOP
             and decision.new_stop_level is not None
@@ -1936,22 +1970,16 @@ class TradingService:
                 position.direction, new_stop, current
             ):
                 return False
-            # The broker stop rests one spread beyond the software follower (live
-            # spread at push time), so the app-side stop is hit first between two
-            # bid polls and the broker order only fires as a deeper safety net.
-            broker_stop = self._broker_stop_level(
-                position.direction, new_stop, float(buf.last.spread or 0)
+            # Advance the follower and push the matching broker stop — clamped to
+            # IG's minimum-distance floor and only persisted on acceptance (see
+            # :meth:`_ratchet_stop`).
+            await self._ratchet_stop(
+                position, new_stop, current_bid, float(buf.last.spread or 0)
             )
-            position.level_follower = Decimal(str(round(new_stop, 5)))
-            position.stop_update = (position.stop_update or 0) + 1
-            self._append_stop_history(position, new_stop, broker_stop)
-            await self._push_stop_to_ig(position, broker_stop)
-            await self._db.commit()
             logger.debug(
-                "Trailing stop for %s -> %.3f (broker %.3f, profile=%s)",
+                "Trailing stop for %s -> %.3f (profile=%s)",
                 position.epic,
                 new_stop,
-                broker_stop,
                 profile.name,
             )
         return False
@@ -2044,26 +2072,17 @@ class TradingService:
         if new_stop is None:
             return
 
-        # 5 dp to match the level column and stop_history: a coarser round would
-        # drop the 4th/5th digit on forex (e.g. 1.62413 → 1.624) and let the next
-        # tick's guard compare against a stop up to ~5 points below the real one,
-        # which then reads as the follower stepping *down* on the chart.
-        # The broker stop rests one spread beyond the software follower (live
-        # spread at push time), so the app-side stop is hit first between two bid
-        # polls and the broker order only fires as a deeper safety net.
-        broker_stop = self._broker_stop_level(
-            position.direction, new_stop, float(buf.last.spread or 0)
+        # Advance the follower and push the matching broker stop — clamped to
+        # IG's minimum-distance floor and only persisted on acceptance (see
+        # :meth:`_ratchet_stop`). 5 dp rounding there matches the level column and
+        # stop_history so the next tick's guard compares against the real level.
+        await self._ratchet_stop(
+            position, new_stop, current_bid, float(buf.last.spread or 0)
         )
-        position.level_follower = Decimal(str(round(new_stop, 5)))
-        position.stop_update = (position.stop_update or 0) + 1
-        self._append_stop_history(position, new_stop, broker_stop)
-        await self._push_stop_to_ig(position, broker_stop)
-        await self._db.commit()
         logger.debug(
-            "Trailing stop for %s -> %.3f (broker %.3f, ATR=%.3f)",
+            "Trailing stop for %s -> %.3f (ATR=%.3f)",
             position.epic,
             new_stop,
-            broker_stop,
             atr_value,
         )
 
@@ -2108,6 +2127,99 @@ class TradingService:
             return software_stop + spread
         return software_stop - spread
 
+    @staticmethod
+    def _clamp_broker_stop_to_min_distance(
+        direction: str | None,
+        broker_level: float,
+        current_price: float,
+        position: Position,
+    ) -> float:
+        """Pull the broker stop back onto IG's minimum-distance floor if needed.
+
+        IG rejects a stop posted closer than ``minNormalStopOrLimitDistance``
+        from the current price ("Stop trop près"), and the swallowed rejection
+        then leaves the previous, far broker order live. ``min_stop_distance`` is
+        that floor (padded, price units) captured at open. When the desired
+        broker level sits inside the floor, move it out to the floor — the
+        deepest still-accepted level. Returned unchanged when the floor is
+        unknown (adopted/legacy rows) or the level is already outside it.
+        """
+        min_dist = float(position.min_stop_distance or 0)
+        if min_dist <= 0:
+            return broker_level
+        if direction == "SELL":
+            # A short's stop sits ABOVE price: keep it at least min_dist above.
+            return max(broker_level, current_price + min_dist)
+        # A long's stop sits BELOW price: keep it at least min_dist below.
+        return min(broker_level, current_price - min_dist)
+
+    async def _ratchet_stop(
+        self,
+        position: Position,
+        new_stop: float,
+        current_price: float,
+        spread: float,
+    ) -> bool:
+        """Advance the software follower and push the matching broker stop to IG.
+
+        The broker stop rests one spread beyond the follower (a deeper safety
+        net), clamped so it never sits inside IG's minimum-distance floor — the
+        tightest level IG still accepts. The persisted broker levels
+        (``level_stop`` / ``level_security``) and the chart's broker ("Loose")
+        point advance ONLY when IG accepts the push; on a rejection they keep the
+        last accepted level, so the broker line always reflects the order truly
+        resting at IG. The software follower advances either way — it is the
+        local guard that closes the position between bid polls.
+
+        Returns True when IG accepted the pushed broker stop.
+        """
+        direction = position.direction
+        broker_target = self._broker_stop_level(direction, new_stop, spread)
+        broker_target = self._clamp_broker_stop_to_min_distance(
+            direction, broker_target, current_price, position
+        )
+        # Broker stop is raise-only, mirroring the follower: never loosen a level
+        # already resting at IG (the clamp above can pull it back on a shrinking
+        # cushion, but a previously accepted, further level must stand).
+        last_broker = float(position.level_stop or 0)
+        if last_broker > 0 and not self._is_favourable_stop_move(
+            direction, broker_target, last_broker
+        ):
+            broker_target = last_broker
+
+        position.level_follower = Decimal(str(round(new_stop, 5)))
+        position.stop_update = (position.stop_update or 0) + 1
+
+        # Nothing to push when the broker level is unchanged (the follower crept
+        # up but the min-distance floor pinned the broker stop): advance the
+        # software follower and record the flat broker step without an IG call.
+        if last_broker > 0 and round(last_broker, 5) == round(broker_target, 5):
+            self._append_stop_history(position, new_stop, last_broker)
+            await self._db.commit()
+            return True
+
+        pushed = await self._push_stop_to_ig(position, broker_target)
+        if pushed:
+            position.level_stop = Decimal(str(round(broker_target, 5)))
+            position.level_security = Decimal(str(round(broker_target, 5)))
+            accepted_broker = broker_target
+        else:
+            # Push refused (e.g. price drifted inside the floor between read and
+            # landing): keep the last accepted broker level so the chart's Loose
+            # line stays truthful; the software follower still guards locally.
+            accepted_broker = float(position.level_stop or broker_target)
+            logger.warning(
+                "IG rejected the stop update for %s (follower->%.5f, broker "
+                "target %.5f); broker stop stays at last accepted %.5f",
+                position.epic,
+                new_stop,
+                broker_target,
+                accepted_broker,
+            )
+        self._append_stop_history(position, new_stop, accepted_broker)
+        await self._db.commit()
+        return pushed
+
     def _clamp_trailing_distance(
         self, raw_distance: float, position: Position, spread: float
     ) -> float:
@@ -2119,17 +2231,25 @@ class TradingService:
             euro_stop=abs(float(position.euro_stop or 0)),
         )
 
-    async def _push_stop_to_ig(self, position: Position, stop_level: float) -> None:
+    async def _push_stop_to_ig(
+        self, position: Position, stop_level: float, *, label: str | None = None
+    ) -> bool:
         """Send the new stop level to IG via PUT /positions/otc/{dealId}.
 
         Uses URGENT priority so the write jumps ahead of price-collection reads.
         Failures are logged but not raised: the local ``level_follower`` still
-        guards the position through ``check_and_close``.
+        guards the position through ``check_and_close``. Returns True when the PUT
+        was accepted by IG, False when it could not be pushed (no dealId or an IG
+        rejection) so a caller can surface the outcome — the automated trailing
+        path ignores the result, the manual raise reports it to the dashboard.
+
+        ``label`` overrides the queue task label so a manual raise is
+        distinguishable from an automatic trail in the API-queue view.
         """
         deal_id = await self._ensure_deal_id(position, f"trail {position.epic}")
         if not deal_id:
             logger.warning("Cannot push trailing stop for %s: no dealId", position.epic)
-            return
+            return False
 
         payload = {
             # 5 dp, matching the open order (``round(stop_level, 5)``) and the
@@ -2146,10 +2266,12 @@ class TradingService:
                 payload,
                 version=2,
                 priority=Priority.URGENT,
-                label=f"trail {position.epic}: stop->{stop_level:.5f}",
+                label=label or f"trail {position.epic}: stop->{stop_level:.5f}",
             )
         except IGAPIError as exc:
             logger.warning("Failed to update IG stop for %s: %s", position.epic, exc)
+            return False
+        return True
 
     async def _ensure_deal_id(self, position: Position, label: str) -> str | None:
         """Return the position's dealId, resolving it from IG's list if missing."""
@@ -2174,6 +2296,98 @@ class TradingService:
                     await self._db.commit()
                 return deal_id
         return None
+
+    async def raise_stop_manually(
+        self,
+        position: Position,
+        target_level: float,
+        buf: EpicBuffer | None,
+        *,
+        profile: CloseProfile | None = None,
+    ) -> tuple[bool, str]:
+        """Manually raise the protective stop to an absolute level (dashboard).
+
+        Triggered by the chart's stop buttons: the user picks a price on the
+        chart's scale and both the **software follower** (the level the bot closes
+        on) and the **broker stop** (posted one spread beyond it, see
+        :meth:`_broker_stop_level`) are moved to it. The move is raise-only — a
+        long's stop may only go up, a short's only down — and must stay on the
+        safe side of the live bid so it does not force an immediate exit.
+
+        The zone the bid sits in *now* is captured into
+        ``position.manual_stop_zone`` so :meth:`manage_position` holds this stop
+        (suspending automatic ratcheting) until the bid crosses into a different
+        zone.
+
+        Returns ``(ok, message)`` — ``message`` is an error reason when refused.
+        """
+        if buf is None or buf.last is None:
+            return False, "No price data for this epic"
+        current_bid = buf.last.bid_close
+        direction = position.direction or "BUY"
+        current = float(position.level_follower or 0)
+
+        if direction == "SELL":
+            if target_level <= current_bid:
+                return False, "Stop must be above the current bid for a short"
+            if current > 0 and target_level >= current:
+                return False, "Stop can only be tightened (moved down for a short)"
+        else:
+            if target_level >= current_bid:
+                return False, "Stop must be below the current bid"
+            if current > 0 and target_level <= current:
+                return False, "Stop can only be raised"
+
+        spread = float(buf.last.spread or 0)
+        broker_stop = self._broker_stop_level(direction, target_level, spread)
+        broker_stop = self._clamp_broker_stop_to_min_distance(
+            direction, broker_stop, current_bid, position
+        )
+
+        position.level_follower = Decimal(str(round(target_level, 5)))
+        position.stop_update = (position.stop_update or 0) + 1
+
+        # Capture the zone so the automatic ratcheting stays suspended until the
+        # bid leaves it (see manage_position). None when the profile has no zone
+        # concept — the stop is then simply set once and the ratchet invariant
+        # takes over on the next tick.
+        zone = (
+            profile.current_zone(position, current_bid, buf)
+            if profile is not None
+            else None
+        )
+        position.manual_stop_zone = zone.value if zone is not None else None
+
+        # Route the broker update through the API queue (URGENT), labelled as a
+        # manual raise so it is identifiable in the queue view. The software
+        # follower is already persisted, so a rejected/blocked broker push still
+        # leaves the bot closing on the raised stop; we surface the outcome so the
+        # dashboard notification says whether IG accepted it. The persisted broker
+        # levels and the chart's Loose point advance only on acceptance, so the
+        # violet line never shows a stop IG never took.
+        pushed = await self._push_stop_to_ig(
+            position,
+            broker_stop,
+            label=f"manual stop {position.epic}: stop->{broker_stop:.5f}",
+        )
+        if pushed:
+            position.level_stop = Decimal(str(round(broker_stop, 5)))
+            position.level_security = Decimal(str(round(broker_stop, 5)))
+            accepted_broker = broker_stop
+        else:
+            accepted_broker = float(position.level_stop or broker_stop)
+        self._append_stop_history(position, target_level, accepted_broker)
+        await self._db.commit()
+        logger.info(
+            "Manual stop raise for %s -> %.5f (broker %.5f, zone=%s, ig_ok=%s)",
+            position.epic,
+            target_level,
+            broker_stop,
+            position.manual_stop_zone or "—",
+            pushed,
+        )
+        message = "ok" if pushed else "queued (broker update not confirmed by IG)"
+        return True, message
 
     async def close_manually(self, position: Position, close_level: float) -> bool:
         """Force-close ``position`` now at ``close_level`` (dashboard manual close).

@@ -396,6 +396,11 @@ def _trade_overlay(p: Position) -> dict:
         # Profit reference line above break-even: +10 € (euro-based), on the bid
         # curve. The +3 % line is derived client-side from the chart range.
         "profit10": profit10,
+        # Euro value of one full point of price movement for the whole position
+        # (currency-converted). Lets the chart label the follower/loose stop lines
+        # of an OPEN trade with the euro P&L the position would realise if the bid
+        # reached that stop — the "potential loss" the user watches.
+        "euroPerPoint": epp,
         "close": close_line,
         # Close reason — lets the chart flag an *estimated* exit (the position
         # vanished from IG and the close level/time were derived, not a captured
@@ -468,7 +473,39 @@ async def api_chart(request: Request, epic: str) -> JSONResponse:
             )
             trades = [_trade_overlay(p) for p in rows]
 
-    return JSONResponse({"epic": epic, "candles": candles, "trades": trades})
+    # Pre-open ("global") chart: no trade was taken on this epic today, so there
+    # are no real position indicators to draw. Instead project — very discreetly,
+    # client-side — where break-even / margin / profit *would* sit if a BUY were
+    # opened right now, so the user can gauge the levels a fresh position would
+    # need to reach. Computed with the live close profile's ``initial_plan`` (the
+    # exact math used at a real open) against the in-memory buffer. Omitted once
+    # any trade exists — those charts keep the real, frozen indicators instead.
+    projection: dict | None = None
+    if not trades:
+        scheduler = getattr(request.app.state, "scheduler", None)
+        profile = getattr(scheduler, "close_profile", None) if scheduler else None
+        buf = request.app.state.buffer.get(epic)
+        if profile is not None and buf is not None and buf.last is not None:
+            try:
+                plan = profile.initial_plan(
+                    entry_level=buf.last.offer_close, direction="BUY", buf=buf
+                )
+                zero = float(plan.level_zero)
+                margin = float(plan.level_margin)
+                projection = {
+                    "zero": zero,
+                    "margin": margin,
+                    # Profit trigger — one further noise margin above the margin
+                    # line (2 × margin − break-even), mirroring the live evaluate().
+                    "profitTrigger": margin + (margin - zero),
+                    "direction": "BUY",
+                }
+            except Exception as exc:  # pragma: no cover - projection is best-effort
+                logger.debug("Chart projection failed for %s: %s", epic, exc)
+
+    return JSONResponse(
+        {"epic": epic, "candles": candles, "trades": trades, "projection": projection}
+    )
 
 
 @router.get("/api/ig-guard")
@@ -593,6 +630,27 @@ async def wallet_resync(request: Request) -> JSONResponse:
             "used": _to_float_or_none(balance.get("deposit")),
         }
     )
+
+
+@router.post("/api/day-history/resync")
+async def day_history_resync(request: Request) -> JSONResponse:
+    """Rebuild the Daily History table from IG's authoritative P&L.
+
+    Loops the last 30 days that hold closed positions, re-reading
+    ``GET /history/transactions`` per day to pull each deal's real
+    ``profitAndLoss``, and upserts every Day summary from the corrected figures.
+    Awaited (not fire-and-forget) so the button can report how many days and
+    positions were corrected.
+    """
+    scheduler = request.app.state.scheduler
+    if not scheduler:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    try:
+        summary = await scheduler.trigger_resync_day_history()
+    except Exception as exc:
+        logger.warning("Day history resync failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(summary)
 
 
 @router.get("/api/positions/funds/{epic}")
@@ -821,6 +879,68 @@ async def close_position_manual(request: Request, position_id: int) -> JSONRespo
                 "epic": position.epic,
                 "level": close_level,
                 "pnl": round(euro_pnl, 2),
+            }
+        )
+
+
+@router.post("/api/positions/stop/{position_id}")
+async def raise_stop_manual(request: Request, position_id: int) -> JSONResponse:
+    """Manually raise an open position's protective stop from the chart buttons.
+
+    Body: ``{"level": <absolute price>}`` — the price picked on the chart's scale.
+    Moves both the software follower and the broker stop to it (raise-only, on the
+    safe side of the live bid) and pins it there until the bid changes zone. See
+    :meth:`TradingService.raise_stop_manually`.
+    """
+    api_queue = getattr(request.app.state, "api_queue", None)
+    session_factory = getattr(request.app.state, "session_factory", None)
+    scheduler = getattr(request.app.state, "scheduler", None)
+    settings = request.app.state.settings
+    buffer = request.app.state.buffer
+
+    if not api_queue or not session_factory:
+        return JSONResponse({"error": "Trading not available"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    level = _to_float_or_none(body.get("level"))
+    if level is None:
+        return JSONResponse({"error": "Missing or invalid 'level'"}, status_code=400)
+
+    async with session_factory() as session:
+        position = await session.get(Position, position_id)
+        if not position:
+            return JSONResponse({"error": "Position not found"}, status_code=404)
+        if position.state != PositionState.OPEN:
+            return JSONResponse({"error": "Position is not open"}, status_code=400)
+
+        buf = buffer.get(position.epic)
+        config = TradeConfig.from_settings(settings)
+        close_profile = scheduler.close_profile if scheduler is not None else None
+        trading = TradingService(
+            api_queue, session, config, close_profile=close_profile
+        )
+        try:
+            ok, message = await trading.raise_stop_manually(
+                position, level, buf, profile=close_profile
+            )
+        except Exception as exc:
+            logger.error("Manual stop raise failed for %s: %s", position.epic, exc)
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        if not ok:
+            return JSONResponse({"error": message}, status_code=400)
+
+        return JSONResponse(
+            {
+                "status": "raised",
+                "epic": position.epic,
+                "level": float(position.level_follower or level),
+                "zone": position.manual_stop_zone,
+                # "ok" when IG confirmed the broker push, otherwise a note that
+                # the software stop is set but the broker update was not confirmed.
+                "detail": message,
             }
         )
 

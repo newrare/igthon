@@ -7,7 +7,11 @@ import pytest
 import respx
 from httpx import Response
 
-from src.core.api.client import IGAPIError, IGClient
+from src.core.api.client import (
+    MARKET_ORDER_NOT_SUPPORTED_CODE,
+    IGAPIError,
+    IGClient,
+)
 from src.core.api.session import IGSession, OAuthToken
 from src.core.config import Settings
 
@@ -257,6 +261,93 @@ async def test_expect_not_found_flag_only_downgrades_404(settings):
             await client.get("/confirms/REF", version=1, expect_not_found=True)
 
     # A 500 is a genuine error even with expect_not_found set.
+    error_log.record.assert_called_once()
+    guard.on_ig_error.assert_called_once()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_expect_market_order_rejection_warns_and_skips_guard_and_log(
+    settings, caplog
+):
+    """A MARKET_ORDER_NOT_SUPPORTED_CODE rejection flagged as expected still raises
+    but logs at WARNING and is kept out of the persistent error log / guard — the
+    caller recovers by retrying as a marketable LIMIT."""
+    respx.post("https://demo-api.ig.com/gateway/deal/session").mock(
+        return_value=Response(
+            200,
+            json={
+                "oauthToken": {
+                    "access_token": "test_access",
+                    "refresh_token": "test_refresh",
+                    "token_type": "Bearer",
+                    "scope": "profile",
+                    "expires_in": "1800",
+                },
+            },
+        )
+    )
+    respx.post("https://demo-api.ig.com/gateway/deal/positions/otc").mock(
+        return_value=Response(400, json={"errorCode": MARKET_ORDER_NOT_SUPPORTED_CODE})
+    )
+
+    error_log = MagicMock()
+    guard = MagicMock()
+    guard.pre_request = AsyncMock()
+    async with IGClient(settings, error_log=error_log, guard=guard) as client:
+        with caplog.at_level(logging.WARNING, logger="src.core.api.client"):
+            with pytest.raises(IGAPIError):
+                await client.post(
+                    "/positions/otc",
+                    {"orderType": "MARKET"},
+                    version=2,
+                    expect_market_order_rejection=True,
+                )
+
+    # Logged, but at WARNING — never ERROR.
+    records = [r for r in caplog.records if "/positions/otc" in r.getMessage()]
+    assert records and all(r.levelno == logging.WARNING for r in records)
+    # Expected outcome: kept out of the persistent error log and away from the guard.
+    error_log.record.assert_not_called()
+    guard.on_ig_error.assert_not_called()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_expect_market_order_rejection_only_downgrades_matching_code(settings):
+    """The flag only tolerates MARKET_ORDER_NOT_SUPPORTED_CODE — any other error
+    on the same call is still recorded/reported normally."""
+    respx.post("https://demo-api.ig.com/gateway/deal/session").mock(
+        return_value=Response(
+            200,
+            json={
+                "oauthToken": {
+                    "access_token": "test_access",
+                    "refresh_token": "test_refresh",
+                    "token_type": "Bearer",
+                    "scope": "profile",
+                    "expires_in": "1800",
+                },
+            },
+        )
+    )
+    respx.post("https://demo-api.ig.com/gateway/deal/positions/otc").mock(
+        return_value=Response(400, json={"errorCode": "error.trading.otc.insufficient"})
+    )
+
+    error_log = MagicMock()
+    guard = MagicMock()
+    guard.pre_request = AsyncMock()
+    async with IGClient(settings, error_log=error_log, guard=guard) as client:
+        with pytest.raises(IGAPIError):
+            await client.post(
+                "/positions/otc",
+                {"orderType": "MARKET"},
+                version=2,
+                expect_market_order_rejection=True,
+            )
+
+    # A different error code is a genuine error even with the flag set.
     error_log.record.assert_called_once()
     guard.on_ig_error.assert_called_once()
 

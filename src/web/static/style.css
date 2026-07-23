@@ -325,6 +325,30 @@ a.kpi-tile:hover {
 .section-body { padding: 1.25rem; }
 .section-body.collapsed { display: none; }
 
+/* ── Section header action button (e.g. Daily History "Resync") ─── */
+.section-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-left: 0.75rem;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  padding: 0.15rem 0.5rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.section-action:hover:not(:disabled) { background: var(--border); color: var(--text); }
+.section-action:disabled { opacity: 0.6; cursor: default; }
+.section-action .lc-icon { width: 13px; height: 13px; }
+.section-action.spinning .lc-icon { animation: kpi-spin 0.7s linear infinite; }
+
 /* ── "Last refresh" timestamps (live polling) ───────────────── */
 .section-refresh {
   margin-left: auto;
@@ -1049,4 +1073,44 @@ footer {
   padding: 0.25rem 0.6rem;
   border-radius: 4px;
   pointer-events: none;
+}
+
+/* Right-edge stop buttons (every 5 % of the scale), shown only for open
+   positions. The container spans the plot's right gutter and lets clicks fall
+   through the gaps to the chart; only the buttons capture pointer events. Each
+   button's ``top`` is set inline by JS to align with its price on the scale. */
+#chart-stop-buttons {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 46px;
+  height: 100%;
+  z-index: 4;
+  pointer-events: none;
+}
+.chart-stop-btn {
+  position: absolute;
+  right: 3px;
+  transform: translateY(-50%);
+  pointer-events: auto;
+  width: 40px;
+  height: 15px;
+  padding: 0;
+  font-size: 0.6rem;
+  line-height: 1;
+  border: 1px solid #4a3a30;
+  background: rgba(28, 23, 20, 0.72);
+  color: #94a3b8;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.chart-stop-btn:hover {
+  background: #ef4444;
+  border-color: #ef4444;
+  color: #fff;
+}
+.chart-stop-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }

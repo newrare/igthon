@@ -34,6 +34,7 @@ from enum import IntEnum, StrEnum
 from itertools import count
 from typing import TYPE_CHECKING
 
+from src.core.api.client import MARKET_ORDER_NOT_SUPPORTED_CODE
 from src.core.api_guard import _QUOTA_EXCEEDED_CODES
 from src.core.recorder import log_api_error
 
@@ -43,14 +44,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# IG rejects ``orderType: "MARKET"`` on epics that only accept working/limit
-# orders (typically forwards) with this error code. The caller (the open path)
-# recovers by retrying as a marketable LIMIT, so a queued call flagged
-# ``expect_market_order_rejection`` treats this specific abandonment as an
+# ``MARKET_ORDER_NOT_SUPPORTED_CODE`` is the IG code for a MARKET order rejected on
+# an epic that only accepts working/limit orders (typically forwards). The caller
+# (open/close paths) recovers by retrying as a marketable LIMIT, so a queued call
+# flagged ``expect_market_order_rejection`` treats this specific abandonment as an
 # expected outcome — logged at WARNING and kept out of the persistent error log.
-MARKET_ORDER_NOT_SUPPORTED_CODE = (
-    "error.trading.otc.market-orders.not-supported-for-epic"
-)
+# It is defined in the HTTP client (the lowest layer that inspects it) and
+# re-exported here so existing ``from src.core.api_queue import ...`` imports keep
+# working.
 
 
 class Priority(IntEnum):
@@ -467,7 +468,10 @@ class APIQueue:
             )
         if call.method == "POST":
             return await self._client.post(
-                call.endpoint, call.payload or {}, version=call.version
+                call.endpoint,
+                call.payload or {},
+                version=call.version,
+                expect_market_order_rejection=call.expect_market_order_rejection,
             )
         if call.method == "PUT":
             return await self._client.put(
@@ -475,7 +479,10 @@ class APIQueue:
             )
         if call.method == "DELETE":
             return await self._client.delete(
-                call.endpoint, call.payload, version=call.version
+                call.endpoint,
+                call.payload,
+                version=call.version,
+                expect_market_order_rejection=call.expect_market_order_rejection,
             )
         raise ValueError(f"Unsupported method: {call.method}")
 

@@ -173,6 +173,28 @@ class CloseZoneProfit(CloseProfile):
             profile=self.name,
         )
 
+    def current_zone(
+        self, position, current_bid: float, buf: EpicBuffer
+    ) -> StopZone | None:
+        """Classify the live bid into a :class:`StopZone` for this position.
+
+        Uses the same open-frozen references and profit-trigger derivation as
+        :meth:`evaluate` so the manual stop-raise "hold" sees exactly the zones
+        the automatic management does. Returns ``None`` when there is no candle to
+        read a spread/ATR fallback from.
+        """
+        last = buf.last if buf is not None else None
+        if last is None:
+            return None
+        level_zero = float(position.level_zero or 0)
+        level_margin = float(getattr(position, "level_margin", 0) or 0)
+        if level_margin <= 0:
+            level_margin = level_zero + self._noise_margin(
+                atr(list(buf.candles), self.atr_period)
+            )
+        level_profit = level_margin + (level_margin - level_zero)
+        return classify_zone(current_bid, level_zero, level_profit)
+
     def evaluate(
         self, position, current_bid: float, buf: EpicBuffer, *, is_close_hour: bool
     ) -> CloseDecision:
