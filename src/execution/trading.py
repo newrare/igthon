@@ -1890,6 +1890,8 @@ class TradingService:
         position: Position,
         current_bid: float,
         buf: EpicBuffer | None = None,
+        *,
+        group_tighten: float | None = None,
     ) -> bool:
         """Decoupled close path: let the position's close profile decide.
 
@@ -1898,6 +1900,11 @@ class TradingService:
         decision to it and applies the result — close the position, ratchet the
         protective stop, or hold. Falls back to :meth:`check_and_close` when no
         close profile is wired (keeps older call sites working).
+
+        ``group_tighten`` is the pre-resolved stop level from a group-aware
+        profile's portfolio pre-pass (``smartgroup``), computed once per monitor
+        tick across the whole book and passed straight to the profile; ``None``
+        for the ordinary per-position path.
 
         Returns:
             True if the position was closed, False otherwise.
@@ -1927,6 +1934,7 @@ class TradingService:
             current_bid,
             buf,
             is_close_hour=await self._is_epic_close_hour(position.epic),
+            group_tighten=group_tighten,
         )
         # A hard close (backstop / end-of-day) is always honoured, even while a
         # manual stop override is active — the user's placed stop IS the follower

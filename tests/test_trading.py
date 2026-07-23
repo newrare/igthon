@@ -492,11 +492,17 @@ class _StubProfile:
 
     def __init__(self, new_stop: float) -> None:
         self._new_stop = new_stop
+        self.seen_group_tighten = "unset"
 
-    def evaluate(self, position, current_bid, buf, *, is_close_hour):
+    def evaluate(
+        self, position, current_bid, buf, *, is_close_hour, group_tighten=None
+    ):
         from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
 
-        return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=self._new_stop)
+        self.seen_group_tighten = group_tighten
+        # Echo the group level when provided so tests can assert it is forwarded.
+        stop = group_tighten if group_tighten is not None else self._new_stop
+        return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=stop)
 
 
 class TestManagePositionRatchet:
@@ -533,6 +539,34 @@ class TestManagePositionRatchet:
         assert float(pos.level_follower) == pytest.approx(1.62418)
         db.commit.assert_awaited()
 
+    async def test_group_tighten_is_forwarded_and_applied(self):
+        # The group pre-pass level reaches the profile and is applied up-only:
+        # 1.62450 > the current follower 1.62413, so the follower ratchets to it.
+        svc, _, db = self._svc_with_profile(_StubProfile(new_stop=0.0))
+        pos = Position(
+            epic="X", deal_id="D", direction="BUY", level_follower=Decimal("1.62413")
+        )
+        await svc.manage_position(
+            pos, current_bid=1.6250, buf=_buffer_with_atr2(), group_tighten=1.62450
+        )
+        assert svc._close_profile.seen_group_tighten == 1.62450
+        assert float(pos.level_follower) == pytest.approx(1.62450)
+        db.commit.assert_awaited()
+
+    async def test_group_tighten_below_follower_is_rejected(self):
+        # A group level that does not tighten (below the current follower) is
+        # dropped by the up-only guard, exactly like any other stop proposal.
+        svc, _, db = self._svc_with_profile(_StubProfile(new_stop=0.0))
+        pos = Position(
+            epic="X", deal_id="D", direction="BUY", level_follower=Decimal("1.62413")
+        )
+        closed = await svc.manage_position(
+            pos, current_bid=1.6250, buf=_buffer_with_atr2(), group_tighten=1.62400
+        )
+        assert closed is False
+        assert float(pos.level_follower) == pytest.approx(1.62413)  # unchanged
+        db.commit.assert_not_awaited()
+
     async def test_short_stop_is_never_raised(self):
         # Mirror for a short: the stop only ratchets down, so a higher proposal is
         # rejected. The short path routes through the recovery short profile.
@@ -559,7 +593,9 @@ class _ZoneStubProfile:
         self._new_stop = new_stop
         self._zone = zone
 
-    def evaluate(self, position, current_bid, buf, *, is_close_hour):
+    def evaluate(
+        self, position, current_bid, buf, *, is_close_hour, group_tighten=None
+    ):
         from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
 
         return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=self._new_stop)
@@ -605,9 +641,7 @@ class TestManagePositionManualHold:
 
         # The bid has crossed into a different zone: the override is cleared and
         # the auto proposal (a higher stop) is applied normally.
-        svc, _, db = self._svc(
-            _ZoneStubProfile(new_stop=1.62500, zone=StopZone.PROFIT)
-        )
+        svc, _, db = self._svc(_ZoneStubProfile(new_stop=1.62500, zone=StopZone.PROFIT))
         pos = Position(
             epic="X",
             deal_id="D",

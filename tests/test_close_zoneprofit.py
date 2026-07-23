@@ -354,3 +354,102 @@ class TestCloseTriggers:
         )
         assert decision.action == ACTION_CLOSE
         assert decision.reason == "stop"
+
+
+class TestGroupPrePass:
+    """Portfolio pre-pass wiring for the group-aware ``smartgroup`` zone-1 updater.
+
+    The pure group maths is covered in ``tests/test_smartgroup.py``; here we check
+    the composer's seam: awareness flag, member extraction, plan delegation, and
+    that a pre-resolved ``group_tighten`` becomes an ``UPDATE_STOP`` for an
+    underwater position (and ``None`` holds).
+    """
+
+    def _smart(self):
+        return get_close_profile(_settings(close_zonestart="smartgroup"))
+
+    def test_hold_profile_is_not_group_aware(self):
+        assert get_close_profile(_settings()).is_group_aware is False
+
+    def test_smartgroup_profile_is_group_aware(self):
+        assert self._smart().is_group_aware is True
+
+    def test_group_member_none_when_not_group_aware(self):
+        buf = _buffer([8000.0] * 20)
+        pos = _position(id=1, level_follower=7990.0)
+        assert get_close_profile(_settings()).group_member(pos, 7995.0, buf) is None
+
+    def test_group_member_none_for_sell(self):
+        buf = _buffer([8000.0] * 20)
+        pos = _position(id=1, direction="SELL", level_follower=7990.0)
+        assert self._smart().group_member(pos, 7995.0, buf) is None
+
+    def test_group_member_none_without_candle(self):
+        empty = EpicBuffer(epic="TEST.EPIC", max_candles=10)
+        pos = _position(id=1, level_follower=7990.0)
+        assert self._smart().group_member(pos, 7995.0, empty) is None
+
+    def test_group_member_populated_for_buy(self):
+        buf = _buffer([8000.0] * 20)
+        pos = _position(
+            id=7,
+            direction="BUY",
+            level_open=8000.0,
+            level_zero=8000.5,
+            level_follower=7990.0,
+            euro_per_point=10.0,
+            min_stop_distance=0.3,
+        )
+        m = self._smart().group_member(pos, 7999.0, buf)
+        assert m is not None
+        assert m.position_id == 7
+        assert m.euro_per_point == 10.0
+        assert m.min_stop_distance == 0.3
+        assert m.current_bid == 7999.0
+
+    def test_plan_group_empty_when_not_group_aware(self):
+        assert get_close_profile(_settings()).plan_group([]) == {}
+
+    def test_plan_group_tightens_a_loser_against_a_winner(self):
+        buf = _buffer([8000.0] * 20)
+        prof = self._smart()
+        winner = _position(
+            id=1,
+            level_open=100.0,
+            level_zero=100.5,
+            level_follower=110.0,
+            euro_per_point=10.0,
+            min_stop_distance=0.2,
+        )
+        loser = _position(
+            id=2,
+            level_open=50.0,
+            level_zero=50.5,
+            level_follower=30.0,
+            euro_per_point=10.0,
+            min_stop_distance=0.2,
+        )
+        members = [
+            prof.group_member(winner, 111.0, buf),
+            prof.group_member(loser, 49.0, buf),
+        ]
+        plan = prof.plan_group(members)
+        assert 2 in plan and 1 not in plan
+        assert 30.0 < plan[2] < 49.0
+
+    def test_evaluate_applies_group_tighten_underwater(self):
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8030.0, level_zero=8030.0, level_follower=8000.0)
+        decision = self._smart().evaluate(
+            pos, current_bid=8020.0, buf=buf, is_close_hour=False, group_tighten=8015.0
+        )
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == 8015.0
+
+    def test_evaluate_holds_without_group_tighten(self):
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8030.0, level_zero=8030.0, level_follower=8000.0)
+        decision = self._smart().evaluate(
+            pos, current_bid=8020.0, buf=buf, is_close_hour=False
+        )
+        assert decision.action == ACTION_HOLD

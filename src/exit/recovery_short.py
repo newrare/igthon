@@ -112,9 +112,19 @@ class RecoveryShortProfile(CloseProfile):
         return closes[-3] > closes[-2] > closes[-1]
 
     def evaluate(
-        self, position, current_bid: float, buf: EpicBuffer, *, is_close_hour: bool
+        self,
+        position,
+        current_bid: float,
+        buf: EpicBuffer,
+        *,
+        is_close_hour: bool,
+        group_tighten: float | None = None,
     ) -> CloseDecision:
-        """End-of-day / backstop first, then the momentum-gated short ratchet."""
+        """End-of-day / backstop first, then the momentum-gated short ratchet.
+
+        ``group_tighten`` is accepted for interface parity with the long profile
+        but ignored: the group loss-capping pre-pass covers BUY positions only.
+        """
         if is_close_hour:
             return CloseDecision(action=ACTION_CLOSE, reason="end_of_day")
 

@@ -95,6 +95,12 @@ class StopContext:
     spread: float
     euro_per_point: float
     buf: EpicBuffer
+    #: Pre-resolved group decision for this position, set only by the portfolio
+    #: pre-pass of a group-aware zone-1 updater (``smartgroup``): the absolute
+    #: stop level this position should tighten to this tick, or ``None`` to hold.
+    #: The group maths runs upstream (once per monitor tick across the whole book,
+    #: see :mod:`src.exit.zones.smartgroup`) so the updater itself stays pure.
+    group_tighten: float | None = None
 
 
 @dataclass(frozen=True)

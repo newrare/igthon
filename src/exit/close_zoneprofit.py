@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from src.core.indicators import atr
+from src.core.indicators import adverse_tick_noise, atr
 from src.exit.base import (
     ACTION_CLOSE,
     ACTION_HOLD,
@@ -55,6 +55,7 @@ from src.exit.zones.base import (
     classify_zone,
 )
 from src.exit.zones.breakeven_band import BreakevenBandStop
+from src.exit.zones.smartgroup import GroupMember, SmartGroupStop
 from src.exit.zones.trailing_ratchet import TrailingRatchetStop
 from src.exit.zones.underwater import UnderwaterStop
 from src.feed.price_buffer import EpicBuffer
@@ -195,10 +196,68 @@ class CloseZoneProfit(CloseProfile):
         level_profit = level_margin + (level_margin - level_zero)
         return classify_zone(current_bid, level_zero, level_profit)
 
+    @property
+    def is_group_aware(self) -> bool:
+        """True when the zone-1 updater manages the book as a whole (smartgroup)."""
+        return isinstance(self.underwater, SmartGroupStop)
+
+    def group_member(
+        self, position, current_bid: float, buf: EpicBuffer
+    ) -> GroupMember | None:
+        """Build the group pre-pass scalars for a BUY position, or ``None``.
+
+        Reads the same live measures (ATR, spread, adverse-tick noise) that
+        :meth:`evaluate` uses, so the group planner and the per-tick management
+        agree on the numbers. Returns ``None`` when the profile is not group-aware,
+        the position is not a BUY (recovery shorts are managed separately), or
+        there is no candle to read a spread/ATR from.
+        """
+        if not self.is_group_aware:
+            return None
+        if getattr(position, "direction", "BUY") == "SELL":
+            return None
+        last = buf.last if buf is not None else None
+        if last is None:
+            return None
+        smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
+        noise = adverse_tick_noise(
+            buf.bid_closes, smart.params.noise_window, smart.params.noise_std_k
+        )
+        return GroupMember(
+            position_id=int(position.id),
+            level_open=float(position.level_open or 0),
+            level_zero=float(position.level_zero or 0),
+            level_follower=float(position.level_follower or 0),
+            euro_per_point=float(position.euro_per_point or 0),
+            current_bid=current_bid,
+            atr_value=atr(list(buf.candles), self.atr_period),
+            spread=float(last.spread or 0),
+            min_stop_distance=float(getattr(position, "min_stop_distance", 0) or 0),
+            noise=noise,
+        )
+
+    def plan_group(self, members: list[GroupMember]) -> dict[int, float]:
+        """Delegate the whole-book tightening plan to the smartgroup updater."""
+        if not self.is_group_aware:
+            return {}
+        smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
+        return smart.plan(members)
+
     def evaluate(
-        self, position, current_bid: float, buf: EpicBuffer, *, is_close_hour: bool
+        self,
+        position,
+        current_bid: float,
+        buf: EpicBuffer,
+        *,
+        is_close_hour: bool,
+        group_tighten: float | None = None,
     ) -> CloseDecision:
-        """End-of-day / backstop first, then classify the zone and delegate."""
+        """End-of-day / backstop first, then classify the zone and delegate.
+
+        ``group_tighten`` carries the pre-resolved stop level from the group
+        pre-pass (``smartgroup`` only); it is threaded into the per-tick
+        :class:`~src.exit.zones.base.StopContext` and left ``None`` otherwise.
+        """
         if is_close_hour:
             return CloseDecision(action=ACTION_CLOSE, reason="end_of_day")
 
@@ -253,6 +312,7 @@ class CloseZoneProfit(CloseProfile):
             spread=spread,
             euro_per_point=float(position.euro_per_point or 0),
             buf=_buffer_since(buf, _opened_at(position)),
+            group_tighten=group_tighten,
         )
 
         zone = classify_zone(current_bid, level_zero, level_profit)

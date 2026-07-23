@@ -32,6 +32,12 @@ from src.exit.zones.breakeven_band import (
     BreakevenLockStop,
     BreakevenSafeStop,
 )
+from src.exit.zones.smartgroup import (
+    GroupMember,
+    SmartGroupParams,
+    SmartGroupStop,
+    plan_group_tightening,
+)
 from src.exit.zones.trailing_ratchet import TrailingRatchetStop
 from src.exit.zones.underwater import UnderwaterStop, UnderwaterTrendCutStop
 
@@ -39,6 +45,7 @@ from src.exit.zones.underwater import UnderwaterStop, UnderwaterTrendCutStop
 ZONESTART_UPDATERS: dict[str, type[StopUpdater]] = {
     UnderwaterStop.name: UnderwaterStop,
     UnderwaterTrendCutStop.name: UnderwaterTrendCutStop,
+    SmartGroupStop.name: SmartGroupStop,
 }
 
 #: Zone 2 (break-even → margin). Name → class; keys are valid ``CLOSE_ZONEMARGE``.
@@ -62,6 +69,10 @@ __all__ = [
     "breakeven_lock_level",
     "classify_zone",
     "build_zone_updater",
+    "GroupMember",
+    "SmartGroupParams",
+    "SmartGroupStop",
+    "plan_group_tightening",
     "UnderwaterStop",
     "UnderwaterTrendCutStop",
     "BreakevenBandStop",

@@ -115,9 +115,50 @@ class CloseProfile(ABC):
 
     @abstractmethod
     def evaluate(
-        self, position, current_bid: float, buf: EpicBuffer, *, is_close_hour: bool
+        self,
+        position,
+        current_bid: float,
+        buf: EpicBuffer,
+        *,
+        is_close_hour: bool,
+        group_tighten: float | None = None,
     ) -> CloseDecision:
-        """Decide what to do with an open position on this tick."""
+        """Decide what to do with an open position on this tick.
+
+        ``group_tighten`` is the pre-resolved stop level from a group-aware
+        profile's portfolio pre-pass (see :meth:`plan_group`); profiles that make
+        only per-position decisions ignore it.
+        """
+
+    @property
+    def is_group_aware(self) -> bool:
+        """True when this profile makes a portfolio-level (whole-book) decision.
+
+        A group-aware profile (``smartgroup`` in zone 1) needs a pre-pass over
+        every open position before the per-position :meth:`evaluate` runs. The
+        base profile decides per-position only, so this is ``False`` and the
+        caller (the monitor loop) skips the pre-pass entirely.
+        """
+        return False
+
+    def group_member(self, position, current_bid: float, buf: EpicBuffer):
+        """Extract this position's scalars for the group pre-pass, or ``None``.
+
+        Returns a lightweight member view consumed by :meth:`plan_group`, or
+        ``None`` when the position does not participate (not group-aware, wrong
+        side, or no live candle). The base profile is never group-aware, so this
+        returns ``None``.
+        """
+        return None
+
+    def plan_group(self, members: list) -> dict[int, float]:
+        """Decide the whole-book stop tightening for this tick.
+
+        Maps ``position_id -> new absolute stop level`` for the positions the
+        group pre-pass elects to tighten; positions absent from the map hold.
+        The base profile makes no group decision, so this returns an empty map.
+        """
+        return {}
 
     def current_zone(self, position, current_bid: float, buf: EpicBuffer):
         """Which price zone the live bid sits in, or ``None`` if not applicable.

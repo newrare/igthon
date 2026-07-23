@@ -1912,9 +1912,12 @@ class BotScheduler:
                 self._client, session, config, close_profile=self.close_profile
             )
 
+            # Phase 1 — resolve the live bid + buffer for every open position.
+            # Done up front so a group-aware profile can see the whole book before
+            # any single position is managed (the group pre-pass below).
+            resolved: list[tuple[Position, float, EpicBuffer | None]] = []
             for position in positions:
                 try:
-                    # Get current bid for this epic
                     buf = self._buffer.get(position.epic)
                     if buf and buf.last:
                         current_bid = buf.last.bid_close
@@ -1924,10 +1927,42 @@ class BotScheduler:
                             f"/markets/{position.epic}", version=3
                         )
                         current_bid = float(market.get("snapshot", {}).get("bid", 0))
+                    resolved.append((position, current_bid, buf))
+                except Exception as exc:
+                    logger.error(
+                        "Error reading bid for position %s: %s", position.epic, exc
+                    )
 
+            # Group pre-pass — a portfolio-aware close profile (``smartgroup`` in
+            # zone 1) decides the whole-book stop tightening once, from every open
+            # position's live state. The decision logic lives in the exit domain;
+            # this only assembles the members and hands the plan back per position.
+            # An ordinary per-position profile yields an empty plan (no behaviour
+            # change) since ``is_group_aware`` is False.
+            group_plan: dict[int, float] = {}
+            if self.close_profile.is_group_aware:
+                members = [
+                    member
+                    for position, current_bid, buf in resolved
+                    if current_bid > 0
+                    and (
+                        member := self.close_profile.group_member(
+                            position, current_bid, buf
+                        )
+                    )
+                    is not None
+                ]
+                group_plan = self.close_profile.plan_group(members)
+
+            # Phase 2 — manage each position, feeding it its own group decision.
+            for position, current_bid, buf in resolved:
+                try:
                     if current_bid > 0:
                         closed = await trading.manage_position(
-                            position, current_bid, buf=buf
+                            position,
+                            current_bid,
+                            buf=buf,
+                            group_tighten=group_plan.get(position.id),
                         )
                         if closed:
                             self._recorder.info(
