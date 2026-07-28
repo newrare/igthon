@@ -80,7 +80,7 @@ def clamp_trailing_distance(
 
 
 def compute_trailing_stop(
-    current_bid: float,
+    current_price: float,
     *,
     atr_value: float,
     spread: float,
@@ -90,19 +90,26 @@ def compute_trailing_stop(
     euro_stop: float,
     config: TrailingConfig,
     noise_floor: float = 0.0,
+    sign: float = 1.0,
 ) -> float | None:
     """Pure ATR chandelier trailing-stop shared by live trading and the simulator.
 
-    The stop trails ``k × ATR`` below price and only ever ratchets up, so it sits
-    ``k × ATR`` below the running high. ``k`` can differ before/after break-even
-    (``atr_k_pre`` / ``atr_k_post``), but the application keeps them EQUAL: for a
-    trend-following breakout, tightening after break-even cuts winners short. The
-    capability is retained so the two-speed regime can still be configured.
+    The stop trails ``k × ATR`` **behind** price and only ever ratchets towards
+    profit, so it sits ``k × ATR`` behind the running extreme: below the running
+    high for a BUY, above the running low for a SELL. ``k`` can differ
+    before/after break-even (``atr_k_pre`` / ``atr_k_post``), but the application
+    keeps them EQUAL: for a trend-following breakout, tightening after break-even
+    cuts winners short. The capability is retained so the two-speed regime can
+    still be configured.
 
-    ``noise_floor`` (points) sets a lower bound on the trailing distance measured
-    from the live bid noise, so the stop never hugs the bid closer than an
-    ordinary pull-back — the candle-based ATR alone can shrink to near-zero in a
-    clean trend and stop a still-running winner out on jitter.
+    ``current_price`` is the close-out price — the bid for a BUY (sell to close),
+    the offer for a SELL (buy to close) — and ``sign`` is ``+1`` for a BUY, ``−1``
+    for a SELL. Everything else is side-independent: the distance is a magnitude
+    bounded by :func:`clamp_trailing_distance`, and ``noise_floor`` (points) sets
+    a lower bound on it measured from the live tick noise, so the stop never hugs
+    price closer than an ordinary pull-back — the candle-based ATR alone can
+    shrink to near-zero in a clean trend and stop a still-running winner out on
+    jitter.
 
     Returns:
         The new stop level, or None when no update is warranted.
@@ -110,7 +117,7 @@ def compute_trailing_stop(
     if atr_value <= 0:
         return None
 
-    past_zero = level_zero > 0 and current_bid >= level_zero
+    past_zero = level_zero > 0 and sign * (current_price - level_zero) >= 0
     k = config.atr_k_post if past_zero else config.atr_k_pre
     distance = clamp_trailing_distance(
         k * atr_value,
@@ -120,65 +127,17 @@ def compute_trailing_stop(
         noise_floor=noise_floor,
     )
 
-    # Trail a full ATR distance below price. The ratchet below ensures the stop
-    # only ever moves up, so once the trail has climbed past break-even it stays
-    # there — break-even is locked organically as the trade runs. The stop is
+    # Trail a full ATR distance behind price. The ratchet below ensures the stop
+    # only ever moves towards profit, so once the trail has passed break-even it
+    # stays there — break-even is locked organically as the trade runs. The stop is
     # deliberately NOT pinned to ``level_zero`` on the first tick of profit:
     # doing so parked it on the entry price and a single spread of pullback
     # closed the trade flat (the "everything exits at 0 €" pathology).
-    new_stop = current_bid - distance
+    new_stop = current_price - sign * distance
 
-    # Ratchet: only move up, and only when the gain is worth an API write.
+    # Ratchet: only move towards profit, and only when the gain is worth an API
+    # write.
     step = config.trailing_step_ratio * atr_value
-    if new_stop <= level_follower + step:
-        return None
-    return new_stop
-
-
-def compute_trailing_stop_short(
-    current_offer: float,
-    *,
-    atr_value: float,
-    spread: float,
-    level_zero: float,
-    level_follower: float,
-    euro_per_point: float,
-    euro_stop: float,
-    config: TrailingConfig,
-    noise_floor: float = 0.0,
-) -> float | None:
-    """Mirror of :func:`compute_trailing_stop` for a SHORT position.
-
-    A short profits when the price falls, so the protective stop sits *above*
-    the price (at the offer, the buy-to-close cost) and only ever ratchets
-    **down**, tracking ``k × ATR`` above the running low. Everything else is
-    symmetric to the long: the distance is bounded by the same
-    :func:`clamp_trailing_distance` (magnitude only), and ``noise_floor`` keeps
-    the stop beyond ordinary up-jitter so a normal pull-back up cannot knock a
-    still-running short out.
-
-    Returns:
-        The new (lower) stop level, or None when no update is warranted.
-    """
-    if atr_value <= 0:
-        return None
-
-    # Past break-even for a short: the offer has fallen below the break-even
-    # level (real profit). Kept for the two-speed regime; the app keeps k equal.
-    past_zero = level_zero > 0 and current_offer <= level_zero
-    k = config.atr_k_post if past_zero else config.atr_k_pre
-    distance = clamp_trailing_distance(
-        k * atr_value,
-        spread=spread,
-        euro_per_point=euro_per_point,
-        euro_stop=euro_stop,
-        noise_floor=noise_floor,
-    )
-
-    new_stop = current_offer + distance
-
-    # Ratchet: only move down, and only when the gain is worth an API write.
-    step = config.trailing_step_ratio * atr_value
-    if new_stop >= level_follower - step:
+    if sign * (new_stop - level_follower) <= step:
         return None
     return new_stop

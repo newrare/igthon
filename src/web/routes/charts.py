@@ -83,8 +83,9 @@ async def charts_index(request: Request) -> HTMLResponse:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Charts</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=13">
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script src="/static/tables.js?v=1"></script>
 </head>
 <body>
 <div class="container">
@@ -126,7 +127,7 @@ async def chart_epic(
     candles = await store.fetch(epic)
     if not candles:
         return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-            <link rel="stylesheet" href="/static/style.css"></head><body>
+            <link rel="stylesheet" href="/static/style.css?v=13"></head><body>
             <div class="container">{_nav("charts")}
             <div class="header-bar"><h1><i data-lucide="trending-up" class="lc-icon"></i> {html.escape(epic)}</h1></div>
             <div class="section"><p style="padding:2rem;text-align:center;color:#475569;">
@@ -167,8 +168,9 @@ async def chart_epic(
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — {html.escape(epic)}</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=13">
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script src="/static/tables.js?v=1"></script>
 </head>
 <body>
 <div class="container">

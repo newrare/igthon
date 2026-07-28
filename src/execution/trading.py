@@ -25,9 +25,7 @@ from src.core.api_queue import (
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal, atr
 from src.entry.base import EntryIntent
 from src.execution.gates import evaluate_open_gates
-from src.execution.recovery import RECOVERY_QTY_MULTIPLIER
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
-from src.exit.recovery_short import RecoveryShortProfile
 from src.exit.trailing import (
     clamp_trailing_distance,
     compute_trailing_stop,
@@ -105,6 +103,15 @@ class TradeConfig:
     # many minutes (added on top of ``close_margin_minutes``). Only applies when
     # the epic's close time is known.
     open_close_buffer_minutes: int = 60
+    # Global same-day re-open policy (``ALLOW_SAME_DAY_REOPEN`` in .env), applied
+    # to EVERY open strategy. False = an epic that already had an opening today
+    # (BUY or SELL, still open or closed) cannot be opened again until tomorrow;
+    # True = it is eligible again as soon as it holds no open position. Concurrent
+    # duplicates are always blocked regardless. Defaults to True here so callers
+    # that build a bare ``TradeConfig`` (tests, ad-hoc scripts) keep the historic
+    # "only concurrent duplicates are blocked" behaviour; the live path always
+    # goes through :meth:`from_settings`, where .env decides.
+    allow_same_day_reopen: bool = True
     # Fraction added on top of IG's minimum stop distance when clamping an order's
     # protective stop, so a fast-moving market can't push the stop back under
     # IG's floor between the market snapshot and the order ("Stop trop près").
@@ -121,6 +128,11 @@ class TradeConfig:
     atr_k_pre: float = 2.5
     atr_k_post: float = 1.5
     trailing_step_ratio: float = 0.3
+    # Noise cushion between the software follower and the broker stop, as a
+    # fraction of the current ATR, added on top of one spread. See
+    # ``TradingService._broker_stop_level`` / ``_broker_stop_buffer``. 0 keeps
+    # the broker stop exactly one spread beyond the follower (legacy behaviour).
+    broker_stop_noise_atr: float = 0.5
 
     @classmethod
     def from_settings(cls, settings) -> "TradeConfig":
@@ -129,6 +141,11 @@ class TradeConfig:
             close_margin_minutes=settings.strategy_close_margin_minutes,
             open_close_buffer_minutes=getattr(
                 settings, "strategy_open_close_buffer_minutes", 60
+            ),
+            # ``None`` means the .env line is missing; startup validation already
+            # refuses that, so treat it as the strict policy here (fail closed).
+            allow_same_day_reopen=bool(
+                getattr(settings, "allow_same_day_reopen", False)
             ),
             stop_min_distance_margin=getattr(
                 settings, "strategy_stop_min_distance_margin", 0.15
@@ -140,6 +157,9 @@ class TradeConfig:
             atr_k_pre=settings.strategy_atr_k_pre,
             atr_k_post=settings.strategy_atr_k_post,
             trailing_step_ratio=settings.strategy_trailing_step_ratio,
+            broker_stop_noise_atr=getattr(
+                settings, "strategy_broker_stop_noise_atr", 0.5
+            ),
         )
 
 
@@ -163,10 +183,9 @@ class TradingService:
         # through ``open_from_intent`` / managed by ``manage_position``. It is
         # chosen independently of the entry strategy (open/close decoupling).
         self._close_profile = close_profile
-        # Dedicated exit for recovery SELL positions (built lazily). The main
-        # close profile is long-only; a short is routed here by ``manage_position``
-        # regardless of the configured long profile.
-        self._recovery_short_profile: RecoveryShortProfile | None = None
+        # Dedicated exit for SELL positions (built lazily). The main close profile
+        # is long-only; a short is routed here by ``manage_position`` regardless of
+        # the configured long profile.
         # Epics that bounced a MARKET order with
         # ``MARKET_ORDER_NOT_SUPPORTED_CODE`` at deal time even though their
         # metadata did not flag it. IG's ``marketOrderPreference`` is an unreliable
@@ -185,6 +204,21 @@ class TradingService:
             )
         )
         return result.scalar_one_or_none() is not None
+
+    async def _is_epic_traded_today(self, epic: str) -> bool:
+        """True when this epic already had an opening today (any state/direction).
+
+        Backs the global ``ALLOW_SAME_DAY_REOPEN`` policy: keyed on
+        ``Position.date`` (the trading day stamped at open) and direction-agnostic,
+        so a BUY *and* a SELL count as the same "the epic was used today".
+        """
+        result = await self._db.execute(
+            select(Position.id).where(
+                Position.epic == epic,
+                Position.date == date.today(),
+            )
+        )
+        return result.first() is not None
 
     async def _epic_close_utc(self, epic: str) -> time | None:
         """The epic's own market close (UTC) from the Epic table, or None."""
@@ -242,7 +276,13 @@ class TradingService:
         )
         return minutes <= threshold
 
-    async def can_open_intent(self, intent: EntryIntent) -> tuple[bool, str]:
+    async def can_open_intent(
+        self,
+        intent: EntryIntent,
+        *,
+        allow_short: bool = False,
+        allow_reopen: bool = False,
+    ) -> tuple[bool, str]:
         """Pre-open gates for a decoupled :class:`EntryIntent`.
 
         The live market-open gate is the per-epic ``marketStatus == TRADEABLE``
@@ -254,13 +294,30 @@ class TradingService:
         market closes within ``open_close_buffer_minutes`` (see
         :meth:`_is_epic_close_soon`), so we never open a trade the per-epic close
         rule would force-close almost immediately.
+
+        A ``same-day re-open`` gate rejects the open when the global
+        ``ALLOW_SAME_DAY_REOPEN`` policy is off and the epic already had an
+        opening today (see :meth:`_is_epic_traded_today`). It applies to every
+        open strategy, both directions.
+
+        ``allow_short`` lifts the long-only gate for a manual dashboard SELL;
+        ``allow_reopen`` lifts the same-day re-open gate the same way (an
+        explicit human open is never blocked by the diversity policy). Automatic
+        callers leave both ``False``.
         """
+        traded_today = (
+            not allow_reopen
+            and not self._config.allow_same_day_reopen
+            and await self._is_epic_traded_today(intent.epic)
+        )
         return evaluate_open_gates(
             epic=intent.epic,
             direction=intent.direction,
             in_trading_hours=True,
             epic_already_open=await self._is_epic_open(intent.epic),
             closes_soon=await self._is_epic_close_soon(intent.epic),
+            allow_short=allow_short,
+            epic_traded_today=traded_today,
         )
 
     async def open_from_intent(
@@ -283,8 +340,11 @@ class TradingService:
         confirmation and DB-record logic in :meth:`open_position` is reused
         unchanged; the resulting position is stamped with the close profile's
         name so :meth:`manage_position` keeps using the same exit for its life.
+
+        Both sides use the same close profile: it is direction-aware and mirrors
+        every reference for a SELL (stop above entry, margin below break-even).
         """
-        profile = close_profile or self._close_profile
+        profile: CloseProfile | None = close_profile or self._close_profile
         if profile is None:
             raise ValueError("open_from_intent requires a close profile")
 
@@ -334,7 +394,9 @@ class TradingService:
         )
 
         position = await self.open_position(
-            signal, quantity_multiplier=quantity_multiplier
+            signal,
+            quantity_multiplier=quantity_multiplier,
+            broker_noise_buffer=self._broker_stop_buffer(buf),
         )
         if position is not None:
             position.close_profile = plan.profile
@@ -515,7 +577,11 @@ class TradingService:
         )
 
     async def open_position(
-        self, signal: TradingSignal, quantity_multiplier: int = 1
+        self,
+        signal: TradingSignal,
+        quantity_multiplier: int = 1,
+        *,
+        broker_noise_buffer: float = 0.0,
     ) -> Position | None:
         """Open a position based on a trading signal.
 
@@ -531,12 +597,23 @@ class TradingService:
             signal: Computed trading signal with levels.
             quantity_multiplier: Multiplies the minimum deal size (default 1).
                 Optional sizing hook for entries that scale up.
+            broker_noise_buffer: ATR-scaled cushion (price units) placed on top of
+                one spread between the software follower and the broker stop posted
+                at IG (see :meth:`_broker_stop_level`). Computed by the caller from
+                the live buffer; 0 keeps the broker stop one spread beyond the
+                follower. The underwater updater holds this open stop untouched
+                until break-even, so the cushion set here protects the whole
+                pre-break-even life — exactly the phase most exposed to bid noise.
 
         Returns:
             Created Position object, or None if open failed.
         """
         epic = signal.epic
         levels = signal.levels
+        # Trade side. A BUY's protective stop sits BELOW the entry and fills at
+        # the ask; a SELL mirrors it — stop ABOVE the entry, fills at the bid.
+        # Every direction-dependent computation below branches on this.
+        direction = signal.direction
 
         # 1. Fetch market info
         market_data = await self._client.get(
@@ -610,16 +687,24 @@ class TradingService:
         # without pushing us back under the floor.
         min_stop_price *= 1 + self._config.stop_min_distance_margin
 
-        # Absolute stop level chosen by the strategy, and its distance below the
-        # entry in price terms.
+        # Absolute stop level chosen by the strategy, and its distance from the
+        # entry in price terms (always positive). A BUY's stop is below the entry,
+        # a SELL's above — so the distance is the signed gap taken on the right
+        # side.
         stop_level = levels.level_security
-        stop_price_distance = levels.bid - stop_level
+        if direction == "SELL":
+            stop_price_distance = stop_level - levels.bid
+        else:
+            stop_price_distance = levels.bid - stop_level
 
         # Never place the stop tighter than IG allows (margin included): clamp out
-        # to the padded minimum.
+        # to the padded minimum, on the correct side of the entry.
         if stop_price_distance < min_stop_price:
             stop_price_distance = min_stop_price
-            stop_level = levels.bid - stop_price_distance
+            if direction == "SELL":
+                stop_level = levels.bid + stop_price_distance
+            else:
+                stop_level = levels.bid - stop_price_distance
 
         if stop_price_distance > max_stop_price:
             logger.info(
@@ -664,28 +749,33 @@ class TradingService:
         else:
             euro_risk = quantity * stop_price_distance
 
-        # The broker stop sits one spread BELOW the software follower (a long):
-        # the app-side stop (``level_follower == stop_level``) is reached first
-        # between two bid polls and the broker order only ever fires as a deeper
-        # safety net. This is the SAME offset applied on every later ratchet
-        # (see ``_broker_stop_level``); applying it here too keeps the bot in
-        # control of the exit from the open onward and right through the start
-        # zone — the underwater updater holds this stop untouched until
-        # break-even, so the spread cushion set here persists for the whole
-        # pre-break-even life. Pushing the broker stop FURTHER from price never
-        # violates IG's minimum-distance rule, and the euro risk is unchanged
-        # because the bot still closes at the (nearer) software ``stop_level``.
+        # The broker stop sits one spread PLUS an ATR-scaled noise cushion
+        # (``broker_noise_buffer``) further from price than the software follower
+        # (below it for a long, above it for a short): the app-side stop
+        # (``level_follower == stop_level``) is reached first between two bid polls
+        # and the broker order only ever fires as a deeper safety net. This is the
+        # SAME offset applied on every later ratchet (see ``_broker_stop_level``);
+        # applying it here too keeps the bot in control of the exit from the open
+        # onward and right through the start zone — the underwater updater holds
+        # this stop untouched until break-even, so the cushion set here persists
+        # for the whole pre-break-even life (the phase most exposed to bid noise).
+        # Pushing the broker stop FURTHER from price never violates IG's
+        # minimum-distance rule, and the euro risk is unchanged because the bot
+        # still closes at the (nearer) software ``stop_level``.
         spread = max(float(levels.spread or 0.0), 0.0)
-        broker_stop = self._broker_stop_level("BUY", stop_level, spread)
+        broker_stop = self._broker_stop_level(
+            direction, stop_level, spread, broker_noise_buffer
+        )
 
-        # 5. Send order with an absolute stop level (avoids any point/price
-        # unit conversion on the IG side). A BUY fills at the ask, so the
-        # marketable-LIMIT fallback prices through ``levels.offer``.
-        reference_price = levels.offer
+        # 5. Send order with an absolute stop level (avoids any point/price unit
+        # conversion on the IG side). A BUY fills at the ask (price through
+        # ``levels.offer``), a SELL at the bid (``levels.bid``), so the
+        # marketable-LIMIT fallback prices through the matching touch.
+        reference_price = levels.bid if direction == "SELL" else levels.offer
         order_payload = {
             "epic": epic,
             "expiry": expiry,
-            "direction": "BUY",
+            "direction": direction,
             "size": str(quantity),
             "orderType": "MARKET",
             "currencyCode": currency,
@@ -697,7 +787,8 @@ class TradingService:
             order_payload = self._to_marketable_limit(order_payload, reference_price)
 
         logger.info(
-            "Opening: epic=%s, qty=%d, stop=%.5f (broker %.5f, -%.5f), risk=%.2f€",
+            "Opening %s: epic=%s, qty=%d, stop=%.5f (broker %.5f, %.5f), risk=%.2f€",
+            direction,
             epic,
             quantity,
             stop_level,
@@ -736,6 +827,7 @@ class TradingService:
             epic_name=instrument.get("name", epic)[:10],
             deal_reference=deal_reference,
             deal_id=None,
+            direction=direction,
             date=now.date(),
             time_open=now.time(),
             state=PositionState.OPEN,
@@ -747,9 +839,10 @@ class TradingService:
             level_follower=Decimal(str(round(follower_level, 5))),
             level_loose=Decimal(str(round(loose_level, 5))),
             # The hard software backstop and the chart's broker line track the
-            # level actually posted at IG — one spread below the software follower
-            # (see ``broker_stop`` above), so the broker line starts a spread
-            # under the follower line and the two ratchet together from there.
+            # level actually posted at IG — one spread plus the ATR noise cushion
+            # below the software follower (see ``broker_stop`` above), so the
+            # broker line starts that far under the follower line and the two
+            # ratchet together from there.
             level_security=Decimal(str(round(broker_stop, 5))),
             level_stop=Decimal(str(round(broker_stop, 5))),
             level_margin=Decimal(str(round(levels.level_margin, 5))),
@@ -819,9 +912,22 @@ class TradingService:
             return None
 
         deal_id = confirmation.get("dealId", "")
-        open_level = float(confirmation.get("level", levels.bid))
+        confirmed_level = confirmation.get("level")
+        open_level = (
+            float(confirmed_level) if confirmed_level is not None else levels.bid
+        )
         position.deal_id = deal_id or None
         position.level_open = Decimal(str(round(open_level, 5)))
+        # The exit references were frozen from the pre-order candle; the fill can
+        # land several points away. Translate them onto the real entry so the
+        # break-even the exit logic (and the chart) uses is the price actually
+        # traded. ``reference_price`` is the touch the order priced through, i.e.
+        # exactly what the close profile assumed the fill would be.
+        delta = (
+            self._reanchor_exit_references(position, reference_price, open_level)
+            if confirmed_level is not None
+            else 0.0
+        )
         await self._db.commit()
 
         logger.info(
@@ -831,236 +937,17 @@ class TradingService:
             open_level,
             stop_level,
         )
-
-        return position
-
-    async def open_recovery_short(
-        self,
-        closed_position: Position,
-        buf: EpicBuffer,
-        *,
-        quantity_multiplier: int = RECOVERY_QTY_MULTIPLIER,
-    ) -> Position | None:
-        """Open a double-size SELL to recover a stopped-out long's loss.
-
-        The loss-recovery feature calls this right after a long closes on the
-        "trend-reversal at open" pattern (see :func:`src.execution.recovery`).
-        It sells the same epic betting on the confirmed decline, at
-        ``quantity_multiplier ×`` the closed long's size, with the mirrored short
-        exit (:class:`~src.exit.recovery_short.RecoveryShortProfile`) placing the
-        initial stop *above* the entry. The short is stamped ``reason_open =
-        "recovery"`` so it can never itself trigger another recovery (anti-loop).
-
-        Mirrors :meth:`open_position` for a SELL rather than reusing it, so the
-        long-only open path stays untouched. Returns the created ``Position`` or
-        ``None`` when the market is not tradeable, the stop breaks the dealing
-        rules, or IG rejects the order.
-        """
-        epic = closed_position.epic
-        last = buf.last
-        if last is None:
-            logger.info("No candle for %s — cannot open recovery short", epic)
-            return None
-
-        # A SELL is filled at the bid; that is the recovery short's entry.
-        entry_level = last.bid_close
-        profile = self._short_profile()
-        plan = profile.initial_plan(entry_level=entry_level, direction="SELL", buf=buf)
-
-        # 1. Market info + dealing rules (same validation as open_position).
-        market_data = await self._client.get(
-            f"/markets/{epic}",
-            version=3,
-            priority=Priority.URGENT,
-            label=f"recovery {epic}: market",
-        )
-        instrument = market_data.get("instrument", {})
-        snapshot = market_data.get("snapshot", {})
-        dealing_rules = market_data.get("dealingRules", {})
-
-        if snapshot.get("marketStatus") != "TRADEABLE":
-            logger.info(
-                "Recovery short skipped — %s not tradeable: %s",
-                epic,
-                snapshot.get("marketStatus"),
-            )
-            return None
-
-        use_market_order = (
-            self._supports_market_orders(instrument)
-            and epic not in self._market_order_unsupported
-        )
-        if not use_market_order:
-            logger.info(
-                "Recovery short — %s does not support market orders "
-                "(marketOrderPreference=%s) — opening with a marketable LIMIT",
-                epic,
-                instrument.get("marketOrderPreference"),
-            )
-
-        min_stop_rule = dealing_rules.get("minNormalStopOrLimitDistance", {})
-        max_stop_rule = dealing_rules.get("maxStopOrLimitDistance", {})
-        min_deal_size = dealing_rules.get("minDealSize", {}).get("value", 1)
-        scaling_factor = (
-            float(str(snapshot.get("scalingFactor", "1")).replace(",", "")) or 1.0
-        )
-
-        min_stop_price = self._rule_to_price_distance(
-            min_stop_rule,
-            0.0,
-            reference_price=entry_level,
-            scaling_factor=scaling_factor,
-        )
-        max_stop_price = self._rule_to_price_distance(
-            max_stop_rule,
-            float("inf"),
-            reference_price=entry_level,
-            scaling_factor=scaling_factor,
-        )
-        min_stop_price *= 1 + self._config.stop_min_distance_margin
-
-        # A short's stop sits ABOVE the entry; the distance is positive upward.
-        stop_level = plan.stop_level
-        stop_price_distance = stop_level - entry_level
-        if stop_price_distance < min_stop_price:
-            stop_price_distance = min_stop_price
-            stop_level = entry_level + stop_price_distance
-        if stop_price_distance > max_stop_price:
-            logger.info(
-                "Recovery short stop too large for %s: %.5f > max %.5f",
-                epic,
-                stop_price_distance,
-                max_stop_price,
-            )
-            return None
-
-        # 2. Quantity — double the closed long's size (bounded to the min deal).
-        base_qty = max(int(closed_position.quantity or int(min_deal_size) or 1), 1)
-        quantity = base_qty * max(int(quantity_multiplier), 1)
-
-        currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
-        expiry = instrument.get("expiry", "-")
-        epp = euro_per_point(market_data, quantity, currency)
-        euro_risk = stop_price_distance * epp if epp else quantity * stop_price_distance
-
-        # The broker stop sits one spread ABOVE the software follower (a short):
-        # the app-side stop is reached first between two bid polls and the broker
-        # order only fires as a deeper safety net — the SAME offset applied on
-        # every later ratchet (see ``_broker_stop_level``), so the spread cushion
-        # holds from the open through the start zone.
-        spread = max(float(last.spread or 0.0), 0.0)
-        broker_stop = self._broker_stop_level("SELL", stop_level, spread)
-
-        # 3. Send the SELL order with an absolute stop level (above entry). A SELL
-        # fills at the bid, so the marketable-LIMIT fallback prices through the
-        # entry bid (``entry_level``).
-        reference_price = entry_level
-        order_payload = {
-            "epic": epic,
-            "expiry": expiry,
-            "direction": "SELL",
-            "size": str(quantity),
-            "orderType": "MARKET",
-            "currencyCode": currency,
-            "guaranteedStop": False,
-            "stopLevel": round(broker_stop, 5),
-            "forceOpen": True,
-        }
-        if not use_market_order:
-            order_payload = self._to_marketable_limit(order_payload, reference_price)
-        logger.info(
-            "Recovery: epic=%s, qty=%d, stop=%.5f (broker %.5f, +%.5f), risk=%.2f€",
-            epic,
-            quantity,
-            stop_level,
-            broker_stop,
-            stop_price_distance,
-            euro_risk,
-        )
-        result = await self._post_open_order(
-            order_payload, epic, f"recovery {epic}: order", reference_price
-        )
-        if result is None:
-            return None
-
-        deal_reference = result.get("dealReference")
-        if not deal_reference:
-            logger.error("No dealReference for recovery short %s", epic)
-            return None
-
-        now = datetime.now(UTC)
-        position = Position(
-            epic=epic,
-            epic_name=instrument.get("name", epic)[:10],
-            deal_reference=deal_reference,
-            deal_id=None,
-            direction="SELL",
-            date=now.date(),
-            time_open=now.time(),
-            state=PositionState.OPEN,
-            strategy=PositionStrategy.TARGET,
-            reason_open="recovery",
-            close_profile=plan.profile,
-            level_open=Decimal(str(round(entry_level, 5))),
-            level_win=Decimal("0"),
-            level_zero=Decimal(str(round(plan.level_zero, 5))),
-            level_follower=Decimal(str(round(stop_level, 5))),
-            level_loose=Decimal(str(round(stop_level, 5))),
-            # Broker-side levels track the level actually posted at IG — one spread
-            # above the software follower for a short (see ``broker_stop`` above).
-            level_security=Decimal(str(round(broker_stop, 5))),
-            level_stop=Decimal(str(round(broker_stop, 5))),
-            level_margin=Decimal(str(round(plan.level_margin, 5))),
-            # Padded IG minimum stop distance (price), reused to clamp every
-            # later broker-stop ratchet so it is never rejected as too close.
-            min_stop_distance=Decimal(str(round(min_stop_price, 5))),
-            pip_spread=Decimal(str(round(last.spread, 5))),
-            quantity=quantity,
-            size=int(round(stop_price_distance * scaling_factor)),
-            euro_stop=Decimal(str(round(euro_risk, 3))),
-            euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
-            stop_history=[
-                {
-                    "t": now.isoformat(),
-                    "level": round(float(stop_level), 5),
-                    "broker": round(float(broker_stop), 5),
-                }
-            ],
-        )
-        self._db.add(position)
-        await self._db.commit()
-        await self._db.refresh(position)
-
-        confirmation = await self._confirm_with_retry(deal_reference, epic)
-        if confirmation is None:
-            logger.error(
-                "Could not confirm recovery short %s for %s — kept, sync reconciles",
-                deal_reference,
-                epic,
-            )
-            return position
-        if confirmation.get("dealStatus") != "ACCEPTED":
-            reason = confirmation.get("reason", "UNKNOWN")
+        if delta:
             logger.warning(
-                "Recovery short rejected for %s: %s — removing draft row", epic, reason
+                "Fill for %s slipped %+.5f from the %.5f snapshot — break-even "
+                "re-anchored to %.5f (margin %.5f)",
+                epic,
+                delta,
+                reference_price,
+                float(position.level_zero or 0),
+                float(position.level_margin or 0),
             )
-            await self._db.delete(position)
-            await self._db.commit()
-            return None
 
-        deal_id = confirmation.get("dealId", "")
-        open_level = float(confirmation.get("level", entry_level))
-        position.deal_id = deal_id or None
-        position.level_open = Decimal(str(round(open_level, 5)))
-        await self._db.commit()
-
-        logger.info(
-            "Recovery short opened: epic=%s, deal=%s, level=%.5f, stop=%.5f",
-            epic,
-            deal_id,
-            open_level,
-            stop_level,
-        )
         return position
 
     async def _confirm_with_retry(self, deal_reference: str, epic: str) -> dict | None:
@@ -1139,6 +1026,80 @@ class TradingService:
             last_exc,
         )
         return None
+
+    def _reanchor_exit_references(
+        self, position: Position, expected_fill: float, actual_fill: float
+    ) -> float:
+        """Translate the open-frozen exit references onto the real fill level.
+
+        ``level_zero`` (break-even) and ``level_margin`` are chosen by the close
+        profile **before** the order is sent, from the last recorded candle (see
+        :meth:`~src.exit.close_zoneprofit.CloseZoneProfit.initial_plan`): the offer
+        for a long, the bid for a short — i.e. exactly the touch the order prices
+        through (``reference_price``). The market moves between that snapshot and
+        the fill, so the confirmed level can land several points away (4 points
+        observed on ``CC.D.NG.UNC.IP``), leaving break-even, the margin line and
+        the derived profit trigger anchored on a price the position never traded
+        at. The whole exit then runs on a shifted frame: the zone classifier reads
+        a break-even below the real entry, the margin-zone updater parks the stop
+        on what looks like locked-in profit but is not, and the chart draws a
+        break-even line the trade never crossed.
+
+        Re-anchoring preserves the profile's geometry — the noise band
+        (``level_margin - level_zero``), and therefore the derived profit trigger
+        (``2 × margin - zero``), is translated, not rescaled. The protective stops
+        are deliberately left untouched: they are market-structure levels
+        (support / regression / ATR) already resting at the broker, not
+        entry-relative offsets, so a slipped fill widens the real risk rather than
+        moving the stop (``euro_stop`` keeps the pre-fill figure).
+
+        Returns the applied delta, ``0.0`` when nothing moved.
+        """
+        if position.level_zero is None or not expected_fill or not actual_fill:
+            return 0.0
+        delta = actual_fill - expected_fill
+        if abs(delta) < 1e-9:
+            return 0.0
+        position.level_zero = Decimal(str(round(float(position.level_zero) + delta, 5)))
+        # ``0`` means "no margin persisted" everywhere else (the profiles fall back
+        # to a per-tick computation), so leave it alone rather than turning it into
+        # a bogus ``delta``-sized level.
+        if position.level_margin is not None and float(position.level_margin) > 0:
+            position.level_margin = Decimal(
+                str(round(float(position.level_margin) + delta, 5))
+            )
+        return delta
+
+    def _bind_real_open_level(self, position: Position, ig_position: dict) -> None:
+        """Adopt IG's open level on a row that bound without a confirmation.
+
+        A provisional row (``deal_id`` still ``None``) is one whose ``/confirms``
+        round-trip never came back: ``level_open`` holds the pre-order estimate
+        (the snapshot bid) and the exit references sit on the snapshot touch. The
+        live position IG hands back at bind time carries the real ``level`` — the
+        first authoritative fill available for that row — so it is re-anchored here
+        exactly as the confirm path does.
+
+        The expected fill is reconstructed from the provisional row: the order
+        priced through the offer for a long (bid + spread), the bid for a short.
+        """
+        ig_level = _to_float(ig_position.get("level"))
+        if not ig_level:
+            return
+        expected = float(position.level_open or 0)
+        if position.direction != "SELL":
+            expected += float(position.pip_spread or 0)
+        position.level_open = Decimal(str(round(ig_level, 5)))
+        delta = self._reanchor_exit_references(position, expected, ig_level)
+        logger.info(
+            "Unconfirmed %s bound to IG open level %.5f (assumed %.5f) — "
+            "break-even re-anchored %+.5f to %.5f",
+            position.epic,
+            ig_level,
+            expected,
+            delta,
+            float(position.level_zero or 0),
+        )
 
     def _euro_pnl(self, position: Position, level: float) -> float:
         """Compute the euro P&L of a position at a given market level.
@@ -1560,6 +1521,7 @@ class TradingService:
             if ig_deal_id:
                 claimed.add(ig_deal_id)
                 if ig_deal_id != position.deal_id:
+                    was_provisional = position.deal_id is None
                     logger.info(
                         "Position %s dealId refreshed: %s -> %s",
                         position.epic,
@@ -1568,6 +1530,8 @@ class TradingService:
                     )
                     position.deal_id = ig_deal_id
                     dirty = True
+                    if was_provisional:
+                        self._bind_real_open_level(position, ig_position)
 
             # Update live unrealized P&L and excursion from the current price. A
             # long marks against the bid (sell-to-close); a short against the
@@ -1621,11 +1585,13 @@ class TradingService:
         up from there) and ``euro_per_point`` is derived from a ``/markets`` call
         for currency-correct P&L.
 
-        Only BUY positions are adopted — the whole close/trailing engine assumes a
-        long; a SELL is logged and skipped rather than mismanaged.
+        Both BUY and SELL positions are adopted so a manually opened short
+        survives a restart: the close profile that :meth:`manage_position` routes
+        to is direction-aware and mirrors every reference for a SELL. An unknown
+        direction is logged and skipped rather than mismanaged.
 
         Returns the created ``Position`` (added to the session, not committed), or
-        ``None`` when the entry is unusable or not a BUY.
+        ``None`` when the entry is unusable or the direction is unknown.
         """
         ig_position = entry.get("position", {})
         market = entry.get("market", {})
@@ -1635,15 +1601,15 @@ class TradingService:
             return None
 
         direction = ig_position.get("direction")
-        if direction != "BUY":
+        if direction not in ("BUY", "SELL"):
             logger.warning(
-                "Not adopting non-BUY IG position %s (%s %s) — unmanaged by the "
-                "long-only engine; close it manually if unwanted",
+                "Not adopting IG position %s (unknown direction %s %s)",
                 deal_id,
                 direction,
                 epic,
             )
             return None
+        is_sell = direction == "SELL"
 
         open_level = _to_float(ig_position.get("level"))
         stop_level = _to_float(ig_position.get("stopLevel")) or None
@@ -1672,7 +1638,13 @@ class TradingService:
         if not epp:
             epp = float(size) * _to_float(ig_position.get("contractSize"))
 
-        stop_distance = max(open_level - stop_level, 0.0) if stop_level else 0.0
+        # A short's stop sits ABOVE the entry, a long's below — take the gap on
+        # the correct side so the distance stays positive either way.
+        if stop_level:
+            gap = stop_level - open_level if is_sell else open_level - stop_level
+            stop_distance = max(gap, 0.0)
+        else:
+            stop_distance = 0.0
         euro_stop = stop_distance * epp if epp else 0.0
 
         created = ig_position.get("createdDateUTC")
@@ -1686,11 +1658,16 @@ class TradingService:
         # A 0 level means "unset" downstream (e.g. level_win 0 = no fixed target,
         # rides the trailing stop; level_loose 0 = no hard stop close).
         stop_dec = Decimal(str(round(stop_level, 5))) if stop_level else Decimal("0")
+        # Running P&L seed, mirrored for a short (profit as price falls). The
+        # monitor recomputes it every tick via ``_euro_pnl``; this is only the
+        # initial value shown until the first tick lands.
+        move = (open_level - bid) if is_sell else (bid - open_level)
         position = Position(
             epic=epic,
             epic_name=(market.get("instrumentName") or epic)[:10],
             deal_reference=ig_position.get("dealReference"),
             deal_id=deal_id,
+            direction=direction,
             date=opened_at.date(),
             time_open=opened_at.time(),
             state=PositionState.OPEN,
@@ -1715,14 +1692,15 @@ class TradingService:
             pip_spread=Decimal(str(round(spread, 5))),
             quantity=int(size),
             size=int(round(stop_distance * scaling)),
-            euro=Decimal(str(round((bid - open_level) * epp, 3))) if epp else None,
+            euro=Decimal(str(round(move * epp, 3))) if epp else None,
             euro_stop=Decimal(str(round(euro_stop, 3))),
             euro_per_point=Decimal(str(round(epp, 6))) if epp else None,
         )
         self._db.add(position)
         logger.warning(
-            "Adopted untracked IG position %s (%s) dealId=%s open=%.5f stop=%s "
+            "Adopted untracked IG position %s %s (%s) dealId=%s open=%.5f stop=%s "
             "epp=%.4f — now managed by the bot",
+            direction,
             epic,
             position.epic_name,
             deal_id,
@@ -1909,22 +1887,19 @@ class TradingService:
         Returns:
             True if the position was closed, False otherwise.
         """
-        # Recovery SELL positions are managed by the mirrored short profile, never
-        # by the long-only close profile — route on the persisted trade side.
-        if position.direction == "SELL":
-            profile: CloseProfile | None = self._short_profile()
-        else:
-            profile = self._close_profile
+        # One direction-aware close profile manages both sides (see
+        # :mod:`src.exit.close_zoneprofit`): the zones, their ``CLOSE_ZONE*``
+        # selectors and the ratchet all mirror themselves for a SELL.
+        profile: CloseProfile | None = self._close_profile
 
         if profile is None or buf is None or buf.last is None:
             # ``check_and_close`` implements long-only close maths (``loose`` fires
-            # on ``bid <= stop``). A recovery SELL must NEVER fall into it: a
-            # short's stop sits ABOVE the price, so that test is true on almost
-            # every tick and would close the short at market — e.g. on the first
+            # on ``bid <= stop``). A SELL must NEVER fall into it: a short's stop
+            # sits ABOVE the price, so that test is true on almost every tick and
+            # would close the short at market — e.g. on the first
             # monitor tick after a restart, before the epic's price buffer is
-            # streamed (``buf is None``). Without a buffer the mirrored short
-            # profile cannot run either, so hold and rely on the broker-side stop
-            # pushed at open.
+            # streamed (``buf is None``). Without a buffer the close profile cannot
+            # run either, so hold and rely on the broker-side stop pushed at open.
             if position.direction == "SELL":
                 return False
             return await self.check_and_close(position, current_bid, buf)
@@ -1980,9 +1955,21 @@ class TradingService:
                 return False
             # Advance the follower and push the matching broker stop — clamped to
             # IG's minimum-distance floor and only persisted on acceptance (see
-            # :meth:`_ratchet_stop`).
+            # :meth:`_ratchet_stop`). The broker stop sits a spread plus an
+            # ATR-scaled noise cushion beyond the follower so tick noise can't trip
+            # it before the (poll-sampled) follower would fire. The min-distance
+            # clamp is measured from the close-out price (the offer for a short), so
+            # a short's floor is not read one spread too close.
+            spread = float(buf.last.spread or 0)
+            close_out = (
+                current_bid + spread if position.direction == "SELL" else current_bid
+            )
             await self._ratchet_stop(
-                position, new_stop, current_bid, float(buf.last.spread or 0)
+                position,
+                new_stop,
+                close_out,
+                spread,
+                self._broker_stop_buffer(buf),
             )
             logger.debug(
                 "Trailing stop for %s -> %.3f (profile=%s)",
@@ -2004,12 +1991,6 @@ class TradingService:
         if direction == "SELL":
             return new_stop < current
         return new_stop > current
-
-    def _short_profile(self) -> RecoveryShortProfile:
-        """The mirrored short exit for recovery SELL positions (built once)."""
-        if self._recovery_short_profile is None:
-            self._recovery_short_profile = RecoveryShortProfile()
-        return self._recovery_short_profile
 
     async def check_and_close(
         self,
@@ -2084,8 +2065,14 @@ class TradingService:
         # IG's minimum-distance floor and only persisted on acceptance (see
         # :meth:`_ratchet_stop`). 5 dp rounding there matches the level column and
         # stop_history so the next tick's guard compares against the real level.
+        # The broker stop sits a spread plus an ATR-scaled noise cushion below the
+        # follower so bid noise can't trip it before the follower would fire.
         await self._ratchet_stop(
-            position, new_stop, current_bid, float(buf.last.spread or 0)
+            position,
+            new_stop,
+            current_bid,
+            float(buf.last.spread or 0),
+            self._broker_stop_buffer(buf),
         )
         logger.debug(
             "Trailing stop for %s -> %.3f (ATR=%.3f)",
@@ -2118,22 +2105,48 @@ class TradingService:
 
     @staticmethod
     def _broker_stop_level(
-        direction: str | None, software_stop: float, spread: float
+        direction: str | None,
+        software_stop: float,
+        spread: float,
+        buffer: float = 0.0,
     ) -> float:
-        """Broker stop level: one spread beyond the software follower.
+        """Broker stop level: one spread plus a noise cushion beyond the follower.
 
         The software follower (``level_follower``) is the level the close profile
-        decides a close on between two bid polls. The stop actually posted at IG
-        is placed a full spread further from price — BELOW for a long, ABOVE for a
-        short — so in normal operation the app-side stop is reached first and the
-        broker order only ever fires as a deeper safety net when the bot misses
-        the touch (e.g. ticks dropped from the livestream between two readings).
-        Both ratchet together: each follower raise pushes a matching broker level
-        a spread below (a short's a spread above).
+        decides a close on between two bid polls, so it is inherently
+        noise-tolerant: a transient down-spike that recovers before the next poll
+        never closes the trade. The stop actually posted at IG is a hard resting
+        order that fires on any real-time tick. Placed only one spread beyond the
+        follower, bid noise trips it before the follower gets its chance — closing
+        a trade the software stop would have ridden through. So the broker stop is
+        pushed a full spread PLUS ``buffer`` (an ATR-scaled noise cushion, see
+        :meth:`_broker_stop_buffer`) further from price — BELOW for a long, ABOVE
+        for a short — so only a sustained move (which the follower would honour
+        too) reaches it, and the broker order stays a genuine deeper safety net
+        for missed touches (e.g. ticks dropped from the livestream). Both ratchet
+        together: each follower raise pushes a matching broker level this far
+        below (a short's this far above). ``buffer=0`` restores the old one-spread
+        offset.
         """
+        cushion = spread + max(buffer, 0.0)
         if direction == "SELL":
-            return software_stop + spread
-        return software_stop - spread
+            return software_stop + cushion
+        return software_stop - cushion
+
+    def _broker_stop_buffer(self, buf: EpicBuffer | None) -> float:
+        """ATR-scaled noise cushion added between the follower and broker stop.
+
+        Returns ``broker_stop_noise_atr × ATR`` in price units, sized from the
+        same recent-ATR the trailing distance uses so the cushion tracks each
+        market's live volatility (DAX noise ≠ forex noise). Zero when there is no
+        buffer or the config disables it — the broker stop then sits exactly one
+        spread beyond the follower (see :meth:`_broker_stop_level`).
+        """
+        k = self._config.broker_stop_noise_atr
+        if buf is None or k <= 0:
+            return 0.0
+        atr_value = atr(list(buf.candles), self._config.atr_period)
+        return max(k * atr_value, 0.0)
 
     @staticmethod
     def _clamp_broker_stop_to_min_distance(
@@ -2167,11 +2180,13 @@ class TradingService:
         new_stop: float,
         current_price: float,
         spread: float,
+        buffer: float = 0.0,
     ) -> bool:
         """Advance the software follower and push the matching broker stop to IG.
 
-        The broker stop rests one spread beyond the follower (a deeper safety
-        net), clamped so it never sits inside IG's minimum-distance floor — the
+        The broker stop rests one spread plus an ATR-scaled noise cushion
+        (``buffer``) beyond the follower (a deeper, noise-tolerant safety net),
+        clamped so it never sits inside IG's minimum-distance floor — the
         tightest level IG still accepts. The persisted broker levels
         (``level_stop`` / ``level_security``) and the chart's broker ("Loose")
         point advance ONLY when IG accepts the push; on a rejection they keep the
@@ -2182,7 +2197,7 @@ class TradingService:
         Returns True when IG accepted the pushed broker stop.
         """
         direction = position.direction
-        broker_target = self._broker_stop_level(direction, new_stop, spread)
+        broker_target = self._broker_stop_level(direction, new_stop, spread, buffer)
         broker_target = self._clamp_broker_stop_to_min_distance(
             direction, broker_target, current_price, position
         )
@@ -2305,7 +2320,7 @@ class TradingService:
                 return deal_id
         return None
 
-    async def raise_stop_manually(
+    async def set_stop_manually(
         self,
         position: Position,
         target_level: float,
@@ -2313,14 +2328,15 @@ class TradingService:
         *,
         profile: CloseProfile | None = None,
     ) -> tuple[bool, str]:
-        """Manually raise the protective stop to an absolute level (dashboard).
+        """Manually move the protective stop to an absolute level (dashboard).
 
         Triggered by the chart's stop buttons: the user picks a price on the
         chart's scale and both the **software follower** (the level the bot closes
         on) and the **broker stop** (posted one spread beyond it, see
-        :meth:`_broker_stop_level`) are moved to it. The move is raise-only — a
-        long's stop may only go up, a short's only down — and must stay on the
-        safe side of the live bid so it does not force an immediate exit.
+        :meth:`_broker_stop_level`) are moved to it. The stop can be moved **either
+        way** — tightened or loosened — for a long or a short; the only constraint
+        is that it must stay on the safe side of the live bid (below the bid for a
+        long, above it for a short) so it does not force an immediate exit.
 
         The zone the bid sits in *now* is captured into
         ``position.manual_stop_zone`` so :meth:`manage_position` holds this stop
@@ -2332,22 +2348,25 @@ class TradingService:
         if buf is None or buf.last is None:
             return False, "No price data for this epic"
         current_bid = buf.last.bid_close
+        spread = float(buf.last.spread or 0)
         direction = position.direction or "BUY"
-        current = float(position.level_follower or 0)
 
+        # Only safety gate: the stop must stay on the side of the CLOSE-OUT price
+        # that does not instantly close the trade — the bid for a long, the offer
+        # for a short (that is what the software backstop fires on, so a short's
+        # stop parked inside the spread would close it on the next tick). Direction
+        # of the move (tighten/loosen) is the user's choice — the buttons span the
+        # whole price scale.
         if direction == "SELL":
-            if target_level <= current_bid:
-                return False, "Stop must be above the current bid for a short"
-            if current > 0 and target_level >= current:
-                return False, "Stop can only be tightened (moved down for a short)"
+            if target_level <= current_bid + spread:
+                return False, "Stop must be above the current offer for a short"
         else:
             if target_level >= current_bid:
                 return False, "Stop must be below the current bid"
-            if current > 0 and target_level <= current:
-                return False, "Stop can only be raised"
 
-        spread = float(buf.last.spread or 0)
-        broker_stop = self._broker_stop_level(direction, target_level, spread)
+        broker_stop = self._broker_stop_level(
+            direction, target_level, spread, self._broker_stop_buffer(buf)
+        )
         broker_stop = self._clamp_broker_stop_to_min_distance(
             direction, broker_stop, current_bid, position
         )
@@ -2355,10 +2374,11 @@ class TradingService:
         position.level_follower = Decimal(str(round(target_level, 5)))
         position.stop_update = (position.stop_update or 0) + 1
 
-        # Capture the zone so the automatic ratcheting stays suspended until the
-        # bid leaves it (see manage_position). None when the profile has no zone
-        # concept — the stop is then simply set once and the ratchet invariant
-        # takes over on the next tick.
+        # Capture the zone so the automatic ratcheting stays suspended until price
+        # leaves it (see manage_position). The close profile is direction-aware, so
+        # the same instance classifies both sides and the manual-hold zone always
+        # matches automatic management. None when no profile is wired: the stop is
+        # then simply set once and the ratchet invariant takes over next tick.
         zone = (
             profile.current_zone(position, current_bid, buf)
             if profile is not None
@@ -2387,7 +2407,7 @@ class TradingService:
         self._append_stop_history(position, target_level, accepted_broker)
         await self._db.commit()
         logger.info(
-            "Manual stop raise for %s -> %.5f (broker %.5f, zone=%s, ig_ok=%s)",
+            "Manual stop set for %s -> %.5f (broker %.5f, zone=%s, ig_ok=%s)",
             position.epic,
             target_level,
             broker_stop,
@@ -2402,7 +2422,7 @@ class TradingService:
 
         Public entry point to the shared close path so callers outside this
         service (the dashboard route) delegate here instead of reimplementing the
-        direction mirror (BUY to close a recovery SELL), the short-aware P&L sign,
+        direction mirror (BUY to close a SELL), the short-aware P&L sign,
         dealId resolution and the IG confirm — all of which live in
         :meth:`_close_position`. ``reason_close`` is stamped ``"manual"``.
         """
@@ -2473,7 +2493,7 @@ class TradingService:
 
         logger.info("Closing %s with dealId=%s", position.epic, deal_id)
         # Closing side is the opposite of the open side: SELL to close a long,
-        # BUY to close a short (the recovery SELL).
+        # BUY to close a short.
         close_direction = "BUY" if position.direction == "SELL" else "SELL"
         close_payload = {
             "dealId": deal_id,

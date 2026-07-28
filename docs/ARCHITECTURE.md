@@ -84,6 +84,10 @@ Selection is one line each in `.env` — the single source of truth, all require
 `STOP_STRATEGY` and the three per-zone close selectors `CLOSE_ZONESTART` /
 `CLOSE_ZONEMARGE` / `CLOSE_ZONEPROFIT` (the close side is split into three
 independently-tuned zones — open→break-even, break-even→margin, above-margin).
+The same file carries `ALLOW_SAME_DAY_REOPEN`, a global open policy (required
+too): whether an epic may be opened more than once in the same day, in either
+direction. It is enforced by the shared pre-open gate and the rolling selector,
+so every entry strategy obeys it.
 
 ______________________________________________________________________
 

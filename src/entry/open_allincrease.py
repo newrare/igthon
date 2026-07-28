@@ -32,13 +32,13 @@ It is built around three requirements that its siblings do not combine:
    line looks. This is the deliberate guard against crowning epics whose rise is
    flat.
 
-3. **Re-openable and paced (selection-layer knobs).** Two class attributes read
-   by the scheduler's rolling selector:
-   - ``allow_same_day_reopen = True`` — an epic is a candidate again as soon as
-     it holds no open position, so the same market can be opened several times in
-     one day (the one-open-per-epic-per-day diversity rule is disabled). A
-     concurrent second open on a still-open epic remains blocked by the shared
-     ``epic_already_open`` gate.
+3. **Re-openable and paced.** Re-opening is a *global* policy —
+   ``ALLOW_SAME_DAY_REOPEN`` in ``.env``, not a strategy knob. This strategy is
+   designed for ``true``: an epic is a candidate again as soon as it holds no
+   open position, so the same market can be opened several times in one day. A
+   concurrent second open on a still-open epic remains blocked by the shared
+   ``epic_already_open`` gate. Pacing stays a class attribute read by the
+   scheduler's rolling selector:
    - ``open_cooldown_minutes = 10`` — the selector opens at most one position per
      pass and waits at least ten minutes between two opens, so positions are
      spaced out rather than fired in a burst. Combined with
@@ -94,13 +94,13 @@ class OpenAllIncrease(EntryStrategy):
     # — not dataclass fields, not settings — so they stay constants of the
     # strategy. The strategy is selected at runtime from the dashboard / .env.
     #
-    # Wallet-bounded, paced and re-openable: keep opening the best-ranked
-    # affordable rising market — the same epic may recur — one at a time, at least
-    # ``open_cooldown_minutes`` apart, until the spendable balance (available
-    # funds minus ``wallet_reserve``) can no longer cover another margin.
+    # Wallet-bounded and paced: keep opening the best-ranked affordable rising
+    # market one at a time, at least ``open_cooldown_minutes`` apart, until the
+    # spendable balance (available funds minus ``wallet_reserve``) can no longer
+    # cover another margin. Whether the same epic may recur within the day is the
+    # global ``ALLOW_SAME_DAY_REOPEN`` policy (.env) — this strategy assumes true.
     wallet_bounded = True  # open epics as long as the wallet has funds
     concurrent_positions = 1  # fallback cap only, used when the balance is unknown
-    allow_same_day_reopen = True  # an epic may be opened again once it is flat
     open_cooldown_minutes = 10  # wait ≥10 min between two opens; one open per pass
     open_after_minutes = 60  # ≈ one hour of livestream warm-up before first open
     wallet_reserve = 0.10  # keep 10% of available funds free

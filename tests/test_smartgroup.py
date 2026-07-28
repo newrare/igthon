@@ -43,7 +43,7 @@ def _member(
         level_zero=level_open + spread if level_zero is None else level_zero,
         level_follower=level_follower,
         euro_per_point=euro_per_point,
-        current_bid=current_bid,
+        current_price=current_bid,
         atr_value=atr_value,
         spread=spread,
         min_stop_distance=min_stop_distance,
@@ -199,7 +199,7 @@ class TestLegality:
         plan = plan_group_tightening(members, _P)
         for m in members[1:]:
             if m.position_id in plan:
-                assert plan[m.position_id] < m.current_bid
+                assert plan[m.position_id] < m.current_price
 
 
 class TestSmartGroupStop:
@@ -207,7 +207,7 @@ class TestSmartGroupStop:
 
     def _ctx(self, group_tighten):
         return StopContext(
-            current_bid=49.0,
+            current_price=49.0,
             level_open=50.0,
             level_zero=50.5,
             level_margin=51.0,

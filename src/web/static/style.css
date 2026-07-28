@@ -109,6 +109,78 @@ body {
   letter-spacing: 1px;
 }
 
+/* ── Auto-open switch ───────────────────────────────────────── */
+/* Full-width banner above the KPI bar: the single control deciding whether the
+   bot may still open a new position today. Green when openings are allowed, red
+   (with a pulsing border) when the user has closed the day, so the state is
+   unmissable from across the room. */
+.autoopen {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.25rem;
+  border: 1px solid var(--border);
+  border-left-width: 5px;
+  border-left-style: solid;
+  transition: background var(--transition), border-color var(--transition);
+}
+.autoopen-icon { width: 26px; height: 26px; flex: 0 0 auto; }
+.autoopen-text { display: flex; flex-direction: column; flex: 1 1 260px; }
+.autoopen-state {
+  font-size: 1.05rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+}
+.autoopen-detail { font-size: 0.8rem; color: var(--text-muted); }
+
+.autoopen-on {
+  background: rgba(74, 222, 128, 0.08);
+  border-color: rgba(74, 222, 128, 0.35);
+  border-left-color: var(--green);
+}
+.autoopen-on .autoopen-icon,
+.autoopen-on .autoopen-state { color: var(--green); }
+
+.autoopen-off {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.5);
+  border-left-color: var(--red);
+  animation: autoopen-alert 2.4s ease-in-out infinite;
+}
+.autoopen-off .autoopen-icon,
+.autoopen-off .autoopen-state { color: var(--red); }
+
+@keyframes autoopen-alert {
+  0%, 100% { border-color: rgba(239, 68, 68, 0.5); }
+  50%      { border-color: rgba(239, 68, 68, 0.9); }
+}
+
+.autoopen-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.65rem 1.4rem;
+  font-family: var(--font);
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--transition);
+}
+.autoopen-on  .autoopen-btn:hover { border-color: var(--red);   color: var(--red); }
+.autoopen-off .autoopen-btn:hover { border-color: var(--green); color: var(--green); }
+.autoopen-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
 /* ── Navigation ─────────────────────────────────────────────── */
 nav {
   background: var(--surface);
@@ -654,8 +726,8 @@ a.kpi-tile:hover {
 .err-hint     { color: var(--text-muted); font-size: 0.75rem; }
 .err-empty    { text-align: center; color: var(--text-dim); padding: 1.5rem; }
 
-.queue-todo-table { border: 1px solid rgba(245, 158, 11, 0.2); border-radius: var(--radius-sm); }
-.queue-todo-table th { background: rgba(245, 158, 11, 0.05); color: var(--amber); border-bottom-color: rgba(245, 158, 11, 0.25); }
+/* `queue-todo-table` used to carry an amber-accented header; it now shares the
+   standard unified table look so every table in the app is visually identical. */
 
 .truncated {
   cursor: pointer;
@@ -724,27 +796,60 @@ a.kpi-tile:hover {
 #filter-count,
 #epic-modal-count { font-size: 0.73rem; color: var(--text-dim); white-space: nowrap; }
 
-/* Epic list table */
-table { width: 100%; border-collapse: collapse; }
+/* ── Unified data table ─────────────────────────────────────────
+   Single source of truth for EVERY <table> in the app (dashboard,
+   charts, simulator, backtest, epic list, modals): bordered grid,
+   striped rows and a sticky uppercase header. The `.err-table` class
+   above resolves to the exact same look via the shared element
+   selectors below — the two are deliberately kept identical so a table
+   looks the same whether or not it carries a class.
+   Note: no `overflow:hidden` on the table — it would trap the sticky
+   header inside the table box and stop it pinning while the body
+   scrolls (in a modal or the page). The rounded border is kept. */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+}
 
 thead th {
   background: var(--bg);
   color: var(--primary);
-  padding: 0.6rem 0.85rem;
+  padding: 0.5rem 0.7rem;
   text-align: left;
-  font-size: 0.7rem;
+  font-size: 0.68rem;
   text-transform: uppercase;
   letter-spacing: 0.8px;
   border-bottom: 2px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
   font-weight: 700;
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: 2;
 }
+thead th:last-child { border-right: none; }
 
-tbody td { padding: 0.52rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.82rem; }
-tbody tr:hover { background: var(--surface-2); }
+tbody td {
+  padding: 0.42rem 0.7rem;
+  border-bottom: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
+  vertical-align: top;
+}
+tbody td:last-child { border-right: none; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:nth-child(odd)  { background: var(--surface); }
+tbody tr:nth-child(even) { background: var(--surface-2); }
+tbody tr:hover { background: #2e261f; }
 tbody tr.hidden { display: none; }
+
+/* Click-to-sort affordance. `tables.js` adds `.sortable` + the arrow
+   <span> to every eligible header at runtime, so no markup change is
+   needed per table; opt a header/table out with `data-nosort`. */
+thead th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+thead th.sortable:hover { color: #f0925a; }
+.sort-arrow { font-size: 0.72em; color: var(--primary); margin-left: 0.3em; }
 
 .desc-col { color: var(--text-muted); }
 .type-col { color: var(--text-dim); font-size: 0.75rem; }
@@ -847,7 +952,9 @@ footer {
 
 /* ── Dashboard-specific rules (migrated from the former inline <style>) ── */
 /* Table overrides — inlined to bypass browser CSS cache */
-.err-table     { border: 1px solid #4a3a30; border-radius: 4px; overflow: hidden; }
+/* No `overflow:hidden` here: it would trap the sticky <thead> inside the
+   table box and break header pinning while the body scrolls. */
+.err-table     { border: 1px solid #4a3a30; border-radius: 4px; }
 .err-table td,
 .err-table th  { text-align: left !important; }
 .err-table td  { border-right: 1px solid #4a3a30; border-bottom: 1px solid #4a3a30; }
@@ -872,16 +979,22 @@ footer {
 .kpi-refresh-btn:disabled { opacity: 0.35; cursor: default; }
 .clickable-row { cursor: pointer; transition: background 0.1s; }
 .clickable-row:hover { background: #2e261f !important; }
-/* Buy button in market table */
-.buy-btn {
-    background: #1a3a1a; border: 1px solid #2d5a2d; color: #4ade80;
+/* Buy / Sell trade buttons — a matched pair (green long, red short) sharing one
+   compact pill so they read as siblings wherever they appear (market table,
+   chart header). Same geometry as .close-pos-btn to stay coherent dashboard-wide. */
+.buy-btn, .sell-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 3.1rem; box-sizing: border-box;
     cursor: pointer; font-size: 0.75rem; font-weight: 600;
-    padding: 0.2rem 0.6rem; border-radius: 4px;
-    transition: background 0.15s, color 0.15s;
+    padding: 0.2rem 0.7rem; border-radius: 4px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
     white-space: nowrap;
 }
+.buy-btn { background: #1a3a1a; border: 1px solid #2d5a2d; color: #4ade80; }
 .buy-btn:hover { background: #16803c; color: #f0fdf4; border-color: #16803c; }
-.buy-btn:disabled { opacity: 0.4; cursor: default; }
+.sell-btn { background: #3a1a1a; border: 1px solid #5a2d2d; color: #f87171; }
+.sell-btn:hover { background: #991b1b; color: #fef2f2; border-color: #991b1b; }
+.buy-btn:disabled, .sell-btn:disabled { opacity: 0.4; cursor: default; }
 /* Close position button in open positions modal */
 .close-pos-btn {
     background: #3a1a1a; border: 1px solid #5a2d2d; color: #ef4444;

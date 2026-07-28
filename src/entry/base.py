@@ -48,6 +48,16 @@ class EntryStrategy(ABC):
     #: Registry key and ``OPEN_STRATEGY`` value (snake_case, stable).
     name: str = "base"
 
+    #: Whether this strategy is allowed to emit ``SELL`` intents on the
+    #: automatic path. The default is long-only: the orchestration layer drops a
+    #: SELL intent from a strategy that has not opted in, and the shared pre-open
+    #: gate (:func:`~src.execution.gates.evaluate_open_gates`) refuses it too, so
+    #: a long-only entry cannot short by accident. A strategy that genuinely
+    #: trades both ways sets this to True; the scheduler then keeps its SELL
+    #: intents and passes ``allow_short`` down to the gate. Manual dashboard
+    #: opens are unaffected — they carry their own ``allow_short``.
+    emits_shorts: bool = False
+
     #: How the orchestration layer drives this strategy. The default per-epic
     #: entries are evaluated by the 30-second analysis loop, which opens on every
     #: BUY intent. A ``cross_epic_selection`` entry is a *ranker* instead:
@@ -84,15 +94,14 @@ class EntryStrategy(ABC):
     # least-bad of a tiny pool instead of the best of the day. ``0.5`` = strictly
     # more than half the universe must be ready to participate.
     min_participation_ratio: float = 0.5
-    # Same-day re-open policy. When False (default) the rolling selector opens
-    # each epic at most once per day (the ``_traded_today`` diversity rule): once
-    # a market has been used it is dropped from re-ranking so the portfolio
-    # rotates across markets. When True that filter is skipped — an epic becomes a
-    # candidate again as soon as it holds no open position, so the same rising
-    # curve can be opened several times in one day. Concurrent duplicate opens on
-    # a still-open epic are always blocked by the shared ``epic_already_open``
-    # gate, independently of this flag.
-    allow_same_day_reopen: bool = False
+    # NOTE: the same-day re-open policy is NOT a strategy knob. It is global to
+    # every open strategy and read from ``ALLOW_SAME_DAY_REOPEN`` in .env: False
+    # = one opening per epic per day (BUY or SELL), True = an epic is a candidate
+    # again as soon as it holds no open position. It is enforced both by the
+    # rolling selector's candidate filter and by the shared pre-open gate
+    # (:func:`~src.execution.gates.evaluate_open_gates`), so per-epic strategies
+    # obey it too. Concurrent duplicates on a still-open epic are always blocked
+    # by ``epic_already_open``, whatever the policy.
     # Minimum minutes the rolling selector must wait between two opens. 0
     # (default) means no cooldown — the wallet-bounded selector may open several
     # positions in a single pass. When > 0 the selector opens at most one

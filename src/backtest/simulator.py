@@ -314,6 +314,9 @@ class StrategySimulator:
         open_positions: dict[int, SimulatedTrade] = {}
         closed_today: list[SimulatedTrade] = []
         last_candles: list[Candle | None] = [None] * len(curves)
+        # Epics already opened today — the global ALLOW_SAME_DAY_REOPEN policy is
+        # applied to per-epic strategies too (by the shared gate in _try_open).
+        used_today: set[int] = set()
 
         events = sorted(
             (
@@ -344,7 +347,14 @@ class StrategySimulator:
                     result.trades.append(position)
             else:
                 self._evaluate(
-                    day, e, candle, buffers[e], open_positions, closed_today, result
+                    day,
+                    e,
+                    candle,
+                    buffers[e],
+                    open_positions,
+                    closed_today,
+                    result,
+                    used_today,
                 )
 
         # Force-close anything still open at the end of the day.
@@ -390,12 +400,14 @@ class StrategySimulator:
         #    wallet reserve would cap concurrent positions further).
         #  - open_cooldown_minutes: at most one open per cooldown window, so
         #    positions are staggered instead of fired in a burst.
-        #  - allow_same_day_reopen: an epic re-enters the candidate pool as soon
-        #    as it holds no open position (the diversity ``used_today`` filter is
-        #    skipped), so the same market can be opened several times in one day.
+        #  - allow_same_day_reopen: the GLOBAL .env policy (carried on
+        #    TradeConfig, not on the strategy). When on, an epic re-enters the
+        #    candidate pool as soon as it holds no open position (the diversity
+        #    ``used_today`` filter is skipped), so the same market can be opened
+        #    several times in one day.
         wallet_bounded = getattr(self._entry, "wallet_bounded", False)
         cooldown_min = int(getattr(self._entry, "open_cooldown_minutes", 0) or 0)
-        allow_reopen = getattr(self._entry, "allow_same_day_reopen", False)
+        allow_reopen = bool(getattr(self._config, "allow_same_day_reopen", True))
         target = (
             len(curves)
             if wallet_bounded
@@ -528,8 +540,8 @@ class StrategySimulator:
                 open_positions,
                 closed_today,
                 result,
+                used_today,  # _try_open records the epic as used on success
             ):
-                used_today.add(e)
                 slots -= 1
                 opened += 1
                 last_open_ts = ts
@@ -548,6 +560,7 @@ class StrategySimulator:
         open_positions: dict[int, SimulatedTrade],
         closed_today: list[SimulatedTrade],
         result: SimulationResult,
+        used_today: set[int] | None = None,
     ) -> None:
         """Per-epic open path — mirror of the scheduler's ``_evaluate_epic``.
 
@@ -562,7 +575,15 @@ class StrategySimulator:
             return
         result.buy_signals += 1
         self._try_open(
-            day, epic_index, candle, buf, intent, open_positions, closed_today, result
+            day,
+            epic_index,
+            candle,
+            buf,
+            intent,
+            open_positions,
+            closed_today,
+            result,
+            used_today,
         )
 
     def _try_open(
@@ -575,6 +596,7 @@ class StrategySimulator:
         open_positions: dict[int, SimulatedTrade],
         closed_today: list[SimulatedTrade],
         result: SimulationResult,
+        used_today: set[int] | None = None,
     ) -> bool:
         """Run the pre-open gates and open on success.
 
@@ -582,13 +604,23 @@ class StrategySimulator:
         and any take-profit via ``initial_plan`` — exactly as the live
         ``open_from_intent`` does.
 
+        ``used_today`` holds the epics already opened during the simulated day.
+        It backs the global ``ALLOW_SAME_DAY_REOPEN`` policy (carried on
+        ``TradeConfig``): with the policy off, an epic in that set is refused by
+        the shared gate exactly as the live path refuses it. Opened epics are
+        recorded here so both day runners share one bookkeeping point.
+
         Returns True when a position was opened.
         """
+        allow_reopen = bool(getattr(self._config, "allow_same_day_reopen", True))
         allowed, reason = evaluate_open_gates(
             epic=buf.epic,
             direction=intent.direction,
             in_trading_hours=True,
             epic_already_open=epic_index in open_positions,
+            epic_traded_today=(
+                not allow_reopen and used_today is not None and epic_index in used_today
+            ),
         )
         if not allowed:
             # Normalize the reason (drop per-run numbers) for the counter.
@@ -617,6 +649,8 @@ class StrategySimulator:
             euro_stop=round(euro_risk, 2),
             euro_per_point=euro_per_point,
         )
+        if used_today is not None:
+            used_today.add(epic_index)
         return True
 
     # ------------------------------------------------------------------ #

@@ -38,6 +38,7 @@ from src.exit.zones.smartgroup import (
     SmartGroupStop,
     plan_group_tightening,
 )
+from src.exit.zones.timedlift import UnderwaterTimedLiftStop
 from src.exit.zones.trailing_ratchet import TrailingRatchetStop
 from src.exit.zones.underwater import UnderwaterStop, UnderwaterTrendCutStop
 
@@ -45,6 +46,7 @@ from src.exit.zones.underwater import UnderwaterStop, UnderwaterTrendCutStop
 ZONESTART_UPDATERS: dict[str, type[StopUpdater]] = {
     UnderwaterStop.name: UnderwaterStop,
     UnderwaterTrendCutStop.name: UnderwaterTrendCutStop,
+    UnderwaterTimedLiftStop.name: UnderwaterTimedLiftStop,
     SmartGroupStop.name: SmartGroupStop,
 }
 
@@ -75,6 +77,7 @@ __all__ = [
     "plan_group_tightening",
     "UnderwaterStop",
     "UnderwaterTrendCutStop",
+    "UnderwaterTimedLiftStop",
     "BreakevenBandStop",
     "BreakevenLockStop",
     "BreakevenSafeStop",

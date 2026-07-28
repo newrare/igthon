@@ -37,12 +37,14 @@ def _settings() -> SimpleNamespace:
         strategy_atr_k_pre=2.5,
         strategy_atr_k_post=1.5,
         strategy_trailing_step_ratio=0.3,
+        # Global .env re-open policy the simulator mirrors (see TradeConfig).
+        allow_same_day_reopen=True,
     )
 
 
-def _run(target: int = 30, seed: int = 42, **overrides):
+def _run(target: int = 30, seed: int = 42, settings=None, **overrides):
     config = SimulationConfig(target_trades=target, seed=seed, **overrides)
-    return run_simulation(_settings(), config)
+    return run_simulation(settings or _settings(), config)
 
 
 class TestSimulationRun:
@@ -80,6 +82,20 @@ class TestSimulationRun:
         assert s["equity"][-1] == pytest.approx(s["total_pnl"], abs=0.05)
         assert len(s["daily_pnl"]) == s["days_simulated"]
         assert sum(s["close_reasons"].values()) == s["trades"]
+
+    def test_same_day_reopen_policy_limits_openings_per_epic(self):
+        # The global ALLOW_SAME_DAY_REOPEN policy is mirrored by the simulator, so
+        # a backtest reports what the live bot would do. With it off, an epic can
+        # be opened at most once per simulated day.
+        strict = _settings()
+        strict.allow_same_day_reopen = False
+        result = _run(target=200, seed=11, settings=strict, max_days=5)
+        per_epic_day = [(t.epic, t.day) for t in result.trades]
+        assert len(per_epic_day) == len(set(per_epic_day))
+        # The permissive policy is what allows several openings on one epic/day.
+        loose = _run(target=200, seed=11, max_days=5)
+        loose_keys = [(t.epic, t.day) for t in loose.trades]
+        assert len(loose_keys) > len(set(loose_keys))
 
     def test_stops_at_max_days_when_no_signals(self):
         # A flat sideways market with a tiny day cap: the run must terminate.

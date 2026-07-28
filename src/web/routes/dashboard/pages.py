@@ -61,13 +61,9 @@ def _render_tradable_list_page(
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Tradable Epics</title>
-    <link rel="stylesheet" href="/static/style.css">
-    <style>
-        th.sortable {{ cursor: pointer; user-select: none; white-space: nowrap; }}
-        th.sortable:hover {{ color: #60a5fa; }}
-        .sort-arrow {{ font-size: 0.7em; color: #60a5fa; }}
-    </style>
+    <link rel="stylesheet" href="/static/style.css?v=13">
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script src="/static/tables.js?v=1"></script>
 </head>
 <body>
 <div class="container">
@@ -103,14 +99,14 @@ def _render_tradable_list_page(
         <table id="epic-table">
             <thead>
                 <tr>
-                    <th class="sortable" style="width:3rem;" data-type="num" onclick="sortTable(0)"># <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="text" onclick="sortTable(1)">Epic <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="text" onclick="sortTable(2)">Name <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="text" onclick="sortTable(3)">Status <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="num" onclick="sortTable(4)">Bid <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="num" onclick="sortTable(5)">Offer <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="num" onclick="sortTable(6)">Spread <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-type="num" onclick="sortTable(7)" title="Worst-case euro loss if a min-size BUY is stopped out at the initial stop">Risk <span class="sort-arrow"></span></th>
+                    <th style="width:3rem;" data-type="num">#</th>
+                    <th data-type="text">Epic</th>
+                    <th data-type="text">Name</th>
+                    <th data-type="text">Status</th>
+                    <th data-type="num">Bid</th>
+                    <th data-type="num">Offer</th>
+                    <th data-type="num">Spread</th>
+                    <th data-type="num" title="Worst-case euro loss if a min-size BUY is stopped out at the initial stop">Risk</th>
                 </tr>
             </thead>
             <tbody id="epic-tbody">
@@ -137,47 +133,8 @@ function filterTable(q) {{
     document.getElementById('filter-count').textContent = shown + ' shown';
 }}
 
-// Click-to-sort on any column header. Clicking the active column toggles the
-// direction. Numeric columns sort on the cell's data-sort float (empty = last);
-// text columns sort case-insensitively on data-sort.
-let sortCol = -1;
-let sortAsc = true;
-function sortTable(col) {{
-    const table = document.getElementById('epic-table');
-    const tbody = document.getElementById('epic-tbody');
-    const rows  = Array.from(tbody.querySelectorAll('tr'));
-    if (rows.length === 0 || rows[0].querySelectorAll('td').length < 8) return;
-
-    const headers = table.querySelectorAll('thead th');
-    const type = headers[col].dataset.type;
-
-    sortAsc = (col === sortCol) ? !sortAsc : true;
-    sortCol = col;
-
-    const dir = sortAsc ? 1 : -1;
-    rows.sort((a, b) => {{
-        const av = a.children[col].dataset.sort ?? '';
-        const bv = b.children[col].dataset.sort ?? '';
-        if (type === 'num') {{
-            // Empty (unknown) values always sort to the bottom, both directions.
-            const an = av === '' ? null : parseFloat(av);
-            const bn = bv === '' ? null : parseFloat(bv);
-            if (an === null && bn === null) return 0;
-            if (an === null) return 1;
-            if (bn === null) return -1;
-            return (an - bn) * dir;
-        }}
-        return av.localeCompare(bv, undefined, {{sensitivity: 'base'}}) * dir;
-    }});
-    rows.forEach(tr => tbody.appendChild(tr));
-
-    headers.forEach(th => {{
-        const arrow = th.querySelector('.sort-arrow');
-        if (arrow) arrow.textContent = '';
-    }});
-    const arrow = headers[col].querySelector('.sort-arrow');
-    if (arrow) arrow.textContent = sortAsc ? '▲' : '▼';
-}}
+// Click-to-sort is provided globally by /static/tables.js (honours the
+// per-header data-type and per-cell data-sort attributes emitted above).
 lucide.createIcons();
 </script>
 </body>

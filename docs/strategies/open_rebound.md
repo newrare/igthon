@@ -92,14 +92,17 @@ The per-epic score above is only half the strategy; *how many* positions are hel
 and *when* they open live in the scheduler's rolling selector
 (`_select_and_open`), driven by class-constant knobs:
 
-| Knob                      | Value   | Effect                                                         |
-| ------------------------- | ------- | -------------------------------------------------------------- |
-| `wallet_bounded`          | `True`  | keep opening the best affordable epic until the wallet is dry  |
-| `wallet_reserve`          | `0.10`  | keep 10 % of available funds free                              |
-| `allow_same_day_reopen`   | `False` | one open per epic per day — rotate across different markets    |
-| `open_cooldown_minutes`   | `5`     | ≥ 5 min between opens; at most one open per pass               |
-| `min_participation_ratio` | `0.5`   | > half the warmed-up universe before crowning a winner         |
-| `concurrent_positions`    | `1`     | fallback cap only, used when the account balance is unreadable |
+| Knob                      | Value  | Effect                                                         |
+| ------------------------- | ------ | -------------------------------------------------------------- |
+| `wallet_bounded`          | `True` | keep opening the best affordable epic until the wallet is dry  |
+| `wallet_reserve`          | `0.10` | keep 10 % of available funds free                              |
+| `open_cooldown_minutes`   | `5`    | ≥ 5 min between opens; at most one open per pass               |
+| `min_participation_ratio` | `0.5`  | > half the warmed-up universe before crowning a winner         |
+| `concurrent_positions`    | `1`    | fallback cap only, used when the account balance is unreadable |
+
+Same-day re-opening is **not** a strategy knob: it is the global
+`ALLOW_SAME_DAY_REOPEN` boolean in `.env` (see [README](README.md)). This
+strategy expects `ALLOW_SAME_DAY_REOPEN=false`.
 
 - **Wallet-bounded** *(on ouvre tant que le wallet le permet)*: every pass opens
   the top-ranked epic whose margin the spendable balance (available − reserve)
@@ -109,9 +112,10 @@ and *when* they open live in the scheduler's rolling selector
   only once ≥ 5 min have elapsed since the most recent open
   (`_minutes_since_last_open`, on `Position.time_open`, UTC).
 - **No same-day re-open** *(pour éviter des éventuels doublons de marché
-  similaire)*: the `_traded_today` diversity filter drops an epic already used
-  today, so the portfolio rotates across *different* markets rather than doubling
-  up on one rebound.
+  similaire)*: with the global `ALLOW_SAME_DAY_REOPEN=false` policy (`.env`, see
+  [README](README.md)) the `_traded_today` diversity filter drops an epic already
+  used today, so the portfolio rotates across *different* markets rather than
+  doubling up on one rebound. This strategy is designed for that value.
 - **Never opens a still-open epic** *(on ouvre si l'epic choisi n'est actuellement
   ouvert)*: the shared `epic_already_open` gate blocks any concurrent duplicate,
   independently of the flags above.

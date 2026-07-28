@@ -80,6 +80,42 @@ def _render_logs_section(entries: list[dict]) -> str:
         </div>"""
 
 
+def _render_auto_open_banner(enabled: bool) -> str:
+    """Render the big auto-open switch (authorise / block automatic openings).
+
+    Deliberately loud: it is the one control that decides whether the bot may
+    still take a new trade today, so it reads as a full-width banner that turns
+    red the moment openings are blocked. Rebuilt from the server state on every
+    poll, so the displayed state can never drift from the scheduler's.
+    """
+    if enabled:
+        state_cls, icon, state_label = "on", "unlock", "Openings allowed"
+        detail = (
+            "The bot may open new positions (BUY or SELL) whenever the active "
+            "entry strategy signals one."
+        )
+        btn_label, btn_icon = "Block for today", "hand"
+    else:
+        state_cls, icon, state_label = "off", "lock", "Openings blocked"
+        detail = (
+            "No automatic opening until tomorrow, whatever the entry strategy. "
+            "Positions already open keep running, and manual Buy / Sell still work."
+        )
+        btn_label, btn_icon = "Allow openings", "play"
+    return f"""
+        <div class="autoopen autoopen-{state_cls}" id="autoopen-banner">
+            <i data-lucide="{icon}" class="lc-icon autoopen-icon"></i>
+            <div class="autoopen-text">
+                <span class="autoopen-state" id="autoopen-state">{state_label}</span>
+                <span class="autoopen-detail" id="autoopen-detail">{detail}</span>
+            </div>
+            <button class="autoopen-btn" id="autoopen-btn" onclick="toggleAutoOpen(this)"
+                    title="Authorise or block every automatic opening for the current day">
+                <i data-lucide="{btn_icon}" class="lc-icon"></i> {btn_label}
+            </button>
+        </div>"""
+
+
 def _render_action_cards(jobs: list[dict]) -> str:
     """Render the job cards for the Actions section.
 
@@ -326,8 +362,9 @@ def _build_fragments(state: dict) -> dict[str, str]:
     (``/api/dashboard-fragments``). Keeping a single source of truth here means
     the page and the incremental updates can never drift apart.
 
-    Fragment ids: ``kpi_bar``, ``market_rows``, ``queue_modal`` (which now also
-    carries the IG API guard detail), ``positions_modal``.
+    Fragment ids: ``auto_open_banner``, ``kpi_bar``, ``market_rows``,
+    ``queue_modal`` (which now also carries the IG API guard detail),
+    ``positions_modal``.
     """
     market_summary: list[dict] = state["market_summary"]
     kpis: dict = state["kpis"]
@@ -420,8 +457,18 @@ def _build_fragments(state: dict) -> dict[str, str]:
         buy_btn = render_button(
             "Buy",
             cls="buy-btn",
-            onclick=f"event.stopPropagation(); openPosition('{epic_esc}', this)",
+            onclick=f"event.stopPropagation(); openPosition('{epic_esc}', this, 'BUY')",
             title="Open BUY position at minimum size",
+            attrs=(
+                f"onmouseenter=\"showFundsTooltip(event, '{epic_esc}')\" "
+                'onmouseleave="hideFundsTooltip()"'
+            ),
+        )
+        sell_btn = render_button(
+            "Sell",
+            cls="sell-btn",
+            onclick=f"event.stopPropagation(); openPosition('{epic_esc}', this, 'SELL')",
+            title="Open SELL (short) position at minimum size",
             attrs=(
                 f"onmouseenter=\"showFundsTooltip(event, '{epic_esc}')\" "
                 'onmouseleave="hideFundsTooltip()"'
@@ -443,8 +490,8 @@ def _build_fragments(state: dict) -> dict[str, str]:
                 </div>
             </td>
             <td class="number">{s['dots']}</td>
-            <td style="text-align:center;">
-                {buy_btn}
+            <td style="text-align:center;white-space:nowrap;">
+                {buy_btn} {sell_btn}
             </td>
         </tr>"""
 
@@ -865,6 +912,9 @@ def _build_fragments(state: dict) -> dict[str, str]:
 
     _today = date.today()
     return {
+        "auto_open_banner": _render_auto_open_banner(
+            bool(state.get("auto_open_enabled", True))
+        ),
         "kpi_bar": kpi_bar,
         "market_rows": market_rows,
         "week_summary": _render_week_summary_section(

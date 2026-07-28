@@ -120,10 +120,13 @@ class TestOpenFromIntent:
         pos = await svc.open_from_intent(EntryIntent(epic="X", direction="BUY"), buf)
 
         assert pos is not None
-        # The stop was chosen by the close profile's stop-distance policy
+        # The software stop was chosen by the close profile's stop-distance policy
         # (entry - 2.5*ATR = 95), not by the entry strategy.
+        assert float(pos.level_follower) == pytest.approx(95.0)
+        # The stop posted at IG sits one spread (0 here) plus the ATR noise cushion
+        # (0.5 * ATR 2 = 1) below the software stop, so it opens at 94.
         payload = client.post.await_args.args[1]
-        assert payload["stopLevel"] == pytest.approx(95.0)
+        assert payload["stopLevel"] == pytest.approx(94.0)
         # The position remembers which profile manages its exit.
         assert pos.close_profile == "close_zoneprofit"
 
@@ -280,3 +283,74 @@ class TestPreOpenCloseSoonGate:
         # now 15:00, close 16:30 -> 90 min > 65 -> allow.
         db.scalar = AsyncMock(return_value=time(16, 30))
         assert await svc._is_epic_close_soon("X") is False
+
+
+class TestSameDayReopenPolicy:
+    """The global ``ALLOW_SAME_DAY_REOPEN`` policy on the shared open path.
+
+    It is carried by ``TradeConfig`` (from ``.env``) rather than by the entry
+    strategy, so every open profile obeys it — per-epic loops included.
+    """
+
+    def _gate_ready(self, svc, *, traded_today: bool):
+        """Neutralise the other gates so only the re-open rule is exercised."""
+        svc._is_epic_open = AsyncMock(return_value=False)
+        svc._is_epic_close_soon = AsyncMock(return_value=False)
+        svc._is_epic_traded_today = AsyncMock(return_value=traded_today)
+
+    async def test_policy_off_blocks_a_second_open_the_same_day(self):
+        svc, _, _ = _service(allow_same_day_reopen=False)
+        self._gate_ready(svc, traded_today=True)
+        allowed, reason = await svc.can_open_intent(
+            EntryIntent(epic="X", direction="BUY")
+        )
+        assert not allowed and "already traded today" in reason
+
+    async def test_policy_off_still_allows_an_unused_epic(self):
+        svc, _, _ = _service(allow_same_day_reopen=False)
+        self._gate_ready(svc, traded_today=False)
+        allowed, _ = await svc.can_open_intent(EntryIntent(epic="X", direction="BUY"))
+        assert allowed is True
+
+    async def test_policy_on_allows_and_skips_the_lookup(self):
+        svc, _, _ = _service(allow_same_day_reopen=True)
+        self._gate_ready(svc, traded_today=True)
+        allowed, _ = await svc.can_open_intent(EntryIntent(epic="X", direction="BUY"))
+        assert allowed is True
+        svc._is_epic_traded_today.assert_not_awaited()  # no needless DB round-trip
+
+    async def test_manual_open_bypasses_the_policy(self):
+        # ``allow_reopen`` mirrors ``allow_short``: an explicit human open is not
+        # refused because a strategy already used this epic today.
+        svc, _, _ = _service(allow_same_day_reopen=False)
+        self._gate_ready(svc, traded_today=True)
+        allowed, _ = await svc.can_open_intent(
+            EntryIntent(epic="X", direction="BUY"), allow_reopen=True
+        )
+        assert allowed is True
+
+    async def test_policy_off_blocks_the_opposite_direction_too(self):
+        # One opening per epic per day covers BUY *and* SELL.
+        svc, _, _ = _service(allow_same_day_reopen=False)
+        self._gate_ready(svc, traded_today=True)
+        allowed, reason = await svc.can_open_intent(
+            EntryIntent(epic="X", direction="SELL"), allow_short=True
+        )
+        assert not allowed and "already traded today" in reason
+
+    async def test_traded_today_reads_todays_openings(self):
+        from datetime import date
+
+        svc, _, db = _service(allow_same_day_reopen=False)
+        result = MagicMock()
+        result.first.return_value = (1,)  # one opening recorded today
+        db.execute = AsyncMock(return_value=result)
+        assert await svc._is_epic_traded_today("X") is True
+        result.first.return_value = None
+        assert await svc._is_epic_traded_today("X") is False
+        # Filtered on the epic and today's trading day, not on the position state.
+        query = db.execute.await_args.args[0]
+        sql = str(query)
+        assert "position.epic" in sql and "position.date" in sql
+        assert "state" not in sql  # a closed opening still counts as "used today"
+        assert query.compile().params["date_1"] == date.today()

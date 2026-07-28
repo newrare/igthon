@@ -379,10 +379,15 @@ class TestGroupPrePass:
         pos = _position(id=1, level_follower=7990.0)
         assert get_close_profile(_settings()).group_member(pos, 7995.0, buf) is None
 
-    def test_group_member_none_for_sell(self):
-        buf = _buffer([8000.0] * 20)
-        pos = _position(id=1, direction="SELL", level_follower=7990.0)
-        assert self._smart().group_member(pos, 7995.0, buf) is None
+    def test_group_member_signs_a_sell(self):
+        # Shorts join the same pot: the member is built with sign −1 and the
+        # close-out OFFER (bid + spread), not the bid.
+        buf = _buffer([8000.0] * 20, spread=0.5)
+        pos = _position(id=1, direction="SELL", level_follower=8010.0)
+        m = self._smart().group_member(pos, 7995.0, buf)
+        assert m is not None
+        assert m.sign == -1.0
+        assert m.current_price == 7995.5
 
     def test_group_member_none_without_candle(self):
         empty = EpicBuffer(epic="TEST.EPIC", max_candles=10)
@@ -405,7 +410,8 @@ class TestGroupPrePass:
         assert m.position_id == 7
         assert m.euro_per_point == 10.0
         assert m.min_stop_distance == 0.3
-        assert m.current_bid == 7999.0
+        assert m.sign == 1.0
+        assert m.current_price == 7999.0
 
     def test_plan_group_empty_when_not_group_aware(self):
         assert get_close_profile(_settings()).plan_group([]) == {}

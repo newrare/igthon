@@ -12,8 +12,8 @@ cases, the ``min_score`` floor, and the two behaviours that define this ranker:
 - **recency weighting** — a curve rising *recently* outscores one that rose early
   and has since gone flat.
 
-The selection-layer knobs (``wallet_bounded``, ``allow_same_day_reopen``,
-``open_cooldown_minutes``) are asserted here as the strategy's contract and
+The selection-layer knobs (``wallet_bounded``, ``open_cooldown_minutes``) are
+asserted here as the strategy's contract and
 exercised end-to-end against the scheduler in ``tests/test_scheduler.py``.
 """
 
@@ -87,7 +87,8 @@ class TestSelectionKnobs:
     def test_wallet_bounded_paced_and_reopenable(self):
         strat = OpenAllIncrease()
         assert strat.wallet_bounded is True
-        assert strat.allow_same_day_reopen is True
+        # Same-day re-open is global (.env ALLOW_SAME_DAY_REOPEN), not a knob.
+        assert not hasattr(strat, "allow_same_day_reopen")
         assert strat.open_cooldown_minutes == 10
 
     def test_recency_weighting_decreases_with_horizon(self):

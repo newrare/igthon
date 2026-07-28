@@ -62,7 +62,8 @@ of the spec directly:
 - ``open_cooldown_minutes = 5`` — *une nouvelle ouverture toutes les 5 minutes au
   mieux*: the selector opens at most one position per pass and waits at least five
   minutes since the most recent open before opening the next.
-- ``allow_same_day_reopen = True`` — the only re-open restriction in the spec is
+- ``ALLOW_SAME_DAY_REOPEN=true`` (global ``.env`` policy, no longer a strategy
+  attribute) — the only re-open restriction in the spec is
   *un epic actuellement ouvert ne pourra pas être ouvert de nouveau*, which is the
   shared ``epic_already_open`` gate (always on, blocks concurrent duplicates).
   Nothing forbids re-opening an epic once it has closed, so the one-open-per-epic-
@@ -100,10 +101,11 @@ class OpenSlope(EntryStrategy):
     # one at a time, at least ``open_cooldown_minutes`` apart, until the spendable
     # balance (available funds minus ``wallet_reserve``) can no longer cover
     # another margin. A concurrent duplicate on a still-open epic is always blocked
-    # by the shared ``epic_already_open`` gate.
+    # by the shared ``epic_already_open`` gate; re-opening a *flat* epic the same
+    # day is the global ALLOW_SAME_DAY_REOPEN policy (.env) — this strategy
+    # assumes true.
     wallet_bounded = True  # open epics as long as the wallet has funds
     concurrent_positions = 1  # fallback cap only, used when the balance is unknown
-    allow_same_day_reopen = True  # only "currently open" is blocked — re-open when flat
     open_cooldown_minutes = 5  # ≥5 min between two opens; one open per pass
     open_after_minutes = 60  # ≈ one hour of livestream warm-up before first open
     wallet_reserve = 0.10  # keep 10% of available funds free

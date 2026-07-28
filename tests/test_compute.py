@@ -7,8 +7,10 @@ import pytest
 from src.core.indicators import (
     adverse_tick_noise,
     atr,
+    channel_position,
     linear_regression,
     rate_of_change,
+    trend_pct,
 )
 from src.feed.price_buffer import Candle
 
@@ -152,3 +154,90 @@ class TestROC:
         values = [100.0, 110.0]
         roc = rate_of_change(values, 5)
         assert roc == 0.0
+
+
+class TestTrendPct:
+    """``trend_pct`` normalises the raw slope into a cross-epic comparable move."""
+
+    def test_reports_the_implied_percentage_move_of_the_fit(self):
+        # A perfectly linear +1/candle climb over 100 candles ending at 200.0:
+        # the fit implies ~100 points of move, i.e. ~50% of the last price.
+        closes = [100.0 + i for i in range(100)]
+        pct, r2 = trend_pct(closes, 100)
+        assert pct == pytest.approx(100 * 100 / 199.0, rel=1e-6)
+        assert r2 == pytest.approx(1.0)
+
+    def test_sign_follows_the_direction_of_the_move(self):
+        rising = [100.0 + i for i in range(60)]
+        falling = [100.0 - i * 0.5 for i in range(60)]
+        assert trend_pct(rising, 60)[0] > 0
+        assert trend_pct(falling, 60)[0] < 0
+
+    def test_is_comparable_across_price_scales(self):
+        """The point of the normalisation: a 1% move scores the same on a
+        1.10 forex pair and on a 5000-point index."""
+        forex = [1.10 * (1 + 0.01 * i / 59) for i in range(60)]
+        index = [5000.0 * (1 + 0.01 * i / 59) for i in range(60)]
+        assert trend_pct(forex, 60)[0] == pytest.approx(
+            trend_pct(index, 60)[0], rel=1e-6
+        )
+
+    def test_uses_the_whole_series_when_shorter_than_the_period(self):
+        closes = [100.0 + i for i in range(10)]
+        assert trend_pct(closes, 60) == trend_pct(closes, 10)
+
+    def test_degenerate_inputs_are_zero(self):
+        assert trend_pct([], 60) == (0.0, 0.0)
+        assert trend_pct([100.0], 60) == (0.0, 0.0)
+        assert trend_pct([100.0, 200.0], 1) == (0.0, 0.0)
+        assert trend_pct([0.0, 0.0], 2) == (0.0, 0.0)  # non-positive last price
+
+
+class TestChannelPosition:
+    """``channel_position`` locates the last bid inside its high/low channel."""
+
+    @staticmethod
+    def _candles(lows_highs, last_close):
+        out = []
+        for i, (lo, hi) in enumerate(lows_highs):
+            close = last_close if i == len(lows_highs) - 1 else (lo + hi) / 2
+            out.append(
+                Candle(
+                    timestamp=datetime(2024, 1, 1, 9, i, tzinfo=UTC),
+                    bid_open=close,
+                    bid_close=close,
+                    bid_high=hi,
+                    bid_low=lo,
+                    offer_open=close,
+                    offer_close=close,
+                    offer_high=hi,
+                    offer_low=lo,
+                )
+            )
+        return out
+
+    def test_reports_zero_at_the_low_and_one_at_the_high(self):
+        band = [(100.0, 200.0)] * 5
+        assert self._candles(band, 100.0) and channel_position(
+            self._candles(band, 100.0), 5
+        ) == (0.0, 200.0, 100.0)
+        assert channel_position(self._candles(band, 200.0), 5) == (1.0, 200.0, 100.0)
+
+    def test_reports_the_midpoint_in_the_middle(self):
+        pos, high, low = channel_position(self._candles([(0.0, 10.0)] * 5, 5.0), 5)
+        assert (pos, high, low) == (0.5, 10.0, 0.0)
+
+    def test_flat_channel_is_reported_as_the_midpoint(self):
+        """A degenerate channel has no meaningful position — never divide by zero."""
+        pos, high, low = channel_position(self._candles([(7.0, 7.0)] * 5, 7.0), 5)
+        assert pos == 0.5 and high == 7.0 and low == 7.0
+
+    def test_only_the_last_period_candles_are_scanned(self):
+        # An old 0-1000 spike must not widen the channel of the recent window.
+        candles = self._candles([(0.0, 1000.0)] + [(100.0, 200.0)] * 4, 150.0)
+        pos, high, low = channel_position(candles, 4)
+        assert (high, low) == (200.0, 100.0)
+        assert pos == pytest.approx(0.5)
+
+    def test_empty_input_is_the_midpoint(self):
+        assert channel_position([], 5) == (0.5, 0.0, 0.0)

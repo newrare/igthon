@@ -113,6 +113,17 @@ constant (`MarketScanner.DEFAULT_MAX_SPREAD_RATIO`), tuned in
 
 ### Opening and closing
 
+| Variable                | Default    | Description                                                                                  |
+| ----------------------- | ---------- | -------------------------------------------------------------------------------------------- |
+| `ALLOW_SAME_DAY_REOPEN` | *required* | `false` = one opening per epic per day (BUY or SELL); `true` = re-open once the epic is flat |
+
+`ALLOW_SAME_DAY_REOPEN` is **global to every entry strategy** and required (no
+code default — a missing value stops startup). With `false`, an epic that already
+had an opening today is dropped for the rest of the day, even after its position
+closed. Two concurrent positions on the same epic are always refused, and a
+manual dashboard open bypasses the policy. See
+[strategies/README.md](strategies/README.md).
+
 There is no wall-clock trading-hours gate: an epic can be opened whenever its
 live market status is TRADEABLE (from the Lightstreamer subscription). Each open
 position is force-closed just before its **own** market close, derived per epic

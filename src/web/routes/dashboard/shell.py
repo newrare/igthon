@@ -78,19 +78,32 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 # opens on top when launched from an open/closed positions row,
                 # rather than behind their dark overlay (which hid the indicators).
                 z_index=8700,
-                # A Buy button next to the title opens a BUY on the epic
-                # currently displayed (tracked client-side in
+                # Buy/Sell buttons next to the title open a BUY or SELL (short) on
+                # the epic currently displayed (tracked client-side in
                 # ``_chartModalEpic``), reusing the same confirm + funds-tooltip
                 # flow as the market-data table rows.
-                header_actions=render_button(
-                    "Buy",
-                    cls="buy-btn",
-                    onclick="openPosition(_chartModalEpic, this)",
-                    title="Open BUY position at minimum size",
-                    attrs=(
-                        'onmouseenter="showFundsTooltip(event, _chartModalEpic)" '
-                        'onmouseleave="hideFundsTooltip()"'
-                    ),
+                header_actions=(
+                    render_button(
+                        "Buy",
+                        cls="buy-btn",
+                        onclick="openPosition(_chartModalEpic, this, 'BUY')",
+                        title="Open BUY position at minimum size",
+                        attrs=(
+                            'onmouseenter="showFundsTooltip(event, _chartModalEpic)" '
+                            'onmouseleave="hideFundsTooltip()"'
+                        ),
+                    )
+                    + " "
+                    + render_button(
+                        "Sell",
+                        cls="sell-btn",
+                        onclick="openPosition(_chartModalEpic, this, 'SELL')",
+                        title="Open SELL (short) position at minimum size",
+                        attrs=(
+                            'onmouseenter="showFundsTooltip(event, _chartModalEpic)" '
+                            'onmouseleave="hideFundsTooltip()"'
+                        ),
+                    )
                 ),
                 # The chart sits in a relative wrapper so the carousel arrows
                 # (previous/next epic in the source table) and the "paused"
@@ -139,6 +152,27 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 confirm_label="Confirm BUY",
                 confirm_style=(
                     "background:#16803c;border:1px solid #16803c;color:#f0fdf4;"
+                    "cursor:pointer;font-size:0.85rem;font-weight:600;"
+                    "padding:0.4rem 1rem;border-radius:4px;"
+                ),
+            ),
+            render_confirm_modal(
+                modal_id="sell-confirm-modal",
+                close_fn="closeSellConfirmModal",
+                title="Confirm SELL (short) Order",
+                title_color="#ef4444",
+                lead_html=(
+                    '<p style="color:#cbd5e1;margin:0 0 0.4rem;">Open SELL (short) on '
+                    '<strong id="sell-confirm-epic" style="color:#fef2f2;">'
+                    "</strong>?</p>"
+                ),
+                note=(
+                    "This places a real short market order at minimum deal size — "
+                    "the stop sits ABOVE the entry and everything is mirrored."
+                ),
+                confirm_label="Confirm SELL",
+                confirm_style=(
+                    "background:#991b1b;border:1px solid #991b1b;color:#fef2f2;"
                     "cursor:pointer;font-size:0.85rem;font-weight:600;"
                     "padding:0.4rem 1rem;border-radius:4px;"
                 ),
@@ -237,7 +271,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=9">
+    <link rel="stylesheet" href="/static/style.css?v=13">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -261,6 +295,9 @@ def _render_dashboard(settings, state: dict) -> str:
             f"{settings.close_zoneprofit}"
         )}
     </div>
+
+    <!-- Auto-open switch — authorises or blocks every automatic opening today -->
+    <div id="frag-auto_open_banner">{frags['auto_open_banner']}</div>
 
     <!-- KPI Bar -->
     <div class="kpi-updated">Live data · updated <span id="refresh-kpi">—</span></div>
@@ -401,6 +438,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/dashboard.js?v=31"></script>
+<script src="/static/tables.js?v=1"></script>
+<script src="/static/dashboard.js?v=35"></script>
 </body>
 </html>"""

@@ -7,8 +7,8 @@ These tests cover the registry, the score contract (a positive relative
 progression, BUY-only, ranked by steepness), the long-only slope gate, the
 structural ``None`` cases and the optional score floor.
 
-The selection-layer knobs (``wallet_bounded``, ``open_cooldown_minutes``,
-``allow_same_day_reopen``) are asserted here as the strategy's contract; they are
+The selection-layer knobs (``wallet_bounded``, ``open_cooldown_minutes``) are
+asserted here as the strategy's contract; they are
 exercised end-to-end against the scheduler in ``tests/test_scheduler.py``.
 """
 
@@ -79,7 +79,8 @@ class TestSelectionKnobs:
         strat = OpenSlope()
         assert strat.wallet_bounded is True  # open while the wallet allows
         assert strat.open_cooldown_minutes == 5  # a new open every 5 min at best
-        assert strat.allow_same_day_reopen is True  # only "currently open" is blocked
+        # Same-day re-open is global (.env ALLOW_SAME_DAY_REOPEN), not a knob.
+        assert not hasattr(strat, "allow_same_day_reopen")
 
 
 class TestScoreContract:

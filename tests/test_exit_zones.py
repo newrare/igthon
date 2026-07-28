@@ -56,9 +56,20 @@ def _buffer(closes: list[float], spread: float = 0.5) -> EpicBuffer:
     return buf
 
 
-def _ctx(buf: EpicBuffer, *, current_bid, level_zero, level_margin, level_follower):
+def _ctx(
+    buf: EpicBuffer,
+    *,
+    current_bid,
+    level_zero,
+    level_margin,
+    level_follower,
+    direction="BUY",
+):
+    """A BUY context by default; ``direction="SELL"`` mirrors it (the caller then
+    passes the live OFFER as ``current_bid``, since that is a short's close-out
+    price)."""
     return StopContext(
-        current_bid=current_bid,
+        current_price=current_bid,
         level_open=level_zero,
         level_zero=level_zero,
         level_margin=level_margin,
@@ -67,6 +78,7 @@ def _ctx(buf: EpicBuffer, *, current_bid, level_zero, level_margin, level_follow
         spread=buf.last.spread,
         euro_per_point=0.0,
         buf=buf,
+        direction=direction,
     )
 
 
@@ -150,7 +162,7 @@ class TestUnderwaterTrendCut:
         # the bid (all-but-immediate cut) rather than at the unreachable cut level.
         result = UnderwaterTrendCutStop().propose(ctx)
         assert result == pytest.approx(7972.0 - buf.last.spread)
-        assert result < ctx.current_bid
+        assert result < ctx.current_price
 
     def test_holds_the_wide_stop_on_a_choppy_drift(self):
         # A sawtooth that drifts down slightly: slope < 0 but ER is low (small net
@@ -241,7 +253,7 @@ class TestBreakevenLock:
         )
         new_stop = BreakevenLockStop().propose(ctx)
         assert new_stop == pytest.approx(8003.0)
-        assert ctx.level_zero < new_stop < ctx.current_bid
+        assert ctx.level_zero < new_stop < ctx.current_price
         assert new_stop > ctx.level_follower
 
     def test_floor_never_pins_the_stop_at_or_above_the_bid(self):
@@ -316,9 +328,10 @@ class TestBreakevenSafe:
         level_margin,
         level_follower,
         euro_per_point,
+        direction="BUY",
     ):
         return StopContext(
-            current_bid=current_bid,
+            current_price=current_bid,
             level_open=level_zero,
             level_zero=level_zero,
             level_margin=level_margin,
@@ -327,6 +340,7 @@ class TestBreakevenSafe:
             spread=buf.last.spread,
             euro_per_point=euro_per_point,
             buf=buf,
+            direction=direction,
         )
 
     def test_locks_the_euro_reference_when_it_is_the_lower(self):
@@ -344,7 +358,7 @@ class TestBreakevenSafe:
         )
         new_stop = BreakevenSafeStop().propose(ctx)
         assert new_stop == pytest.approx(8005.0)  # 8000 + 10 € / 2 €·pt
-        assert ctx.level_zero < new_stop < ctx.current_bid
+        assert ctx.level_zero < new_stop < ctx.current_price
 
     def test_locks_the_three_percent_reference_when_it_is_the_lower(self):
         # Tight range → +3 % is tiny; euro_per_point = 2 → +10 € = 5 pts is higher.
@@ -360,7 +374,7 @@ class TestBreakevenSafe:
         )
         new_stop = BreakevenSafeStop().propose(ctx)
         assert new_stop == pytest.approx(8000.096)  # 8000 + 0.03 × 3.2
-        assert ctx.level_zero < new_stop < ctx.current_bid
+        assert ctx.level_zero < new_stop < ctx.current_price
 
     def test_uses_the_range_reference_when_euro_per_point_is_missing(self):
         # No euro-per-point → the euro reference drops out, only +3 % remains.
@@ -485,7 +499,7 @@ class TestBreakevenHalf:
         )
         new_stop = BreakevenHalfStop().propose(ctx)
         assert new_stop == pytest.approx(8002.5)
-        assert ctx.level_zero < new_stop < ctx.current_bid
+        assert ctx.level_zero < new_stop < ctx.current_price
 
     def test_holds_without_two_ticks_above_the_margin(self):
         # The rise stays inside the band (8009 never clears the 8010 margin), so the
@@ -608,7 +622,7 @@ class TestTrailingRatchet:
         new_stop = TrailingRatchetStop().propose(ctx)
         # swing_low = 8050, noise = 0 → floor = 8000 + 0.6 × 50 = 8030.
         assert new_stop == pytest.approx(8030.0)
-        assert ctx.level_follower < new_stop < ctx.current_bid
+        assert ctx.level_follower < new_stop < ctx.current_price
 
     def test_floor_applies_when_chandelier_is_in_the_dead_band(self):
         # The live scenario: rising in profit, but the chandelier (bid − k·ATR)

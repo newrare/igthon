@@ -28,7 +28,7 @@ Three shaping rules (all class constants on :class:`SmartGroupParams`):
   usable as a loss budget, leaving a safety margin so the group stays net-positive
   even after spreads/slippage.
 - **Budget-adaptive cushion** — the richer the budget relative to the exposure,
-  the *wider* the cushion below the bid (more room to breathe); a thin budget
+  the *wider* the cushion behind price (more room to breathe); a thin budget
   collapses the cushion onto the noise band (``adverse_tick_noise``) — just beyond
   ordinary jitter, so a normal tick does not trigger it.
 - **Priority-greedy arming** — negatives are ranked by *loss-reduction
@@ -68,25 +68,31 @@ class SmartGroupParams:
 
 @dataclass(slots=True)
 class GroupMember:
-    """Per-position scalars the group planner needs — one per open BUY.
+    """Per-position scalars the group planner needs — one per open position.
 
     Deliberately holds only plain numbers (no ORM row, no buffer) so
     :func:`plan_group_tightening` is a pure, fully unit-testable function. Built by
     :meth:`~src.exit.close_zoneprofit.CloseZoneProfit.group_member` from the
     persisted position plus the live buffer.
 
+    Longs and shorts share one pot: every quantity below is either a euro amount
+    (already side-free) or a price compared through :attr:`sign`, so a book mixing
+    both sides is planned in a single pass.
+
     Attributes:
         position_id: Stable key used to return the decision to the right position.
         level_open: Fill level of the position (P&L reference).
-        level_zero: Break-even level (entry offer for a BUY) — the winner boundary.
+        level_zero: Break-even level (entry offer for a BUY, entry bid for a SELL)
+            — the winner boundary.
         level_follower: Current software stop; the level a winner's guaranteed
-            euro is measured at, and the floor an underwater stop ratchets up from.
+            euro is measured at, and the floor an underwater stop tightens from.
         euro_per_point: Euro P&L per point of price move (position size).
-        current_bid: Live bid.
+        current_price: Live close-out price (bid for a BUY, offer for a SELL).
         atr_value: Recent ATR (sizes the widest cushion).
         spread: Live bid/offer spread.
         min_stop_distance: IG minimum stop distance in price units (0 when unknown).
         noise: Adverse-tick-noise band (tightest safe cushion floor).
+        sign: ``+1`` for a BUY, ``−1`` for a SELL — the direction profit moves in.
     """
 
     position_id: int
@@ -94,11 +100,12 @@ class GroupMember:
     level_zero: float
     level_follower: float
     euro_per_point: float
-    current_bid: float
+    current_price: float
     atr_value: float
     spread: float
     min_stop_distance: float
     noise: float
+    sign: float = 1.0
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -137,46 +144,54 @@ def plan_group_tightening(
     """
     params = params or SmartGroupParams()
 
-    # 1. Guaranteed pot from the winners (stop already at/above break-even).
+    # 1. Guaranteed pot from the winners (stop already at/past break-even). Both
+    # quantities are signed by the member's direction, so a short's stop sitting
+    # BELOW its entry contributes the same positive euros as a long's above.
     guaranteed = sum(
-        (m.level_follower - m.level_open) * m.euro_per_point
+        m.sign * (m.level_follower - m.level_open) * m.euro_per_point
         for m in members
-        if m.level_follower >= m.level_zero and m.euro_per_point > 0
+        if m.sign * (m.level_follower - m.level_zero) >= 0 and m.euro_per_point > 0
     )
     budget = params.budget_fraction * guaranteed
     if budget <= 0:
         return {}
 
-    # 2. Losers = underwater BUYs (bid at/below break-even) whose floor cushion is
-    # a genuine up-only tightening sitting strictly below the live bid.
+    # 2. Losers = underwater positions (price has not cleared break-even) whose
+    # floor cushion is a genuine tightening sitting strictly behind the live price.
     def floor(m: GroupMember) -> float:
         return max(m.noise, m.min_stop_distance)
 
     def cost_of(m: GroupMember, stop: float) -> float:
         # Euros lost if the tightened stop is hit (positive for an underwater stop).
-        return (m.level_open - stop) * m.euro_per_point
+        return m.sign * (m.level_open - stop) * m.euro_per_point
 
     candidates = []  # (efficiency, floor_cost, member, floor_stop, max_cushion)
     for m in members:
-        if m.euro_per_point <= 0 or m.current_bid > m.level_zero:
+        if m.euro_per_point <= 0 or m.sign * (m.current_price - m.level_zero) > 0:
             continue
         floor_c = floor(m)
-        floor_stop = m.current_bid - floor_c
-        if floor_stop <= m.level_follower or floor_stop >= m.current_bid:
+        floor_stop = m.current_price - m.sign * floor_c
+        if (
+            m.sign * (floor_stop - m.level_follower) <= 0
+            or m.sign * (m.current_price - floor_stop) <= 0
+        ):
             continue
         floor_cost = cost_of(m, floor_stop)
-        saving = (floor_stop - m.level_follower) * m.euro_per_point
+        saving = m.sign * (floor_stop - m.level_follower) * m.euro_per_point
         # Efficiency = downside capped per euro of budget spent. A non-positive
         # cost means the stop already locks break-even-or-better: free protection,
         # ranked ahead of everything (sentinel infinity).
         efficiency = saving / floor_cost if floor_cost > 0 else float("inf")
         # The widest the cushion may ever grow: the ATR band, but never so far that
-        # the widened stop drops to/under the initial follower (that would undo the
-        # tightening rather than add breathing room), and never narrower than the
-        # floor (a tiny ATR must not pull the cap below the noise floor).
+        # the widened stop falls back to/behind the initial follower (that would undo
+        # the tightening rather than add breathing room), and never narrower than the
+        # floor (a tiny ATR must not pull the cap inside the noise floor).
         max_cushion = max(
             floor_c,
-            min(params.max_cushion_atr * m.atr_value, m.current_bid - m.level_follower),
+            min(
+                params.max_cushion_atr * m.atr_value,
+                m.sign * (m.current_price - m.level_follower),
+            ),
         )
         candidates.append(
             (efficiency, max(0.0, floor_cost), m, floor_stop, max_cushion)
@@ -192,7 +207,7 @@ def plan_group_tightening(
     for _efficiency, floor_cost, m, floor_stop, max_cushion in candidates:
         if spent + floor_cost > budget:
             continue
-        selected.append((m, m.current_bid - floor_stop, max_cushion))
+        selected.append((m, m.sign * (m.current_price - floor_stop), max_cushion))
         spent += floor_cost
     if not selected:
         return {}
@@ -210,7 +225,7 @@ def plan_group_tightening(
     plan: dict[int, float] = {}
     for m, floor_c, max_c in selected:
         cushion = floor_c + widen * (max_c - floor_c)
-        plan[m.position_id] = m.current_bid - cushion
+        plan[m.position_id] = m.current_price - m.sign * cushion
     return plan
 
 

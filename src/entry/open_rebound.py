@@ -68,12 +68,13 @@ of the spec directly:
   epic*: the selector opens at most one position per pass and waits at least five
   minutes between two opens, so similar markets rebounding together are not opened
   in a single burst.
-- ``allow_same_day_reopen = False`` (default) — *pour éviter des éventuels
-  doublons de marché similaire*: an epic used once today is dropped from
-  re-ranking, so the portfolio rotates across *different* markets rather than
-  re-opening the same rebound. A concurrent duplicate open on a still-open epic is
-  always blocked by the shared ``epic_already_open`` gate regardless of this flag
-  — that is the *"on ouvre si l'epic choisi n'est actuellement ouvert"* guarantee.
+- ``ALLOW_SAME_DAY_REOPEN=false`` (global ``.env`` policy, no longer a strategy
+  attribute) — *pour éviter des éventuels doublons de marché similaire*: an epic
+  used once today is dropped from re-ranking, so the portfolio rotates across
+  *different* markets rather than re-opening the same rebound. A concurrent
+  duplicate open on a still-open epic is always blocked by the shared
+  ``epic_already_open`` gate regardless of that policy — that is the *"on ouvre si
+  l'epic choisi n'est actuellement ouvert"* guarantee.
 
 Documented in ``docs/strategies/open_rebound.md``.
 """
@@ -123,11 +124,11 @@ class OpenRebound(EntryStrategy):
     # Wallet-bounded and paced: keep opening the best-ranked affordable rebound one
     # at a time, at least ``open_cooldown_minutes`` apart, until the spendable
     # balance (available funds minus ``wallet_reserve``) can no longer cover another
-    # margin. Same-day re-open stays OFF (the default) so the portfolio rotates
-    # across different markets and does not double up on one rebound.
+    # margin. This strategy expects the global ALLOW_SAME_DAY_REOPEN policy OFF so
+    # the portfolio rotates across different markets and does not double up on one
+    # rebound.
     wallet_bounded = True  # open epics as long as the wallet has funds
     concurrent_positions = 1  # fallback cap only, used when the balance is unknown
-    allow_same_day_reopen = False  # one open per epic per day — rotate markets
     open_cooldown_minutes = 5  # wait ≥5 min between two opens; one open per pass
     open_after_minutes = 60  # ≈ one hour of livestream warm-up before first open
     wallet_reserve = 0.10  # keep 10% of available funds free

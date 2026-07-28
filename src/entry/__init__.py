@@ -18,9 +18,11 @@ from __future__ import annotations
 from src.entry.base import EntryIntent, EntryStrategy
 from src.entry.open_allincrease import OpenAllIncrease
 from src.entry.open_donchian import OpenDonchian
+from src.entry.open_fade import OpenFade
 from src.entry.open_linear import OpenLinear
 from src.entry.open_manual import OpenManual
 from src.entry.open_projection import OpenProjection
+from src.entry.open_pullback import OpenPullback
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_rebound import OpenRebound
 from src.entry.open_saferanking import OpenSafeRanking
@@ -31,9 +33,11 @@ from src.entry.open_testing import OpenTesting
 ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenAllIncrease.name: OpenAllIncrease,
     OpenDonchian.name: OpenDonchian,
+    OpenFade.name: OpenFade,
     OpenLinear.name: OpenLinear,
     OpenManual.name: OpenManual,
     OpenProjection.name: OpenProjection,
+    OpenPullback.name: OpenPullback,
     OpenRanking.name: OpenRanking,
     OpenRebound.name: OpenRebound,
     OpenSafeRanking.name: OpenSafeRanking,
@@ -61,9 +65,11 @@ __all__ = [
     "ENTRY_STRATEGIES",
     "OpenAllIncrease",
     "OpenDonchian",
+    "OpenFade",
     "OpenLinear",
     "OpenManual",
     "OpenProjection",
+    "OpenPullback",
     "OpenRanking",
     "OpenRebound",
     "OpenSafeRanking",

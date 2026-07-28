@@ -68,9 +68,12 @@ driven by class-constant knobs:
 | `wallet_bounded`          | `True` | keep opening the best affordable epic until the wallet is dry  |
 | `wallet_reserve`          | `0.10` | keep 10 % of available funds free                              |
 | `open_cooldown_minutes`   | `5`    | ≥ 5 min between opens; at most one open per pass               |
-| `allow_same_day_reopen`   | `True` | only "currently open" is blocked; re-open an epic once it flat |
 | `min_participation_ratio` | `0.5`  | > half the warmed-up universe before crowning a winner         |
 | `concurrent_positions`    | `1`    | fallback cap only, used when the account balance is unreadable |
+
+Same-day re-opening is **not** a strategy knob: it is the global
+`ALLOW_SAME_DAY_REOPEN` boolean in `.env` (see [README](README.md)). This
+strategy expects `ALLOW_SAME_DAY_REOPEN=true`.
 
 - **Wallet-bounded** *(ouvrir tant que le wallet le permet)*: every pass opens the
   top-ranked epic whose margin the spendable balance (available − reserve) can
@@ -82,8 +85,9 @@ driven by class-constant knobs:
 - **Re-open policy** *(un epic actuellement ouvert ne pourra pas être ouvert de
   nouveau)*: the only restriction is the concurrent duplicate, which the shared
   `epic_already_open` gate always blocks. Nothing forbids re-opening an epic once
-  it has closed, so `allow_same_day_reopen = True` skips the one-open-per-epic-
-  per-day diversity filter — a market that is flat again is a candidate again.
+  it has closed, so this strategy expects the global `ALLOW_SAME_DAY_REOPEN=true`
+  policy (`.env`, see [README](README.md)), which skips the one-open-per-epic-per-day
+  diversity filter — a market that is flat again is a candidate again.
 - **Nothing qualifies is logged**: when the wallet has room and the cooldown has
   elapsed but every warmed-up epic is falling (no positive recent slope), the
   selector logs at `INFO` *"none of N warmed-up epic(s) qualifies to open … —

@@ -334,10 +334,11 @@ class TestTrailingStop:
         assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
         assert "t" in pos.stop_history[-1]
 
-    async def test_broker_stop_pushed_one_spread_below_follower(self):
+    async def test_broker_stop_pushed_spread_plus_noise_below_follower(self):
         # The software follower is what the bot closes on; the stop posted at IG
-        # rests one spread below it (live spread), so the app-side stop is hit
-        # first and the broker order is a deeper safety net.
+        # rests one spread PLUS an ATR-scaled noise cushion below it, so the
+        # app-side stop is hit first and bid noise can't trip the broker order
+        # before the (poll-sampled) follower would fire.
         svc, client, _ = _trailing_service()
         buf = _buffer_with_atr2(spread=2.0)  # ATR 2 -> dist 5; live spread 2
         pos = Position(
@@ -352,12 +353,34 @@ class TestTrailingStop:
 
         # Follower unchanged: 105 - 5 = 100.
         assert float(pos.level_follower) == pytest.approx(100.0)
-        # Broker stop pushed a spread (2) below the follower.
+        # Broker stop pushed spread (2) + noise cushion (0.5 * ATR 2 = 1) = 3
+        # below the follower.
         payload = client.put.await_args.args[1]
-        assert payload["stopLevel"] == pytest.approx(98.0)
+        assert payload["stopLevel"] == pytest.approx(97.0)
         # History records both levels so the chart can draw the two lines apart.
         assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
-        assert pos.stop_history[-1]["broker"] == pytest.approx(98.0)
+        assert pos.stop_history[-1]["broker"] == pytest.approx(97.0)
+
+    async def test_broker_noise_cushion_scales_and_disables(self):
+        # The cushion is broker_stop_noise_atr * ATR on top of one spread. At 0 it
+        # collapses to the legacy one-spread offset; larger k widens the gap.
+        for k, expected in ((0.0, 98.0), (0.5, 97.0), (1.5, 95.0)):
+            svc, client, _ = _trailing_service()
+            svc._config.broker_stop_noise_atr = k
+            buf = _buffer_with_atr2(spread=2.0)  # ATR 2, spread 2, follower 100
+            pos = Position(
+                epic="X",
+                deal_id="DEAL1",
+                level_open=Decimal("100"),
+                level_zero=Decimal("110"),
+                level_follower=None,
+            )
+
+            await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
+
+            assert float(pos.level_follower) == pytest.approx(100.0)
+            payload = client.put.await_args.args[1]
+            assert payload["stopLevel"] == pytest.approx(expected)
 
     async def test_no_ratchet_leaves_stop_history_untouched(self):
         svc, _, _ = _trailing_service()
@@ -426,12 +449,13 @@ class TestBrokerStopTruth:
 
         await svc._update_trailing_stop(pos, current_bid=105.0, buf=buf)
 
-        # Broker accepted at 99 (follower 100 − spread 1): persisted levels and the
-        # Loose history point advance to the accepted level.
+        # Broker accepted at 98 (follower 100 − spread 1 − noise cushion 1):
+        # persisted levels and the Loose history point advance to the accepted
+        # level.
         assert float(pos.level_follower) == pytest.approx(100.0)
-        assert float(pos.level_stop) == pytest.approx(99.0)
-        assert float(pos.level_security) == pytest.approx(99.0)
-        assert pos.stop_history[-1]["broker"] == pytest.approx(99.0)
+        assert float(pos.level_stop) == pytest.approx(98.0)
+        assert float(pos.level_security) == pytest.approx(98.0)
+        assert pos.stop_history[-1]["broker"] == pytest.approx(98.0)
 
     async def test_rejected_push_keeps_last_accepted_broker(self):
         svc, client, _ = _trailing_service()
@@ -569,10 +593,10 @@ class TestManagePositionRatchet:
 
     async def test_short_stop_is_never_raised(self):
         # Mirror for a short: the stop only ratchets down, so a higher proposal is
-        # rejected. The short path routes through the recovery short profile.
+        # rejected. The short path routes through the mirrored short profile.
         svc, _, db = _trailing_service()
         svc._is_epic_close_hour = AsyncMock(return_value=False)
-        svc._recovery_short_profile = _StubProfile(new_stop=1.62500)
+        svc._short_profile_instance = _StubProfile(new_stop=1.62500)
         pos = Position(
             epic="X", deal_id="D", direction="SELL", level_follower=Decimal("1.62413")
         )
@@ -658,10 +682,10 @@ class TestManagePositionManualHold:
         db.commit.assert_awaited()
 
 
-class TestRaiseStopManually:
-    """The dashboard chart buttons raise the stop and pin its zone."""
+class TestSetStopManually:
+    """The dashboard chart buttons move the stop (either way) and pin its zone."""
 
-    async def test_long_raise_sets_follower_broker_and_zone(self):
+    async def test_long_set_sets_follower_broker_and_zone(self):
         from src.exit.zones import StopZone
 
         svc, client, db = _trailing_service()
@@ -671,14 +695,15 @@ class TestRaiseStopManually:
         )
         profile = _ZoneStubProfile(new_stop=0.0, zone=StopZone.BREAKEVEN_BAND)
 
-        ok, msg = await svc.raise_stop_manually(pos, 100.0, buf, profile=profile)
+        ok, msg = await svc.set_stop_manually(pos, 100.0, buf, profile=profile)
 
         assert ok is True
         assert float(pos.level_follower) == pytest.approx(100.0)
         assert pos.manual_stop_zone == "breakeven_band"
-        # Broker stop pushed a spread (2) below the follower.
+        # Broker stop pushed spread (2) + noise cushion (0.5 * ATR 2 = 1) below
+        # the follower.
         payload = client.put.await_args.args[1]
-        assert payload["stopLevel"] == pytest.approx(98.0)
+        assert payload["stopLevel"] == pytest.approx(97.0)
         assert pos.stop_history[-1]["level"] == pytest.approx(100.0)
         db.commit.assert_awaited()
 
@@ -687,23 +712,54 @@ class TestRaiseStopManually:
         buf = _buffer_with_atr2()  # bid 100
         pos = Position(epic="X", deal_id="D", direction="BUY")
 
-        ok, msg = await svc.raise_stop_manually(pos, 101.0, buf, profile=None)
+        ok, msg = await svc.set_stop_manually(pos, 101.0, buf, profile=None)
 
         assert ok is False
         assert "below the current bid" in msg
         client.put.assert_not_awaited()
 
-    async def test_long_rejects_lowering_the_stop(self):
-        svc, client, _ = _trailing_service()
+    async def test_long_allows_lowering_the_stop(self):
+        # Bidirectional: a long's stop may now be loosened (moved down) as long as
+        # it stays below the bid — no more raise-only restriction.
+        svc, client, db = _trailing_service()
         buf = _buffer_with_atr2()  # bid 100
         pos = Position(
             epic="X", deal_id="D", direction="BUY", level_follower=Decimal("97")
         )
 
-        ok, msg = await svc.raise_stop_manually(pos, 96.0, buf, profile=None)
+        ok, msg = await svc.set_stop_manually(pos, 96.0, buf, profile=None)
+
+        assert ok is True
+        assert float(pos.level_follower) == pytest.approx(96.0)
+        db.commit.assert_awaited()
+
+    async def test_short_allows_raising_the_stop(self):
+        # Bidirectional mirror: a short's stop may be loosened (moved up) as long
+        # as it stays above the bid.
+        svc, client, db = _trailing_service()
+        buf = _buffer_with_atr2()  # bid 100
+        pos = Position(
+            epic="X", deal_id="D", direction="SELL", level_follower=Decimal("103")
+        )
+
+        ok, msg = await svc.set_stop_manually(pos, 105.0, buf, profile=None)
+
+        assert ok is True
+        assert float(pos.level_follower) == pytest.approx(105.0)
+        db.commit.assert_awaited()
+
+    async def test_short_rejects_stop_at_or_below_the_offer(self):
+        # A short is closed on the OFFER, so a stop parked between bid and offer
+        # would be tripped by the software backstop on the very next tick.
+        svc, client, _ = _trailing_service()
+        buf = _buffer_with_atr2()  # bid 100
+        pos = Position(epic="X", deal_id="D", direction="SELL")
+        offer = buf.last.offer_close
+
+        ok, msg = await svc.set_stop_manually(pos, offer, buf, profile=None)
 
         assert ok is False
-        assert "raised" in msg
+        assert "above the current offer" in msg
         client.put.assert_not_awaited()
 
 
@@ -731,7 +787,7 @@ class TestReconcileVanishedCloseLevel:
 
 
 class TestManagePositionShortRouting:
-    """A recovery SELL must never fall into the long-only ``check_and_close``."""
+    """A SELL must never fall into the long-only ``check_and_close``."""
 
     async def test_short_with_no_buffer_is_not_closed_by_long_maths(self):
         # Regression: on the first monitor tick after a restart the epic's price
@@ -739,8 +795,8 @@ class TestManagePositionShortRouting:
         # ``check_and_close`` there is long-only: it fires ``loose`` on
         # ``bid <= level_loose``, but a short's ``level_loose`` sits ABOVE the
         # price, so that is true on nearly every tick and would close the
-        # double-size short at market regardless of P&L. It must hold instead and
-        # rely on the broker-side stop pushed at open.
+        # short at market regardless of P&L. It must hold instead and rely on the
+        # broker-side stop pushed at open.
         svc, _, _ = _trailing_service()
         svc._is_epic_close_hour = AsyncMock(return_value=False)
         svc._close_position = AsyncMock(return_value=True)
@@ -993,6 +1049,58 @@ class TestOpenPosition:
         # size is the distance expressed in IG points (0.0045 * 10000).
         assert pos.size == 45
 
+    async def test_sell_places_stop_above_entry_and_fills_at_bid(self):
+        # A manual SELL mirrors the long: the stop sits ABOVE the entry, the
+        # broker stop one spread further above, and the order carries direction
+        # SELL. Regression guard for the direction-aware open path.
+        svc, client, db = _open_service()
+        spread = 0.0003
+        signal = TradingSignal(
+            epic="CS.D.AUDNZD.CFD.IP",
+            score=0.9,
+            direction="SELL",
+            regression=RegressionResult(slope=-0.1, intercept=1.21, r_squared=0.9),
+            sma_fast=1.21,
+            sma_slow=1.21,
+            roc=-0.1,
+            spread=spread,
+            avg_spread=spread,
+            position_in_range=45.0,
+            levels=TradingLevels(
+                bid=1.21000,
+                offer=1.21000 + spread,
+                spread=spread,
+                high=1.22,
+                low=1.20,
+                scope=0.02,
+                average=1.21,
+                level_follower=1.21450,
+                level_win=0.0,
+                level_zero=1.21000 - spread,
+                level_loose=1.21450,
+                level_security=1.21450,  # short stop 45 points ABOVE the entry
+                stop_distance=1,
+                level_margin=1.20950,
+            ),
+        )
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALS", "level": 1.21000},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REFS"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        payload = client.post.await_args.args[1]
+        assert payload["direction"] == "SELL"
+        # Broker stop posted one spread ABOVE the software stop (short safety net).
+        assert payload["stopLevel"] == pytest.approx(1.21480)  # 1.21450 + 0.0003
+        assert pos.direction == "SELL"
+        assert float(pos.level_stop) == pytest.approx(1.21480)
+        assert float(pos.level_stop) > float(pos.level_open)  # stop above entry
+        assert pos.size == 45  # 0.0045 * 10000
+
     async def test_opens_marketable_limit_when_metadata_flags_no_market_orders(self):
         """An epic advertising marketOrderPreference=NOT_AVAILABLE (forwards, some
         futures) opens with a marketable LIMIT directly — no doomed MARKET first.
@@ -1235,6 +1343,121 @@ class TestOpenPosition:
         assert float(pos.level_loose) == pytest.approx(1.20700)  # bid - 0.003
 
 
+class TestOpenFillReanchorsExitReferences:
+    """The exit references are frozen from the pre-order candle, so a fill that
+    lands away from that snapshot must translate them onto the price actually
+    traded. Without it break-even (and the margin / profit-trigger derived from
+    it) sits on a level the position never reached: the zone classifier reads a
+    phantom gain, the margin-zone updater locks a stop that is really at
+    break-even, and the chart draws a break-even line the trade never crossed.
+    """
+
+    def _buy_signal(self, *, bid: float, spread: float = 0.0003):
+        signal = _open_signal(bid=bid, level_security=bid - 0.0045)
+        # Noise band frozen at open: break-even (the offer) + 0.0010.
+        signal.levels.level_margin = bid + spread + 0.0010
+        return signal
+
+    async def test_buy_fill_above_snapshot_shifts_break_even_and_margin(self):
+        svc, client, _ = _open_service()
+        signal = self._buy_signal(bid=1.21000)  # snapshot offer (= break-even) 1.21030
+        # IG fills 0.0004 higher than the offer the order priced through.
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21070},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert pos is not None
+        assert float(pos.level_open) == pytest.approx(1.21070)
+        # Break-even is the real fill, not the stale snapshot offer.
+        assert float(pos.level_zero) == pytest.approx(1.21070)
+        # The band is translated, not rescaled: margin keeps its 0.0010 width, so
+        # the derived profit trigger (2 × margin − zero) follows too.
+        assert float(pos.level_margin) == pytest.approx(1.21170)
+        assert float(pos.level_margin) - float(pos.level_zero) == pytest.approx(0.0010)
+
+    async def test_buy_fill_on_snapshot_leaves_references_untouched(self):
+        svc, client, _ = _open_service()
+        signal = self._buy_signal(bid=1.21000)
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX", "level": 1.21030},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert float(pos.level_zero) == pytest.approx(1.21030)
+        assert float(pos.level_margin) == pytest.approx(1.21130)
+
+    async def test_confirm_without_level_keeps_snapshot_references(self):
+        # IG accepted the deal but omitted the fill level: there is nothing
+        # authoritative to re-anchor on, so the snapshot references stand.
+        svc, client, _ = _open_service()
+        signal = self._buy_signal(bid=1.21000)
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALX"},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF1"})
+
+        pos = await svc.open_position(signal)
+
+        assert float(pos.level_open) == pytest.approx(1.21000)  # provisional bid
+        assert float(pos.level_zero) == pytest.approx(1.21030)
+        assert float(pos.level_margin) == pytest.approx(1.21130)
+
+    async def test_sell_fill_below_snapshot_shifts_references_down(self):
+        # A short prices through the BID and its margin sits BELOW break-even:
+        # the same translation, in the mirrored direction.
+        svc, client, _ = _open_service()
+        spread = 0.0003
+        signal = TradingSignal(
+            epic="CS.D.AUDNZD.CFD.IP",
+            score=0.9,
+            direction="SELL",
+            regression=RegressionResult(slope=-0.1, intercept=1.21, r_squared=0.9),
+            sma_fast=1.21,
+            sma_slow=1.21,
+            roc=-0.1,
+            spread=spread,
+            avg_spread=spread,
+            position_in_range=45.0,
+            levels=TradingLevels(
+                bid=1.21000,
+                offer=1.21000 + spread,
+                spread=spread,
+                high=1.22,
+                low=1.20,
+                scope=0.02,
+                average=1.21,
+                level_follower=1.21450,
+                level_win=0.0,
+                # For a SELL break-even IS the sell (bid) price, margin below it.
+                level_zero=1.21000,
+                level_loose=1.21450,
+                level_security=1.21450,
+                stop_distance=1,
+                level_margin=1.20900,
+            ),
+        )
+        # Filled 0.0004 BELOW the bid the order priced through.
+        client.get.side_effect = [
+            _open_market(),
+            {"dealStatus": "ACCEPTED", "dealId": "DEALS", "level": 1.20960},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REFS"})
+
+        pos = await svc.open_position(signal)
+
+        assert float(pos.level_open) == pytest.approx(1.20960)
+        assert float(pos.level_zero) == pytest.approx(1.20960)
+        assert float(pos.level_margin) == pytest.approx(1.20860)
+
+
 class TestOpenPositionPersistence:
     """The position is recorded the instant IG accepts the order — before the
     /confirms round-trip — so a failed confirm can never leave a live position
@@ -1441,9 +1664,22 @@ class TestSyncAdoption:
 
         db.add.assert_not_called()
 
-    async def test_does_not_adopt_non_buy(self):
+    async def test_adopts_sell_position(self):
+        # A manually opened SELL must survive a restart: it is adopted and routed
+        # to the mirrored short profile, not skipped.
         svc, client, db = _sync_service(db_open=[])
         entry = _ig_entry(deal_id="D2", epic="CS.D.EURUSD.CEF.IP", direction="SELL")
+        client.get = AsyncMock(return_value={"positions": [entry]})
+
+        await svc.sync_open_positions()
+
+        db.add.assert_called_once()
+        adopted = db.add.call_args.args[0]
+        assert adopted.direction == "SELL"
+
+    async def test_does_not_adopt_unknown_direction(self):
+        svc, client, db = _sync_service(db_open=[])
+        entry = _ig_entry(deal_id="D3", epic="CS.D.EURUSD.CEF.IP", direction="HOLD")
         client.get = AsyncMock(return_value={"positions": [entry]})
 
         await svc.sync_open_positions()
@@ -1564,6 +1800,29 @@ class TestSyncReconcileUnconfirmed:
             level_open=Decimal(str(level)),
             euro_per_point=Decimal("10.000000"),
         )
+
+    async def test_binding_adopts_ig_open_level_and_reanchors_references(self):
+        # The confirm never landed, so the row still carries the pre-order
+        # estimate: level_open = snapshot bid, break-even = snapshot offer. The
+        # live position IG returns at bind time is the first authoritative fill
+        # for that row — level_open AND the exit references must follow it.
+        now = datetime.now(UTC).replace(tzinfo=None)
+        prov = self._provisional(opened=now, level=100.0)
+        prov.deal_reference = "REF-D1"
+        prov.pip_spread = Decimal("0.5")
+        prov.level_zero = Decimal("100.5")  # snapshot offer = assumed fill
+        prov.level_margin = Decimal("101.5")  # + a 1.0 noise band
+        svc, client, db = _sync_service(db_open=[prov])
+        entry = _ig_entry(deal_id="D1", epic="E1", level=101.0, bid=100.8)
+        client.get = AsyncMock(return_value={"positions": [entry]})
+
+        await svc.sync_open_positions()
+
+        assert prov.deal_id == "D1"
+        assert float(prov.level_open) == pytest.approx(101.0)
+        # Break-even moved onto the real fill (+0.5), band width preserved.
+        assert float(prov.level_zero) == pytest.approx(101.0)
+        assert float(prov.level_margin) == pytest.approx(102.0)
 
     async def test_fresh_unconfirmed_row_is_left_alone_within_grace(self):
         # Opened a moment ago and absent from IG /positions (eventual

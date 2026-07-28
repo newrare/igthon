@@ -95,16 +95,20 @@ and *when* they open live in the scheduler's rolling selector
 | ------------------------- | ------ | -------------------------------------------------------------- |
 | `wallet_bounded`          | `True` | keep opening the best affordable epic until the wallet is dry  |
 | `wallet_reserve`          | `0.10` | keep 10 % of available funds free                              |
-| `allow_same_day_reopen`   | `True` | skip the one-open-per-epic-per-day filter                      |
 | `open_cooldown_minutes`   | `10`   | ≥ 10 min between opens; at most one open per pass              |
 | `min_participation_ratio` | `0.5`  | > half the warmed-up universe before crowning a winner         |
 | `concurrent_positions`    | `1`    | fallback cap only, used when the account balance is unreadable |
+
+Same-day re-opening is **not** a strategy knob: it is the global
+`ALLOW_SAME_DAY_REOPEN` boolean in `.env` (see [README](README.md)). This
+strategy expects `ALLOW_SAME_DAY_REOPEN=true`.
 
 - **Wallet-bounded** *(open positions as long as the wallet has funds)*: every
   pass opens the top-ranked epic whose margin the spendable balance (available −
   reserve) can still cover.
 - **Same-day re-open** *(la même journée, un epic peut être ouvert plusieurs
-  fois)*: the `_traded_today` diversity filter is skipped. An epic becomes a
+  fois)*: requires the global `ALLOW_SAME_DAY_REOPEN=true` policy (`.env`, see
+  [README](README.md)), which skips the `_traded_today` diversity filter. An epic becomes a
   candidate again as soon as it holds **no** open position — the concurrent
   duplicate is still blocked by the shared `epic_already_open` gate, so a
   still-open epic is never opened twice at once.

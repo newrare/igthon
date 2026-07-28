@@ -20,7 +20,8 @@ Like [`open_ranking`](open_ranking.md) it is a **cross-epic ranker**
 routine unchanged. What it changes is only *which* markets that routine opens and
 *how many*:
 
-- **One opening per epic per day.** Enforced by the scheduler
+- **One opening per epic per day.** Requires the global `ALLOW_SAME_DAY_REOPEN=false`
+  policy (`.env`, see [README](README.md)), enforced by the scheduler
   (`_traded_today_epics`): an epic used today is dropped from the candidate set,
   so the bot keeps spreading across **new** markets rather than re-opening one.
 - **Open until the wallet is exhausted.** `concurrent_positions` is set very high

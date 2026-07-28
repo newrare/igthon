@@ -7,8 +7,8 @@ These tests cover the registry, the score contract ([0, 1], BUY-only), the
 structural ``None`` cases, and the three hard gates that define the setup — a
 bullish day, a genuine sharp drop, and a recovery already under way.
 
-The selection-layer knobs (``wallet_bounded``, ``open_cooldown_minutes``,
-``allow_same_day_reopen``) are asserted here as the strategy's contract and
+The selection-layer knobs (``wallet_bounded``, ``open_cooldown_minutes``) are
+asserted here as the strategy's contract and
 exercised end-to-end against the scheduler in ``tests/test_scheduler.py``.
 """
 
@@ -112,7 +112,9 @@ class TestSelectionKnobs:
         strat = OpenRebound()
         assert strat.wallet_bounded is True  # open while the wallet allows
         assert strat.open_cooldown_minutes == 5  # wait 5 min between opens
-        assert strat.allow_same_day_reopen is False  # rotate across markets
+        # Rotating across markets is now the global .env policy
+        # (ALLOW_SAME_DAY_REOPEN=false), not a strategy attribute.
+        assert not hasattr(strat, "allow_same_day_reopen")
 
     def test_composite_weights_sum_to_one(self):
         strat = OpenRebound()

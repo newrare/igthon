@@ -63,6 +63,7 @@ async def api_dashboard_fragments(request: Request) -> JSONResponse:
         {
             "fragments": fragments,
             "bot_paused": state["bot_paused"],
+            "auto_open": state["auto_open_enabled"],
             "scheduler_available": state["scheduler_available"],
             "server_time": datetime.now(_PARIS).strftime("%H:%M:%S"),
         }
@@ -94,6 +95,7 @@ async def api_status(request: Request) -> JSONResponse:
             "tracked_epics": len(buffer),
             "epics": buffer.tracked_epics,
             "bot_paused": scheduler.is_paused if scheduler else None,
+            "auto_open": scheduler.auto_open_enabled if scheduler else None,
             "scheduler_available": scheduler is not None,
         }
     )
@@ -115,6 +117,24 @@ async def bot_resume(request: Request) -> JSONResponse:
     if scheduler:
         await scheduler.resume_bot()
     return JSONResponse({"bot_paused": False})
+
+
+@router.post("/api/auto-open/{mode}")
+async def set_auto_open(request: Request, mode: str) -> JSONResponse:
+    """Authorise (``mode=on``) or block (``mode=off``) automatic openings.
+
+    The big dashboard switch. Blocking applies to the current day only and stops
+    every automatic open whatever the selected entry strategy and whatever the
+    direction; open positions keep running and the manual Buy/Sell buttons keep
+    working.
+    """
+    scheduler = request.app.state.scheduler
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    if mode not in ("on", "off"):
+        return JSONResponse({"error": f"Unknown mode: {mode}"}, status_code=400)
+    await scheduler.set_auto_open(mode == "on")
+    return JSONResponse({"auto_open": mode == "on"})
 
 
 _ACTIONS = {
@@ -318,32 +338,66 @@ def _trade_overlay(p: Position) -> dict:
     #   - the LOOSE stop (``level_stop`` + its pushed updates): the protective
     #     stop actually resting at the broker, the safety net that secures a close
     #     if price gaps between two bid readings.
-    # They diverge because the broker stop is deliberately posted one spread below
-    # the software follower (see TradingService._broker_stop_level), so the app
-    # closes first and the broker order is a pure safety net — from the open
-    # onward (the offset is now applied at open too, not only on ratchets) and
-    # also whenever IG's minimum-stop-distance rule widened the broker stop. The
-    # loose trajectory is the broker's initial level (index 0, ``level_stop``,
-    # already a spread below the follower) followed by the level actually pushed
+    # They diverge because the broker stop is deliberately posted one spread plus
+    # an ATR-scaled noise cushion below the software follower (see
+    # TradingService._broker_stop_level), so the app closes first and the broker
+    # order is a pure safety net that bid noise can't trip prematurely — from the
+    # open onward (the offset is now applied at open too, not only on ratchets)
+    # and also whenever IG's minimum-stop-distance rule widened the broker stop.
+    # The loose trajectory is the broker's initial level (index 0, ``level_stop``,
+    # already this far below the follower) followed by the level actually pushed
     # to IG at each ratchet (the per-point ``broker``); legacy points without it
     # fall back to the follower level.
     raw_stops = _stops()
+    # For a SHORT both protective stops are decided in OFFER terms (the close
+    # engine fires on the buy-to-close offer, and the trail is computed from it —
+    # see close_zoneprofit.py, which judges a short on the offer), so they must be
+    # mapped onto the bid curve by subtracting one spread, exactly like
+    # zero/margin/close above. Without this the follower/loose lines are drawn one
+    # spread too high and the bid never appears to reach them at the close. A
+    # long's stops are already bid-comparable (shift 0).
+    stop_shift = -spread if (direction == "SELL" and have_spread) else 0.0
     # Follower (application-side) line: strip the internal per-point broker level
-    # so the software-stop trajectory stays {t, level}.
+    # so the software-stop trajectory stays {t, level}, shifted onto the bid curve.
     follower_stops = (
-        [{"t": s["t"], "level": s["level"]} for s in raw_stops] if raw_stops else None
+        [{"t": s["t"], "level": s["level"] + stop_shift} for s in raw_stops]
+        if raw_stops
+        else None
     )
-    loose_initial = _level("level_stop")
+    # Loose (broker) line: the level actually posted at IG for each ratchet — the
+    # per-point ``broker`` when present, shifted onto the bid curve.
+    #
+    # Modern rows seed ``stop_history[0]`` with the initial broker level (see
+    # TradingService.open_position), so index 0 must use that seeded ``broker`` —
+    # the previous code overrode index 0 with the CURRENT ``level_stop`` even when
+    # a seeded value existed, plotting the FINAL broker level at the open instant
+    # and producing a spurious first step (very visible on a short, where the
+    # broker ratchets down). Legacy rows have no ``broker`` key: index 0 then still
+    # falls back to ``level_stop`` (the initial clamped broker level), later points
+    # to the follower ``level``.
+    loose_initial_raw = _level("level_stop")
     if not raw_stops:
         loose_stops = None
     else:
         loose_stops = []
         for i, s in enumerate(raw_stops):
-            if i == 0 and loose_initial is not None:
-                level = loose_initial
+            if "broker" in s:
+                level = s["broker"]
+            elif i == 0 and loose_initial_raw is not None:
+                level = loose_initial_raw
             else:
-                level = s.get("broker", s["level"])
-            loose_stops.append({"t": s["t"], "level": level})
+                level = s["level"]
+            loose_stops.append({"t": s["t"], "level": level + stop_shift})
+    # Scalar fallbacks for the flat stop lines when no ratchet history exists
+    # (legacy rows): the current follower / broker levels, shifted onto the bid
+    # curve like their stepped counterparts above.
+    loose_initial = (
+        loose_initial_raw + stop_shift if loose_initial_raw is not None else None
+    )
+    follower_initial = _level("level_follower")
+    follower_initial = (
+        follower_initial + stop_shift if follower_initial is not None else None
+    )
 
     # ``profit10``: the bid level at which the trade's running P&L is +10 €,
     # derived from the stored ``euro_per_point`` (10 € / €-per-point in price
@@ -390,7 +444,7 @@ def _trade_overlay(p: Position) -> dict:
         # the loose stop above. Empty/absent for positions opened before the
         # history was captured — the chart then falls back to the flat
         # ``stopFollower`` / ``stopLoose`` scalars.
-        "stopFollower": _level("level_follower"),
+        "stopFollower": follower_initial,
         "stopsFollower": follower_stops,
         "target": _level("level_win"),
         # Profit reference line above break-even: +10 € (euro-based), on the bid
@@ -731,19 +785,21 @@ async def position_funds_required(request: Request, epic: str) -> JSONResponse:
 
 @router.post("/api/positions/open/{epic}")
 async def open_position_manual(request: Request, epic: str) -> JSONResponse:
-    """Open a BUY position for the given epic, manually from the dashboard.
+    """Open a position for the given epic, manually from the dashboard.
 
     This forces the *open decision only*: the entry strategy is bypassed
-    (direction is hard-coded BUY), but everything else goes through the bot's
-    normal open path. The active close profile chooses the protective stop via
-    :meth:`CloseProfile.initial_plan`, and
-    :meth:`TradingService.open_from_intent` reuses the same sizing, risk caps,
-    dealing-rule validation, confirmation and DB record as an automatic open —
-    so the stop is the strategy's stop, not IG's bare minimum (which sat
-    inside the spread and closed the trade on the first monitor tick).
+    (direction comes from the request body — ``BUY`` by default, ``SELL`` for a
+    short), but everything else goes through the bot's normal open path. The close
+    profile chooses the protective stop via :meth:`CloseProfile.initial_plan`
+    (one direction-aware profile: it mirrors every reference for a SELL),
+    and :meth:`TradingService.open_from_intent` reuses the same sizing, risk caps,
+    dealing-rule validation, confirmation and DB record as an automatic open — so
+    the stop is the strategy's stop, not IG's bare minimum (which sat inside the
+    spread and closed the trade on the first monitor tick).
 
-    The portfolio risk gates (max positions, duplicate epic, daily P&L limits,
-    win-rate) still apply: a manual open that violates them is refused.
+    A manual SELL passes ``allow_short=True`` to lift the long-only pre-open gate
+    (automatic strategies stay long-only). The duplicate-epic and market gates
+    still apply: a manual open that violates them is refused.
     """
     api_queue = getattr(request.app.state, "api_queue", None)
     session_factory = getattr(request.app.state, "session_factory", None)
@@ -754,13 +810,24 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
     if not api_queue or not session_factory or scheduler is None:
         return JSONResponse({"error": "Trading not available"}, status_code=503)
 
+    # Direction comes from the JSON body; default BUY keeps older callers working.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    direction = str((body or {}).get("direction", "BUY")).upper()
+    if direction not in ("BUY", "SELL"):
+        return JSONResponse(
+            {"error": f"Invalid direction {direction!r}"}, status_code=400
+        )
+
     buf = buffer.get(epic)
     if not buf or not buf.last:
         return JSONResponse({"error": "No price data for this epic"}, status_code=400)
 
     try:
         config = TradeConfig.from_settings(settings)
-        intent = EntryIntent(epic=epic, direction="BUY")
+        intent = EntryIntent(epic=epic, direction=direction)
         async with session_factory() as session:
             trading = TradingService(
                 api_queue, session, config, close_profile=scheduler.close_profile
@@ -771,7 +838,20 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             # or the analysis tick opening this epic at the same instant — can no
             # longer slip two orders through the duplicate-epic gate before the
             # first commits its row. The lock spans the gate re-check + order.
-            position, reason = await scheduler.open_epic_guarded(trading, intent, buf)
+            # ``allow_short`` lets a manual SELL past the long-only gate, and
+            # ``allow_reopen`` past the global ALLOW_SAME_DAY_REOPEN policy: an
+            # explicit human open is never refused because a strategy already
+            # used this epic today (concurrent duplicates are still blocked).
+            # ``manual=True`` also bypasses the auto-open switch: closing the day
+            # stops the *bot* from opening, it never disables these buttons.
+            position, reason = await scheduler.open_epic_guarded(
+                trading,
+                intent,
+                buf,
+                allow_short=(direction == "SELL"),
+                allow_reopen=True,
+                manual=True,
+            )
             if reason:
                 return JSONResponse({"error": reason}, status_code=400)
             if position is None:
@@ -791,11 +871,16 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             deal_id = position.deal_id or ""
 
         logger.info(
-            "Manual position opened: %s qty=%d level=%.5f", epic, quantity, level
+            "Manual position opened: %s %s qty=%d level=%.5f",
+            direction,
+            epic,
+            quantity,
+            level,
         )
         return JSONResponse(
             {
                 "status": "opened",
+                "direction": direction,
                 "deal_id": deal_id,
                 "level": level,
                 "quantity": quantity,
@@ -827,7 +912,7 @@ async def close_position_manual(request: Request, position_id: int) -> JSONRespo
 
         # Delegate the whole close to TradingService rather than reimplementing it.
         # The old inline code hard-coded ``direction="SELL"`` and a long-only
-        # ``move = close - open``, so it could neither close a recovery SELL (IG
+        # ``move = close - open``, so it could neither close a short SELL (IG
         # rejects a SELL to close a SELL) nor record a short's P&L with the right
         # sign. ``_close_position`` (via ``close_manually``) mirrors the direction
         # (BUY to close a SELL), mirrors the P&L, resolves a missing dealId,
@@ -884,13 +969,14 @@ async def close_position_manual(request: Request, position_id: int) -> JSONRespo
 
 
 @router.post("/api/positions/stop/{position_id}")
-async def raise_stop_manual(request: Request, position_id: int) -> JSONResponse:
-    """Manually raise an open position's protective stop from the chart buttons.
+async def set_stop_manual(request: Request, position_id: int) -> JSONResponse:
+    """Manually move an open position's protective stop from the chart buttons.
 
     Body: ``{"level": <absolute price>}`` — the price picked on the chart's scale.
-    Moves both the software follower and the broker stop to it (raise-only, on the
-    safe side of the live bid) and pins it there until the bid changes zone. See
-    :meth:`TradingService.raise_stop_manually`.
+    Moves both the software follower and the broker stop to it — up or down, for a
+    long or a short — as long as it stays on the safe side of the live bid, and
+    pins it there until the bid changes zone. See
+    :meth:`TradingService.set_stop_manually`.
     """
     api_queue = getattr(request.app.state, "api_queue", None)
     session_factory = getattr(request.app.state, "session_factory", None)
@@ -923,18 +1009,18 @@ async def raise_stop_manual(request: Request, position_id: int) -> JSONResponse:
             api_queue, session, config, close_profile=close_profile
         )
         try:
-            ok, message = await trading.raise_stop_manually(
+            ok, message = await trading.set_stop_manually(
                 position, level, buf, profile=close_profile
             )
         except Exception as exc:
-            logger.error("Manual stop raise failed for %s: %s", position.epic, exc)
+            logger.error("Manual stop set failed for %s: %s", position.epic, exc)
             return JSONResponse({"error": str(exc)}, status_code=500)
         if not ok:
             return JSONResponse({"error": message}, status_code=400)
 
         return JSONResponse(
             {
-                "status": "raised",
+                "status": "set",
                 "epic": position.epic,
                 "level": float(position.level_follower or level),
                 "zone": position.manual_stop_zone,

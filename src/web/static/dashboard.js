@@ -140,6 +140,73 @@ async function setAllJobs(auto, btn) {
     }
 }
 
+// ── Auto-open switch (big banner above the KPI bar) ─────────────────────────
+// Authorises or blocks every AUTOMATIC opening for the current day, whatever the
+// entry strategy selected in .env. Open positions keep running and the manual
+// Buy / Sell buttons stay usable.
+//
+// The banner is server-rendered on every poll (_render_auto_open_banner), which
+// stays the source of truth; the strings below mirror it only so the flip is
+// instant instead of waiting for the next poll — and so the banner still updates
+// when live refreshes are paused.
+const AUTOOPEN_TEXT = {
+    on: {
+        state:  'Openings allowed',
+        detail: 'The bot may open new positions (BUY or SELL) whenever the active entry strategy signals one.',
+        btn:    '<i data-lucide="hand" class="lc-icon"></i> Block for today',
+    },
+    off: {
+        state:  'Openings blocked',
+        detail: 'No automatic opening until tomorrow, whatever the entry strategy. Positions already open keep running, and manual Buy / Sell still work.',
+        btn:    '<i data-lucide="play" class="lc-icon"></i> Allow openings',
+    },
+};
+
+function _applyAutoOpenUI(allowed) {
+    const banner = document.getElementById('autoopen-banner');
+    if (!banner) return;
+    const text = AUTOOPEN_TEXT[allowed ? 'on' : 'off'];
+    banner.classList.toggle('autoopen-on', allowed);
+    banner.classList.toggle('autoopen-off', !allowed);
+    const icon   = banner.querySelector('.autoopen-icon');
+    const state  = document.getElementById('autoopen-state');
+    const detail = document.getElementById('autoopen-detail');
+    const btn    = document.getElementById('autoopen-btn');
+    // lucide swaps <i data-lucide> for an inline <svg>, so the icon element must
+    // be rebuilt (not just re-attributed) and re-rendered.
+    if (icon) icon.outerHTML = '<i data-lucide="' + (allowed ? 'unlock' : 'lock') + '" class="lc-icon autoopen-icon"></i>';
+    if (state)  state.textContent  = text.state;
+    if (detail) detail.textContent = text.detail;
+    if (btn)    btn.innerHTML      = text.btn;
+    lucide.createIcons();
+}
+
+async function toggleAutoOpen(btn) {
+    const banner  = document.getElementById('autoopen-banner');
+    // Currently allowed → the button blocks; currently blocked → it re-allows.
+    const allowed = banner && banner.classList.contains('autoopen-on');
+    const target  = !allowed;
+    btn.disabled  = true;
+    try {
+        const res = await fetch('/api/auto-open/' + (target ? 'on' : 'off'), { method: 'POST' });
+        if (res.ok) {
+            _applyAutoOpenUI(target);
+            showToast(
+                target ? 'Auto-open allowed' : 'Auto-open blocked for today',
+                target ? 'The bot may open new positions again'
+                       : 'No new automatic opening today — open positions keep running',
+                target ? 'success' : 'warning',
+            );
+        } else {
+            showToast('Auto-open', 'Failed to change the setting', 'error');
+        }
+    } catch (e) {
+        showToast('Auto-open', 'Network error', 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 // ── Live fragment polling (single request → in-place section updates) ────────
 // One request every POLL_INTERVAL returns the HTML for every dynamic region.
 // Only the fragments whose markup actually changed are swapped into the DOM, so
@@ -523,6 +590,25 @@ function closeBuyConfirmModal(confirmed) {
     }
 }
 
+// ── Sell (short) Confirmation Modal ──────────────────────────────────────────
+let _sellConfirmResolve = null;
+
+function openSellConfirmModal(epic) {
+    return new Promise(function(resolve) {
+        _sellConfirmResolve = resolve;
+        document.getElementById('sell-confirm-epic').textContent = epic;
+        document.getElementById('sell-confirm-modal').style.display = 'flex';
+    });
+}
+
+function closeSellConfirmModal(confirmed) {
+    document.getElementById('sell-confirm-modal').style.display = 'none';
+    if (_sellConfirmResolve) {
+        _sellConfirmResolve(confirmed);
+        _sellConfirmResolve = null;
+    }
+}
+
 // ── Close Position Confirmation Modal ────────────────────────────────────────
 let _closeConfirmResolve = null;
 
@@ -553,6 +639,7 @@ document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
         if (chartOpen) { closeChartModal(); return; }
         if (document.getElementById('buy-confirm-modal').style.display !== 'none') closeBuyConfirmModal(false);
+        if (document.getElementById('sell-confirm-modal').style.display !== 'none') closeSellConfirmModal(false);
         if (document.getElementById('close-confirm-modal').style.display !== 'none') closeCloseConfirmModal(false);
         if (document.getElementById('epics-modal').style.display !== 'none') closeEpicsModal();
         if (document.getElementById('positions-modal').style.display !== 'none') closePositionsModal();
@@ -561,24 +648,31 @@ document.addEventListener('keydown', function(e) {
     }
 });
 
-// ── Open position (manual BUY from dashboard) ─────────────────────────────────
-async function openPosition(epic, btn) {
-    const confirmed = await openBuyConfirmModal(epic);
+// ── Open position (manual BUY or SELL from dashboard) ─────────────────────────
+async function openPosition(epic, btn, direction) {
+    direction = (direction || 'BUY').toUpperCase();
+    const isSell = direction === 'SELL';
+    const confirmed = isSell ? await openSellConfirmModal(epic) : await openBuyConfirmModal(epic);
     if (!confirmed) return;
     const origText  = btn.textContent;
     const origBg    = btn.style.background;
     const origColor = btn.style.color;
+    const origTitle = 'Open ' + direction + (isSell ? ' (short)' : '') + ' position at minimum size';
     btn.disabled = true;
     btn.textContent = '…';
     try {
-        const res  = await fetch('/api/positions/open/' + encodeURIComponent(epic), { method: 'POST' });
+        const res  = await fetch('/api/positions/open/' + encodeURIComponent(epic), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ direction: direction }),
+        });
         const data = await res.json();
         if (res.ok) {
             btn.textContent      = '✓';
             btn.style.background = '#16803c';
             btn.style.color      = '#f0fdf4';
-            btn.title = 'Opened @ ' + data.level + ' qty=' + data.quantity;
-            showToast('Position opened', epic + ' @ ' + data.level + ' — qty ' + data.quantity, 'success');
+            btn.title = 'Opened ' + direction + ' @ ' + data.level + ' qty=' + data.quantity;
+            showToast('Position opened', direction + ' ' + epic + ' @ ' + data.level + ' — qty ' + data.quantity, 'success');
         } else {
             btn.textContent      = '✗';
             btn.style.background = '#991b1b';
@@ -597,7 +691,7 @@ async function openPosition(epic, btn) {
             btn.textContent      = origText;
             btn.style.background = origBg;
             btn.style.color      = origColor;
-            btn.title            = 'Open BUY position at minimum size';
+            btn.title            = origTitle;
             btn.disabled         = false;
         }, 5000);
     }
@@ -871,10 +965,11 @@ function _setChartZoomed(zoomed) {
     if (strip) strip.style.display = zoomed ? 'none' : '';
 }
 
-// ── Chart stop buttons (raise the stop from the right edge of the scale) ──────
+// ── Chart stop buttons (move the stop to any mark on the scale) ───────────────
 // A column of buttons every 5 % of the chart's price scale, shown only when the
-// epic has an OPEN position. Clicking one raises the software + broker stop to
-// the price at that mark (POST /api/positions/stop/{id}); the stop then holds
+// epic has an OPEN position. Clicking one moves the software + broker stop to the
+// price at that mark (POST /api/positions/stop/{id}) — up or down, for a long or
+// a short, as long as it stays on the safe side of the bid; the stop then holds
 // until the bid changes zone (server-side). The vertical placement mirrors the
 // Plotly layout (margins t:22 / b:50 and the yaxis range [-3, 103]) so each
 // button sits at the pixel of its price on the plotted scale.
@@ -909,20 +1004,20 @@ function _renderStopButtons(container, trade, lo, range) {
         btn.type = 'button';
         btn.style.top = (_STOP_BTN_TOP + frac * plotH) + 'px';
         btn.textContent = p + '%';
-        btn.title = 'Raise stop to ' + price.toFixed(5);
-        btn.onclick = function() { _raiseStop(trade, price, btn); };
+        btn.title = 'Set stop to ' + price.toFixed(5);
+        btn.onclick = function() { _setStop(trade, price, btn); };
         strip.appendChild(btn);
     }
     wrap.appendChild(strip);
 }
 
-async function _raiseStop(trade, price, btn) {
+async function _setStop(trade, price, btn) {
     const orig = btn.textContent;
     btn.disabled = true;
     btn.textContent = '…';
     // Immediate acknowledgment: tell the user the request was taken into account
     // and is going through the API queue, before the (queued) round-trip returns.
-    showToast('Stop raise requested', 'Sent to the API queue @ ' + price.toFixed(5), 'info');
+    showToast('Stop change requested', 'Sent to the API queue @ ' + price.toFixed(5), 'info');
     try {
         const res = await fetch('/api/positions/stop/' + trade.id, {
             method: 'POST',
@@ -936,19 +1031,19 @@ async function _raiseStop(trade, price, btn) {
             // software stop is set but the broker update was not confirmed.
             const confirmed = !data.detail || data.detail === 'ok';
             showToast(
-                'Stop raised',
+                'Stop set',
                 'New stop @ ' + lvl + (confirmed ? '' : ' — ' + data.detail),
                 confirmed ? 'success' : 'warning'
             );
             // Repaint so the new Follower/Loose step shows immediately.
             if (_chartModalEpic) _loadChart(_chartModalEpic, false);
         } else {
-            showToast('Stop not raised', data.error || 'Rejected', 'error');
+            showToast('Stop not changed', data.error || 'Rejected', 'error');
             btn.disabled = false;
             btn.textContent = orig;
         }
     } catch (e) {
-        showToast('Stop not raised', e.message, 'error');
+        showToast('Stop not changed', e.message, 'error');
         btn.disabled = false;
         btn.textContent = orig;
     }
@@ -979,9 +1074,24 @@ function _attachChartZoomListener(container) {
     container.on('plotly_relayout', _onChartRelayout);
 }
 
+// Direction chip for a trade: "BUY ▲" green / "SELL ▼" red. The modal header's
+// Buy/Sell buttons are ACTIONS (open a new position), so without this the chart
+// gave no clue which way an existing position was actually taken — and a fading
+// strategy (open_fade) legitimately buys a falling market, which reads as a bug
+// unless the side is stated. Empty string when the direction is unknown.
+function _directionChip(direction) {
+    const dir = (direction || '').toUpperCase();
+    if (dir !== 'BUY' && dir !== 'SELL') return '';
+    const isBuy = dir === 'BUY';
+    return '<span style="color:' + (isBuy ? '#4ade80' : '#ef4444')
+        + ';font-weight:700;letter-spacing:0.03em;">'
+        + dir + ' ' + (isBuy ? '▲' : '▼') + '</span>';
+}
+
 // Paint the P&L badge overlaid on the chart: one entry per trade on the epic,
-// green/red by sign, tagged "en cours" while the position is open (running P&L)
-// or "validé" once it is closed (realised P&L). Hidden when no trade has a P&L.
+// prefixed by its BUY/SELL direction chip, green/red by sign, tagged "en cours"
+// while the position is open (running P&L) or "validé" once it is closed
+// (realised P&L). Hidden when no trade has a P&L.
 function _renderChartPnl(trades) {
     const el = document.getElementById('chart-modal-pnl');
     if (!el) return;
@@ -992,7 +1102,9 @@ function _renderChartPnl(trades) {
             const sign = t.pnl >= 0 ? '+' : '';
             const color = t.pnl >= 0 ? '#4ade80' : '#ef4444';
             const tag = running ? 'en cours' : 'validé';
-            return '<span style="color:' + color + ';font-weight:600;">P&amp;L '
+            const chip = _directionChip(t.direction);
+            return (chip ? chip + '<span style="color:#475569;"> · </span>' : '')
+                + '<span style="color:' + color + ';font-weight:600;">P&amp;L '
                 + sign + t.pnl.toFixed(2) + ' €</span>'
                 + ' <span style="color:#94a3b8;">(' + tag + ')</span>';
         });
@@ -1260,15 +1372,19 @@ async function _loadChart(epic, initial) {
         // marker's X to where the bid curve equals that price so the diamond lands
         // on the curve; the visible label keeps the broker's true execution time.
         // ``estimated`` = the level/time were derived (position closed outside the
-        // bot, not a captured fill): drawn as a hollow diamond with an "(est.)"
+        // bot, not a captured fill): drawn as a hollow marker with an "(est.)"
         // tag so it is not mistaken for a real stop/limit execution.
-        function addEventMarker(timeStr, value, color, label, estimated) {
+        // ``symbol`` overrides the default diamond — the entry marker passes a
+        // triangle pointing the way the position was taken (up = BUY, down =
+        // SELL), so the trade's side is readable straight off the curve.
+        function addEventMarker(timeStr, value, color, label, estimated, symbol) {
             if (!timeStr || typeof value !== 'number' || !isFinite(value)) return;
             const realHhmm = _toParisNaive(timeStr).slice(11, 16);
             const refMs = new Date(_toParisNaive(timeStr)).getTime();
             const snapped = _snapMsToBid(value, refMs);
             const xParis = snapped !== null ? _msToParisNaive(snapped) : _toParisNaive(timeStr);
             const tag = estimated ? ' (est.)' : '';
+            const sym = symbol || 'diamond';
             shapes.push({
                 type: 'line', xref: 'x', x0: xParis, x1: xParis, yref: 'paper', y0: 0, y1: 1,
                 line: { color: color, width: 1, dash: 'dash' }
@@ -1282,9 +1398,10 @@ async function _loadChart(epic, initial) {
                 x: [xParis], y: [toPct(value)], customdata: [value],
                 type: 'scatter', mode: 'markers', name: label,
                 marker: estimated
-                    ? { color: 'rgba(0,0,0,0)', size: 10, symbol: 'diamond-open',
+                    ? { color: 'rgba(0,0,0,0)', size: 10, symbol: sym + '-open',
                         line: { color: color, width: 2 } }
-                    : { color: color, size: 9, symbol: 'diamond', line: { color: '#1c1714', width: 1 } },
+                    : { color: color, size: sym === 'diamond' ? 9 : 12, symbol: sym,
+                        line: { color: '#1c1714', width: 1 } },
                 hovertemplate: label + ' ' + realHhmm + tag + ': %{customdata:.4f}<extra></extra>'
             });
         }
@@ -1373,7 +1490,15 @@ async function _loadChart(epic, initial) {
             if (!addStopStep(t.stopsLoose, t.closeTime, '#a78bfa', 'Loose', 'dot', t)) {
                 addLevelLine(t.stopLoose, '#a78bfa', 'dot', 'Loose', t);
             }
-            addEventMarker(t.openTime, t.openBid, '#E0B341', 'Entry', false);
+            // Entry marker: the label states the side ("Entry BUY" / "Entry SELL")
+            // and the marker is a triangle pointing that way. Mandatory now that
+            // the live opener (open_fade) is two-sided — the geometry alone is
+            // ambiguous, and the header's Buy/Sell buttons are actions, not state.
+            const dir = (t.direction || '').toUpperCase();
+            const entryLabel = (dir === 'BUY' || dir === 'SELL') ? 'Entry ' + dir : 'Entry';
+            const entrySymbol = dir === 'SELL' ? 'triangle-down'
+                              : dir === 'BUY' ? 'triangle-up' : 'diamond';
+            addEventMarker(t.openTime, t.openBid, '#E0B341', entryLabel, false, entrySymbol);
             addEventMarker(t.closeTime, t.close, '#60a5fa', 'Exit',
                 !!_ESTIMATED_CLOSE[t.closeReason]);
         });

@@ -193,6 +193,57 @@ def adverse_tick_noise(
     return mean + std_k * math.sqrt(variance)
 
 
+def trend_pct(values: list[float], period: int) -> tuple[float, float]:
+    """Size and cleanliness of the trend over the last ``period`` values.
+
+    The raw least-squares slope is per-step and in price units, so it is not
+    comparable between a forex pair and a commodity. This normalises it into the
+    **total percentage move implied by the fit across the window**
+    (``slope × window_length / last_price × 100``), which is directly comparable
+    across every epic in the universe — the form a cross-epic entry needs.
+
+    Args:
+        values: Ordered values, oldest first (bid closes).
+        period: Lookback window; the whole list is used when shorter.
+
+    Returns:
+        ``(pct, r_squared)`` — the signed implied move in percent and the fit's
+        R² (its linearity, 0-1). ``(0.0, 0.0)`` when there is nothing to fit or
+        the last value is non-positive.
+    """
+    if period < 2 or len(values) < 2:
+        return 0.0, 0.0
+    window = values[-period:]
+    price = window[-1]
+    if price <= 0:
+        return 0.0, 0.0
+    reg = linear_regression(window)
+    return reg.slope * len(window) / price * 100, reg.r_squared
+
+
+def channel_position(candles: list[Candle], period: int) -> tuple[float, float, float]:
+    """Locate the last bid inside the high/low channel of the last ``period`` candles.
+
+    Args:
+        candles: Ordered candles, oldest first; the whole list is used when
+            shorter than ``period``.
+        period: Channel lookback.
+
+    Returns:
+        ``(position, high, low)`` where ``position`` is 0 at the channel low, 1
+        at its high, and 0.5 for a degenerate (flat) channel.
+    """
+    if period < 1 or not candles:
+        return 0.5, 0.0, 0.0
+    window = candles[-period:]
+    high = max(c.bid_high for c in window)
+    low = min(c.bid_low for c in window)
+    span = high - low
+    if span <= 0:
+        return 0.5, high, low
+    return (window[-1].bid_close - low) / span, high, low
+
+
 def efficiency_ratio(values: list[float], period: int) -> float:
     """Kaufman Efficiency Ratio over the last ``period`` values (0-1).
 

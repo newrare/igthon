@@ -1,35 +1,50 @@
 """Per-zone stop updaters — the *close* side split by where price sits.
 
-A position's stop is managed differently depending on where the live bid sits
-relative to three references frozen at open:
+A position's stop is managed differently depending on where the live **close-out
+price** sits relative to three references frozen at open. The close-out price is
+the one a close would actually be filled at: the **bid** for a BUY (sell to
+close), the **offer** for a SELL (buy to close).
 
-- ``level_zero`` — the break-even level (the entry offer for a BUY);
-- ``level_margin`` — break-even plus the epic's noise margin, the smallest move
+- ``level_zero`` — the break-even level (the entry offer for a BUY, the entry bid
+  for a SELL);
+- ``level_margin`` — break-even plus the epic's noise margin *in the direction of
+  profit* (above break-even for a BUY, below it for a SELL): the smallest move
   that counts as real profit rather than bid/offer churn. It is the **ceiling of
   where the raised stop is parked**, not a zone boundary;
-- ``level_profit`` — the *profit trigger*, one further noise margin above the
-  margin line (``level_margin + noise_margin`` = ``2 × level_margin − level_zero``).
-  It is the boundary above which the stop trails progressively.
+- ``level_profit`` — the *profit trigger*, one further noise margin past the
+  margin line (``2 × level_margin − level_zero``, which mirrors itself). It is
+  the boundary past which the stop trails progressively.
 
 That splits the price axis into three zones, each its own responsibility and its
 own :class:`StopUpdater` (so each can be reasoned about and unit-tested alone):
 
-- :class:`StopZone.UNDERWATER` — ``bid <= level_zero`` —
+- :class:`StopZone.UNDERWATER` — price has not cleared break-even —
   :class:`~src.exit.zones.underwater.UnderwaterStop`;
-- :class:`StopZone.BREAKEVEN_BAND` — ``level_zero < bid <= level_profit`` —
-  :class:`~src.exit.zones.breakeven_band.BreakevenBandStop`. Spans from break-even
-  up to the profit trigger (i.e. *across* the margin line): the raised stop is
-  parked on a support inside the break-even→margin band, and this zone keeps
-  governing while the bid hovers just above the margin. Extending it past the
-  margin is what stops a bid from skipping a break-even→margin band that is often
+- :class:`StopZone.BREAKEVEN_BAND` — past break-even, not yet past the profit
+  trigger — :class:`~src.exit.zones.breakeven_band.BreakevenBandStop`. Spans from
+  break-even up to the profit trigger (i.e. *across* the margin line): the raised
+  stop is parked on a support inside the break-even→margin band, and this zone
+  keeps governing while price hovers just past the margin. Extending it past the
+  margin is what stops price from skipping a break-even→margin band that is often
   thinner than a single live poll's move;
-- :class:`StopZone.PROFIT` — ``bid > level_profit`` —
+- :class:`StopZone.PROFIT` — past the profit trigger —
   :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`. Real, sustained
-  profit: the stop trails progressively above the margin line.
+  profit: the stop trails progressively beyond the margin line.
 
 A :class:`~src.exit.base.CloseProfile` composes the three updaters: on each tick
 it classifies the zone and delegates to the matching updater, which returns a new
-stop level to ratchet to (always higher than the current one) or ``None`` to hold.
+stop level to ratchet to (always tighter than the current one) or ``None`` to
+hold.
+
+**Direction.** Every zone works identically for a BUY and a SELL — only the sign
+of "forward" changes. Rather than duplicating each updater, :class:`StopContext`
+carries the position's ``direction`` and exposes the direction-aware primitives
+the updaters reason with (:meth:`~StopContext.gain`,
+:meth:`~StopContext.beyond`, :meth:`~StopContext.offset`) plus a *sign-normalised*
+view of the price series (:attr:`~StopContext.favourable_closes`), in which
+"rising" always means "moving into profit" whichever side the position is on. An
+updater that computes in that normalised space converts its answer back with
+:meth:`~StopContext.absolute`.
 """
 
 from __future__ import annotations
@@ -39,11 +54,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 from src.core.indicators import adverse_tick_noise
-from src.feed.price_buffer import EpicBuffer
+from src.feed.price_buffer import Candle, EpicBuffer
 
 
 class StopZone(Enum):
-    """Which price zone the live bid sits in (see module docstring)."""
+    """Which price zone the live close-out price sits in (see module docstring)."""
 
     UNDERWATER = "underwater"
     BREAKEVEN_BAND = "breakeven_band"
@@ -51,28 +66,35 @@ class StopZone(Enum):
 
 
 def classify_zone(
-    current_bid: float, level_zero: float, level_profit: float
+    current_price: float,
+    level_zero: float,
+    level_profit: float,
+    sign: float = 1.0,
 ) -> StopZone:
-    """Classify the live bid into a :class:`StopZone`.
+    """Classify the live close-out price into a :class:`StopZone`.
 
     Three open-frozen references split the price axis (see the module docstring):
     break-even (``level_zero``), the margin line, and the profit trigger
-    (``level_profit`` — one noise margin *above* the margin line):
+    (``level_profit`` — one noise margin past the margin line):
 
-    - ``UNDERWATER`` at or below break-even;
+    - ``UNDERWATER`` while price has not cleared break-even;
     - ``BREAKEVEN_BAND`` from break-even up to the profit trigger — the whole
       region in which the stop is parked on a support inside the
       break-even→margin band. Deliberately extends *past* the margin line so the
-      margin-zone updater still governs while the bid hovers just above the
-      margin (the band between break-even and margin is often thinner than a
-      single live poll's move, so gating the profit zone on the margin line alone
-      let the bid skip the band entirely);
-    - ``PROFIT`` once the bid clears the profit trigger — real, sustained profit,
-      where the stop trails progressively above the margin line.
+      margin-zone updater still governs while price hovers just past the margin
+      (the band between break-even and margin is often thinner than a single live
+      poll's move, so gating the profit zone on the margin line alone let price
+      skip the band entirely);
+    - ``PROFIT`` once price clears the profit trigger — real, sustained profit,
+      where the stop trails progressively beyond the margin line.
+
+    ``sign`` is ``+1`` for a BUY (profit is up) and ``−1`` for a SELL (profit is
+    down); the comparisons are written on the signed distance so both sides
+    classify with one rule.
     """
-    if current_bid > level_profit:
+    if sign * (current_price - level_profit) > 0:
         return StopZone.PROFIT
-    if current_bid > level_zero:
+    if sign * (current_price - level_zero) > 0:
         return StopZone.BREAKEVEN_BAND
     return StopZone.UNDERWATER
 
@@ -84,9 +106,14 @@ class StopContext:
     Assembled once per tick by the close profile from the live market state and
     the position's persisted levels, so the updaters stay pure and side-effect
     free.
+
+    All price fields are in **close-out terms** — the price a close would be
+    filled at, which is the bid for a BUY and the offer for a SELL. The
+    direction-aware helpers below are what let one updater serve both sides.
     """
 
-    current_bid: float
+    #: Live close-out price: the bid for a BUY, the offer for a SELL.
+    current_price: float
     level_open: float
     level_zero: float
     level_margin: float
@@ -95,12 +122,112 @@ class StopContext:
     spread: float
     euro_per_point: float
     buf: EpicBuffer
+    #: Trade side — ``"BUY"`` or ``"SELL"``. Drives :attr:`sign` and with it every
+    #: direction-aware helper, so an updater never tests the side itself.
+    direction: str = "BUY"
+    #: IG's minimum stop distance for this epic, in price units (0 when unknown).
+    #: Read by the updaters that place a stop relative to the live price, so they
+    #: never propose a level closer than the broker would accept.
+    min_stop_distance: float = 0.0
     #: Pre-resolved group decision for this position, set only by the portfolio
     #: pre-pass of a group-aware zone-1 updater (``smartgroup``): the absolute
     #: stop level this position should tighten to this tick, or ``None`` to hold.
     #: The group maths runs upstream (once per monitor tick across the whole book,
     #: see :mod:`src.exit.zones.smartgroup`) so the updater itself stays pure.
     group_tighten: float | None = None
+
+    # ---- direction-aware primitives -------------------------------------------
+    # Every zone rule is the same trade for a long and a short; only the sign of
+    # "forward" flips. These helpers express the rules in profit terms so no
+    # updater has to branch on the side (the branching that left shorts unmanaged).
+
+    @property
+    def sign(self) -> float:
+        """``+1`` when profit is up (BUY), ``−1`` when profit is down (SELL)."""
+        return -1.0 if self.direction == "SELL" else 1.0
+
+    def gain(self, level: float) -> float:
+        """Profit distance of ``level`` from break-even — positive = in profit."""
+        return self.sign * (level - self.level_zero)
+
+    def beyond(self, level: float, reference: float) -> bool:
+        """True when ``level`` sits strictly further into profit than ``reference``.
+
+        The direction-free form of "above" for a long / "below" for a short — used
+        for every up-only ratchet guard and every "is the stop safely inside the
+        market" test.
+        """
+        return self.sign * (level - reference) > 0
+
+    def offset(self, reference: float, distance: float) -> float:
+        """``reference`` moved ``distance`` **towards profit** (negative = adverse)."""
+        return reference + self.sign * distance
+
+    def favourable(self, level: float) -> float:
+        """``level`` in sign-normalised space (see :attr:`favourable_closes`)."""
+        return self.sign * level
+
+    def absolute(self, favourable_level: float) -> float:
+        """Convert a sign-normalised level back to a real price level."""
+        return self.sign * favourable_level
+
+    @property
+    def closes(self) -> list[float]:
+        """Recorded close-out prices — bid closes for a BUY, offer closes for a SELL."""
+        return self.buf.offer_closes if self.sign < 0 else self.buf.bid_closes
+
+    @property
+    def favourable_closes(self) -> list[float]:
+        """:attr:`closes` sign-normalised so *rising always means going into profit*.
+
+        Multiplying by :attr:`sign` maps a short's falling offer onto a rising
+        series, so a rule written for a long ("the swing low held above break-even",
+        "the last two ticks rose") reads correctly for both sides with no branch.
+        Levels compared against it must be mapped with :meth:`favourable`, and a
+        level computed in this space mapped back with :meth:`absolute`.
+        """
+        return [self.sign * c for c in self.closes]
+
+    def adverse_noise(self, window: int, std_k: float) -> float:
+        """Adverse tick-noise band of the close-out series, in price units.
+
+        The adverse direction is a down-move for a long and an up-move for a
+        short; measuring on :attr:`favourable_closes` makes
+        :func:`~src.core.indicators.adverse_tick_noise` (which only counts
+        down-steps) the right measure on both sides.
+        """
+        return adverse_tick_noise(self.favourable_closes, window, std_k)
+
+    def bar_close(self, candle: Candle) -> float:
+        """The candle's close-out close — bid close (BUY) / offer close (SELL)."""
+        return candle.offer_close if self.sign < 0 else candle.bid_close
+
+    def bar_open(self, candle: Candle) -> float:
+        """The candle's close-out open (bid open for a BUY, offer open for a SELL)."""
+        return candle.offer_open if self.sign < 0 else candle.bid_open
+
+    def bar_adverse(self, candle: Candle) -> float:
+        """The candle's worst close-out print — its bid low (BUY) / offer high (SELL).
+
+        The level a stop must sit beyond to survive the wicks the market really
+        traded through on this side.
+        """
+        return candle.offer_high if self.sign < 0 else candle.bid_low
+
+    def price_range(self) -> float:
+        """Range of the close-out price over the buffer — its vertical scale.
+
+        The server-side analogue of the dashboard chart's ``hi − lo``, measured on
+        the series this side actually closes at.
+        """
+        candles = self.buf.candles
+        if not candles:
+            return 0.0
+        if self.sign < 0:
+            return max(c.offer_high for c in candles) - min(
+                c.offer_low for c in candles
+            )
+        return max(c.bid_high for c in candles) - min(c.bid_low for c in candles)
 
 
 @dataclass(frozen=True)
@@ -116,13 +243,13 @@ class BreakevenLockParams:
     jumping between two unrelated policies — there is no unmanaged gap between zones.
     """
 
-    #: Recent candles whose bids must all have held above break-even (net of
-    #: noise) before the lock arms — the persistence gate.
+    #: Recent candles whose close-out prices must all have held past break-even
+    #: (net of noise) before the lock arms — the persistence gate.
     confirm_window: int = 10
     #: Where the stop is parked, as a fraction of the break-even→swing-low gap
     #: (``0 < f ≤ 1``): ``f=1`` sits at the swing low, smaller values keep a
-    #: safety buffer below it. Always clamped to at least one spread above
-    #: break-even so a sliver of profit is locked.
+    #: safety buffer behind it. Always clamped to at least one spread into
+    #: profit so a sliver of gain is locked.
     lock_fraction: float = 0.6
     #: Adverse-tick-noise band (same measure as the profit trailing floor) used
     #: to require the move to have cleared break-even beyond ordinary jitter.
@@ -134,48 +261,54 @@ class BreakevenLockParams:
 def breakeven_lock_level(ctx: StopContext, params: BreakevenLockParams) -> float | None:
     """Support-anchored break-even lock level, or ``None`` while the move has not held.
 
-    The stop is parked ``lock_fraction`` of the way from break-even up to the
-    recent swing low (the lowest bid close in the confirmation window), but only
-    once that swing low sits a full adverse-noise band **above** break-even. That
-    persistence-and-noise gate is exactly the dashboard's ``bid − noise`` curve
-    holding above the break-even line: a move that genuinely holds rather than
-    bid/offer churn.
+    The stop is parked ``lock_fraction`` of the way from break-even towards the
+    recent swing low (the least-profitable close in the confirmation window), but
+    only once that swing low sits a full adverse-noise band **past** break-even.
+    That persistence-and-noise gate is exactly the dashboard's ``price − noise``
+    curve holding beyond the break-even line: a move that genuinely holds rather
+    than bid/offer churn.
 
-    Anchoring under a real swing low (not a fixed spread offset) is what lets this
+    Anchoring behind a real swing low (not a fixed spread offset) is what lets this
     stop sit safely inside the old dead band between break-even and the margin —
-    ordinary noise cannot reach a level placed below a low the market has already
+    ordinary noise cannot reach a level placed beyond a low the market has already
     respected, so this does not reintroduce the "everything exits at 0 €" pin.
 
-    Returns the absolute stop level (never below ``level_zero + spread``, so a
-    sliver of profit is always locked), or ``None`` when there are too few bids or
+    The whole computation runs in :attr:`~StopContext.favourable_closes` space, so
+    "swing low", "above break-even" and "at least one spread of profit" all read
+    the same for a long and a short; the answer is mapped back to a real price
+    level at the end.
+
+    Returns the absolute stop level (never less than one spread into profit, so a
+    sliver of gain is always locked), or ``None`` when there are too few ticks or
     the move has not yet cleared break-even net of noise.
     """
-    closes = ctx.buf.bid_closes
+    closes = ctx.favourable_closes
     if params.confirm_window < 1 or len(closes) < params.confirm_window:
         return None
     noise = params.noise_mult * adverse_tick_noise(
         closes, params.noise_window, params.noise_std_k
     )
+    zero = ctx.favourable(ctx.level_zero)
     swing_low = min(closes[-params.confirm_window :])
     # The worst pull-back in the window, net of the noise band, must still be
-    # above break-even — otherwise the move has not truly held above it yet.
-    if swing_low - noise <= ctx.level_zero:
+    # past break-even — otherwise the move has not truly held beyond it yet.
+    if swing_low - noise <= zero:
         return None
-    target = ctx.level_zero + params.lock_fraction * (swing_low - ctx.level_zero)
-    level = max(target, ctx.level_zero + ctx.spread)
-    # Never return a lock at or above the live bid. The close profile's software
-    # backstop closes the position as soon as ``bid <= follower`` (see
+    target = zero + params.lock_fraction * (swing_low - zero)
+    level = max(target, zero + ctx.spread)
+    # Never return a lock at or beyond the live price. The close profile's software
+    # backstop closes the position as soon as price reaches the follower (see
     # :meth:`~src.exit.close_zoneprofit.CloseZoneProfit.evaluate`), so a lock placed
-    # at/above the current bid forces an immediate exit at ~break-even — exactly the
+    # at/past the current price forces an immediate exit at ~break-even — exactly the
     # "everything exits at 0 €" pin this module exists to avoid. It slips through on
     # a flat/monotone plateau hugging break-even, where ``adverse_tick_noise`` is 0
-    # (it only measures down-moves): the noise cushion in the guard above vanishes
-    # and the ``level_zero + spread`` floor can rise above a bid sitting just inside
-    # a spread of break-even. When there is no room to lock safely below the bid,
-    # hold (the previous, lower follower still protects the position).
-    if level >= ctx.current_bid:
+    # (it only measures adverse steps): the noise cushion in the guard above vanishes
+    # and the one-spread floor can pass a price sitting just inside a spread of
+    # break-even. When there is no room to lock safely behind price, hold (the
+    # previous, safer follower still protects the position).
+    if level >= ctx.favourable(ctx.current_price):
         return None
-    return level
+    return ctx.absolute(level)
 
 
 class StopUpdater(ABC):
@@ -202,8 +335,12 @@ class StopUpdater(ABC):
 
     @abstractmethod
     def propose(self, ctx: StopContext) -> float | None:
-        """New absolute stop level to ratchet to (higher than the current follower),
-        or ``None`` to hold the stop where it is this tick."""
+        """New absolute stop level to ratchet to, or ``None`` to hold this tick.
+
+        The level must be strictly tighter than the current follower in the
+        position's own direction (:meth:`StopContext.beyond`) — higher for a BUY,
+        lower for a SELL. The composer applies what is returned verbatim.
+        """
 
 
 def build_zone_updater(

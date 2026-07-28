@@ -10,6 +10,7 @@ import sys
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -27,6 +28,7 @@ _ROUTER_MOD = sys.modules["src.web.routes.dashboard.router"]
 # ── Fixtures / builders ─────────────────────────────────────────────────────
 
 _FRAGMENT_KEYS = {
+    "auto_open_banner",
     "kpi_bar",
     "market_rows",
     "week_summary",
@@ -477,6 +479,73 @@ class TestTradeOverlay:
             {"t": "2026-06-08T10:30:00+00:00", "level": 459.3},  # per-point broker
         ]
 
+    def test_short_stop_lines_shift_onto_bid_curve(self):
+        # Regression: for a SELL both protective stops are decided in OFFER terms
+        # (the software backstop fires on the buy-to-close offer, and the trail is
+        # computed from it), so on the bid curve the chart draws they must sit one
+        # spread BELOW their stored levels — exactly like zero/margin/close. Before
+        # the fix the follower (red) line was drawn a spread too high, so the bid
+        # never appeared to reach it at the (correctly-firing) close.
+        #
+        # It also locks in that the Loose line's first point uses the SEEDED open
+        # broker level (``stop_history[0]["broker"]``), not the mutated current
+        # ``level_stop``: for a short the broker ratchets DOWN, so reading the final
+        # ``level_stop`` at the open instant produced a spurious step UP.
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        spread = 0.00030
+        pos = SimpleNamespace(
+            id=21,
+            direction="SELL",
+            date=date(2026, 7, 24),
+            time_open=time(13, 5, 0),
+            time_close=time(13, 46, 0),
+            level_open=1.62780,
+            level_zero=1.62780,
+            level_margin=1.62750,
+            # Broker ratcheted DOWN over the trade: final (current) level_stop is
+            # the LOWEST, while the seeded open broker (in history[0]) is highest.
+            level_stop=1.62890,
+            level_follower=1.62810,
+            level_win=0.0,
+            level_close=1.62840,
+            pip_spread=spread,
+            euro=-24.14,
+            stop_history=[
+                # open seed: follower + broker both high (offer terms).
+                {"t": "2026-07-24T13:05:00+00:00", "level": 1.63000, "broker": 1.63080},
+                # ratchet down.
+                {"t": "2026-07-24T13:20:00+00:00", "level": 1.62810, "broker": 1.62890},
+            ],
+        )
+        ov = _trade_overlay(pos)
+        assert ov["direction"] == "SELL"
+        # Follower steps: raw offer levels minus one spread.
+        assert ov["stopsFollower"] == [
+            {
+                "t": "2026-07-24T13:05:00+00:00",
+                "level": pytest.approx(1.63000 - spread),
+            },
+            {
+                "t": "2026-07-24T13:20:00+00:00",
+                "level": pytest.approx(1.62810 - spread),
+            },
+        ]
+        # Loose steps: the SEEDED broker at index 0 (not the final level_stop),
+        # both shifted onto the bid curve. Index 0 must be ABOVE index 1 (the
+        # broker ratchets down for a short) — never a step up.
+        assert ov["stopsLoose"] == [
+            {
+                "t": "2026-07-24T13:05:00+00:00",
+                "level": pytest.approx(1.63080 - spread),
+            },
+            {
+                "t": "2026-07-24T13:20:00+00:00",
+                "level": pytest.approx(1.62890 - spread),
+            },
+        ]
+        assert ov["stopsLoose"][0]["level"] > ov["stopsLoose"][1]["level"]
+
     def test_stop_history_absent_yields_none(self):
         from src.web.routes.dashboard.router import _trade_overlay
 
@@ -620,7 +689,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=31" in html
+        assert "/static/dashboard.js?v=35" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -657,6 +726,32 @@ class TestRenderDashboard:
         html = _render_dashboard(_settings(), _base_state())
         assert "setAllJobs(true, this)" in html
         assert "setAllJobs(false, this)" in html
+
+    def test_auto_open_banner_allowed_state(self):
+        html = _render_dashboard(_settings(), _base_state())
+        banner = _build_fragments(_base_state())["auto_open_banner"]
+        # The fragment container must be in the shell so the poll can refresh it.
+        assert 'id="frag-auto_open_banner"' in html
+        assert "autoopen-on" in banner
+        assert "Openings allowed" in banner
+        # The button offers the opposite action (block), wired to the toggle.
+        assert "Block for today" in banner
+        assert "toggleAutoOpen(this)" in banner
+        # The handler the markup calls must actually exist in the served script.
+        js = (
+            Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
+        ).read_text()
+        assert "function toggleAutoOpen(" in js
+        assert "/api/auto-open/" in js
+
+    def test_auto_open_banner_blocked_state(self):
+        state = _base_state(auto_open_enabled=False)
+        banner = _build_fragments(state)["auto_open_banner"]
+        assert "autoopen-off" in banner
+        assert "Openings blocked" in banner
+        # It must be explicit that this does not touch live positions.
+        assert "Positions already open keep running" in banner
+        assert "Allow openings" in banner
 
 
 # ── /api/dashboard-fragments endpoint ────────────────────────────────────────
@@ -883,14 +978,20 @@ class _NoopSession:
         return None
 
 
-async def _guarded_open(trading, intent, buf):
+async def _guarded_open(
+    trading, intent, buf, *, allow_short=False, allow_reopen=False, manual=False
+):
     """Faithful stand-in for ``BotScheduler.open_epic_guarded``.
 
     Mirrors the real method's contract — gate first, then open — so the manual
     route's delegation is exercised without spinning up a full scheduler. The
-    per-epic lock itself is covered by the scheduler unit tests.
+    per-epic lock itself is covered by the scheduler unit tests. ``manual`` is
+    accepted (and ignored) exactly as the real method ignores it once past the
+    auto-open switch, which the scheduler unit tests cover.
     """
-    allowed, reason = await trading.can_open_intent(intent)
+    allowed, reason = await trading.can_open_intent(
+        intent, allow_short=allow_short, allow_reopen=allow_reopen
+    )
     if not allowed:
         return None, reason
     return await trading.open_from_intent(intent, buf), None
@@ -909,6 +1010,68 @@ def _manual_app() -> object:
         close_profile=object(), open_epic_guarded=_guarded_open
     )
     return app, epic
+
+
+class TestAutoOpenEndpoint:
+    """``POST /api/auto-open/{on,off}`` — the big dashboard switch."""
+
+    def _app_with_switch(self):
+        """App whose scheduler records the auto-open calls it receives."""
+        app = create_app(settings=_settings(), buffer=PriceBuffer())
+        calls: list[bool] = []
+
+        async def _set(enabled: bool) -> None:
+            calls.append(enabled)
+
+        app.state.scheduler = SimpleNamespace(
+            set_auto_open=_set, auto_open_enabled=True
+        )
+        return app, calls
+
+    async def test_off_blocks_and_on_allows(self):
+        app, calls = self._app_with_switch()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            off = await client.post("/api/auto-open/off")
+            on = await client.post("/api/auto-open/on")
+        assert off.status_code == 200 and off.json() == {"auto_open": False}
+        assert on.status_code == 200 and on.json() == {"auto_open": True}
+        assert calls == [False, True]
+
+    async def test_unknown_mode_returns_400(self):
+        app, calls = self._app_with_switch()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/auto-open/maybe")
+        assert resp.status_code == 400
+        assert calls == []
+
+    async def test_no_scheduler_returns_503(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/auto-open/off")
+        assert resp.status_code == 503
+
+    async def test_state_is_exposed_to_the_poll_and_status(self):
+        app, _ = self._app_with_switch()
+        app.state.scheduler = SimpleNamespace(
+            set_auto_open=AsyncMock(),
+            auto_open_enabled=False,
+            is_paused=True,
+            all_epics=[],
+            epic_last_refresh=None,
+            tradable_epics=[],
+            tradable_last_refresh=None,
+            positions_synced_at=None,
+            jobs_status=lambda: [],
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            frags = (await client.get("/api/dashboard-fragments")).json()
+            status = (await client.get("/api/status")).json()
+        assert frags["auto_open"] is False
+        assert "autoopen-off" in frags["fragments"]["auto_open_banner"]
+        assert status["auto_open"] is False
 
 
 class TestManualOpenEndpoint:
@@ -934,7 +1097,9 @@ class TestManualOpenEndpoint:
             def __init__(self, *a, **k) -> None:
                 pass
 
-            async def can_open_intent(self, intent):
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
                 return False, "Epic already open"
 
             async def open_from_intent(self, intent, buf):  # pragma: no cover
@@ -958,7 +1123,9 @@ class TestManualOpenEndpoint:
             def __init__(self, client, session, config, close_profile=None) -> None:
                 seen["close_profile"] = close_profile
 
-            async def can_open_intent(self, intent):
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
                 seen["direction"] = intent.direction
                 seen["epic"] = intent.epic
                 return True, "ok"
@@ -975,6 +1142,7 @@ class TestManualOpenEndpoint:
         data = resp.json()
         assert data == {
             "status": "opened",
+            "direction": "BUY",
             "deal_id": "DEAL1",
             "level": 1000.0,
             "quantity": 1,
@@ -993,7 +1161,9 @@ class TestManualOpenEndpoint:
             def __init__(self, *a, **k) -> None:
                 pass
 
-            async def can_open_intent(self, intent):
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
                 return True, "ok"
 
             async def open_from_intent(self, intent, buf):
@@ -1003,4 +1173,49 @@ class TestManualOpenEndpoint:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(f"/api/positions/open/{epic}")
+        assert resp.status_code == 400
+
+    async def test_manual_sell_passes_direction_and_allow_short(self, monkeypatch):
+        # A dashboard SELL forwards direction="SELL" and lifts the long-only gate
+        # via allow_short=True; the persisted origin stays "manual".
+        app, epic = _manual_app()
+        seen = {}
+        position = SimpleNamespace(
+            level_open=1000.0, quantity=1, deal_id="DEALS", reason_open="auto"
+        )
+
+        class _ShortTrading:
+            def __init__(self, client, session, config, close_profile=None) -> None:
+                pass
+
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
+                seen["direction"] = intent.direction
+                seen["allow_short"] = allow_short
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return position
+
+        monkeypatch.setattr(_ROUTER_MOD, "TradingService", _ShortTrading)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/positions/open/{epic}", json={"direction": "SELL"}
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["direction"] == "SELL"
+        assert seen["direction"] == "SELL"
+        assert seen["allow_short"] is True
+        assert position.reason_open == "manual"
+
+    async def test_manual_open_invalid_direction_returns_400(self, monkeypatch):
+        app, epic = _manual_app()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/positions/open/{epic}", json={"direction": "HOLD"}
+            )
         assert resp.status_code == 400

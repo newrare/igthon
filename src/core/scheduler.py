@@ -24,7 +24,6 @@ from src.core.api_queue import APIQueue, Priority
 from src.core.config import Settings
 from src.core.recorder import Recorder
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
-from src.execution.recovery import is_recovery_trigger
 from src.execution.trading import (
     TradeConfig,
     TradingService,
@@ -54,18 +53,20 @@ logger = logging.getLogger(__name__)
 
 
 def validate_strategy_selection(settings: Settings) -> None:
-    """Ensure the three strategy selections from ``.env`` are set and known.
+    """Ensure the ``.env`` trading selection is complete and known.
 
     The ``.env`` file is the single source of truth for the open / stop / close
-    selection — there is no code default and no persistence. A missing, empty or
-    unknown name raises a single actionable error naming every offending
-    variable, so the bot and the dashboard can surface a "configure your .env"
-    message instead of failing obscurely deep in the pipeline.
+    selection **and** for the global open policies — there is no code default and
+    no persistence. A missing, empty or unknown value raises a single actionable
+    error naming every offending variable, so the bot and the dashboard can
+    surface a "configure your .env" message instead of failing obscurely deep in
+    the pipeline.
 
     Raises:
         ValueError: when any of ``OPEN_STRATEGY`` / ``STOP_STRATEGY`` /
             ``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT`` is
-            empty or not a registered name.
+            empty or not a registered name, or when ``ALLOW_SAME_DAY_REOPEN`` is
+            missing.
     """
     checks = (
         ("OPEN_STRATEGY", settings.open_strategy, ENTRY_STRATEGIES),
@@ -82,11 +83,29 @@ def validate_strategy_selection(settings: Settings) -> None:
             problems.append(
                 f"{var}={name!r} is unknown (available: {sorted(registry)})"
             )
+    # Global same-day re-open policy: a boolean shared by every open strategy, so
+    # it must be stated explicitly rather than silently defaulted one way.
+    if getattr(settings, "allow_same_day_reopen", None) is None:
+        problems.append("ALLOW_SAME_DAY_REOPEN is not set (expected true or false)")
     if problems:
         raise ValueError(
             "Invalid strategy selection — please configure your .env file:\n  - "
             + "\n  - ".join(problems)
         )
+
+
+# Reserved ``JobPreference`` key persisting the auto-open switch. Deliberately
+# NOT a member of ``JOB_DEFINITIONS``: it is a trading authorisation, not a
+# schedulable job, so the "enable/pause all jobs" bulk writes and the per-job
+# restore loop never touch it. It shares the table because the row is the same
+# shape — a named boolean the user chose, plus the moment they chose it.
+AUTO_OPEN_PREF_KEY = "auto_open"
+
+# Refusal reason returned by ``open_epic_guarded`` when the auto-open switch is
+# off. Named so the analysis loop can recognise it and report it louder than an
+# ordinary gate refusal — the user set this one themselves and wants to see what
+# it cost them.
+AUTO_OPEN_REFUSAL = "Auto-open disabled for today"
 
 
 # Registry of schedulable jobs surfaced in the dashboard "Actions" section.
@@ -296,6 +315,17 @@ class BotScheduler:
         self._positions_synced_at: datetime | None = None
         # Epics that returned 403 on /prices — skipped until next hourly refresh
         self._pricing_blacklist: set[str] = set()
+
+        # Auto-open switch (the big dashboard button). When False the bot opens
+        # NOTHING on its own — every automatic open is refused whatever the
+        # selected entry strategy and whatever the direction (BUY or SELL) —
+        # while positions already open keep living their normal life (monitoring,
+        # stop ratchets, closes). It is a day-scoped decision ("I have decided
+        # today is over"): ``_auto_open_day`` records the day the block was set
+        # on so the next day starts authorised again with no action needed.
+        # Manual dashboard opens are never affected.
+        self._auto_open_enabled: bool = True
+        self._auto_open_day: date | None = None
 
         self._scanner = MarketScanner(
             client=client,
@@ -520,6 +550,42 @@ class BotScheduler:
             for entry in JOB_DEFINITIONS
         )
 
+    @property
+    def auto_open_enabled(self) -> bool:
+        """Return True when the bot is authorised to open on its own right now.
+
+        A block is scoped to the calendar day it was set on: once the day has
+        rolled over the switch self-heals back to authorised, so a "no more
+        trades today" decision never silently carries into the next session. The
+        reset lives here rather than in the midnight ``daily_reset`` job because
+        that job is user-toggleable (and manual by default) — it may never run.
+        """
+        if not self._auto_open_enabled and self._auto_open_day != date.today():
+            self._auto_open_enabled = True
+            self._auto_open_day = None
+            logger.info("Auto-open re-authorised — the blocked day is over")
+        return self._auto_open_enabled
+
+    async def set_auto_open(self, enabled: bool) -> None:
+        """Authorise (``True``) or block (``False``) every automatic open.
+
+        Persisted so a restart in the middle of a blocked day keeps the block;
+        the stored row carries the day it was set on and is ignored afterwards
+        (see :meth:`_restore_auto_open`).
+        """
+        self._auto_open_enabled = enabled
+        self._auto_open_day = None if enabled else date.today()
+        logger.info(
+            "Auto-open %s by the user",
+            "authorised" if enabled else "blocked for the rest of the day",
+        )
+        self._recorder.info(
+            "Auto-open authorised — the bot may open again"
+            if enabled
+            else "Auto-open blocked for today — open positions keep running"
+        )
+        await self._save_job_preference(AUTO_OPEN_PREF_KEY, enabled)
+
     def jobs_status(self) -> list[dict]:
         """Return every registered job with its current auto/manual mode.
 
@@ -593,14 +659,23 @@ class BotScheduler:
         Called once on startup (after ``start()``) so the bot resumes with the
         same job configuration the user had before the server was stopped.
         Jobs with no persisted preference stay in manual (the startup default).
+
+        The auto-open switch is restored from the same table in the same pass
+        (see :meth:`_restore_auto_open`).
         """
         try:
             async with self._session_factory() as session:
-                rows = await session.scalars(select(JobPreference))
-                prefs = {row.action: row.auto for row in rows}
+                rows = list(await session.scalars(select(JobPreference)))
         except Exception as exc:
             logger.warning("Could not load job preferences: %s", exc)
             return
+
+        prefs = {
+            row.action: row.auto for row in rows if row.action != AUTO_OPEN_PREF_KEY
+        }
+        self._restore_auto_open(
+            next((r for r in rows if r.action == AUTO_OPEN_PREF_KEY), None)
+        )
 
         for entry in JOB_DEFINITIONS:
             action = entry["action"]
@@ -619,6 +694,31 @@ class BotScheduler:
         logger.info(
             "Job preferences restored: %d/%d automatic", active, len(JOB_DEFINITIONS)
         )
+
+    def _restore_auto_open(self, row: JobPreference | None) -> None:
+        """Re-apply a persisted auto-open block, but only within its own day.
+
+        A stored ``False`` from an earlier day is stale by design — the block is
+        a "today is over" decision — so it is logged and ignored, leaving the
+        bot authorised. Anything else (no row, or an authorised row) is a no-op:
+        authorised is the startup default.
+        """
+        if row is None or row.auto:
+            return
+        stamped = row.updated_at
+        if stamped.tzinfo is None:
+            # SQLite hands back naive datetimes; they were written as UTC.
+            stamped = stamped.replace(tzinfo=UTC)
+        blocked_on = stamped.astimezone().date()
+        if blocked_on != date.today():
+            logger.info(
+                "Ignoring stale auto-open block from %s — a new day is authorised",
+                blocked_on.isoformat(),
+            )
+            return
+        self._auto_open_enabled = False
+        self._auto_open_day = blocked_on
+        logger.info("Auto-open block restored — still blocked for today")
 
     async def _save_job_preference(self, action: str, auto: bool) -> None:
         """Upsert a single job preference row."""
@@ -1532,6 +1632,10 @@ class BotScheduler:
         trading: "TradingService",
         intent: EntryIntent,
         buf: EpicBuffer,
+        *,
+        allow_short: bool = False,
+        allow_reopen: bool = False,
+        manual: bool = False,
     ) -> tuple[Position | None, str | None]:
         """Open ``intent.epic`` under its per-epic lock (single-flight per epic).
 
@@ -1541,11 +1645,28 @@ class BotScheduler:
         gate only after the first has committed its provisional row — and is then
         correctly refused instead of placing a second order on the same epic.
 
+        ``allow_short`` lifts the long-only gate for a manual dashboard SELL and
+        ``allow_reopen`` lifts the global same-day re-open gate
+        (``ALLOW_SAME_DAY_REOPEN``); automatic callers leave both ``False``.
+
+        ``manual`` marks a human-triggered open (the dashboard Buy/Sell buttons),
+        which bypasses the auto-open switch: blocking auto-open stops the *bot*
+        from opening, it never takes the buttons away from the user.
+
         Returns ``(position, None)`` on success, ``(None, reason)`` when the gate
         refuses the open, and ``(None, None)`` when IG rejected the order.
         """
+        # Auto-open switch — the single choke point every automatic open path
+        # goes through, so no entry strategy (per-epic or cross-epic ranker) can
+        # open while the user has closed the day. Checked before the lock: no
+        # point serialising an open that is refused outright.
+        if not manual and not self.auto_open_enabled:
+            return None, AUTO_OPEN_REFUSAL
+
         async with self._open_lock(intent.epic):
-            allowed, reason = await trading.can_open_intent(intent)
+            allowed, reason = await trading.can_open_intent(
+                intent, allow_short=allow_short, allow_reopen=allow_reopen
+            )
             if not allowed:
                 return None, reason
             position = await trading.open_from_intent(intent, buf)
@@ -1569,7 +1690,11 @@ class BotScheduler:
         if not buf or len(buf) < strategy.warmup:
             return
         intent = strategy.evaluate(epic, buf)
-        if intent and intent.direction == "BUY":
+        # Long-only unless the strategy declares it trades both ways: a SELL from
+        # a strategy that has not opted in is dropped here (and would be refused
+        # by the shared pre-open gate anyway).
+        allow_short = getattr(strategy, "emits_shorts", False)
+        if intent and (intent.direction == "BUY" or allow_short):
             logger.info(
                 "Entry intent [%s]: %s %s (score=%.2f)",
                 strategy.name,
@@ -1581,10 +1706,19 @@ class BotScheduler:
                 trading = TradingService(
                     self._client, session, config, close_profile=self.close_profile
                 )
-                position, reason = await self.open_epic_guarded(trading, intent, buf)
+                position, reason = await self.open_epic_guarded(
+                    trading, intent, buf, allow_short=allow_short
+                )
                 if position:
                     self._recorder.info(
                         f"Position opened: {epic} @ {position.level_open}"
+                    )
+                elif reason == AUTO_OPEN_REFUSAL:
+                    # The strategy did signal an open and the user's own switch
+                    # stopped it — worth an INFO line so the dashboard log shows
+                    # what the closed day is skipping (intents are rare).
+                    logger.info(
+                        "Auto-open blocked — skipped %s on %s", intent.direction, epic
                     )
                 elif reason:
                     logger.debug("Cannot open %s: %s", epic, reason)
@@ -1640,6 +1774,12 @@ class BotScheduler:
         if not strategy.cross_epic_selection:
             return  # per-epic entry strategy drives opens via _collect_and_analyze
 
+        # Auto-open blocked: skip the whole scoring pass rather than rank every
+        # epic only to have ``open_epic_guarded`` refuse each candidate.
+        if not self.auto_open_enabled:
+            logger.debug("Rolling select: auto-open disabled for today — skipping")
+            return
+
         config = self._build_trade_config()
 
         epics = [e for e in self._tradable_epics if e not in self._pricing_blacklist]
@@ -1694,11 +1834,13 @@ class BotScheduler:
                 # rolling position rotates across markets instead of re-opening the
                 # same epic the moment it closes. The shared ``epic_already_open``
                 # gate only blocks *concurrent* duplicates, not a same-day re-open.
-                # A strategy that explicitly allows same-day re-opens
-                # (``allow_same_day_reopen``) skips this filter: an epic is a
-                # candidate again as soon as it holds no open position, so the same
-                # rising market can be opened several times in one day.
-                if getattr(strategy, "allow_same_day_reopen", False):
+                # The policy is GLOBAL to every open strategy and comes from
+                # ``ALLOW_SAME_DAY_REOPEN`` in .env: when it is on this filter is
+                # skipped — an epic is a candidate again as soon as it holds no
+                # open position, so the same rising market can be opened several
+                # times in one day. This is only a cheap pre-filter; the shared
+                # pre-open gate re-checks it under the per-epic lock.
+                if bool(self._settings.allow_same_day_reopen):
                     candidates = list(epics)
                 else:
                     traded_today = await self._traded_today_epics(session)
@@ -1733,8 +1875,11 @@ class BotScheduler:
                     )
                     return
 
-                # Score every epic with enough buffered history; keep BUY
-                # candidates, then rank by score (highest first).
+                # Score every epic with enough buffered history; keep the
+                # tradable candidates, then rank by score (highest first). A SELL
+                # is kept only when the strategy declares it trades both ways
+                # (``emits_shorts``); otherwise the ranker stays long-only.
+                allow_short = getattr(strategy, "emits_shorts", False)
                 ranked: list[tuple[EntryIntent, EpicBuffer]] = []
                 evaluated = 0
                 for epic in candidates:
@@ -1743,7 +1888,7 @@ class BotScheduler:
                         continue
                     evaluated += 1
                     intent = strategy.evaluate(epic, buf)
-                    if intent and intent.direction == "BUY":
+                    if intent and (intent.direction == "BUY" or allow_short):
                         ranked.append((intent, buf))
                 if not ranked:
                     if evaluated:
@@ -1805,7 +1950,9 @@ class BotScheduler:
                 for intent, buf in ranked:
                     if opened >= slots:
                         break
-                    allowed, reason = await trading.can_open_intent(intent)
+                    allowed, reason = await trading.can_open_intent(
+                        intent, allow_short=allow_short
+                    )
                     if not allowed:
                         gate_blocked += 1
                         logger.debug("Rolling select skip %s: %s", intent.epic, reason)
@@ -1831,7 +1978,9 @@ class BotScheduler:
                     # Single-flight per epic: re-checks the duplicate gate under
                     # the per-epic lock so a manual dashboard open on the same
                     # epic cannot slip a second order through the race window.
-                    position, _ = await self.open_epic_guarded(trading, intent, buf)
+                    position, _ = await self.open_epic_guarded(
+                        trading, intent, buf, allow_short=allow_short
+                    )
                     if position:
                         opened += 1
                         if spendable is not None and need is not None:
@@ -1970,81 +2119,8 @@ class BotScheduler:
                                 f"reason={position.reason_close} "
                                 f"P&L={position.euro}€"
                             )
-                            await self._maybe_open_recovery(
-                                trading, session, position, buf
-                            )
                 except Exception as exc:
                     logger.error("Error monitoring position %s: %s", position.epic, exc)
-
-    async def _maybe_open_recovery(
-        self,
-        trading: TradingService,
-        session: AsyncSession,
-        closed_position: Position,
-        buf: EpicBuffer | None,
-    ) -> None:
-        """Open a double-size SELL when a long stopped out on the reversal pattern.
-
-        Gated by ``RECOVERY_ENABLED``. Fires only when the just-closed position
-        matches :func:`~src.execution.recovery.is_recovery_trigger` (a quick,
-        never-in-profit long stop-out). The open is serialised under the same
-        lock as the rolling ranking selector and re-checks that no position is
-        open, so the recovery short and a ranker BUY can never both grab the
-        single freed slot — the recovery short takes it and, counting as the one
-        open position, blocks any further BUY while it runs.
-        """
-        if not self._settings.recovery_enabled:
-            return
-        if buf is None or buf.last is None:
-            return
-        if not is_recovery_trigger(closed_position):
-            return
-
-        # Serialise like the ranker AND like a per-epic/manual BUY. Hold the
-        # cross-epic selection lock (so a ranker BUY and this recovery cannot both
-        # grab the single freed slot) AND the per-epic open lock (so a per-epic
-        # analysis-tick BUY or a manual dashboard open on THIS epic — both of which
-        # run under ``open_epic_guarded`` → the per-epic lock, not ``_select_lock``
-        # — cannot open the same epic concurrently with this SELL). Lock order
-        # matches ``_select_and_open`` → ``open_epic_guarded`` (``_select_lock``
-        # first, then the per-epic lock), so the two paths can never deadlock.
-        async with self._select_lock, self._open_lock(closed_position.epic):
-            open_count = (
-                await session.scalar(
-                    select(func.count())
-                    .select_from(Position)
-                    .where(Position.state == PositionState.OPEN)
-                )
-            ) or 0
-            if open_count > 0:
-                logger.info(
-                    "Recovery skipped for %s: %d position(s) already open",
-                    closed_position.epic,
-                    open_count,
-                )
-                return
-            # Duplicate-epic gate, re-checked under the per-epic lock. This is the
-            # gate ``open_recovery_short`` otherwise bypasses (it never calls
-            # ``_is_epic_open``): it closes the gate→commit race a bare open_count
-            # check leaves open against a same-epic BUY still in flight, and guards
-            # the same-epic case should ``concurrent_positions`` ever exceed one.
-            if await trading._is_epic_open(closed_position.epic):
-                logger.info(
-                    "Recovery skipped for %s: a position on this epic is already open",
-                    closed_position.epic,
-                )
-                return
-            logger.info(
-                "Recovery trigger on %s (loss=%s€) — opening double-size SELL",
-                closed_position.epic,
-                closed_position.euro,
-            )
-            short = await trading.open_recovery_short(closed_position, buf)
-            if short is not None:
-                self._recorder.info(
-                    f"Recovery short opened: {closed_position.epic} "
-                    f"@ {short.level_open} (x{short.quantity})"
-                )
 
     async def _sync_positions(self) -> None:
         """Reconcile DB open positions against IG's live position list.

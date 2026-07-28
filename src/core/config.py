@@ -153,6 +153,21 @@ class Settings(BaseSettings):
     close_zonemarge: str = ""  # zone break-even→margin (e.g. hold)
     close_zoneprofit: str = ""  # zone above margin      (e.g. trailing_ratchet)
 
+    # Same-day re-open policy — GLOBAL to every open strategy (ALLOW_SAME_DAY_REOPEN).
+    # False: an epic may be opened at most ONCE per day. Whatever the direction
+    # (BUY or SELL), once a position has been opened on an epic today that epic is
+    # out for the rest of the day — the portfolio rotates across markets instead of
+    # re-entering the same curve after a close.
+    # True: an epic becomes a candidate again as soon as it holds no open position,
+    # so the same market can be opened several times in one day.
+    # Concurrent duplicates on a still-open epic are ALWAYS blocked by the shared
+    # ``epic_already_open`` gate, independently of this flag; a manual dashboard
+    # open also bypasses it (explicit human action).
+    # REQUIRED like the selection names above: no code default, so ``None`` here
+    # means "missing from .env" and startup fails with an actionable message
+    # instead of silently picking a policy (see ``validate_strategy_selection``).
+    allow_same_day_reopen: bool | None = None
+
     # Open strategies (open_donchian, open_projection, open_ranking), stop policies
     # (stop_support, stop_atr) and the close profile (close_zoneprofit) keep their
     # parameters as constants on their own classes under src/entry/, src/stops/ and
@@ -172,6 +187,17 @@ class Settings(BaseSettings):
     strategy_atr_k_pre: float = 2.5  # multiplier before break-even
     strategy_atr_k_post: float = 2.5  # kept equal: do not tighten after break-even
     strategy_trailing_step_ratio: float = 0.3  # min gain (xATR) before a PUT
+    # Noise cushion between the software follower and the broker stop, as a
+    # fraction of the current ATR (added on top of one spread). The follower is
+    # only acted on at a bid poll, so a transient down-spike that recovers before
+    # the next poll never closes the trade; the broker order is a hard resting
+    # order that fires on any real-time tick. With only one spread between them,
+    # bid noise trips the broker order before the (noise-tolerant) follower gets
+    # its chance — closing a trade the software stop would have ridden through.
+    # This ATR-scaled cushion pushes the broker stop far enough beyond the
+    # follower that only a sustained move (which the follower would honour too)
+    # reaches it. 0 restores the old one-spread-only behaviour.
+    strategy_broker_stop_noise_atr: float = 0.5
 
     # The "close_zoneprofit" close profile composes a stop policy (src/stops/) at
     # open with three per-zone stop updaters (src/exit/zones/) — their shaping
@@ -203,17 +229,6 @@ class Settings(BaseSettings):
     # so EXECUTE_AND_ELIMINATE fills the whole size at the best available price;
     # the buffer only caps the acceptable slippage, never the fill price.
     strategy_market_order_limit_slippage: float = 0.002
-    # Loss-recovery — master switch (single boolean, the only .env knob here).
-    # When True, a long that closes on the "trend-reversal at open" pattern (a
-    # quick stop-out that never crossed break-even) immediately triggers a
-    # double-size SELL on the same epic, managed by a mirrored trailing_ratchet
-    # short exit, to try and recoup the loss on the ensuing decline. The detection
-    # thresholds and the size multiplier are constants in src/execution/recovery.py
-    # (convention: only selectors/switches live in .env). Anti-loop: a recovery
-    # short that itself loses never spawns another recovery. The recovery short
-    # counts as the single open position, so the ranking strategy's one-position
-    # budget still holds. See src/execution/recovery.py and src/exit/recovery_short.py.
-    recovery_enabled: bool = False
 
     # Max margin (EUR) to open one minimum-size BUY; epics above this are dropped
     # from the tradable/streaming set — pointless to analyze (and subscribe to)

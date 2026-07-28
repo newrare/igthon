@@ -42,6 +42,7 @@ def _make_scheduler(session_factory) -> BotScheduler:
     """Build a BotScheduler with mocked services and a real session factory."""
     settings = MagicMock()
     settings.strategy_hour_close = 17
+    settings.allow_same_day_reopen = True  # global .env policy (real bool)
     return BotScheduler(
         settings=settings,
         client=MagicMock(),
@@ -92,7 +93,9 @@ class TestOpenEpicGuarded:
         opened = False
 
         class _Trading:
-            async def can_open_intent(self, intent):
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
                 return False, "Epic IX.D.DAX.IFMM.IP already open"
 
             async def open_from_intent(self, intent, buf):
@@ -111,7 +114,9 @@ class TestOpenEpicGuarded:
         sentinel = object()
 
         class _Trading:
-            async def can_open_intent(self, intent):
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
                 return True, "ok"
 
             async def open_from_intent(self, intent, buf):
@@ -131,7 +136,9 @@ class TestOpenEpicGuarded:
             def __init__(self, tag: str) -> None:
                 self.tag = tag
 
-            async def can_open_intent(self, intent):
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
                 order.append(("gate", self.tag))
                 return True, "ok"
 
@@ -174,6 +181,32 @@ class TestValidateStrategySelection:
             close_zonestart="hold",
             close_zonemarge="hold",
             close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=False,
+        )
+        validate_strategy_selection(settings)  # does not raise
+
+    def test_missing_same_day_reopen_is_rejected(self):
+        # The global re-open policy is required too: no code default, so a
+        # missing .env line must fail startup instead of picking a policy.
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=None,
+        )
+        with pytest.raises(ValueError, match="ALLOW_SAME_DAY_REOPEN"):
+            validate_strategy_selection(settings)
+
+    def test_same_day_reopen_true_passes(self):
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=True,
         )
         validate_strategy_selection(settings)  # does not raise
 
@@ -184,6 +217,7 @@ class TestValidateStrategySelection:
             close_zonestart="",
             close_zonemarge="",
             close_zoneprofit="",
+            allow_same_day_reopen=False,
         )
         with pytest.raises(ValueError) as exc:
             validate_strategy_selection(settings)
@@ -201,6 +235,7 @@ class TestValidateStrategySelection:
             close_zonestart="hold",
             close_zonemarge="hold",
             close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=False,
         )
         with pytest.raises(ValueError, match="OPEN_STRATEGY"):
             validate_strategy_selection(settings)
@@ -228,6 +263,194 @@ class TestLastScheduledFire:
         now = datetime(2026, 6, 15, 10, 0, tzinfo=UTC)
         last = BotScheduler._last_scheduled_fire(trigger, now)
         assert last == datetime(2026, 6, 12, 18, 30, tzinfo=UTC)
+
+
+class TestAutoOpenSwitch:
+    """The dashboard auto-open switch: block every automatic open for the day.
+
+    It must stop the bot whatever the selected entry strategy, leave manual opens
+    alone, survive a restart within the same day, and expire on its own once the
+    day is over (the midnight job is user-toggleable and may never run).
+    """
+
+    async def test_enabled_by_default(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        assert scheduler.auto_open_enabled is True
+
+    async def test_blocking_refuses_automatic_open(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        await scheduler.set_auto_open(False)
+        gate_ran = False
+
+        class _Trading:
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
+                nonlocal gate_ran
+                gate_ran = True
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                raise AssertionError("must not open while auto-open is blocked")
+
+        intent = SimpleNamespace(epic="E", direction="BUY")
+        position, reason = await scheduler.open_epic_guarded(_Trading(), intent, None)
+        assert position is None
+        assert reason == "Auto-open disabled for today"
+        assert gate_ran is False  # refused before the gate, and before the lock
+
+    async def test_blocking_refuses_short_intents_too(self, session_factory):
+        # Direction-agnostic: a two-sided strategy's SELL is blocked as well.
+        scheduler = _make_scheduler(session_factory)
+        await scheduler.set_auto_open(False)
+
+        class _Trading:
+            async def can_open_intent(self, intent, **kwargs):
+                raise AssertionError("must not reach the gate")
+
+            async def open_from_intent(self, intent, buf):
+                raise AssertionError("must not open")
+
+        intent = SimpleNamespace(epic="E", direction="SELL")
+        position, reason = await scheduler.open_epic_guarded(
+            _Trading(), intent, None, allow_short=True
+        )
+        assert position is None
+        assert reason == "Auto-open disabled for today"
+
+    async def test_manual_open_bypasses_the_block(self, session_factory):
+        # Blocking auto-open stops the bot, never the dashboard Buy/Sell buttons.
+        scheduler = _make_scheduler(session_factory)
+        await scheduler.set_auto_open(False)
+        sentinel = object()
+
+        class _Trading:
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return sentinel
+
+        intent = SimpleNamespace(epic="E", direction="BUY")
+        position, reason = await scheduler.open_epic_guarded(
+            _Trading(), intent, None, allow_reopen=True, manual=True
+        )
+        assert position is sentinel
+        assert reason is None
+
+    async def test_re_enabling_restores_automatic_opens(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        await scheduler.set_auto_open(False)
+        await scheduler.set_auto_open(True)
+        assert scheduler.auto_open_enabled is True
+
+    async def test_block_expires_when_the_day_is_over(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        await scheduler.set_auto_open(False)
+        # Simulate the calendar day rolling over while the process kept running.
+        scheduler._auto_open_day = date.today() - timedelta(days=1)
+        assert scheduler.auto_open_enabled is True
+        assert scheduler._auto_open_day is None  # self-healed, not re-checked daily
+
+    async def test_choice_is_persisted(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        await scheduler.set_auto_open(False)
+
+        async with session_factory() as session:
+            pref = await session.get(JobPreference, "auto_open")
+        assert pref is not None
+        assert pref.auto is False
+
+    async def test_same_day_block_is_restored_on_startup(self, session_factory):
+        async with session_factory() as session:
+            session.add(
+                JobPreference(
+                    action="auto_open", auto=False, updated_at=datetime.now(UTC)
+                )
+            )
+            await session.commit()
+
+        scheduler = _make_scheduler(session_factory)
+        scheduler.start()
+        try:
+            await scheduler.load_job_preferences()
+            assert scheduler.auto_open_enabled is False
+        finally:
+            scheduler.stop()
+
+    async def test_stale_block_is_ignored_on_startup(self, session_factory):
+        # A block set yesterday must not silently carry into today's session.
+        async with session_factory() as session:
+            session.add(
+                JobPreference(
+                    action="auto_open",
+                    auto=False,
+                    updated_at=datetime.now(UTC) - timedelta(days=3),
+                )
+            )
+            await session.commit()
+
+        scheduler = _make_scheduler(session_factory)
+        scheduler.start()
+        try:
+            await scheduler.load_job_preferences()
+            assert scheduler.auto_open_enabled is True
+        finally:
+            scheduler.stop()
+
+    async def test_per_epic_intent_blocked_is_logged(
+        self, session_factory, monkeypatch, caplog
+    ):
+        # A per-epic strategy signals a BUY while the day is closed: nothing must
+        # open, and the log must say the switch (not a market gate) stopped it.
+        scheduler = _make_scheduler(session_factory)
+        # Minimal per-epic strategy stub (cross_epic_selection False) that always
+        # signals a BUY — the point is the switch, not any real strategy's logic.
+        scheduler._strategy = SimpleNamespace(
+            cross_epic_selection=False,
+            warmup=1,
+            name="stub",
+            evaluate=MagicMock(
+                return_value=EntryIntent(epic="E", direction="BUY", score=1.0)
+            ),
+        )
+        scheduler._close_profile_obj = MagicMock()
+        buf = MagicMock()
+        buf.__len__ = MagicMock(return_value=1)
+        scheduler._buffer = MagicMock()
+        scheduler._buffer.get = MagicMock(return_value=buf)
+        trading_stub = MagicMock()
+        trading_stub.can_open_intent = AsyncMock(
+            side_effect=AssertionError("must not reach the gate")
+        )
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        await scheduler.set_auto_open(False)
+
+        with caplog.at_level(logging.INFO, logger="src.core.scheduler"):
+            await scheduler._evaluate_epic("E", MagicMock())
+
+        assert any(
+            "Auto-open blocked — skipped BUY on E" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_rolling_selection_skips_scoring_when_blocked(
+        self, session_factory, monkeypatch
+    ):
+        # A cross-epic ranker must not even score the universe while blocked.
+        scheduler = _make_scheduler(session_factory)
+        scheduler._strategy = OpenRanking()
+        scheduler._strategy.evaluate = MagicMock(
+            side_effect=AssertionError("must not score while auto-open is blocked")
+        )
+        scheduler._tradable_epics = ["E0", "E1"]
+        await scheduler.set_auto_open(False)
+
+        await scheduler._select_and_open()  # no-op, no exception
 
 
 class TestRecordJobRun:
@@ -343,6 +566,11 @@ class TestRunCatchUp:
             stub.assert_not_awaited()
         finally:
             scheduler.stop()
+
+
+def intent_strategy_emits_shorts(scheduler) -> bool:
+    """What the selector must forward as ``allow_short`` for this strategy."""
+    return getattr(scheduler._strategy, "emits_shorts", False)
 
 
 def _candle(ts: datetime) -> Candle:
@@ -488,7 +716,10 @@ class TestWalletBoundedRollingSelect:
         # Stub the guarded open so nothing touches IG; record what was opened.
         opened: list[str] = []
 
-        async def _open(trading, intent, buf):
+        async def _open(trading, intent, buf, *, allow_short=False):
+            # ``allow_short`` mirrors the real signature: the selector
+            # forwards the strategy's ``emits_shorts`` flag down to the gate.
+            assert allow_short == intent_strategy_emits_shorts(scheduler)
             opened.append(intent.epic)
             position = Position(
                 epic=intent.epic,
@@ -608,16 +839,25 @@ class TestMinutesSinceLastOpen:
 class TestOpenAllIncreaseSelection:
     """The paced, re-openable wallet-bounded selection knobs, end-to-end.
 
-    Covers the three behaviours ``open_allincrease`` adds on top of the shared
-    rolling selector: same-day re-open (skip the ``_traded_today`` filter), a
-    ≥10-minute open cooldown, and one open per pass when a cooldown is set.
+    Covers the behaviours ``open_allincrease`` relies on: the ≥10-minute open
+    cooldown, one open per pass when a cooldown is set, and the GLOBAL
+    ``ALLOW_SAME_DAY_REOPEN`` policy driving the ``_traded_today`` filter (the
+    policy lives in ``.env``, not on the strategy, so both values are covered).
     """
 
     def _scheduler(
-        self, session_factory, monkeypatch, *, available=1000.0, margin=100.0
+        self,
+        session_factory,
+        monkeypatch,
+        *,
+        available=1000.0,
+        margin=100.0,
+        allow_same_day_reopen=True,
     ):
         streaming = MagicMock()
-        scheduler = _streaming_scheduler(session_factory, streaming)
+        scheduler = _streaming_scheduler(
+            session_factory, streaming, allow_same_day_reopen=allow_same_day_reopen
+        )
         scheduler._strategy = OpenAllIncrease()
         scheduler._close_profile_obj = MagicMock()
         epics = [f"E{i}" for i in range(5)]
@@ -643,7 +883,10 @@ class TestOpenAllIncreaseSelection:
 
         opened: list[str] = []
 
-        async def _open(trading, intent, buf):
+        async def _open(trading, intent, buf, *, allow_short=False):
+            # ``allow_short`` mirrors the real signature: the selector
+            # forwards the strategy's ``emits_shorts`` flag down to the gate.
+            assert allow_short == intent_strategy_emits_shorts(scheduler)
             opened.append(intent.epic)
             position = Position(
                 epic=intent.epic,
@@ -706,13 +949,8 @@ class TestOpenAllIncreaseSelection:
         await scheduler._select_and_open()
         assert opened == ["E0"]
 
-    async def test_same_day_reopen_keeps_already_traded_epic(
-        self, session_factory, monkeypatch
-    ):
-        scheduler, opened = self._scheduler(session_factory, monkeypatch)
-        # E0 already traded today and now closed, plus an old open (cooldown ok).
-        # allow_same_day_reopen means E0 stays a candidate and, being top-ranked,
-        # is re-opened — a diversity-filtered ranker would have skipped to E1.
+    async def _seed_closed_e0(self, session_factory) -> None:
+        """E0 was opened earlier today and has since closed (cooldown elapsed)."""
         async with session_factory() as session:
             session.add(
                 Position(
@@ -724,15 +962,42 @@ class TestOpenAllIncreaseSelection:
                 )
             )
             await session.commit()
+
+    async def test_same_day_reopen_keeps_already_traded_epic(
+        self, session_factory, monkeypatch
+    ):
+        # ALLOW_SAME_DAY_REOPEN=true: E0 stays a candidate and, being top-ranked,
+        # is re-opened the same day.
+        scheduler, opened = self._scheduler(
+            session_factory, monkeypatch, allow_same_day_reopen=True
+        )
+        await self._seed_closed_e0(session_factory)
         await scheduler._select_and_open()
         assert opened == ["E0"]
 
+    async def test_policy_off_skips_already_traded_epic(
+        self, session_factory, monkeypatch
+    ):
+        # ALLOW_SAME_DAY_REOPEN=false: the same top-ranked E0 is dropped from the
+        # candidate set for the rest of the day, so the selector falls to E1.
+        scheduler, opened = self._scheduler(
+            session_factory, monkeypatch, allow_same_day_reopen=False
+        )
+        await self._seed_closed_e0(session_factory)
+        await scheduler._select_and_open()
+        assert opened == ["E1"]
 
-def _streaming_scheduler(session_factory, streaming):
-    """Scheduler wired with a real PriceBuffer and the given streaming stub."""
+
+def _streaming_scheduler(session_factory, streaming, *, allow_same_day_reopen=True):
+    """Scheduler wired with a real PriceBuffer and the given streaming stub.
+
+    ``allow_same_day_reopen`` is the global ``.env`` policy the rolling selector
+    reads (a real boolean, not a MagicMock attribute, so the filter is exercised).
+    """
     settings = MagicMock()
     settings.strategy_hour_close = 17
     settings.streaming_stale_seconds = 180
+    settings.allow_same_day_reopen = allow_same_day_reopen
     return BotScheduler(
         settings=settings,
         client=MagicMock(),
@@ -976,3 +1241,103 @@ class TestStreamingKeepsOpenPositions:
         epics_arg, reason_arg = trading.close_epics.await_args.args
         assert epics_arg == {"A"}
         assert reason_arg == "market_closed"
+
+
+class TestTwoSidedRankerSelection:
+    """A ranker declaring ``emits_shorts`` may open SELL on the automatic path.
+
+    Every entry before ``open_fade`` / ``open_pullback`` was long-only, and both
+    the selector (which dropped non-BUY intents) and the shared pre-open gate
+    (``allow_short=False``) enforced that. A two-sided ranker must have its SELL
+    intents kept *and* have ``allow_short`` forwarded down to the gate — the two
+    halves are separate, so both are asserted here.
+    """
+
+    def _scheduler(self, session_factory, monkeypatch, *, emits_shorts: bool):
+        streaming = MagicMock()
+        scheduler = _streaming_scheduler(session_factory, streaming)
+        strategy = OpenSafeRanking()
+        # Toggle only the two-sided flag; everything else stays the sibling
+        # ranker's behaviour so the test isolates the SELL plumbing.
+        strategy.emits_shorts = emits_shorts
+        strategy.allow_same_day_reopen = True
+        scheduler._strategy = strategy
+        scheduler._close_profile_obj = MagicMock()
+        epics = [f"E{i}" for i in range(4)]
+        scheduler._tradable_epics = epics
+
+        warmup = strategy.warmup
+        base = datetime.now(UTC) - timedelta(minutes=warmup)
+        for e in epics:
+            for i in range(warmup):
+                scheduler._buffer.add_candle(e, _candle(base + timedelta(minutes=i)))
+
+        # E0/E2 score SELL, E1/E3 score BUY, descending so order is deterministic.
+        scores = {e: float(len(epics) - i) for i, e in enumerate(epics)}
+        scheduler._strategy.evaluate = MagicMock(
+            side_effect=lambda epic, buf: EntryIntent(
+                epic=epic,
+                direction="SELL" if int(epic[1:]) % 2 == 0 else "BUY",
+                score=scores[epic],
+            )
+        )
+        scheduler._tradable_markets = [
+            SimpleNamespace(epic=e, funds_needed=100.0) for e in epics
+        ]
+        scheduler._account_available_funds = AsyncMock(return_value=1000.0)
+
+        opened: list[tuple[str, str]] = []
+        gate_calls: list[bool] = []
+
+        async def _open(trading, intent, buf, *, allow_short=False):
+            opened.append((intent.epic, intent.direction))
+            return (
+                Position(
+                    epic=intent.epic,
+                    epic_name=intent.epic,
+                    date=date.today(),
+                    state=PositionState.OPEN,
+                    level_open=1.0,
+                ),
+                None,
+            )
+
+        scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
+
+        async def _can_open(intent, *, allow_short=False):
+            gate_calls.append(allow_short)
+            return True, None
+
+        trading_stub = MagicMock()
+        trading_stub.can_open_intent = AsyncMock(side_effect=_can_open)
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        return scheduler, opened, gate_calls
+
+    async def test_two_sided_ranker_opens_both_directions(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, opened, gate_calls = self._scheduler(
+            session_factory, monkeypatch, emits_shorts=True
+        )
+
+        await scheduler._select_and_open()
+
+        # Both sides survive the selector, ranked by score.
+        assert opened == [("E0", "SELL"), ("E1", "BUY"), ("E2", "SELL"), ("E3", "BUY")]
+        # ...and the long-only pre-open gate was lifted for every one of them.
+        assert gate_calls == [True, True, True, True]
+
+    async def test_long_only_ranker_still_drops_sells(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, opened, gate_calls = self._scheduler(
+            session_factory, monkeypatch, emits_shorts=False
+        )
+
+        await scheduler._select_and_open()
+
+        # The default stays long-only: SELL candidates never reach the open path.
+        assert opened == [("E1", "BUY"), ("E3", "BUY")]
+        assert gate_calls == [False, False]

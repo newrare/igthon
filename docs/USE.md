@@ -120,6 +120,32 @@ Each section shows its own "last refresh" time, and the **Pause** button (or
 stopping the bot. Pausing the **bot** (the Bot KPI tile) is independent and
 suspends the scheduled API jobs instead.
 
+### Auto-open switch (authorise / block new openings)
+
+The banner at the top of the dashboard is the master switch for **automatic
+openings**. Click **Block for today** once you consider the trading day over:
+
+- the bot opens **nothing** more on its own — BUY or SELL, whatever
+  `OPEN_STRATEGY` is selected in `.env` (per-epic entries and cross-epic rankers
+  alike are refused with `Auto-open disabled for today`);
+- **positions already open keep living normally**: monitoring, stop ratchets,
+  targets and closes are untouched;
+- the manual **Buy / Sell** buttons keep working — the switch stops the bot, not
+  the user.
+
+The block is scoped to the **current day**: it survives a server restart (stored
+in the `job_preference` table under the reserved `auto_open` key) but expires on
+its own at the next calendar day, so a "day is over" decision never silently
+carries into the next session. **Allow openings** lifts it immediately.
+
+| URL                                       | Method | Effect                              |
+| ----------------------------------------- | ------ | ----------------------------------- |
+| `http://localhost:8000/api/auto-open/off` | POST   | Block every automatic opening today |
+| `http://localhost:8000/api/auto-open/on`  | POST   | Authorise automatic openings again  |
+
+`/api/status` and the fragments poll both report the current state as
+`auto_open`.
+
 ### Position endpoint filters
 
 ```bash
@@ -243,6 +269,13 @@ STOP_STRATEGY=stop_support
 CLOSE_ZONESTART=hold
 CLOSE_ZONEMARGE=hold
 CLOSE_ZONEPROFIT=trailing_ratchet
+
+# Global open policy (also REQUIRED, applies to every entry strategy):
+# false = one opening per epic per day (BUY or SELL), no re-open after a close;
+# true  = several openings per epic per day, as soon as the epic is flat again.
+# Two concurrent positions on one epic are always refused; a manual dashboard
+# open bypasses the policy.
+ALLOW_SAME_DAY_REOPEN=false
 ```
 
 There is no trading-hours gate: an epic is opened whenever its live market

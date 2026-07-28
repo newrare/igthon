@@ -546,6 +546,10 @@ async def _gather_dashboard_state(request: Request) -> dict:
         "day_records": day_records,
         "resume_records": resume_records,
         "bot_paused": scheduler.is_paused if scheduler else None,
+        # Auto-open switch: True when the bot may open by itself. Defaults to
+        # True with no scheduler so the banner never claims a block that is not
+        # actually in force (the web app runs even in degraded mode).
+        "auto_open_enabled": scheduler.auto_open_enabled if scheduler else True,
         "scheduler_available": scheduler is not None,
         "jobs": scheduler.jobs_status() if scheduler else [],
         "log_entries": log_entries,
