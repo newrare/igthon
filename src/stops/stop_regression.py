@@ -43,10 +43,9 @@ week, and the choppiness widening lifted the win rate without the degenerate
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-from src.core.indicators import atr, efficiency_ratio, linear_regression
+from src.core.indicators import atr, band_noise, efficiency_ratio
 from src.feed.price_buffer import EpicBuffer
 from src.stops.base import StopDistance
 
@@ -56,8 +55,12 @@ def residual_sigma(values: list[float]) -> float:
 
     The population standard deviation of ``value[i] − (slope·i + intercept)``:
     the price dispersion that remains once the linear trend is removed, i.e. a
-    trend-independent measure of noise. Returns ``0.0`` for fewer than two
-    values (no line to fit).
+    trend-independent measure of noise. Returns ``0.0`` for fewer than three
+    values (a line through two points has no residual).
+
+    This policy's own name for :func:`~src.core.indicators.band_noise`, which is
+    the shared implementation — ``stop_hourlow`` derives its minimum stop distance
+    from the same measure.
 
     Args:
         values: Ordered numeric series, oldest first.
@@ -65,12 +68,7 @@ def residual_sigma(values: list[float]) -> float:
     Returns:
         The residual standard deviation (``>= 0``).
     """
-    n = len(values)
-    if n < 2:
-        return 0.0
-    reg = linear_regression(values)
-    ss_res = sum((v - (reg.slope * i + reg.intercept)) ** 2 for i, v in enumerate(values))
-    return math.sqrt(ss_res / n)
+    return band_noise(values)
 
 
 @dataclass

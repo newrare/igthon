@@ -7,6 +7,7 @@ import pytest
 from src.core.indicators import (
     adverse_tick_noise,
     atr,
+    band_noise,
     channel_position,
     linear_regression,
     rate_of_change,
@@ -93,6 +94,39 @@ class TestAdverseTickNoise:
     def test_insufficient_data(self):
         assert adverse_tick_noise([100.0]) == 0.0
         assert adverse_tick_noise([]) == 0.0
+
+
+class TestBandNoise:
+    """Tests for the detrended band amplitude."""
+
+    def test_perfect_line_has_no_residual(self):
+        # However steep: the trend is removed before measuring.
+        assert band_noise([100.0 + 5 * i for i in range(20)]) == pytest.approx(0.0)
+
+    def test_flat_series_has_no_residual(self):
+        assert band_noise([100.0] * 20) == pytest.approx(0.0)
+
+    def test_saw_tooth_measures_its_half_amplitude(self):
+        # ±1 around the mean → std ≈ 1.0. An even-length alternating series fits a
+        # very slightly non-zero slope, hence the relative tolerance.
+        assert band_noise([100.0, 102.0] * 10) == pytest.approx(1.0, rel=0.01)
+
+    def test_trend_does_not_inflate_the_band(self):
+        # The same ±1 saw-tooth riding a +5/step ramp: identical band.
+        saw = [100.0, 102.0] * 10
+        assert band_noise([v + 5 * i for i, v in enumerate(saw)]) == pytest.approx(
+            band_noise(saw)
+        )
+
+    def test_wider_oscillation_scores_higher(self):
+        narrow = band_noise([100.0, 101.0] * 10)
+        wide = band_noise([100.0, 110.0] * 10)
+        assert wide > narrow
+
+    def test_insufficient_data(self):
+        assert band_noise([100.0, 110.0]) == 0.0
+        assert band_noise([100.0]) == 0.0
+        assert band_noise([]) == 0.0
 
 
 class TestLinearRegression:

@@ -85,6 +85,33 @@ class TestConversionRate:
         }
         assert conversion_rate(instrument, "EUR") == 1.0
 
+    def test_account_currency_ignores_a_bogus_exchange_rate(self):
+        # Real IX.D.DOW.IFE.IP payload ("Wall Street Cash (€1)"): IG advertises a
+        # 0.9 exchangeRate on a market already quoted in euro. There is nothing to
+        # convert, so the only correct rate is 1.0 — taking the 0.9 scaled every
+        # euro figure of the epic by 0.9 (a real deal booked 12.7429 points as
+        # E-12.74, i.e. 1.00 €/point).
+        instrument = {
+            "currencies": [
+                {
+                    "code": "EUR",
+                    "symbol": "E",
+                    "baseExchangeRate": 1.0,
+                    "exchangeRate": 0.9,
+                    "isDefault": True,
+                }
+            ]
+        }
+        assert conversion_rate(instrument, "EUR") == 1.0
+
+    def test_account_currency_short_circuits_the_default_entry_too(self):
+        # Same short-circuit when the entry is reached by the isDefault/first
+        # fallback rather than by an explicit currency_code.
+        instrument = {
+            "currencies": [{"code": "EUR", "exchangeRate": 0.9, "isDefault": True}]
+        }
+        assert conversion_rate(instrument, None) == 1.0
+
     def test_placeholder_without_base_keeps_one(self):
         # No baseExchangeRate to recover the real rate: fall back to 1.0 rather
         # than crash — the caller's euro_per_point guard flags the 0-contract case.
@@ -129,6 +156,23 @@ class TestEuroPerPoint:
         epp = euro_per_point(market_data, size, currency)
         pnl = (close_p - open_p) * epp
         assert pnl == pytest.approx(expected_pnl, abs=0.01)
+
+    def test_dow_cash_is_one_euro_per_point(self):
+        # The regression: contract size 1, quoted in euro, IG advertising 0.9. The
+        # deal that exposed it — BUY 1 at 52505.4, stopped at 52492.6571 — was
+        # booked E-12.74 by IG, which only a 1.00 €/point rate reproduces.
+        market_data = {
+            "instrument": {
+                "contractSize": "1",
+                "lotSize": 1.0,
+                "currencies": [
+                    {"code": "EUR", "baseExchangeRate": 1.0, "exchangeRate": 0.9}
+                ],
+            }
+        }
+        epp = euro_per_point(market_data, 1, "EUR")
+        assert epp == pytest.approx(1.0)
+        assert (52492.6571 - 52505.4) * epp == pytest.approx(-12.74, abs=0.01)
 
     def test_zero_when_contract_size_unknown(self):
         """Returns 0.0 so callers fall back to the legacy estimate."""

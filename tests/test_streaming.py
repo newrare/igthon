@@ -103,6 +103,11 @@ def _full_candle_values(cons_end: str = "1") -> dict[str, str]:
     }
 
 
+def _make_candle():
+    """A parsed ``Candle`` matching ``_full_candle_values`` (bid close 100.5)."""
+    return _parse_stream_candle(FakeUpdate(_full_candle_values()).getValue)
+
+
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
@@ -191,6 +196,47 @@ def test_listener_appends_finished_candle(settings, fake_client):
     assert buf is not None
     assert len(buf) == 1
     assert buf.last.bid_close == 100.5
+
+
+# ------------------------------------------------------------------ candle listeners
+
+
+def test_candle_listener_is_notified_after_the_buffer_is_updated(settings, fake_client):
+    """Observers must see the new candle already in the buffer.
+
+    They are the event-driven trigger for position management, which reads the
+    buffer rather than the callback argument, so ordering here is the contract.
+    """
+    buffer = PriceBuffer()
+    streamer = IGStreamingClient(fake_client, buffer, settings)
+    seen: list[tuple[str, float, int]] = []
+
+    streamer.add_candle_listener(
+        lambda epic, candle: seen.append(
+            (epic, candle.bid_close, len(buffer.get(epic)))
+        )
+    )
+    streamer.on_candle("EPIC.A", _make_candle())
+
+    assert seen == [("EPIC.A", 100.5, 1)]
+
+
+def test_a_failing_candle_listener_does_not_break_the_feed(settings, fake_client):
+    """A misbehaving observer must not stop the buffer, the store or its peers."""
+    buffer = PriceBuffer()
+    streamer = IGStreamingClient(fake_client, buffer, settings)
+    reached: list[str] = []
+
+    def boom(epic, candle):
+        raise RuntimeError("observer blew up")
+
+    streamer.add_candle_listener(boom)
+    streamer.add_candle_listener(lambda epic, candle: reached.append(epic))
+
+    streamer.on_candle("EPIC.A", _make_candle())
+
+    assert reached == ["EPIC.A"]  # the second observer still ran
+    assert len(buffer.get("EPIC.A")) == 1  # and the candle was buffered
 
 
 # ------------------------------------------------------------------- subscriptions

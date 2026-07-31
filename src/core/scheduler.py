@@ -2,11 +2,16 @@
 
 Uses APScheduler to run periodic tasks:
 - Price collection and analysis (every 30s-2min)
-- Position monitoring (every 30s)
 - End-of-day forced close and summary
 - Daily/weekly summaries
 - Daily epic list refresh from IG market search (7:30 AM)
 - Hourly active epic refresh (filter by TRADEABLE status)
+
+Position monitoring is deliberately NOT one of them: it is driven by the arrival of
+candles from the price feed (``on_candle``), because that is the only moment the
+price the close profile reads changes. The 30-second cron is kept purely as a
+heartbeat for when streaming is off or the feed goes silent. See
+``docs/DATAFLOW.md`` §5.
 """
 
 import asyncio
@@ -24,6 +29,12 @@ from src.core.api_queue import APIQueue, Priority
 from src.core.config import Settings
 from src.core.recorder import Recorder
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
+from src.execution.gates import (
+    RECOVERY_REVERT_REASON_OPEN,
+    original_stop_level,
+    reverse_direction,
+    should_revert_after_stop_loss,
+)
 from src.execution.trading import (
     TradeConfig,
     TradingService,
@@ -65,8 +76,8 @@ def validate_strategy_selection(settings: Settings) -> None:
     Raises:
         ValueError: when any of ``OPEN_STRATEGY`` / ``STOP_STRATEGY`` /
             ``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT`` is
-            empty or not a registered name, or when ``ALLOW_SAME_DAY_REOPEN`` is
-            missing.
+            empty or not a registered name, or when ``ALLOW_SAME_DAY_REOPEN`` or
+            ``ALLOW_RECOVERY_REVERT`` is missing.
     """
     checks = (
         ("OPEN_STRATEGY", settings.open_strategy, ENTRY_STRATEGIES),
@@ -87,6 +98,10 @@ def validate_strategy_selection(settings: Settings) -> None:
     # it must be stated explicitly rather than silently defaulted one way.
     if getattr(settings, "allow_same_day_reopen", None) is None:
         problems.append("ALLOW_SAME_DAY_REOPEN is not set (expected true or false)")
+    # Recovery-revert policy: same contract — a rule that opens a position on its
+    # own must be stated explicitly, never silently defaulted.
+    if getattr(settings, "allow_recovery_revert", None) is None:
+        problems.append("ALLOW_RECOVERY_REVERT is not set (expected true or false)")
     if problems:
         raise ValueError(
             "Invalid strategy selection — please configure your .env file:\n  - "
@@ -165,8 +180,11 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "action": "monitor_positions",
         "job_id": "monitor_positions",
         "name": "Monitor Positions",
-        "description": "Check all open positions and apply the close strategy.",
-        "schedule": "Every 30s · 24/7",
+        "description": (
+            "Check all open positions and apply the close strategy. Runs on each "
+            "candle arrival; the 30s cron is only a heartbeat."
+        ),
+        "schedule": "On new candle · 30s heartbeat · 24/7",
         "danger": "safe",
     },
     {
@@ -302,6 +320,22 @@ class BotScheduler:
         # same live IG position → duplicate "adopted" rows (the very bug the
         # idempotent-adoption guard exists to prevent). This lock closes that gap.
         self._sync_lock = asyncio.Lock()
+        # Serialises position monitoring. It now has two triggers — the arrival of
+        # candles from the feed and the cron heartbeat — so overlapping passes are a
+        # real possibility, and two concurrent passes would both read the same open
+        # positions and could both push a stop update for them. A pass in flight
+        # makes any new trigger a no-op (the data it would read is the data the
+        # running pass is already reading), so triggers never queue up.
+        self._monitor_lock = asyncio.Lock()
+        # Pending debounced monitoring pass scheduled by ``on_candle``. Candles for
+        # the streamed universe land together, so the first arrival schedules the
+        # pass and the rest of the wave joins it — one whole-book pass per wave,
+        # which is also what the group pre-pass requires (see docs/DATAFLOW.md §5).
+        self._monitor_debounce_task: asyncio.Task | None = None
+        # The feed keeps its listeners for the life of the process, so registration
+        # must be idempotent: a second ``start()`` would otherwise subscribe twice
+        # and run two passes per wave.
+        self._candle_listener_registered = False
 
         # Epic lists — start with the provided seed list
         self._all_epics: list[str] = list(epics)
@@ -381,14 +415,22 @@ class BotScheduler:
             name="Hourly trend-template selection",
         )
 
-        # Position monitoring: every 30 seconds, 24/7. No hour/day restriction —
-        # a position must be watched for the WHOLE time its own market is open,
-        # which for CFD/forex and late-closing commodities/indices runs well past
-        # 18:00 UTC and across the weekend. The loop self-gates: it returns
-        # immediately when there is no open position, and skips any epic without a
-        # live bid, so running out of index-market hours is cheap. This is also
-        # what lets the per-epic close rule (close ~close_margin before an epic's
-        # own market close) fire for markets closing outside the old 8–18 window.
+        # Position monitoring: HEARTBEAT ONLY. The real trigger is the arrival of a
+        # candle from the feed (see ``on_candle`` / ``_register_candle_listener``),
+        # because that is the only moment the price the zones read actually changes:
+        # a fixed clock offset from the data just adds latency and re-evaluates
+        # identical inputs. This cron stays registered so monitoring still runs when
+        # streaming is disabled or the feed goes silent, and so the job keeps its
+        # dashboard auto/manual toggle. Both paths funnel through ``_monitor_lock``.
+        #
+        # No hour/day restriction — a position must be watched for the WHOLE time
+        # its own market is open, which for CFD/forex and late-closing
+        # commodities/indices runs well past 18:00 UTC and across the weekend. The
+        # loop self-gates: it returns immediately when there is no open position,
+        # and skips any epic without a live bid, so running out of index-market
+        # hours is cheap. This is also what lets the per-epic close rule (close
+        # ~close_margin before an epic's own market close) fire for markets closing
+        # outside the old 8–18 window.
         self._scheduler.add_job(
             self._monitor_positions,
             "cron",
@@ -521,14 +563,110 @@ class BotScheduler:
             id="startup_tradable_refresh",
             name="Tradable epic refresh on startup",
         )
+        # Drive position management from the price feed rather than from the clock.
+        self._register_candle_listener()
+        self._warn_if_warmup_exceeds_buffer()
+
         logger.info(
             "Scheduler started — recurring jobs in manual mode — %d seed epics — "
             "startup discovery scheduled — enable jobs via web dashboard",
             len(self._all_epics),
         )
 
+    def _register_candle_listener(self) -> None:
+        """Subscribe position monitoring to candle arrivals from the feed.
+
+        A no-op when streaming is disabled: the cron heartbeat then remains the only
+        trigger, which is exactly its purpose.
+        """
+        if self._streaming is None or self._candle_listener_registered:
+            return
+        self._streaming.add_candle_listener(self.on_candle)
+        self._candle_listener_registered = True
+        logger.info(
+            "Position monitoring is candle-driven (debounce %.1fs; 30s cron kept "
+            "as heartbeat)",
+            self._settings.monitor_debounce_seconds,
+        )
+
+    def _warn_if_warmup_exceeds_buffer(self) -> None:
+        """Warn when the selected strategy needs more history than the buffer holds.
+
+        The buffer window is a hard ceiling on every lookback (see
+        ``docs/DATAFLOW.md`` §3). Exceeding it is not an error — the strategy simply
+        runs on a truncated window — but it is silent, and a strategy quietly
+        evaluated on half the history it was designed for is indistinguishable from
+        one that is merely underperforming. So it is said out loud, once, at startup.
+        """
+        capacity = self._buffer.max_candles
+        try:
+            warmup = self.strategy.warmup
+        except Exception as exc:  # pragma: no cover - stub settings in tests
+            logger.debug("Warm-up capacity check skipped: %s", exc)
+            return
+        if warmup > capacity:
+            logger.warning(
+                "Entry strategy '%s' needs %d candles but the buffer holds %d: it "
+                "will be evaluated on a TRUNCATED window. Raise BUFFER_MAX_CANDLES "
+                "to %d instead of shrinking the strategy.",
+                self.strategy.name,
+                warmup,
+                capacity,
+                warmup,
+            )
+
+    def on_candle(self, epic: str, candle) -> None:  # noqa: ANN001 - feed callback
+        """Schedule a debounced monitoring pass when a fresh candle lands.
+
+        Called by the streaming client on the event loop, once per completed candle
+        and after the buffer holds it. It must return immediately, so the actual pass
+        is a task.
+
+        Candles for the streamed universe arrive together, so the first one schedules
+        the pass and the rest of the wave joins it: one whole-book pass per wave,
+        never one per epic — the group pre-pass needs every open position priced in
+        the same pass to be valid at all.
+        """
+        if self._monitor_debounce_task is not None:
+            return  # a pass is already scheduled for this wave
+        if not self._monitor_trigger_allowed():
+            return
+        self._monitor_debounce_task = asyncio.ensure_future(
+            self._run_debounced_monitor()
+        )
+
+    def _monitor_trigger_allowed(self) -> bool:
+        """True when an event-driven monitoring pass may run right now.
+
+        The user's manual/paused mode is the same single source of truth the cron
+        obeys (a paused APScheduler job has no ``next_run_time``): pausing the
+        Monitor Positions job from the dashboard must silence the candle-driven path
+        too, or the toggle would quietly stop meaning anything.
+        """
+        if not self._running:
+            return False
+        job = self._scheduler.get_job("monitor_positions")
+        return job is not None and job.next_run_time is not None
+
+    async def _run_debounced_monitor(self) -> None:
+        """Wait out the debounce window, then run one whole-book monitoring pass."""
+        try:
+            await asyncio.sleep(self._settings.monitor_debounce_seconds)
+            # Re-checked after the wait: the job may have been paused meanwhile.
+            if self._monitor_trigger_allowed():
+                await self._monitor_positions()
+        except asyncio.CancelledError:  # pragma: no cover - shutdown path
+            raise
+        except Exception as exc:
+            logger.error("Candle-driven monitoring pass failed: %s", exc)
+        finally:
+            self._monitor_debounce_task = None
+
     def stop(self) -> None:
         """Stop the scheduler."""
+        if self._monitor_debounce_task is not None:
+            self._monitor_debounce_task.cancel()
+            self._monitor_debounce_task = None
         if self._running:
             self._scheduler.shutdown(wait=False)
             self._running = False
@@ -1322,6 +1460,55 @@ class BotScheduler:
         last_dt = datetime.combine(now.date(), latest, tzinfo=UTC)
         return (now - last_dt).total_seconds() / 60.0
 
+    async def _alive_positions(self, session: AsyncSession) -> list[str]:
+        """Epics of the open positions whose gain is already **locked in**.
+
+        Drives the ``block_open_while_alive`` brake in :meth:`_select_and_open`.
+        A position is *alive* when both hold:
+
+        1. its **software** stop (``level_follower`` — the level the close profile
+           enforces between bid polls, not the deeper ``level_stop`` resting at IG)
+           has ratcheted to or past ``level_margin``, so the stop itself guarantees
+           a profit rather than merely protecting the entry;
+        2. the live close-out price (bid for a long, offer for a short) is beyond
+           break-even (``level_zero``).
+
+        Both comparisons are written on the signed distance, so a short is judged
+        by the same rule mirrored (``sign = -1``).
+
+        Condition 1 is the decisive one — it already implies 2 for any position
+        whose stop has not fired — so a missing live price does not make a secured
+        position look unsecured. Conversely a row lacking the levels to judge
+        (adopted/legacy positions opened without them) is reported as **not** alive:
+        the brake exists to stop adding risk beside a *confirmed* winner, never to
+        freeze opening on an unknown.
+
+        Returns the epics, so the caller can name them in its log.
+        """
+        rows = (
+            await session.scalars(
+                select(Position).where(Position.state == PositionState.OPEN)
+            )
+        ).all()
+        alive: list[str] = []
+        for position in rows:
+            sign = 1.0 if (position.direction or "BUY") == "BUY" else -1.0
+            level_zero = float(position.level_zero or 0)
+            level_margin = float(position.level_margin or 0)
+            follower = float(position.level_follower or 0)
+            if level_zero <= 0 or level_margin <= 0 or follower <= 0:
+                continue  # not enough levels to judge — treat as still waiting
+            if sign * (follower - level_margin) < 0:
+                continue  # software stop has not reached the margin yet
+            buf = self._buffer.get(position.epic)
+            last = buf.last if buf is not None else None
+            if last is not None:
+                price = last.bid_close if sign > 0 else last.offer_close
+                if sign * (price - level_zero) <= 0:
+                    continue  # locked stop but price back at break-even
+            alive.append(position.epic)
+        return alive
+
     async def _refresh_tradable_epics(self) -> None:
         """Filter ``_all_epics`` to those currently open and TRADEABLE.
 
@@ -1672,6 +1859,118 @@ class BotScheduler:
             position = await trading.open_from_intent(intent, buf)
             return position, None
 
+    async def _revert_after_stop_loss(
+        self,
+        session: AsyncSession,
+        position: Position,
+        config: TradeConfig,
+    ) -> Position | None:
+        """Open the opposite side when ``position`` was stopped out at a loss.
+
+        The recovery-revert rule (``ALLOW_RECOVERY_REVERT`` in ``.env``): a trade
+        — BUY or SELL — whose price came all the way back to the protective stop
+        it was **opened with** did not just lose, it was *wrong about the
+        direction*. The market walked through the level the trade was built on, so
+        the bot immediately takes the reverse side on the same epic to follow the
+        turn, instead of leaving the move alone until some entry strategy happens
+        to signal it.
+
+        Which closes qualify is decided by the pure
+        :func:`~src.execution.gates.should_revert_after_stop_loss` rule (stop hit,
+        real loss, original stop, single hop). Called from the two places a
+        position can be recorded as closed by its stop:
+        :meth:`_monitor_positions` (the software backstop fired) and
+        :meth:`_sync_positions` (the broker-side stop resting at IG fired and the
+        vanished position was reconciled).
+
+        The revert goes through the shared open path — same per-epic lock, same
+        gates, same close profile and sizing as any other open — with two gates
+        deliberately lifted:
+
+        * ``allow_short=True``: the reverse of a long *is* a short, so the
+          long-only restriction on automatic opens cannot apply here;
+        * ``allow_reopen=True``: the epic was traded seconds ago, so
+          ``ALLOW_SAME_DAY_REOPEN=false`` would refuse every revert — the rule
+          would be dead code.
+
+        Everything else still applies. It is **not** a manual open, so the
+        auto-open switch governs it: a user who closed the day gets no reverts.
+        The duplicate-epic gate and the "market closes soon" gate apply too.
+
+        Returns the reverse :class:`Position` when one was opened, ``None``
+        otherwise (policy off, close not eligible, no price data, gate refusal or
+        an IG rejection). Never raises: a failed revert must not break the
+        monitor/sync tick that closed the position.
+        """
+        if not bool(getattr(self._settings, "allow_recovery_revert", False)):
+            return None
+
+        revert, reason = should_revert_after_stop_loss(
+            direction=position.direction,
+            reason_close=position.reason_close,
+            reason_open=position.reason_open,
+            euro=float(position.euro or 0),
+            level_close=float(position.level_close or 0),
+            original_stop=original_stop_level(position),
+            stop_ratcheted=bool(position.stop_update or 0),
+        )
+        if not revert:
+            logger.debug("No recovery revert for %s: %s", position.epic, reason)
+            return None
+
+        direction = reverse_direction(position.direction)
+        buf = self._buffer.get(position.epic)
+        if not buf or not buf.last:
+            logger.warning(
+                "Recovery revert for %s skipped: no live price data to open %s on",
+                position.epic,
+                direction,
+            )
+            return None
+
+        logger.info(
+            "Recovery revert: %s %s stopped out at its opening stop (%.5f, "
+            "P&L=%.2f€) — opening %s to follow the reversal",
+            position.direction,
+            position.epic,
+            original_stop_level(position),
+            float(position.euro or 0),
+            direction,
+        )
+        intent = EntryIntent(epic=position.epic, direction=direction)
+        try:
+            trading = TradingService(
+                self._client, session, config, close_profile=self.close_profile
+            )
+            reverse, refusal = await self.open_epic_guarded(
+                trading,
+                intent,
+                buf,
+                allow_short=True,
+                allow_reopen=True,
+            )
+        except Exception as exc:
+            logger.error("Recovery revert failed for %s: %s", position.epic, exc)
+            return None
+
+        if reverse is None:
+            logger.info(
+                "Recovery revert on %s not taken: %s",
+                position.epic,
+                refusal or "IG rejected the order",
+            )
+            return None
+
+        # Mark the origin so the dashboard shows where the position came from and
+        # the single-hop cap can recognise it if it is stopped out in turn.
+        reverse.reason_open = RECOVERY_REVERT_REASON_OPEN
+        await session.commit()
+        self._recorder.info(
+            f"Recovery revert: {direction} {position.epic} @ {reverse.level_open} "
+            f"after a {float(position.euro or 0):.2f}€ stop-out"
+        )
+        return reverse
+
     async def _evaluate_epic(self, epic: str, config: TradeConfig) -> None:
         """Run the entry strategy on one epic's buffer and open on an intent.
 
@@ -1751,6 +2050,11 @@ class BotScheduler:
           the best-ranked affordable epics until the spendable balance can no
           longer cover another margin.
 
+        A count-bounded strategy may also declare ``require_flat_book``
+        (``open_five``), which turns the top-up into an all-or-nothing **series**:
+        nothing is opened while any position is still open, and when the book is
+        empty the whole basket goes on in a single pass.
+
         Each invocation:
 
         1. count-bounded only — returns early when the target position count is
@@ -1796,6 +2100,21 @@ class BotScheduler:
                         .where(Position.state == PositionState.OPEN)
                     )
                 ) or 0
+                # Flat-book brake: a strategy that opens *in series*
+                # (``require_flat_book``, e.g. ``open_five``) opens nothing while
+                # any position is still open, whatever its state — the next basket
+                # waits for the previous one to be entirely closed, so a series is
+                # judged as a whole. Stricter than ``block_open_while_alive``
+                # below, which only steps aside for an already-secured winner.
+                if getattr(strategy, "require_flat_book", False) and open_count:
+                    logger.debug(
+                        "Rolling select [%s]: %d position(s) still open — a new "
+                        "series waits for a flat book",
+                        strategy.name,
+                        open_count,
+                    )
+                    return
+
                 target = max(int(strategy.concurrent_positions), 1)
                 wallet_bounded = getattr(strategy, "wallet_bounded", False)
                 slots = target - int(open_count)
@@ -1811,6 +2130,24 @@ class BotScheduler:
                         target,
                     )
                     return  # target met — a position is already running
+
+                # Alive-position brake: a strategy that declares
+                # ``block_open_while_alive`` stops opening entirely while one of
+                # its positions has already locked its gain in (software stop past
+                # the margin) — no point adding risk next to a secured winner. A
+                # position still *waiting* for its move is not alive and does not
+                # block, so an idle trade never sits on an opportunity.
+                if getattr(strategy, "block_open_while_alive", False):
+                    alive = await self._alive_positions(session)
+                    if alive:
+                        logger.info(
+                            "Rolling select [%s]: %d position(s) alive (%s) — "
+                            "gain already locked in, opening nothing new",
+                            strategy.name,
+                            len(alive),
+                            ", ".join(alive),
+                        )
+                        return
 
                 # Open cooldown: a strategy that spaces its opens out
                 # (``open_cooldown_minutes`` > 0) opens at most one position per
@@ -1875,6 +2212,23 @@ class BotScheduler:
                     )
                     return
 
+                # Same guard expressed as an absolute count, for a strategy whose
+                # rule is "a ranking needs at least N candidates" rather than a
+                # fraction of a universe that drifts in size across the session.
+                # Both gates apply; 0 (the default) disables this one.
+                min_candidates = int(
+                    getattr(strategy, "min_participation_count", 0) or 0
+                )
+                if min_candidates and ready < min_candidates:
+                    logger.info(
+                        "Rolling select [%s]: only %d warmed-up epic(s) < %d "
+                        "required candidates — ranking not valid, skipping",
+                        strategy.name,
+                        ready,
+                        min_candidates,
+                    )
+                    return
+
                 # Score every epic with enough buffered history; keep the
                 # tradable candidates, then rank by score (highest first). A SELL
                 # is kept only when the strategy declares it trades both ways
@@ -1911,6 +2265,32 @@ class BotScheduler:
                         logger.debug("Rolling select: no scorable epic yet")
                     return
                 ranked.sort(key=lambda item: item[0].score, reverse=True)
+
+                # Post-ranking cross-epic filter (identity for most strategies).
+                # A per-epic score cannot see anything that is a property of the
+                # *set* of winners, so the strategy gets one look at the sorted
+                # ranking before any order is placed — e.g. ``open_five`` drops the
+                # candidates whose curve duplicates the shape of a better-ranked
+                # one, so a basket of five is five different bets. Filtering the
+                # whole ranking (not just the slots) lets a survivor further down
+                # take a dropped candidate's place.
+                filtered = strategy.filter_ranked(ranked)
+                if len(filtered) != len(ranked):
+                    logger.info(
+                        "Rolling select [%s]: %d of %d ranked candidate(s) kept "
+                        "after the cross-epic filter",
+                        strategy.name,
+                        len(filtered),
+                        len(ranked),
+                    )
+                ranked = filtered
+                if not ranked:
+                    logger.info(
+                        "Rolling select [%s]: every ranked candidate was refused "
+                        "by the cross-epic filter — staying flat",
+                        strategy.name,
+                    )
+                    return
 
                 available = await self._account_available_funds()
                 reserve = max(0.0, min(1.0, strategy.wallet_reserve))
@@ -2038,14 +2418,28 @@ class BotScheduler:
         return None
 
     async def _monitor_positions(self) -> None:
-        """Check open positions and apply close strategy.
+        """Run one monitoring pass, unless one is already in flight.
 
-        Runs every 30s around the clock (see the job registration): a position is
-        watched for the whole time its own market is open, not only 8–18 UTC. It
-        returns immediately when no position is open, so the 24/7 cadence is cheap.
+        Three callers reach this: the candle-driven trigger (the normal one), the
+        30 s cron heartbeat, and the dashboard's manual "Run". Skipping rather than
+        queueing is deliberate — a pass in flight is already reading the very data a
+        new trigger would read, so waiting for it only to re-run on the same candles
+        would duplicate work and risk two concurrent stop pushes for one position.
+
+        A position is watched around the clock, for the whole time its own market is
+        open (not only 08–18 UTC). The pass returns immediately when no position is
+        open, so being triggered often is cheap.
 
         Equivalent to apiCheckPosition.php.
         """
+        if self._monitor_lock.locked():
+            logger.debug("Monitoring pass already running — trigger skipped")
+            return
+        async with self._monitor_lock:
+            await self._monitor_positions_pass()
+
+    async def _monitor_positions_pass(self) -> None:
+        """Check every open position and apply its close profile's decision."""
         config = self._build_trade_config()
 
         async with self._session_factory() as session:
@@ -2101,7 +2495,22 @@ class BotScheduler:
                     )
                     is not None
                 ]
-                group_plan = self.close_profile.plan_group(members)
+                # The group decision is an arithmetic claim about the WHOLE book
+                # ("all these stops together still book a gain"), so it is only
+                # valid when every open position is in the sum. A position the
+                # pre-pass could not price (no bid, no candle yet) would silently
+                # drop its own — typically negative — contribution and make the
+                # book look greener than it is, arming a tightening the group
+                # cannot actually afford. Skip the plan entirely for that tick.
+                if len(members) == len(positions):
+                    group_plan = self.close_profile.plan_group(members)
+                else:
+                    logger.warning(
+                        "Group stop pre-pass skipped: only %d of %d open positions "
+                        "could be priced this tick",
+                        len(members),
+                        len(positions),
+                    )
 
             # Phase 2 — manage each position, feeding it its own group decision.
             for position, current_bid, buf in resolved:
@@ -2119,6 +2528,14 @@ class BotScheduler:
                                 f"reason={position.reason_close} "
                                 f"P&L={position.euro}€"
                             )
+                            # Recovery revert: the software backstop fired on the
+                            # stop this position was opened with — take the
+                            # opposite side at once (see
+                            # :meth:`_revert_after_stop_loss`; a no-op unless
+                            # ALLOW_RECOVERY_REVERT is on and the close qualifies).
+                            await self._revert_after_stop_loss(
+                                session, position, config
+                            )
                 except Exception as exc:
                     logger.error("Error monitoring position %s: %s", position.epic, exc)
 
@@ -2132,6 +2549,12 @@ class BotScheduler:
         any position IG no longer reports (closed by a broker-side stop/limit or
         manually outside the bot). This is what keeps the dashboard in step with the
         broker between strategy passes.
+
+        It is also where a **broker-side stop-out** is first seen by the bot (the
+        IG order fires on a tick the monitor never polls), so each position the
+        sync reconciled as ``closed_externally`` is offered to the recovery-revert
+        rule (:meth:`_revert_after_stop_loss`) — a no-op unless
+        ``ALLOW_RECOVERY_REVERT`` is on and the close hit the stop placed at open.
         """
         # Single-flight: a manual dashboard trigger must not run a second sync
         # concurrently with the scheduled one (see ``self._sync_lock``).
@@ -2144,6 +2567,8 @@ class BotScheduler:
                 except Exception as exc:
                     logger.error("Position sync failed: %s", exc)
                     return
+                for closed in trading.reconciled_closed:
+                    await self._revert_after_stop_loss(session, closed, config)
             # Stamp the "as of" time only on a successful sync so the dashboard
             # can show when the displayed P&L figures were last refreshed from IG.
             self._positions_synced_at = datetime.now(UTC)

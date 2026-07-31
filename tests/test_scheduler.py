@@ -9,6 +9,7 @@ recording until it closes.
 import asyncio
 import logging
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,8 +20,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.core.scheduler import BotScheduler, validate_strategy_selection
 from src.entry.base import EntryIntent
 from src.entry.open_allincrease import OpenAllIncrease
+from src.entry.open_five import OpenFive
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_saferanking import OpenSafeRanking
+from src.entry.open_steady import OpenSteady
 from src.feed.price_buffer import Candle, PriceBuffer
 from src.models.database import Base
 from src.models.job_preference import JobPreference
@@ -43,6 +46,7 @@ def _make_scheduler(session_factory) -> BotScheduler:
     settings = MagicMock()
     settings.strategy_hour_close = 17
     settings.allow_same_day_reopen = True  # global .env policy (real bool)
+    settings.allow_recovery_revert = False  # global .env policy (real bool)
     return BotScheduler(
         settings=settings,
         client=MagicMock(),
@@ -182,6 +186,7 @@ class TestValidateStrategySelection:
             close_zonemarge="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
+            allow_recovery_revert=False,
         )
         validate_strategy_selection(settings)  # does not raise
 
@@ -195,6 +200,7 @@ class TestValidateStrategySelection:
             close_zonemarge="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=None,
+            allow_recovery_revert=False,
         )
         with pytest.raises(ValueError, match="ALLOW_SAME_DAY_REOPEN"):
             validate_strategy_selection(settings)
@@ -207,8 +213,23 @@ class TestValidateStrategySelection:
             close_zonemarge="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=True,
+            allow_recovery_revert=True,
         )
         validate_strategy_selection(settings)  # does not raise
+
+    def test_missing_recovery_revert_is_rejected(self):
+        # A rule that opens a position on its own must be stated explicitly.
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=False,
+            allow_recovery_revert=None,
+        )
+        with pytest.raises(ValueError, match="ALLOW_RECOVERY_REVERT"):
+            validate_strategy_selection(settings)
 
     def test_empty_selection_is_rejected(self):
         settings = SimpleNamespace(
@@ -218,6 +239,7 @@ class TestValidateStrategySelection:
             close_zonemarge="",
             close_zoneprofit="",
             allow_same_day_reopen=False,
+            allow_recovery_revert=False,
         )
         with pytest.raises(ValueError) as exc:
             validate_strategy_selection(settings)
@@ -236,6 +258,7 @@ class TestValidateStrategySelection:
             close_zonemarge="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
+            allow_recovery_revert=False,
         )
         with pytest.raises(ValueError, match="OPEN_STRATEGY"):
             validate_strategy_selection(settings)
@@ -998,6 +1021,7 @@ def _streaming_scheduler(session_factory, streaming, *, allow_same_day_reopen=Tr
     settings.strategy_hour_close = 17
     settings.streaming_stale_seconds = 180
     settings.allow_same_day_reopen = allow_same_day_reopen
+    settings.allow_recovery_revert = False  # opt-in policy, off unless tested
     return BotScheduler(
         settings=settings,
         client=MagicMock(),
@@ -1341,3 +1365,845 @@ class TestTwoSidedRankerSelection:
         # The default stays long-only: SELL candidates never reach the open path.
         assert opened == [("E1", "BUY"), ("E3", "BUY")]
         assert gate_calls == [False, False]
+
+
+class TestMinParticipationCount:
+    """``min_participation_count`` — an absolute candidate floor, not a ratio.
+
+    ``open_steady`` requires strictly more than 20 candidate epics for a ranking to
+    be valid. No ``min_participation_ratio`` expresses that on a universe whose
+    size drifts between 40 and 51 epics across a session, so the count gate carries
+    the rule and the ratio gate is disabled.
+    """
+
+    @staticmethod
+    def _warm_up(scheduler: BotScheduler, epic: str, count: int) -> None:
+        base = datetime.now(UTC) - timedelta(minutes=count)
+        for i in range(count):
+            scheduler._buffer.add_candle(epic, _candle(base + timedelta(minutes=i)))
+
+    def _scheduler(self, session_factory, ready: int):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        scheduler._strategy = OpenSteady()
+        scheduler._tradable_epics = [f"E{i}" for i in range(40)]
+        scheduler._strategy.evaluate = MagicMock(return_value=None)
+        for i in range(ready):
+            self._warm_up(scheduler, f"E{i}", scheduler._strategy.warmup)
+        return scheduler
+
+    async def test_twenty_candidates_is_not_enough(self, session_factory):
+        # Exactly 20 ready: the spec wants strictly MORE than 20.
+        scheduler = self._scheduler(session_factory, ready=20)
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_twenty_one_candidates_runs_the_tournament(self, session_factory):
+        scheduler = self._scheduler(session_factory, ready=21)
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 21
+
+    async def test_the_ratio_gate_alone_would_have_allowed_it(self, session_factory):
+        """The count gate is what blocks — the disabled ratio gate would not.
+
+        20 of 40 warmed up is 50%, which ``min_participation_ratio = 0.5`` would
+        also refuse; the point here is that ``open_steady`` sets the ratio to 0.0,
+        so without the count gate the thin pool would have been crowned.
+        """
+        scheduler = self._scheduler(session_factory, ready=20)
+        assert scheduler._strategy.min_participation_ratio == 0.0
+        # Ratio disabled => ready (20) > 0.0 * 40, so only the count gate can stop it.
+        scheduler._strategy.min_participation_count = 0
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 20
+
+
+class TestBlockOpenWhileAlive:
+    """``block_open_while_alive`` — stop opening beside a secured winner only.
+
+    A position is *alive* once its software stop (``level_follower``) has ratcheted
+    past ``level_margin`` while the close-out price is in profit. A position merely
+    *waiting* for its move must NOT block: it may not sit on an opportunity.
+    """
+
+    @staticmethod
+    def _warm_up(scheduler: BotScheduler, epic: str, count: int) -> None:
+        base = datetime.now(UTC) - timedelta(minutes=count)
+        for i in range(count):
+            scheduler._buffer.add_candle(epic, _candle(base + timedelta(minutes=i)))
+
+    def _scheduler(self, session_factory):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        scheduler._strategy = OpenSteady()
+        # The alive brake must be reached before the participation gate matters.
+        scheduler._strategy.min_participation_count = 0
+        scheduler._tradable_epics = [f"E{i}" for i in range(3)]
+        scheduler._strategy.evaluate = MagicMock(return_value=None)
+        for i in range(3):
+            self._warm_up(scheduler, f"E{i}", scheduler._strategy.warmup)
+        return scheduler
+
+    @staticmethod
+    async def _add(session_factory, **levels) -> None:
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="HELD",
+                    epic_name="HELD",
+                    date=date.today(),
+                    state=PositionState.OPEN,
+                    **levels,
+                )
+            )
+            await session.commit()
+
+    async def test_secured_winner_blocks_opening(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        # Software stop past the margin: the gain is locked in.
+        await self._add(
+            session_factory,
+            direction="BUY",
+            level_zero=100,
+            level_margin=102,
+            level_follower=103,
+        )
+        # A live price in profit, so both alive conditions hold.
+        scheduler._buffer.add_candle("HELD", _candle(datetime.now(UTC)))
+        scheduler._buffer.get("HELD").candles[-1].bid_close = 110.0
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_waiting_position_does_not_block(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        # Stop still short of the margin — the trade is waiting, not alive.
+        await self._add(
+            session_factory,
+            direction="BUY",
+            level_zero=100,
+            level_margin=102,
+            level_follower=98,
+        )
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_short_is_judged_mirrored(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        # SELL: profit is down, so a locked stop sits BELOW the margin.
+        await self._add(
+            session_factory,
+            direction="SELL",
+            level_zero=100,
+            level_margin=98,
+            level_follower=97,
+        )
+        scheduler._buffer.add_candle("HELD", _candle(datetime.now(UTC)))
+        scheduler._buffer.get("HELD").candles[-1].offer_close = 90.0
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_short_with_a_stop_the_wrong_side_does_not_block(
+        self, session_factory
+    ):
+        scheduler = self._scheduler(session_factory)
+        # Same numbers as a locked long, which for a SELL means NOT yet locked.
+        await self._add(
+            session_factory,
+            direction="SELL",
+            level_zero=100,
+            level_margin=98,
+            level_follower=103,
+        )
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_row_without_levels_does_not_block(self, session_factory):
+        """An adopted/legacy row cannot be judged — it must not freeze opening."""
+        scheduler = self._scheduler(session_factory)
+        await self._add(session_factory, direction="BUY")
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_locked_stop_with_no_live_price_still_blocks(self, session_factory):
+        """Condition 1 is decisive: a missing feed must not unsecure a winner."""
+        scheduler = self._scheduler(session_factory)
+        await self._add(
+            session_factory,
+            direction="BUY",
+            level_zero=100,
+            level_margin=102,
+            level_follower=103,
+        )
+        # No candle for HELD at all — the live-price confirmation is skipped.
+        assert scheduler._buffer.get("HELD") is None
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_other_strategies_are_unaffected(self, session_factory):
+        """The brake is opt-in: a ranker that does not declare it keeps opening."""
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        scheduler._strategy = OpenSafeRanking()
+        assert scheduler._strategy.block_open_while_alive is False
+        # Neutralise the sibling's own participation ratio so the only thing that
+        # could stop this pass is the alive brake it does not declare.
+        scheduler._strategy.min_participation_ratio = 0.0
+        scheduler._strategy.evaluate = MagicMock(return_value=None)
+        scheduler._tradable_epics = [f"E{i}" for i in range(3)]
+        for i in range(3):
+            self._warm_up(scheduler, f"E{i}", scheduler._strategy.warmup)
+        await self._add(
+            session_factory,
+            direction="BUY",
+            level_zero=100,
+            level_margin=102,
+            level_follower=103,
+        )
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+
+class TestRecoveryRevert:
+    """``ALLOW_RECOVERY_REVERT``: flip the side after an opening-stop loss.
+
+    A position taken out at a loss by the stop it was OPENED with means the
+    market walked through the level the trade was built on, so the bot opens the
+    opposite side at once (see ``BotScheduler._revert_after_stop_loss``). The
+    reverse open goes through the shared guarded path with the long-only and
+    same-day-re-open gates lifted, and is capped at one hop.
+    """
+
+    def _scheduler(self, session_factory, *, allow: bool = True) -> BotScheduler:
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        scheduler._settings.allow_recovery_revert = allow  # real bool, not a Mock
+        # Skip building a real close profile from the MagicMock settings.
+        scheduler._close_profile_obj = MagicMock()
+        # One live candle so the revert has a price to open on.
+        scheduler._buffer.add_candle("E", _candle(datetime.now(UTC)))
+        return scheduler
+
+    def _stub_open(self, scheduler) -> list[dict]:
+        """Record every guarded open instead of touching IG."""
+        calls: list[dict] = []
+
+        async def _open(trading, intent, buf, **kwargs):
+            calls.append({"direction": intent.direction, "epic": intent.epic, **kwargs})
+            return (
+                Position(
+                    epic=intent.epic,
+                    epic_name=intent.epic,
+                    date=date.today(),
+                    direction=intent.direction,
+                    state=PositionState.OPEN,
+                    level_open=1.0,
+                ),
+                None,
+            )
+
+        scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
+        return calls
+
+    @staticmethod
+    def _stopped_out(**overrides) -> Position:
+        """A long closed at a loss on the stop placed at open."""
+        fields = {
+            "epic": "E",
+            "epic_name": "E",
+            "date": date.today(),
+            "direction": "BUY",
+            "state": PositionState.CLOSE,
+            "reason_open": "auto",
+            "reason_close": "closed_externally",
+            "level_open": Decimal("1.10000"),
+            "level_close": Decimal("1.09800"),
+            "level_follower": Decimal("1.09850"),
+            "stop_update": 0,
+            "stop_history": [{"t": "1", "level": 1.09850, "broker": 1.09800}],
+            "euro": Decimal("-12.500"),
+        }
+        fields.update(overrides)
+        return Position(**fields)
+
+    async def test_opening_stop_loss_opens_the_reverse_side(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+        position = self._stopped_out()
+
+        async with session_factory() as session:
+            session.add(position)
+            await session.commit()
+            reverse = await scheduler._revert_after_stop_loss(
+                session, position, scheduler._build_trade_config()
+            )
+
+        assert reverse is not None
+        # The reverse of a long is a short, so the long-only gate must be lifted,
+        # and the epic was traded seconds ago so the same-day gate must be too.
+        assert calls == [
+            {
+                "direction": "SELL",
+                "epic": "E",
+                "allow_short": True,
+                "allow_reopen": True,
+            }
+        ]
+        # Not a manual open: the auto-open switch still governs the revert.
+        assert "manual" not in calls[0]
+        assert reverse.reason_open == "recovery_revert"
+
+    async def test_short_stopped_out_reverts_to_a_long(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+        position = self._stopped_out(
+            direction="SELL",
+            level_close=Decimal("1.10200"),
+            level_follower=Decimal("1.10150"),
+            stop_history=[{"t": "1", "level": 1.10150, "broker": 1.10200}],
+        )
+
+        async with session_factory() as session:
+            await scheduler._revert_after_stop_loss(
+                session, position, scheduler._build_trade_config()
+            )
+
+        assert [c["direction"] for c in calls] == ["BUY"]
+
+    async def test_policy_off_never_reverts(self, session_factory):
+        scheduler = self._scheduler(session_factory, allow=False)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session, self._stopped_out(), scheduler._build_trade_config()
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_a_win_never_reverts(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(euro=Decimal("9.000"), reason_close="win"),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_a_revert_is_not_reverted_again(self, session_factory):
+        # Single hop: a stopped-out revert does not flip back, so a choppy market
+        # cannot ping-pong the account through an endless BUY/SELL sequence.
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(reason_open="recovery_revert"),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_no_price_data_skips_the_revert(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(epic="NOFEED", epic_name="NOFEED"),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_gate_refusal_is_not_an_error(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        scheduler.open_epic_guarded = AsyncMock(
+            return_value=(None, "Market E closes soon")
+        )
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session, self._stopped_out(), scheduler._build_trade_config()
+            )
+
+        assert reverse is None
+
+    async def test_monitor_reverts_after_a_software_stop_close(
+        self, session_factory, monkeypatch
+    ):
+        """The monitor tick that closes on the follower opens the reverse side."""
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            position = self._stopped_out(state=PositionState.OPEN)
+            session.add(position)
+            await session.commit()
+
+        async def _manage(position, current_bid, buf=None, **kwargs):
+            # Stand in for the real close: the software backstop fired on the
+            # stop placed at open.
+            position.state = PositionState.CLOSE
+            position.reason_close = "stop"
+            return True
+
+        trading_stub = MagicMock()
+        trading_stub.manage_position = AsyncMock(side_effect=_manage)
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+
+        await scheduler._monitor_positions()
+
+        assert [c["direction"] for c in calls] == ["SELL"]
+
+    async def test_sync_reverts_a_broker_stop_out(self, session_factory, monkeypatch):
+        """A stop filled at IG is only seen by the sync — it reverts too."""
+        scheduler = self._scheduler(session_factory)
+        calls = self._stub_open(scheduler)
+        closed = self._stopped_out()
+
+        trading_stub = MagicMock()
+        trading_stub.sync_open_positions = AsyncMock(return_value={})
+        trading_stub.reconciled_closed = [closed]
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+
+        await scheduler._sync_positions()
+
+        assert [c["direction"] for c in calls] == ["SELL"]
+
+
+class TestRequireFlatBook:
+    """``require_flat_book`` — open in *series*, never top up.
+
+    ``open_five`` opens a basket of five in one pass and then waits for the book to
+    be **completely** empty before opening the next one, so a series can be judged
+    as a whole. It is deliberately stricter than ``block_open_while_alive``: any
+    open position blocks, secured or not, and a row too incomplete to judge blocks
+    too (that brake lets both through).
+    """
+
+    @staticmethod
+    def _warm_up(scheduler: BotScheduler, epic: str, count: int) -> None:
+        base = datetime.now(UTC) - timedelta(minutes=count)
+        for i in range(count):
+            scheduler._buffer.add_candle(epic, _candle(base + timedelta(minutes=i)))
+
+    def _scheduler(self, session_factory, strategy):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        scheduler._strategy = strategy
+        # The participation gates are exercised on their own elsewhere; keep the
+        # universe small so this test isolates the flat-book brake.
+        strategy.min_participation_ratio = 0.0
+        strategy.min_participation_count = 0
+        scheduler._tradable_epics = [f"E{i}" for i in range(3)]
+        strategy.evaluate = MagicMock(return_value=None)
+        for i in range(3):
+            self._warm_up(scheduler, f"E{i}", strategy.warmup)
+        return scheduler
+
+    @staticmethod
+    async def _add_position(session_factory, **fields) -> None:
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="HELD",
+                    epic_name="HELD",
+                    date=date.today(),
+                    state=PositionState.OPEN,
+                    **fields,
+                )
+            )
+            await session.commit()
+
+    async def test_an_empty_book_runs_the_tournament(self, session_factory):
+        scheduler = self._scheduler(session_factory, OpenFive())
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_any_open_position_blocks_the_next_series(self, session_factory):
+        scheduler = self._scheduler(session_factory, OpenFive())
+        # One open position out of a basket of five: the four free slots are NOT
+        # topped up — the whole series waits.
+        await self._add_position(session_factory, direction="BUY")
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_a_waiting_position_blocks_too(self, session_factory):
+        """Where it differs from ``block_open_while_alive``.
+
+        This position's software stop is nowhere near its margin, so it is merely
+        *waiting* and the alive brake would let the selector keep opening. The
+        series model blocks anyway.
+        """
+        scheduler = self._scheduler(session_factory, OpenFive())
+        await self._add_position(
+            session_factory,
+            direction="BUY",
+            level_zero=100,
+            level_margin=102,
+            level_follower=98,
+        )
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_other_strategies_are_unaffected(self, session_factory):
+        """The brake is opt-in: a ranker that does not declare it keeps opening."""
+        strategy = OpenSafeRanking()
+        scheduler = self._scheduler(session_factory, strategy)
+        assert strategy.require_flat_book is False
+        await self._add_position(session_factory, direction="BUY")
+
+        await scheduler._select_and_open()
+
+        assert strategy.evaluate.call_count == 3
+
+
+class TestCrossEpicFilter:
+    """``filter_ranked`` — the strategy's look at the sorted ranking before opening.
+
+    The scheduler must apply the hook *after* the sort and *before* the first
+    order, and must honour the shortened list: a refused candidate loses its slot
+    to the next survivor rather than leaving a hole in the basket. The duplicate
+    maths itself lives in ``tests/test_open_five.py``; here the hook is stubbed so
+    only the wiring is under test.
+    """
+
+    def _scheduler(self, session_factory, monkeypatch, *, epic_count: int = 8):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        strategy = OpenFive()
+        strategy.min_participation_ratio = 0.0
+        strategy.min_participation_count = 0
+        scheduler._strategy = strategy
+        scheduler._close_profile_obj = MagicMock()
+        epics = [f"E{i}" for i in range(epic_count)]
+        scheduler._tradable_epics = epics
+
+        base = datetime.now(UTC) - timedelta(minutes=strategy.warmup)
+        for epic in epics:
+            for i in range(strategy.warmup):
+                scheduler._buffer.add_candle(epic, _candle(base + timedelta(minutes=i)))
+
+        # Descending scores so the ranking order is deterministic and equals the
+        # epic order.
+        strategy.evaluate = MagicMock(
+            side_effect=lambda epic, buf: EntryIntent(
+                epic=epic, direction="BUY", score=float(epic_count - int(epic[1:]))
+            )
+        )
+        scheduler._tradable_markets = [
+            SimpleNamespace(epic=e, funds_needed=100.0) for e in epics
+        ]
+        scheduler._account_available_funds = AsyncMock(return_value=100_000.0)
+
+        opened: list[str] = []
+
+        async def _open(trading, intent, buf, *, allow_short=False):
+            opened.append(intent.epic)
+            return (
+                Position(
+                    epic=intent.epic,
+                    epic_name=intent.epic,
+                    date=date.today(),
+                    state=PositionState.OPEN,
+                    level_open=1.0,
+                ),
+                None,
+            )
+
+        scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
+        trading_stub = MagicMock()
+        trading_stub.can_open_intent = AsyncMock(return_value=(True, None))
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        return scheduler, opened
+
+    async def test_the_basket_is_opened_in_one_pass(self, session_factory, monkeypatch):
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+
+        await scheduler._select_and_open()
+
+        # Five at once, best-ranked first — the series model.
+        assert opened == ["E0", "E1", "E2", "E3", "E4"]
+
+    async def test_refused_candidates_lose_their_slot_to_the_next(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+        # Stand in for the duplicate-shape veto: drop ranks 2 and 3.
+        scheduler._strategy.filter_ranked = MagicMock(
+            side_effect=lambda ranked: [ranked[0]] + ranked[3:]
+        )
+
+        await scheduler._select_and_open()
+
+        # The basket is still five deep — E3/E4 were promoted into the free slots.
+        assert opened == ["E0", "E3", "E4", "E5", "E6"]
+
+    async def test_the_hook_sees_the_sorted_ranking(self, session_factory, monkeypatch):
+        scheduler, _ = self._scheduler(session_factory, monkeypatch)
+        seen: list[list[tuple[str, float]]] = []
+
+        def _spy(ranked):
+            seen.append([(i.epic, i.score) for i, _ in ranked])
+            return ranked
+
+        scheduler._strategy.filter_ranked = MagicMock(side_effect=_spy)
+
+        await scheduler._select_and_open()
+
+        assert len(seen) == 1
+        scores = [score for _epic, score in seen[0]]
+        assert scores == sorted(scores, reverse=True)
+
+    async def test_filtering_everything_out_opens_nothing(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, opened = self._scheduler(session_factory, monkeypatch)
+        scheduler._strategy.filter_ranked = MagicMock(return_value=[])
+
+        await scheduler._select_and_open()
+
+        assert opened == []
+        scheduler.open_epic_guarded.assert_not_called()
+
+
+class TestGroupStopPrePass:
+    """The monitor's whole-book pre-pass for a group-aware close profile.
+
+    ``smartgroup`` claims "all these stops together still book a gain", which is
+    only true if every open position is in the sum. The scheduler must therefore
+    hand the profile a *complete* book or none at all, and feed each position its
+    own resolved level.
+    """
+
+    def _scheduler(self, session_factory, monkeypatch, *, epics=("A", "B")):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        for epic in epics:
+            scheduler._buffer.add_candle(epic, _candle(datetime.now(UTC)))
+
+        profile = MagicMock()
+        profile.is_group_aware = True
+        profile.group_member = MagicMock(side_effect=lambda p, bid, buf: p.id)
+        profile.plan_group = MagicMock(return_value={1: 1.5, 2: 2.5})
+        scheduler._close_profile_obj = profile
+
+        seen: list[tuple[str, float | None]] = []
+
+        async def _manage(position, current_bid, buf=None, *, group_tighten=None):
+            seen.append((position.epic, group_tighten))
+            return False
+
+        trading_stub = MagicMock()
+        trading_stub.manage_position = AsyncMock(side_effect=_manage)
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        return scheduler, profile, seen
+
+    @staticmethod
+    async def _add_positions(session_factory, epics) -> None:
+        async with session_factory() as session:
+            for i, epic in enumerate(epics, start=1):
+                session.add(
+                    Position(
+                        id=i,
+                        epic=epic,
+                        epic_name=epic,
+                        date=date.today(),
+                        direction="BUY",
+                        state=PositionState.OPEN,
+                        level_open=Decimal("1.10000"),
+                    )
+                )
+            await session.commit()
+
+    async def test_each_position_gets_its_own_level(self, session_factory, monkeypatch):
+        scheduler, profile, seen = self._scheduler(session_factory, monkeypatch)
+        await self._add_positions(session_factory, ("A", "B"))
+
+        await scheduler._monitor_positions()
+
+        assert profile.plan_group.call_args.args[0] == [1, 2]
+        assert sorted(seen) == [("A", 1.5), ("B", 2.5)]
+
+    async def test_an_unpriceable_position_skips_the_whole_plan(
+        self, session_factory, monkeypatch
+    ):
+        # B cannot be priced, so its (possibly negative) contribution is missing
+        # from the book total — planning on the remaining member would arm a
+        # tightening the group cannot afford. B is still managed normally.
+        scheduler, profile, seen = self._scheduler(session_factory, monkeypatch)
+        profile.group_member = MagicMock(
+            side_effect=lambda p, bid, buf: p.id if p.epic == "A" else None
+        )
+        await self._add_positions(session_factory, ("A", "B"))
+
+        await scheduler._monitor_positions()
+
+        profile.plan_group.assert_not_called()
+        assert sorted(seen) == [("A", None), ("B", None)]
+
+
+class TestCandleDrivenMonitoring:
+    """Position management is triggered by data arrival, not by the clock.
+
+    A candle is the only moment the price the close profile reads changes, so the
+    feed drives the pass and the 30 s cron is only a heartbeat. What must hold: one
+    pass per *wave* of candles (never one per epic — the group pre-pass needs the
+    whole book in a single pass), the user's pause is honoured, and two triggers can
+    never run two concurrent passes.
+    """
+
+    def _scheduler(self, session_factory, *, paused: bool = False) -> BotScheduler:
+        sched = _make_scheduler(session_factory)
+        sched._settings.monitor_debounce_seconds = 0.01  # real float, not a Mock
+        sched._running = True
+        job = SimpleNamespace(next_run_time=None if paused else datetime.now(UTC))
+        sched._scheduler = MagicMock()
+        sched._scheduler.get_job = MagicMock(return_value=job)
+        return sched
+
+    async def test_a_wave_of_candles_runs_exactly_one_pass(self, session_factory):
+        sched = self._scheduler(session_factory)
+        sched._monitor_positions = AsyncMock()
+
+        for epic in ("A", "B", "C", "D"):  # one wave, ~40 epics in production
+            sched.on_candle(epic, MagicMock())
+        await asyncio.sleep(0.05)
+
+        sched._monitor_positions.assert_awaited_once()
+
+    async def test_a_later_wave_runs_its_own_pass(self, session_factory):
+        sched = self._scheduler(session_factory)
+        sched._monitor_positions = AsyncMock()
+
+        sched.on_candle("A", MagicMock())
+        await asyncio.sleep(0.05)
+        sched.on_candle("A", MagicMock())
+        await asyncio.sleep(0.05)
+
+        assert sched._monitor_positions.await_count == 2
+
+    async def test_a_paused_job_silences_the_candle_trigger(self, session_factory):
+        # Pausing "Monitor Positions" on the dashboard must stop the event-driven
+        # path too, or the toggle would quietly stop meaning anything.
+        sched = self._scheduler(session_factory, paused=True)
+        sched._monitor_positions = AsyncMock()
+
+        sched.on_candle("A", MagicMock())
+        await asyncio.sleep(0.05)
+
+        sched._monitor_positions.assert_not_awaited()
+
+    async def test_pausing_during_the_debounce_cancels_the_pass(self, session_factory):
+        sched = self._scheduler(session_factory)
+        sched._monitor_positions = AsyncMock()
+
+        sched.on_candle("A", MagicMock())
+        sched._scheduler.get_job.return_value = SimpleNamespace(next_run_time=None)
+        await asyncio.sleep(0.05)
+
+        sched._monitor_positions.assert_not_awaited()
+
+    async def test_a_pass_in_flight_makes_a_new_trigger_a_no_op(self, session_factory):
+        # Skipping, not queueing: the running pass is already reading the data the
+        # new trigger would read, and two concurrent passes could both push a stop.
+        sched = self._scheduler(session_factory)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow_pass():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+
+        sched._monitor_positions_pass = slow_pass
+        first = asyncio.ensure_future(sched._monitor_positions())
+        await started.wait()
+
+        await sched._monitor_positions()  # cron heartbeat lands mid-pass
+        assert calls == 1
+
+        release.set()
+        await first
+        await sched._monitor_positions()  # free again
+        assert calls == 2
+
+    def test_the_listener_is_registered_only_when_streaming_is_on(
+        self, session_factory
+    ):
+        sched = _make_scheduler(session_factory)
+        sched._register_candle_listener()  # streaming is None — must not raise
+
+        streaming = MagicMock()
+        sched._streaming = streaming
+        sched._settings.monitor_debounce_seconds = 2.0
+        sched._register_candle_listener()
+
+        streaming.add_candle_listener.assert_called_once_with(sched.on_candle)
+
+        # Idempotent: a second start() must not subscribe twice (two passes per wave)
+        sched._register_candle_listener()
+        streaming.add_candle_listener.assert_called_once()
+
+
+class TestWarmupCapacityWarning:
+    """A strategy needing more history than the buffer holds must say so.
+
+    The buffer window is a hard ceiling on every lookback, and exceeding it is
+    silent: the strategy just runs on a truncated window, which is indistinguishable
+    from it merely underperforming.
+    """
+
+    def _scheduler(self, session_factory, *, warmup: int, capacity: int):
+        sched = _make_scheduler(session_factory)
+        sched._buffer = PriceBuffer(max_candles=capacity)
+        sched._strategy = SimpleNamespace(name="open_stub", warmup=warmup)
+        return sched
+
+    def test_warns_when_the_warmup_exceeds_capacity(self, session_factory, caplog):
+        sched = self._scheduler(session_factory, warmup=300, capacity=200)
+        with caplog.at_level(logging.WARNING):
+            sched._warn_if_warmup_exceeds_buffer()
+        assert "TRUNCATED" in caplog.text
+        assert "300" in caplog.text
+
+    def test_silent_when_the_buffer_is_big_enough(self, session_factory, caplog):
+        sched = self._scheduler(session_factory, warmup=180, capacity=200)
+        with caplog.at_level(logging.WARNING):
+            sched._warn_if_warmup_exceeds_buffer()
+        assert caplog.text == ""

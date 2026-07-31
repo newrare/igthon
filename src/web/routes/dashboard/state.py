@@ -229,6 +229,10 @@ def _open_reason_label(reason: str | None) -> tuple[str, str]:
     mapping = {
         "manual": ("Manual", "#60a5fa"),
         "auto": ("Script / Job", "#a78bfa"),
+        # Opened by the recovery-revert rule (ALLOW_RECOVERY_REVERT): the
+        # previous trade on this epic was stopped out at a loss on its opening
+        # stop and this position took the opposite side.
+        "recovery_revert": ("Revert (stop-out)", "#f59e0b"),
     }
     if reason in mapping:
         return mapping[reason]

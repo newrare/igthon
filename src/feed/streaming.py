@@ -16,6 +16,13 @@ Design notes:
   ``password = "CST-{cst}|XST-{xst}"``.
 - IG allows at most **40 simultaneous subscriptions per connection**; opening
   several connections breaches IG's terms. ``set_epics`` truncates defensively.
+- Only **consolidated** candles (``CONS_END == "1"``) are forwarded. IG also sends
+  sub-second frames updating the forming bar; they are dropped, and that filter is
+  **load-bearing** rather than an optimisation — see :class:`_CandleListener`.
+- A completed candle is the application's price *event*: besides the buffer and the
+  durable store, it notifies the listeners registered with
+  :meth:`IGStreamingClient.add_candle_listener`, which is how position management
+  runs on data arrival instead of on a fixed clock (see ``docs/DATAFLOW.md`` §5).
 
 The module stays importable when ``lightstreamer-client-lib`` is absent (e.g.
 ``streaming_enabled=False`` deployments or CI) — the import is guarded and the
@@ -120,8 +127,15 @@ class _CandleListener(SubscriptionListener):  # type: ignore[misc,valid-type]
         self._epic = epic
 
     def onItemUpdate(self, update: Any) -> None:  # noqa: N802 - lib callback name
-        # Only act on a finished (consolidated) candle; mid-candle frames update
-        # the forming bar and would pollute the buffer with partial data.
+        # Only act on a finished (consolidated) candle. This filter is REQUIRED for
+        # correctness, not just to save work: every frame of a given minute carries
+        # the same ``UTM``, and both write paths downstream deduplicate on a
+        # STRICTLY INCREASING timestamp (``PriceBuffer.append_candles``,
+        # ``CandleStore.save``). Forwarding partial frames would therefore store the
+        # first sample of each minute and make the finished candle fail the ``>``
+        # test — the whole history silently degrading to start-of-minute prices with
+        # no error anywhere. Sub-minute reactivity must be a separate channel that
+        # never writes into the candle history (see docs/DATAFLOW.md §6-7).
         if update.getValue("CONS_END") != "1":
             return
         candle = _parse_stream_candle(update.getValue)
@@ -168,6 +182,9 @@ class IGStreamingClient:
         self._scale = scale or settings.streaming_resolution
         self._adapter_set = adapter_set
         self._on_candle_persist = on_candle_persist
+        # Synchronous observers notified after each completed candle is buffered
+        # (see ``add_candle_listener``).
+        self._candle_listeners: list[Callable[[str, Candle], None]] = []
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ls: Any = None  # LightstreamerClient instance once connected
@@ -357,11 +374,32 @@ class IGStreamingClient:
             except Exception:  # pragma: no cover - defensive
                 logger.debug("Streaming: error unsubscribing %s", epic, exc_info=True)
 
+    def add_candle_listener(self, callback: Callable[[str, Candle], None]) -> None:
+        """Register an observer notified after each completed candle is buffered.
+
+        The callback runs **on the event loop**, synchronously, once per completed
+        candle and *after* the buffer has been updated — so an observer that wants
+        to act on the new price can read it straight from the buffer. It must not
+        block: schedule any real work as a task (this is exactly what the
+        scheduler's debounced monitoring trigger does).
+
+        This is the seam that makes the application event-driven: price data is what
+        announces itself, rather than a clock going out to look for it.
+        """
+        self._candle_listeners.append(callback)
+
     def on_candle(self, epic: str, candle: Candle) -> None:
         """Feed a completed candle into the buffer (runs on the event loop)."""
         self._buffer.append_candles(epic, [candle])
         if self._on_candle_persist is not None:
             asyncio.ensure_future(self._persist(epic, candle))
+        # Notified last, so listeners always observe an up-to-date buffer. A
+        # misbehaving observer must never break the feed or stop the others.
+        for listener in self._candle_listeners:
+            try:
+                listener(epic, candle)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Streaming: candle listener failed for %s", epic)
 
     async def _persist(self, epic: str, candle: Candle) -> None:
         """Persist a candle via the configured callback, swallowing errors."""

@@ -113,15 +113,29 @@ constant (`MarketScanner.DEFAULT_MAX_SPREAD_RATIO`), tuned in
 
 ### Opening and closing
 
-| Variable                | Default    | Description                                                                                  |
-| ----------------------- | ---------- | -------------------------------------------------------------------------------------------- |
-| `ALLOW_SAME_DAY_REOPEN` | *required* | `false` = one opening per epic per day (BUY or SELL); `true` = re-open once the epic is flat |
+| Variable                | Default    | Description                                                                                       |
+| ----------------------- | ---------- | ------------------------------------------------------------------------------------------------- |
+| `ALLOW_SAME_DAY_REOPEN` | *required* | `false` = one opening per epic per day (BUY or SELL); `true` = re-open once the epic is flat      |
+| `ALLOW_RECOVERY_REVERT` | *required* | `true` = open the opposite side at once when a trade is stopped out at a loss on its opening stop |
 
 `ALLOW_SAME_DAY_REOPEN` is **global to every entry strategy** and required (no
 code default — a missing value stops startup). With `false`, an epic that already
 had an opening today is dropped for the rest of the day, even after its position
 closed. Two concurrent positions on the same epic are always refused, and a
 manual dashboard open bypasses the policy. See
+[strategies/README.md](strategies/README.md).
+
+`ALLOW_RECOVERY_REVERT` is global and required too. With `true`, a position (BUY
+or SELL) taken out at a **loss** by the stop it was **opened with** is followed
+immediately by an opening on the opposite side of the same epic: the market walked
+through the level the trade was built on, so the bot turns around with it. Only a
+genuine stop hit at the original level qualifies (`stop` / `loose` /
+`closed_externally`) — a win, a manual close, an end-of-day close or a stop-out on
+a *ratcheted* stop never reverts — and the chain is capped at one hop, so a
+stopped-out revert is not reverted back. The revert lifts the long-only gate and
+`ALLOW_SAME_DAY_REOPEN`, but it stays an automatic open: the auto-open switch, the
+duplicate-epic gate and the "market closes soon" gate all apply, and the reverse
+trade is sized/stopped by the configured `STOP_STRATEGY` and close zones. See
 [strategies/README.md](strategies/README.md).
 
 There is no wall-clock trading-hours gate: an epic can be opened whenever its

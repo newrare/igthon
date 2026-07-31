@@ -276,6 +276,14 @@ CLOSE_ZONEPROFIT=trailing_ratchet
 # Two concurrent positions on one epic are always refused; a manual dashboard
 # open bypasses the policy.
 ALLOW_SAME_DAY_REOPEN=false
+
+# Recovery revert (also REQUIRED, applies to every entry strategy):
+# true  = when a trade (BUY or SELL) is stopped out at a LOSS on the stop placed
+#         at its open, immediately open the opposite side on the same epic to
+#         follow the market that turned. One hop only — a stopped-out revert is
+#         never reverted back.
+# false = a stop-out is just a closed trade; the next open waits for a signal.
+ALLOW_RECOVERY_REVERT=true
 ```
 
 There is no trading-hours gate: an epic is opened whenever its live market

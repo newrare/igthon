@@ -1,6 +1,6 @@
 """Tests for the trading service."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -169,6 +169,139 @@ class TestTransactionMatching:
         assert TradingService._level_distance(
             pos, near
         ) < TradingService._level_distance(pos, far)
+
+    def test_match_cost_prefers_the_transaction_at_the_same_time(self):
+        """Two deals on one instrument sit at near-identical prices, so time —
+        not level — decides which transaction belongs to which position."""
+        morning = Position(
+            time_open=time(7, 26, 30),
+            time_close=time(9, 21, 15),
+            level_open=Decimal("3485.43"),
+            level_close=Decimal("3480.00"),
+        )
+        morning_txn = {
+            "openDateUtc": "2026-07-30T07:26:30",
+            "dateUtc": "2026-07-30T09:21:04",
+        }
+        afternoon_txn = {
+            "openDateUtc": "2026-07-30T12:35:57",
+            "dateUtc": "2026-07-30T13:33:10",
+        }
+        assert TradingService._match_cost(morning, morning_txn) < 60.0
+        assert TradingService._match_cost(morning, afternoon_txn) is None
+
+    def test_match_cost_falls_back_to_levels_without_timestamps(self):
+        pos = Position(
+            time_close=time(9, 21, 15),
+            level_open=Decimal("1.157"),
+            level_close=Decimal("1.157"),
+        )
+        cost = TradingService._match_cost(
+            pos, {"openLevel": "1.158", "closeLevel": "1.158"}
+        )
+        assert cost == pytest.approx(0.002, abs=1e-9)
+
+
+class TestReconcileRealizedPnl:
+    """reconcile_realized_pnl assigns each IG transaction to the right row."""
+
+    @staticmethod
+    def _svc(closed: list[Position], transactions: list[dict]):
+        db = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = closed
+        db.execute = AsyncMock(return_value=result)
+        client = AsyncMock()
+        client.get = AsyncMock(return_value={"transactions": transactions})
+        return TradingService(client=client, db_session=db, config=TradeConfig())
+
+    async def test_two_deals_on_one_instrument_keep_their_own_pnl(self):
+        """Regression: a morning loss and an afternoon gain on the same epic both
+        showed the gain. The per-position greedy loop matched the morning row to
+        the afternoon transaction (levels are nearly identical intraday), then had
+        nothing left for the afternoon row, which kept its estimated P&L."""
+        morning = Position(
+            id=647,
+            epic="IX.D.TAIWAN.IFM.IP",
+            epic_name="Taiwan Ind",
+            direction="SELL",
+            time_open=time(7, 26, 30),
+            time_close=time(9, 21, 15),
+            level_open=Decimal("3485.43"),
+            level_close=Decimal("3491.52"),
+        )
+        afternoon = Position(
+            id=672,
+            epic="IX.D.TAIWAN.IFM.IP",
+            epic_name="Taiwan Ind",
+            direction="BUY",
+            time_open=time(12, 35, 57),
+            time_close=time(13, 33, 20),
+            level_open=Decimal("3485.43"),
+            level_close=Decimal("3496.08"),
+        )
+        transactions = [
+            {
+                "instrumentName": "Taiwan Index",
+                "profitAndLoss": "E105.35",
+                "openLevel": "3485.4",
+                "closeLevel": "3496.08",
+                "openDateUtc": "2026-07-30T12:35:57",
+                "dateUtc": "2026-07-30T13:33:10",
+            },
+            {
+                "instrumentName": "Taiwan Index",
+                "profitAndLoss": "E-88.20",
+                "openLevel": "3485.43",
+                "closeLevel": "3492.10",
+                "openDateUtc": "2026-07-30T07:26:30",
+                "dateUtc": "2026-07-30T09:21:04",
+            },
+        ]
+        svc = self._svc([morning, afternoon], transactions)
+
+        assert await svc.reconcile_realized_pnl(date(2026, 7, 30)) == 2
+
+        assert morning.euro == Decimal("-88.200")
+        assert morning.win == 0
+        assert morning.time_close_broker == time(9, 21, 4)
+        assert afternoon.euro == Decimal("105.350")
+        assert afternoon.win == 1
+        assert afternoon.time_close_broker == time(13, 33, 10)
+
+    async def test_position_without_a_transaction_stays_untouched(self):
+        """A row IG has no deal for must keep its estimate, not steal the one
+        transaction of the day for that instrument."""
+        matched = Position(
+            id=1,
+            epic="IX.D.TAIWAN.IFM.IP",
+            epic_name="Taiwan Ind",
+            time_open=time(12, 35, 57),
+            time_close=time(13, 33, 20),
+        )
+        orphan = Position(
+            id=2,
+            epic="IX.D.TAIWAN.IFM.IP",
+            epic_name="Taiwan Ind",
+            time_open=time(7, 26, 30),
+            time_close=time(9, 21, 15),
+            euro=Decimal("12.000"),
+        )
+        transactions = [
+            {
+                "instrumentName": "Taiwan Index",
+                "profitAndLoss": "E105.35",
+                "openDateUtc": "2026-07-30T12:35:57",
+                "dateUtc": "2026-07-30T13:33:10",
+            }
+        ]
+        svc = self._svc([matched, orphan], transactions)
+
+        assert await svc.reconcile_realized_pnl(date(2026, 7, 30)) == 1
+
+        assert matched.euro == Decimal("105.350")
+        assert orphan.euro == Decimal("12.000")
+        assert orphan.time_close_broker is None
 
 
 class TestTradingSignalStructure:
@@ -1885,6 +2018,47 @@ class TestSyncReconcileUnconfirmed:
 
         assert real.state == PositionState.CLOSE
         assert real.reason_close == "closed_externally"
+
+    async def test_reconciled_close_is_exposed_for_the_recovery_revert(self):
+        # A broker-side stop-out is first seen HERE (the IG order fires on a tick
+        # the monitor never polls), so the reconciled close is published on
+        # ``reconciled_closed`` for the scheduler's recovery-revert rule.
+        real = self._real()
+        svc, client, db = _sync_service(db_open=[real])
+        client.get = AsyncMock(side_effect=[{"positions": []}, _ig_error(404)])
+
+        await svc.sync_open_positions()
+
+        assert svc.reconciled_closed == [real]
+
+    async def test_reconciled_list_is_reset_on_each_sync(self):
+        # It must only ever hold the LAST run's closes, or a revert would be
+        # re-attempted on every later tick.
+        real = self._real()
+        svc, client, db = _sync_service(db_open=[real])
+        client.get = AsyncMock(side_effect=[{"positions": []}, _ig_error(404)])
+        await svc.sync_open_positions()
+        assert svc.reconciled_closed == [real]
+
+        # Second pass: nothing left OPEN in the DB → nothing reconciled.
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = []
+        db.execute = AsyncMock(return_value=result)
+        client.get = AsyncMock(return_value={"positions": []})
+        await svc.sync_open_positions()
+
+        assert svc.reconciled_closed == []
+
+    async def test_never_opened_row_is_not_offered_to_the_revert(self):
+        # A provisional row that never became a trade is not a stop-out.
+        prov = self._provisional(opened=datetime(2026, 6, 16, 10, 0))
+        svc, client, db = _sync_service(db_open=[prov])
+        client.get = AsyncMock(return_value={"positions": []})
+
+        await svc.sync_open_positions()
+
+        assert prov.reason_close == "never_opened"
+        assert svc.reconciled_closed == []
 
     async def test_confirmed_vanish_kept_open_when_targeted_refetch_still_open(self):
         # The false-positive this fixes: a transient bulk /positions miss (seen

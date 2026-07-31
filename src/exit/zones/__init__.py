@@ -36,6 +36,7 @@ from src.exit.zones.smartgroup import (
     GroupMember,
     SmartGroupParams,
     SmartGroupStop,
+    candidate_stop,
     plan_group_tightening,
 )
 from src.exit.zones.timedlift import UnderwaterTimedLiftStop
@@ -74,6 +75,7 @@ __all__ = [
     "GroupMember",
     "SmartGroupParams",
     "SmartGroupStop",
+    "candidate_stop",
     "plan_group_tightening",
     "UnderwaterStop",
     "UnderwaterTrendCutStop",

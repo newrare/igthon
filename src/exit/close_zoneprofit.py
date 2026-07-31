@@ -248,7 +248,12 @@ class CloseZoneProfit(CloseProfile):
 
     @property
     def is_group_aware(self) -> bool:
-        """True when the zone-1 updater manages the book as a whole (smartgroup)."""
+        """True when the zone-1 updater manages the book as a whole (smartgroup).
+
+        Selected in zone 1, but its decision is applied in **all three** zones (see
+        :meth:`evaluate`): the rule is about the book's total, so the winners are
+        tightened alongside the losers that their gain protects.
+        """
         return isinstance(self.underwater, SmartGroupStop)
 
     def group_member(
@@ -256,11 +261,13 @@ class CloseZoneProfit(CloseProfile):
     ) -> GroupMember | None:
         """Build the group pre-pass scalars for this position, or ``None``.
 
-        Reads the same live measures (ATR, spread, adverse-tick noise) that
+        Built for **every** open position, whichever zone it sits in — the group
+        rule values winners and losers alike (see :mod:`src.exit.zones.smartgroup`).
+        Reads the same live measures (spread, adverse-tick noise) that
         :meth:`evaluate` uses, so the group planner and the per-tick management
         agree on the numbers — including the close-out price and the sign, so longs
-        and shorts share one budget. Returns ``None`` when the profile is not
-        group-aware or there is no candle to read a spread/ATR from.
+        and shorts are valued in one pass. Returns ``None`` when the profile is not
+        group-aware or there is no candle to read a spread from.
         """
         if not self.is_group_aware:
             return None
@@ -281,12 +288,9 @@ class CloseZoneProfit(CloseProfile):
         return GroupMember(
             position_id=int(position.id),
             level_open=float(position.level_open or 0),
-            level_zero=float(position.level_zero or 0),
             level_follower=float(position.level_follower or 0),
             euro_per_point=float(position.euro_per_point or 0),
             current_price=_close_out_price(current_bid, spread, sign),
-            atr_value=atr(list(buf.candles), self.atr_period),
-            spread=spread,
             min_stop_distance=float(getattr(position, "min_stop_distance", 0) or 0),
             noise=noise,
             sign=sign,
@@ -312,7 +316,9 @@ class CloseZoneProfit(CloseProfile):
 
         ``group_tighten`` carries the pre-resolved stop level from the group
         pre-pass (``smartgroup`` only); it is threaded into the per-tick
-        :class:`~src.exit.zones.base.StopContext` and left ``None`` otherwise.
+        :class:`~src.exit.zones.base.StopContext` and left ``None`` otherwise. It
+        is a **whole-book** decision, so it is honoured in every zone, not only in
+        the zone-1 slot it is selected from.
         """
         if is_close_hour:
             return CloseDecision(action=ACTION_CLOSE, reason="end_of_day")
@@ -382,6 +388,18 @@ class CloseZoneProfit(CloseProfile):
             updater = self.underwater
 
         new_stop = updater.propose(ctx)
+
+        # A group-aware zone-1 updater (``smartgroup``) decides for the WHOLE book,
+        # not just for the positions still under water: once the group is green net
+        # of noise, the winners' stops must be pulled up too — possibly past the
+        # margin or profit line. So its pre-resolved level applies in every zone,
+        # and wins whenever it is tighter than what the zone's own updater proposed
+        # (the zone keeps governing when it is already ahead of the group level, so
+        # the profit trailing is never traded away for a looser group stop).
+        if group_tighten is not None and self.is_group_aware:
+            if new_stop is None or sign * (group_tighten - new_stop) > 0:
+                new_stop = group_tighten
+
         if new_stop is None:
             return CloseDecision(action=ACTION_HOLD)
         return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=new_stop)

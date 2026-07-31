@@ -184,3 +184,80 @@ at most once per period instead of degenerating into an under-water trailing sto
 | `cushion_noise_mult` / `cushion_atr_k`             | 1.0/0.5     | cushion kept below the period's floor           |
 | `safety_noise_mult` / `safety_atr_k` / `_spread_k` | 2.0/1.0/2.0 | minimum clearance kept below the live bid       |
 | `min_advance_atr_k`                                | 0.25        | minimum improvement (× ATR) worth a broker push |
+
+## Zone 1 — `smartgroup` (one decision for the whole book)
+
+Every other updater reasons about a single position. `smartgroup`
+([`src/exit/zones/smartgroup.py`](../../src/exit/zones/smartgroup.py)) reasons
+about **the book**, and its decision applies to **every open position** — winners
+included — not only to the ones its zone-1 slot would normally cover.
+
+The rule, in one sentence: *if closing every open position at "its live price
+minus its own noise" would already bank a net gain, park every stop exactly
+there.*
+
+On each monitor tick, for the whole book at once:
+
+```
+cushion_i   = max(adverse_tick_noise_i, min_stop_distance_i)   # the epic's own jitter
+candidate_i = price_i − sign_i × cushion_i                     # just beyond the churn
+euro_i      = sign_i × (candidate_i − level_open_i) × euro_per_point_i
+
+arm  ⇔  Σ euro_i > min_group_euro (0 €)
+```
+
+When it arms, every `candidate_i` that is a legal tightening becomes the position's
+new stop in one pass. When it does not, nothing moves — the behaviour is exactly
+`hold`, which is also what happens at open (a fresh book is never green net of
+noise).
+
+Worked example — five positions, 10 €/point, noise 0.3:
+
+| Position   | Open | Price | Candidate | Euro at candidate |
+| ---------- | ---- | ----- | --------- | ----------------: |
+| winner     | 100  | 120   | 119.7     |            +197 € |
+| flat loser | 50   | 49.5  | 49.2      |              −8 € |
+| flat loser | 50   | 49.5  | 49.2      |              −8 € |
+| sinking    | 50   | 46    | 45.7      |             −43 € |
+| sinking    | 50   | 46    | 45.7      |             −43 € |
+| **total**  |      |       |           |         **+95 €** |
+
++95 € > 0, so all five stops — including the winner's, which is pulled up past its
+margin line — move onto their candidate. The trade is deliberate: some of those
+stops **will** be hit and book small individual losses, but the arithmetic
+guarantees the book is green when they all are, and the ones that survive keep
+running for more.
+
+Two departures from a literal `price − noise`, both conservative:
+
+- the cushion is floored at IG's `min_stop_distance` — a stop the broker would
+  reject is not a stop, and a wider cushion only lowers the estimate;
+- a stop is **never loosened**: a candidate that does not beat the position's
+  current follower is skipped (it keeps the better stop it has), and one that
+  would sit on the live price is skipped too (the software backstop would close
+  the position on the spot).
+
+A skipped position is valued in the sum **at the stop it actually keeps**, never
+at the candidate it will not be moved to. That is what makes the gate honest:
+every euro in the total sits behind a stop that is either already resting at IG
+or about to be placed this tick. Counting a skipped position at its candidate
+would break exactly the case the rule exists for — a position on a flat plateau
+(noise 0, no broker minimum) cannot be tightened at all, so its whole paper
+profit would be claimed as protected while its stop stays at the wide level it
+opened with. A position that can neither be tightened nor already carries a stop
+has unbounded downside and disarms the plan outright.
+
+Because the decision is portfolio-level it is computed once per tick, before any
+position is managed: the monitor loop resolves every open position's live bid,
+`CloseZoneProfit.group_member()` reduces each to plain scalars, and the pure
+`plan_group_tightening()` returns `position_id → stop level`. Each position is then
+fed **its own** answer through `StopContext.group_tighten`, so the updater itself
+stays as pure as the others. The level is applied in all three zones and wins
+whenever it is tighter than what the zone's own updater proposed — the profit
+trailing is never traded away for a looser group stop. From there it takes the
+normal ratchet path (up-only, broker push a spread beyond, min-distance clamp).
+
+| Constant                       | Default | Meaning                                                |
+| ------------------------------ | ------- | ------------------------------------------------------ |
+| `noise_window` / `noise_std_k` | 20/2.0  | adverse-tick-noise band = the step back from the price |
+| `min_group_euro`               | 0.0     | euros the book total must exceed for the plan to arm   |

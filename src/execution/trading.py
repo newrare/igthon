@@ -54,6 +54,16 @@ logger = logging.getLogger(__name__)
 # ``_mark_never_opened``). Comfortably covers a few 20s sync cycles.
 RECONCILE_GRACE_SECONDS = 60.0
 
+# Widest gap (seconds) tolerated between a closed position's own clock
+# (``time_open`` / ``time_close``) and an IG transaction's UTC execution
+# timestamps for the two to be considered the same deal
+# (``TradingService._match_cost``). The bot detects a close within one 20s sync
+# cycle, so a real pair sits well under a minute apart; the allowance is
+# deliberately generous but finite — a position IG has no transaction for must
+# stay unmatched rather than steal another deal's P&L, which is exactly how a
+# morning loss ended up displaying the afternoon's gain.
+RECONCILE_MATCH_MAX_SECONDS = 900.0
+
 # ``MARKET_ORDER_NOT_SUPPORTED_CODE`` (imported from api_queue): the IG code for
 # an epic that rejects ``orderType: "MARKET"`` (typically forwards). The metadata
 # does not always flag it up front, so a MARKET order can bounce at deal time —
@@ -194,6 +204,13 @@ class TradingService:
         # queue log / persistent error entry) then happens at most once per epic
         # per process instead of on every scan.
         self._market_order_unsupported: set[str] = set()
+        # Positions the last :meth:`sync_open_positions` run reconciled as
+        # ``closed_externally`` — the broker-side stop (or a close made outside
+        # the bot) took them out. Exposed so the orchestration layer can react to
+        # a broker stop-out it never saw itself, chiefly the recovery-revert rule
+        # (see ``BotScheduler._revert_after_stop_loss``). Reset on every sync, so
+        # it only ever holds the closes of the most recent run.
+        self.reconciled_closed: list[Position] = []
 
     async def _is_epic_open(self, epic: str) -> bool:
         """Check if a position is already open for this epic."""
@@ -740,7 +757,10 @@ class TradingService:
         # the currency-converted euro value of one full point of price movement
         # for the whole position, so the worst-case loss is simply
         # distance × euro_per_point. Fall back to a rough estimate only when the
-        # contract size is unknown.
+        # contract size is unknown. Both paths are ESTIMATES (IG's exchangeRate is
+        # a reference rate on a foreign quote) — the open log below prints the
+        # resolved euro-per-point alongside the risk so a suspect figure is
+        # traceable, and ``reconcile_realized_pnl`` fixes the realized P&L later.
         currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
         expiry = instrument.get("expiry", "-")
         epp = euro_per_point(market_data, quantity, currency)
@@ -787,7 +807,8 @@ class TradingService:
             order_payload = self._to_marketable_limit(order_payload, reference_price)
 
         logger.info(
-            "Opening %s: epic=%s, qty=%d, stop=%.5f (broker %.5f, %.5f), risk=%.2f€",
+            "Opening %s: epic=%s, qty=%d, stop=%.5f (broker %.5f, %.5f), "
+            "risk≈%.2f€ (%s %.4f€/pt)",
             direction,
             epic,
             quantity,
@@ -795,6 +816,8 @@ class TradingService:
             broker_stop,
             stop_price_distance,
             euro_risk,
+            currency,
+            epp if epp else float(quantity),
         )
 
         result = await self._post_open_order(
@@ -1203,15 +1226,19 @@ class TradingService:
         including those closed outside the bot (``closed_externally`` /
         ``not_found_in_ig``), whose levels and euro were only estimated.
 
-        Positions are matched to transactions by deal reference first, then by
-        instrument name when exactly one unmatched transaction remains for that
-        instrument. Returns the number of positions updated.
+        Positions are matched to transactions by instrument name, then paired by
+        execution *time* (see :meth:`_match_cost`) using a globally greedy
+        assignment: every candidate pair is ranked by cost and consumed
+        cheapest-first, so one instrument's several deals of the day land on the
+        right rows instead of the first row winning the closest transaction and
+        pushing its neighbours onto someone else's deal. Returns the number of
+        positions updated.
         """
         day = day or date.today()
         result = await self._db.execute(
-            select(Position).where(
-                Position.date == day, Position.state == PositionState.CLOSE
-            )
+            select(Position)
+            .where(Position.date == day, Position.state == PositionState.CLOSE)
+            .order_by(Position.id)
         )
         closed = list(result.scalars().all())
         if not closed:
@@ -1242,27 +1269,41 @@ class TradingService:
         # IG's transaction ``reference`` is unrelated to our stored deal
         # reference/id, so we match on instrument name (normalized: the
         # "… converted at <rate>" suffix on currency-converted pairs is dropped)
-        # and disambiguate same-instrument positions by the closest open/close
-        # levels. Each transaction is consumed once.
-        remaining = list(transactions)
+        # and disambiguate same-instrument positions by execution time. Every
+        # (position, transaction) pair is scored, then consumed cheapest-first so
+        # the assignment is global rather than first-come: a per-position greedy
+        # loop let an early row take a later deal's transaction and cascaded the
+        # whole instrument's rows onto the wrong deals (a morning loss then
+        # displaying the afternoon's gain).
+        pairs = []
+        for index, position in enumerate(closed):
+            for txn_index, txn in enumerate(transactions):
+                if not self._names_match(position.epic_name, txn.get("instrumentName")):
+                    continue
+                cost = self._match_cost(position, txn)
+                if cost is None:
+                    continue
+                pairs.append((cost, index, txn_index))
+        pairs.sort()
+
+        matched_positions: set[int] = set()
+        matched_txns: set[int] = set()
         updated = 0
-        for position in closed:
-            candidates = [
-                t
-                for t in remaining
-                if self._names_match(position.epic_name, t.get("instrumentName"))
-            ]
-            if not candidates:
+        for _cost, index, txn_index in pairs:
+            if index in matched_positions or txn_index in matched_txns:
+                continue
+            matched_positions.add(index)
+            matched_txns.add(txn_index)
+            if self._apply_transaction(closed[index], transactions[txn_index]):
+                updated += 1
+
+        for index, position in enumerate(closed):
+            if index not in matched_positions:
                 logger.debug(
                     "No IG transaction matched closed position %s (%s)",
                     position.id,
                     position.epic,
                 )
-                continue
-            txn = min(candidates, key=lambda t: self._level_distance(position, t))
-            remaining.remove(txn)
-            if self._apply_transaction(position, txn):
-                updated += 1
 
         if updated:
             await self._db.commit()
@@ -1335,11 +1376,64 @@ class TradingService:
         return a[:n] == base[:n]
 
     @staticmethod
+    def _seconds_between(left: time | None, right: time | None) -> float | None:
+        """Absolute gap in seconds between two times of day.
+
+        Returns ``None`` when either side is missing so callers can fall back to
+        another discriminator instead of scoring the pair as a perfect match.
+        """
+        if left is None or right is None:
+            return None
+        return abs(
+            (left.hour * 3600 + left.minute * 60 + left.second + left.microsecond / 1e6)
+            - (
+                right.hour * 3600
+                + right.minute * 60
+                + right.second
+                + right.microsecond / 1e6
+            )
+        )
+
+    @classmethod
+    def _match_cost(cls, position: Position, txn: dict) -> float | None:
+        """Cost of pairing a closed position with an IG transaction, or ``None``
+        when they are too far apart in time to be the same deal.
+
+        Execution *times* are the discriminator, not levels: two deals on the
+        same instrument the same day sit at nearly identical prices, so level
+        distance regularly picked another position's transaction. Times also make
+        the match **idempotent** — ``time_open`` / ``time_close`` are the bot's
+        own clock and :meth:`_apply_transaction` never rewrites them, whereas the
+        level-based cost scored against ``level_open`` / ``level_close`` that a
+        previous (bad) match had already overwritten, so every rerun re-confirmed
+        the error.
+
+        The close gap dominates and the open gap breaks ties: the bot detects a
+        close within one sync cycle, and an adopted row's ``time_open`` comes
+        from IG's ``createdDateUTC``. Falls back to level distance only when the
+        transaction carries no usable timestamp at all.
+        """
+        close_gap = cls._seconds_between(
+            position.time_close, _parse_ig_utc_time(txn.get("dateUtc"))
+        )
+        open_gap = cls._seconds_between(
+            position.time_open, _parse_ig_utc_time(txn.get("openDateUtc"))
+        )
+        gaps = [gap for gap in (close_gap, open_gap) if gap is not None]
+        if not gaps:
+            return cls._level_distance(position, txn)
+        if max(gaps) > RECONCILE_MATCH_MAX_SECONDS:
+            return None
+        return 2.0 * (close_gap if close_gap is not None else open_gap) + (
+            open_gap or 0.0
+        )
+
+    @staticmethod
     def _level_distance(position: Position, txn: dict) -> float:
         """Sum of |open Δ| + |close Δ| between a position and a transaction.
 
-        Used to pick which transaction belongs to which position when several
-        share an instrument. Missing levels contribute nothing.
+        Last-resort discriminator when a transaction carries no timestamp (see
+        :meth:`_match_cost`). Missing levels contribute nothing.
         """
         distance = 0.0
         if position.level_open is not None:
@@ -1375,11 +1469,17 @@ class TradingService:
         ``/confirms`` round-trip) would run forever untracked, tying up margin
         with no open position shown — the bug this method now guards against.
 
+        Positions reconciled as ``closed_externally`` by this run are also
+        recorded on :attr:`reconciled_closed` (reset at each call) so the caller
+        can act on a broker-side stop-out it never observed itself — the
+        recovery-revert rule reads it to open the reverse side.
+
         Returns:
             Map of ``epic -> live IG entry`` ({"position": ..., "market": ...})
             for every position still open at IG, so callers can reuse the data
             without issuing a second request.
         """
+        self.reconciled_closed = []
         result = await self._db.execute(
             select(Position).where(Position.state == PositionState.OPEN)
         )
@@ -1510,6 +1610,7 @@ class TradingService:
                     if not await self._ig_position_gone(position):
                         continue  # still open / uncertain — retry on a later sync
                     self._reconcile_vanished(position)
+                    self.reconciled_closed.append(position)
                 dirty = True
                 continue
 

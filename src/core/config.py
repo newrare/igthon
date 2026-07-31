@@ -127,6 +127,23 @@ class Settings(BaseSettings):
     # the candle resolution (3x a 1-minute bar) to avoid churn on slow markets.
     streaming_stale_seconds: int = 180
 
+    # Rolling in-memory candle window kept per epic. This is a HARD CEILING on the
+    # history ANY strategy can see, whatever its own lookback says: a strategy
+    # declaring a longer window is silently evaluated on a truncated one (the
+    # scheduler logs a warning at startup when that happens). Raise this rather
+    # than shrinking a strategy parameter — the candles exist in the DB, it is the
+    # buffer that cuts them. See docs/DATAFLOW.md §3.
+    buffer_max_candles: int = 200  # ~3 h 20 of 1-minute candles
+
+    # Position monitoring is driven by candle ARRIVAL, not by a fixed clock (the
+    # cron job remains as a heartbeat). Candles for the ~40 streamed epics land
+    # together, so the trigger is debounced: the first arrival schedules one
+    # whole-book pass this many seconds later, and every other arrival in that
+    # window joins it. It must stay short (the whole point is cutting latency) but
+    # long enough to coalesce one wave — the group pre-pass needs every open
+    # position priced in the SAME pass. See docs/DATAFLOW.md §5.
+    monitor_debounce_seconds: float = 2.0
+
     # Open / stop / close selection — the trading decisions are decoupled and
     # chosen independently, and the ``.env`` file is the SINGLE source of truth:
     # there is no code default (empty string here), no database persistence and no
@@ -167,6 +184,24 @@ class Settings(BaseSettings):
     # means "missing from .env" and startup fails with an actionable message
     # instead of silently picking a policy (see ``validate_strategy_selection``).
     allow_same_day_reopen: bool | None = None
+
+    # Recovery-revert policy — GLOBAL to every open strategy (ALLOW_RECOVERY_REVERT).
+    # True: when a position (BUY or SELL) is taken out at a LOSS by the protective
+    # stop it was opened with, the bot immediately opens the opposite side on the
+    # same epic — the market walked through the level the trade was built on, so it
+    # follows the turn instead of waiting for a fresh signal on a market it just
+    # misread. The revert lifts the long-only gate (the reverse of a long is a
+    # short) and the ALLOW_SAME_DAY_REOPEN gate (the epic was just traded), but it
+    # is still an automatic open: the auto-open switch, the duplicate-epic gate and
+    # the "market closes soon" gate all apply. It is capped at ONE hop — a revert
+    # that is itself stopped out is never reverted back, so a choppy market cannot
+    # ping-pong the account. See src/execution/gates.py
+    # (``should_revert_after_stop_loss``) and BotScheduler._revert_after_stop_loss.
+    # False: a stop-out is simply a closed trade; the next open waits for a signal.
+    # REQUIRED like the selection names and the same-day policy: no code default,
+    # so ``None`` here means "missing from .env" and startup fails with an
+    # actionable message (see ``validate_strategy_selection``).
+    allow_recovery_revert: bool | None = None
 
     # Open strategies (open_donchian, open_projection, open_ranking), stop policies
     # (stop_support, stop_atr) and the close profile (close_zoneprofit) keep their

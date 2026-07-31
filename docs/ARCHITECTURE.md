@@ -17,6 +17,7 @@ igthon/
 │   │   ├── config.py       # pydantic-settings — loads .env
 │   │   ├── scheduler.py    # APScheduler jobs (thin: orchestration, no decisions)
 │   │   ├── indicators.py   # Technical indicators (regression, SMA, ROC, ATR, ER)
+│   │   ├── similarity.py   # Curve-shape signature + "same bet?" redundancy
 │   │   ├── recorder.py     # Structured logging + alerts
 │   │   ├── api_queue.py    # Single-worker queue — serialises all IG calls
 │   │   ├── api_guard.py    # Rate-limit tracker (per-second + per-minute)
@@ -37,7 +38,9 @@ igthon/
 │   ├── stops/              # ARRÊT — initial-stop placement (drives sizing)
 │   │   ├── base.py            # StopDistance → initial_stop()
 │   │   ├── stop_support.py    # Stop below a recency-weighted support
-│   │   └── stop_atr.py        # Flat stop_atr_k × ATR from the entry
+│   │   ├── stop_atr.py        # Flat stop_atr_k × ATR from the entry
+│   │   ├── stop_regression.py # Choppiness-scaled residual-noise band
+│   │   └── stop_linearspeed.py# Tight when the last 10 min accelerate, else structure
 │   ├── exit/               # FERMETURE — close profiles (own the whole exit)
 │   │   ├── base.py            # CloseProfile → OpenPlan / CloseDecision
 │   │   ├── trailing.py        # Pure close maths (decide_close_reason, trailing stop)
@@ -87,7 +90,14 @@ independently-tuned zones — open→break-even, break-even→margin, above-marg
 The same file carries `ALLOW_SAME_DAY_REOPEN`, a global open policy (required
 too): whether an epic may be opened more than once in the same day, in either
 direction. It is enforced by the shared pre-open gate and the rolling selector,
-so every entry strategy obeys it.
+so every entry strategy obeys it. `ALLOW_RECOVERY_REVERT` (required as well) is
+the second global open policy: when a position is stopped out at a loss on the
+stop it was **opened with**, the bot immediately opens the opposite side on the
+same epic to follow the reversal. The rule is pure
+(`execution/gates.should_revert_after_stop_loss`) and composed in
+`core/scheduler.BotScheduler._revert_after_stop_loss`, so it belongs to neither
+the entry nor the exit domain — it only reacts to a close and asks the shared open
+path for the reverse side.
 
 ______________________________________________________________________
 
@@ -118,9 +128,13 @@ ______________________________________________________________________
 
 ## Data flow
 
+The full time-and-data contract — what the feed sends, what is dropped, what each
+decision layer reads, and the latency budget — lives in
+[DATAFLOW.md](DATAFLOW.md). The summary below is the shape only.
+
 ```
 Lightstreamer feed (feed/streaming.py)
-      │  live 1-min candles
+      │  consolidated 1-min candles only (intra-candle frames are dropped)
       ▼
 IGStreamingClient ──persist──▶ CandleStore (DB candle table)
       │  on_candle callback
@@ -136,13 +150,21 @@ PriceBuffer (in-memory, per epic)
 BotScheduler ──▶ TradingService.open_from_intent() ──▶ POST /positions/otc
                                                      └▶ DB position (+close_profile)
 
-monitor tick:  CloseProfile.evaluate(position, bid, buffer)
-                 → HOLD / CLOSE(reason) / UPDATE_STOP
-                 → TradingService.manage_position() applies it
+monitoring pass:  CloseProfile.evaluate(position, bid, buffer)
+                    → HOLD / CLOSE(reason) / UPDATE_STOP
+                    → TradingService.manage_position() applies it
 ```
 
-On startup the buffer is **rehydrated** from the candle table (last 90 minutes by
-default) so indicators are immediately valid without waiting for live candles.
+A monitoring pass is triggered by the **arrival of candles** (debounced into one
+whole-book pass), with the 30 s cron kept as a heartbeat for when streaming is off
+or the feed goes silent. Both funnel through a single-flight guard, and both
+respect the job's manual/paused mode. See [DATAFLOW.md](DATAFLOW.md) for the
+latency budget and why the pass covers the whole book at once.
+
+On startup the buffer is **rehydrated** from the candle table with **today's**
+candles (from midnight UTC, capped at the buffer's capacity) so indicators are
+immediately valid without waiting for live candles — and without spending the IG
+historical-data allowance.
 
 ______________________________________________________________________
 
@@ -156,7 +178,10 @@ ______________________________________________________________________
 | `resume`   | Per-epic direction summary (day/week)         | Direction analysis                                                                                        |
 | `candle`   | 1-minute OHLC + volume                        | Rehydrates buffer on restart; archived per-week to CSV then pruned (see [BACKTESTING.md](BACKTESTING.md)) |
 
-**Not stored:** intraday tick-by-tick data — fetched on demand from `/prices` when needed.
+**Not stored — and not held anywhere at all:** market tick data. The finest
+granularity the bot ever sees is the 1-minute candle; `/prices` returns those same
+candles, not ticks. Sub-minute frames are received from the feed and dropped (see
+[DATAFLOW.md](DATAFLOW.md)).
 
 ______________________________________________________________________
 
@@ -184,7 +209,15 @@ of live price data. The REST `/prices` endpoint is used only as a **fallback** t
 1. Seed the buffer on first start (no candle history yet).
 1. Rehydrate after a gap in the feed.
 
-This avoids consuming the IG historical data allowance on every tick.
+This avoids consuming the IG historical data allowance on every cycle.
+
+The feed subscribes to `CHART:{epic}:1MINUTE` and keeps **only consolidated
+candles** (`CONS_END == "1"`); the sub-second frames that update the forming bar
+are dropped. That filter is **load-bearing**, not an optimisation: both write paths
+deduplicate on a strictly increasing timestamp and all frames of a minute share one
+timestamp, so letting partial frames through would keep the first sample of each
+minute and silently discard the finished candle. See
+[DATAFLOW.md](DATAFLOW.md) §6.
 
 ______________________________________________________________________
 

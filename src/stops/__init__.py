@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from src.stops.base import StopDistance
 from src.stops.stop_atr import StopAtr
+from src.stops.stop_hourlow import StopHourLow, noise_floor_distance, window_extreme
+from src.stops.stop_linearspeed import StopLinearSpeed, weighted_resistance
 from src.stops.stop_regression import StopRegression, residual_sigma
 from src.stops.stop_support import StopSupport, weighted_support
 
@@ -24,6 +26,8 @@ STOP_DISTANCES: dict[str, type[StopDistance]] = {
     StopAtr.name: StopAtr,
     StopSupport.name: StopSupport,
     StopRegression.name: StopRegression,
+    StopLinearSpeed.name: StopLinearSpeed,
+    StopHourLow.name: StopHourLow,
 }
 
 
@@ -46,8 +50,13 @@ __all__ = [
     "StopAtr",
     "StopSupport",
     "StopRegression",
+    "StopLinearSpeed",
+    "StopHourLow",
     "StopDistance",
     "get_stop_distance",
     "weighted_support",
+    "weighted_resistance",
     "residual_sigma",
+    "noise_floor_distance",
+    "window_extreme",
 ]

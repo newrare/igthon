@@ -94,6 +94,30 @@ class EntryStrategy(ABC):
     # least-bad of a tiny pool instead of the best of the day. ``0.5`` = strictly
     # more than half the universe must be ready to participate.
     min_participation_ratio: float = 0.5
+    # Absolute floor on the same warmed-up count, checked alongside the ratio
+    # above (both must pass). 0 (default) disables it. Use it instead of the ratio
+    # when the rule is a *count* rather than a fraction of the universe — e.g.
+    # ``open_steady`` requires strictly more than 20 candidate epics for a ranking
+    # to be valid, which no ratio expresses on a universe whose size drifts
+    # between 40 and 51 epics across a session.
+    min_participation_count: int = 0
+    # When True the rolling selector opens nothing while any open position is
+    # already *alive* — its software stop (``level_follower``) has ratcheted past
+    # ``level_margin`` while the close-out price is in profit, so the gain is
+    # locked in. The point is to stop adding risk once a winner is secured. A
+    # position that is merely *waiting* (flat since open, drifting between
+    # break-even and its stop, or heading for it) is NOT alive and does not block:
+    # it must never sit on an opportunity. False (default) keeps the historic
+    # behaviour, where only the count/wallet bounds limit opening.
+    block_open_while_alive: bool = False
+    # When True the rolling selector opens **nothing** while *any* position is
+    # open, whatever its state. Stricter and simpler than
+    # ``block_open_while_alive`` (which only steps aside for a secured winner):
+    # this is the "open in series" model — a basket is opened in one pass and the
+    # next basket waits for the book to be completely empty, so the strategy is
+    # always judged on a whole series rather than on a drip of overlapping trades.
+    # See :class:`~src.entry.open_five.OpenFive`.
+    require_flat_book: bool = False
     # NOTE: the same-day re-open policy is NOT a strategy knob. It is global to
     # every open strategy and read from ``ALLOW_SAME_DAY_REOPEN`` in .env: False
     # = one opening per epic per day (BUY or SELL), True = an epic is a candidate
@@ -134,3 +158,27 @@ class EntryStrategy(ABC):
             An :class:`EntryIntent` (direction only, no exit levels) when a
             setup is present, or ``None`` to stay flat.
         """
+
+    def filter_ranked(
+        self, ranked: list[tuple[EntryIntent, EpicBuffer]]
+    ) -> list[tuple[EntryIntent, EpicBuffer]]:
+        """Post-ranking, cross-epic filter — identity by default.
+
+        :meth:`evaluate` scores one epic in isolation, so it cannot see anything
+        that is a property of the *set* of winners. This hook runs once per
+        selection pass, after the scheduler has sorted the candidates
+        highest-score-first and before it starts opening them, and returns the
+        candidates it accepts, in the order they should be opened.
+
+        Consulted only for a ``cross_epic_selection`` ranker (the per-epic path
+        never builds a ranking). The list may be shortened or reordered but must
+        not be extended: every element has already passed :meth:`evaluate`, the
+        direction gate and the score floor.
+
+        The reason it exists: a basket-opening ranker must reject *duplicates of
+        shape* among its winners — two listings of the same commodity score alike
+        and would fill the basket with one bet taken several times. That is a
+        pairwise property, invisible to a per-epic score. See
+        :meth:`~src.entry.open_five.OpenFive.filter_ranked`.
+        """
+        return ranked

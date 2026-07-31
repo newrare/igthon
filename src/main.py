@@ -183,7 +183,9 @@ async def run_bot(
         with_web: Also start the FastAPI web interface.
     """
     settings = get_settings()
-    buffer = PriceBuffer(max_candles=200)
+    # The buffer window bounds every strategy's usable lookback, so it is a
+    # setting rather than a literal (see docs/DATAFLOW.md §3).
+    buffer = PriceBuffer(max_candles=settings.buffer_max_candles)
     recorder = Recorder(settings)
     session_factory = create_session_factory(settings)
     error_log = APIErrorLog(max_entries=20)

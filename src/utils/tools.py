@@ -6,6 +6,10 @@ General-purpose helpers for number formatting, data conversion, etc.
 import re
 from datetime import datetime, time
 
+#: The account's currency. Every euro figure in the project is expressed in it,
+#: and an instrument quoted in it needs no conversion at all.
+ACCOUNT_CURRENCY = "EUR"
+
 
 def _parse_ig_utc_time(value: object) -> time | None:
     """Parse an IG UTC datetime string into a naive UTC :class:`~datetime.time`.
@@ -74,15 +78,30 @@ def conversion_rate(instrument: dict, currency_code: str | None = None) -> float
     ``currency_code``, else the default currency, else the first one. Falls back
     to ``1.0`` (no conversion) when nothing is available.
 
-    Two rate fields exist and are reciprocals: ``exchangeRate`` is the
-    quote->account (EUR) rate we want; ``baseExchangeRate`` is its inverse
-    (account->quote). IG leaves ``exchangeRate`` as a ``1.0`` **placeholder** on
-    some markets (e.g. ``EDITS_ONLY`` / non-default currencies) while
-    ``baseExchangeRate`` keeps the real reference rate. Trusting that ``1.0`` for
-    a non-EUR quote currency silently under-states the euro risk (``euro_stop``)
-    by the whole conversion factor, so we invert ``baseExchangeRate`` instead.
+    An instrument **already quoted in the account currency** short-circuits to
+    ``1.0``: there is nothing to convert, whatever rate IG ships. This is not
+    theoretical — ``IX.D.DOW.IFE.IP`` ("Wall Street Cash (€1)", contract size 1,
+    €1 per point) advertises ``exchangeRate: 0.9`` next to
+    ``baseExchangeRate: 1.0``, seemingly the USD reference rate leaking onto a
+    euro-quoted market. Taking that 0.9 scaled every euro figure of the epic by
+    0.9 (checked against a real deal: 12.7429 points → IG's ``E-12.74``, so
+    1.00 €/point, not 0.90).
+
+    For a genuine foreign quote, two rate fields exist and are reciprocals:
+    ``exchangeRate`` is the quote->account rate we want; ``baseExchangeRate`` is
+    its inverse (account->quote). IG leaves ``exchangeRate`` as a ``1.0``
+    **placeholder** on some markets (e.g. ``EDITS_ONLY`` / non-default
+    currencies) while ``baseExchangeRate`` keeps the real reference rate.
+    Trusting that ``1.0`` silently under-states the euro risk (``euro_stop``) by
+    the whole conversion factor, so we invert ``baseExchangeRate`` instead.
     Example — London Cocoa (GBP): ``exchangeRate=1.0`` (placeholder),
     ``baseExchangeRate=0.854`` -> ``1 / 0.854 = 1.171`` (≈ the broker's 1.16).
+
+    Rates for foreign quotes remain an **estimate**: IG's figure is a reference
+    rate, not the one the deal is settled at. Every euro figure derived from it
+    (``euro_stop``, live P&L) is therefore approximate until
+    ``TradingService.reconcile_realized_pnl`` overwrites the realized P&L with
+    IG's own.
     """
     currencies = instrument.get("currencies") or []
     entry = None
@@ -95,11 +114,15 @@ def conversion_rate(instrument: dict, currency_code: str | None = None) -> float
     if not entry:
         return 1.0
     code = entry.get("code")
+    # Quoted in the account currency: no conversion exists, so no rate IG ships
+    # can be right other than 1.0 (see the docstring — some are not).
+    if code == ACCOUNT_CURRENCY:
+        return 1.0
     exchange = _to_float(entry.get("exchangeRate"), default=0.0)
     base = _to_float(entry.get("baseExchangeRate"), default=0.0)
-    # A 1.0 exchangeRate on a non-EUR currency is IG's placeholder, not a real
+    # A 1.0 exchangeRate on a foreign currency is IG's placeholder, not a real
     # 1:1 rate — prefer the reciprocal of baseExchangeRate when available.
-    placeholder = code not in (None, "EUR") and abs(exchange - 1.0) < 1e-9
+    placeholder = code is not None and abs(exchange - 1.0) < 1e-9
     if exchange > 0 and not placeholder:
         return exchange
     if base > 0:
@@ -118,6 +141,16 @@ def euro_per_point(
     is currency-aware (e.g. JPY pairs) and instrument-aware, unlike the legacy
     ``1 / scalingFactor`` heuristic. Returns ``0.0`` when the contract size is
     unknown so callers can fall back to the legacy estimate.
+
+    **This is an estimate, by design.** It is exact for an instrument quoted in
+    the account currency (rate 1.0), and approximate for a foreign quote, where
+    IG's ``exchangeRate`` is a reference rate rather than the one the deal
+    settles at — expect the order of magnitude, not the cent. Every figure
+    derived from it (``euro_stop``, live P&L, ``euro_max`` / ``euro_min``) carries
+    that approximation; only the realized ``euro`` is exact, because
+    ``TradingService.reconcile_realized_pnl`` replaces it with IG's own
+    ``profitAndLoss``. Audit any epic's resolved value with
+    ``python -m src.scripts.inspect_market <epic>``.
     """
     instrument = market_data.get("instrument", {})
     contract = _to_float(instrument.get("contractSize"), default=0.0)

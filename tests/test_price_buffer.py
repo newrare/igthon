@@ -100,3 +100,55 @@ class TestPriceBuffer:
         buffer = PriceBuffer(max_candles=10)
         buffer.add_candle("NEW_EPIC", _make_candle(150.0))
         assert buffer.get("NEW_EPIC").last.bid_close == 150.0
+
+
+class TestCapacityIsExplicit:
+    """The rolling window is a hard ceiling on every strategy's usable lookback.
+
+    It is exposed so the orchestration layer can compare it against a strategy's
+    declared warm-up instead of letting the strategy run, silently, on a truncated
+    window (see ``docs/DATAFLOW.md`` §3).
+    """
+
+    def test_max_candles_is_readable(self):
+        assert PriceBuffer(max_candles=42).max_candles == 42
+
+    def test_capacity_truncates_the_oldest_candles(self):
+        buffer = PriceBuffer(max_candles=3)
+        for i in range(6):
+            buffer.add_candle("EPIC_A", _make_candle(100.0 + i))
+        buf = buffer.get("EPIC_A")
+        assert len(buf) == 3
+        assert buf.bid_closes == [103.0, 104.0, 105.0]  # oldest three dropped
+
+
+class TestAppendDedup:
+    """``append_candles`` keeps only strictly newer candles.
+
+    This is what deduplicates overlapping ``/prices`` windows — and the reason the
+    feed must never forward partial candles: every frame of a minute shares one
+    timestamp, so the first one seen would win and the finished candle would be
+    dropped. Pinning the behaviour here makes that coupling visible.
+    """
+
+    def test_older_and_equal_timestamps_are_skipped(self):
+        buffer = PriceBuffer(max_candles=10)
+        buffer.append_candles("EPIC_A", [_make_candle(100.0, ts="2026-01-01 10:00")])
+
+        buffer.append_candles(
+            "EPIC_A",
+            [
+                _make_candle(999.0, ts="2026-01-01 09:59"),  # older
+                _make_candle(888.0, ts="2026-01-01 10:00"),  # same minute
+            ],
+        )
+
+        buf = buffer.get("EPIC_A")
+        assert len(buf) == 1
+        assert buf.last.bid_close == 100.0  # first seen for that minute wins
+
+    def test_a_strictly_newer_candle_is_appended(self):
+        buffer = PriceBuffer(max_candles=10)
+        buffer.append_candles("EPIC_A", [_make_candle(100.0, ts="2026-01-01 10:00")])
+        buffer.append_candles("EPIC_A", [_make_candle(101.0, ts="2026-01-01 10:01")])
+        assert buffer.get("EPIC_A").bid_closes == [100.0, 101.0]

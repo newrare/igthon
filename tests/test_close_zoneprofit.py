@@ -16,6 +16,7 @@ import pytest
 from src.core.indicators import atr
 from src.exit import CloseZoneProfit, get_close_profile
 from src.exit.base import ACTION_CLOSE, ACTION_HOLD, ACTION_UPDATE_STOP, CloseProfile
+from src.exit.zones import SmartGroupStop, StopUpdater
 from src.feed.price_buffer import Candle, EpicBuffer
 from src.stops import StopAtr, StopSupport
 
@@ -54,6 +55,18 @@ def _buffer(closes: list[float], spread: float = 0.5) -> EpicBuffer:
         )
         prev = close
     return buf
+
+
+class _FixedStop(StopUpdater):
+    """A zone updater that always proposes the same level (deterministic seam)."""
+
+    name = "fixed"
+
+    def __init__(self, level: float) -> None:
+        self._level = level
+
+    def propose(self, ctx):
+        return self._level
 
 
 def _position(**overrides) -> SimpleNamespace:
@@ -416,7 +429,7 @@ class TestGroupPrePass:
     def test_plan_group_empty_when_not_group_aware(self):
         assert get_close_profile(_settings()).plan_group([]) == {}
 
-    def test_plan_group_tightens_a_loser_against_a_winner(self):
+    def test_plan_group_tightens_the_whole_book(self):
         buf = _buffer([8000.0] * 20)
         prof = self._smart()
         winner = _position(
@@ -440,7 +453,10 @@ class TestGroupPrePass:
             prof.group_member(loser, 49.0, buf),
         ]
         plan = prof.plan_group(members)
-        assert 2 in plan and 1 not in plan
+        # The winner (+110 € at its candidate) carries the loser (−12 €), so the
+        # book is green and BOTH stops are raised onto their noise band.
+        assert set(plan) == {1, 2}
+        assert 110.0 < plan[1] < 111.0
         assert 30.0 < plan[2] < 49.0
 
     def test_evaluate_applies_group_tighten_underwater(self):
@@ -457,5 +473,50 @@ class TestGroupPrePass:
         pos = _position(level_open=8030.0, level_zero=8030.0, level_follower=8000.0)
         decision = self._smart().evaluate(
             pos, current_bid=8020.0, buf=buf, is_close_hour=False
+        )
+        assert decision.action == ACTION_HOLD
+
+    def test_evaluate_applies_group_tighten_in_the_breakeven_band(self):
+        # The group decision is book-wide: a position that has cleared break-even
+        # is tightened too, even though ``smartgroup`` is selected in zone 1.
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8000.0, level_zero=8000.0, level_margin=8010.0)
+        pos.level_follower = 8002.0
+        decision = self._smart().evaluate(
+            pos, current_bid=8015.0, buf=buf, is_close_hour=False, group_tighten=8012.0
+        )
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == 8012.0
+
+    def test_evaluate_applies_group_tighten_in_the_profit_zone(self):
+        # Profit trigger = 2×8010 − 8000 = 8020, so a bid at 8030 is in zone 3 and
+        # still takes the (tighter) group level, above the margin line.
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8000.0, level_zero=8000.0, level_margin=8010.0)
+        pos.level_follower = 8005.0
+        decision = self._smart().evaluate(
+            pos, current_bid=8030.0, buf=buf, is_close_hour=False, group_tighten=8029.0
+        )
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == 8029.0
+
+    def test_zone_proposal_wins_when_tighter_than_the_group_level(self):
+        # The group level never loosens what a zone updater already secured.
+        prof = CloseZoneProfit(underwater=SmartGroupStop(), trailing=_FixedStop(8028.0))
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8000.0, level_zero=8000.0, level_margin=8010.0)
+        pos.level_follower = 8005.0
+        decision = prof.evaluate(
+            pos, current_bid=8030.0, buf=buf, is_close_hour=False, group_tighten=8025.0
+        )
+        assert decision.new_stop_level == 8028.0
+
+    def test_group_level_is_ignored_by_a_non_group_profile(self):
+        # ``hold`` in zone 1: the profile is not group-aware, so a stray group
+        # level must not leak into the decision.
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8030.0, level_zero=8030.0, level_follower=8000.0)
+        decision = get_close_profile(_settings()).evaluate(
+            pos, current_bid=8020.0, buf=buf, is_close_hour=False, group_tighten=8015.0
         )
         assert decision.action == ACTION_HOLD

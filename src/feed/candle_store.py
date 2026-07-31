@@ -108,6 +108,15 @@ class CandleStore:
         Candles older than or equal to the latest stored timestamp are skipped,
         which deduplicates the overlapping windows returned by repeated bootstrap
         and incremental fetches. Returns the number of rows inserted.
+
+        Like :meth:`~src.feed.price_buffer.PriceBuffer.append_candles`, this is a
+        **strictly increasing** timestamp test and it relies on callers passing only
+        **consolidated** candles. Every Lightstreamer frame of one minute shares the
+        same ``UTM``: a partial frame reaching here would be stored and would then
+        make the real, finished candle for that minute fail the ``>`` test and be
+        discarded — silently poisoning the history the charts and the backtester
+        read. The ``CONS_END == "1"`` filter in :mod:`src.feed.streaming` is what
+        guarantees it (see ``docs/DATAFLOW.md`` §6).
         """
         if not candles:
             return 0

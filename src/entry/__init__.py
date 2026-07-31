@@ -19,6 +19,7 @@ from src.entry.base import EntryIntent, EntryStrategy
 from src.entry.open_allincrease import OpenAllIncrease
 from src.entry.open_donchian import OpenDonchian
 from src.entry.open_fade import OpenFade
+from src.entry.open_five import OpenFive
 from src.entry.open_linear import OpenLinear
 from src.entry.open_manual import OpenManual
 from src.entry.open_projection import OpenProjection
@@ -27,6 +28,7 @@ from src.entry.open_ranking import OpenRanking
 from src.entry.open_rebound import OpenRebound
 from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_slope import OpenSlope
+from src.entry.open_steady import OpenSteady
 from src.entry.open_testing import OpenTesting
 
 #: Name → class map. Keys are the valid ``OPEN_STRATEGY`` values.
@@ -34,6 +36,7 @@ ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenAllIncrease.name: OpenAllIncrease,
     OpenDonchian.name: OpenDonchian,
     OpenFade.name: OpenFade,
+    OpenFive.name: OpenFive,
     OpenLinear.name: OpenLinear,
     OpenManual.name: OpenManual,
     OpenProjection.name: OpenProjection,
@@ -42,6 +45,7 @@ ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenRebound.name: OpenRebound,
     OpenSafeRanking.name: OpenSafeRanking,
     OpenSlope.name: OpenSlope,
+    OpenSteady.name: OpenSteady,
     OpenTesting.name: OpenTesting,
 }
 
@@ -66,6 +70,7 @@ __all__ = [
     "OpenAllIncrease",
     "OpenDonchian",
     "OpenFade",
+    "OpenFive",
     "OpenLinear",
     "OpenManual",
     "OpenProjection",
@@ -74,6 +79,7 @@ __all__ = [
     "OpenRebound",
     "OpenSafeRanking",
     "OpenSlope",
+    "OpenSteady",
     "OpenTesting",
     "EntryIntent",
     "EntryStrategy",

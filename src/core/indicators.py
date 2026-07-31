@@ -157,27 +157,34 @@ def atr(candles: list[Candle], period: int = 14) -> float:
 def adverse_tick_noise(
     bid_closes: list[float], window: int = 20, std_k: float = 2.0
 ) -> float:
-    """Typical *adverse* (downward) tick-to-tick amplitude of the bid.
+    """Typical *adverse* (downward) close-to-close amplitude of the bid.
+
+    Despite the historical name, the "tick" here is one **1-minute candle close**,
+    not a market tick: the application holds no sub-minute data at all (see
+    ``docs/DATAFLOW.md`` §1). So this measures step-to-step *closing* moves, and it
+    complements ATR by looking at a different thing — ATR spans each bar's full
+    high-low range, this one only at what one bar's close gives back versus the
+    previous. Feeding it genuinely sub-minute prices would collapse the measured
+    amplitude and, with it, every trailing distance floored on it.
 
     Sizes a long's trailing stop off the noise that can actually hit it. Only
     downward moves are counted — for a long, upward jitter never triggers the
     stop, so a symmetric measure (mean ``|Δbid|``) would be inflated by the
     trend's upward drift and misstate the real pull-back risk. Each step
-    contributes ``max(0, bid[i-1] - bid[i])``; up-ticks contribute ``0``.
+    contributes ``max(0, bid[i-1] - bid[i])``; up-moves contribute ``0``.
 
     Returns ``mean(down) + std_k × std(down)``: the centre of the down-move
     distribution plus a volatility band, so the result sits *beyond* a normal
-    down-tick rather than at its average. This is the natural per-tick floor for
-    the trailing distance, complementing the (candle-based) ATR which does not
-    capture bid jitter.
+    adverse step rather than at its average — the natural per-candle floor for the
+    trailing distance.
 
     Args:
-        bid_closes: Ordered bid closes (oldest first).
+        bid_closes: Ordered bid closes (oldest first), one per candle.
         window: Number of most-recent steps to measure over.
         std_k: Multiplier on the down-move standard deviation.
 
     Returns:
-        The adverse tick-noise amplitude in price points, or 0.0 when there are
+        The adverse noise amplitude in price points, or 0.0 when there are
         fewer than two bids.
     """
     if window < 1 or len(bid_closes) < 2:
@@ -191,6 +198,38 @@ def adverse_tick_noise(
     mean = sum(downs) / len(downs)
     variance = sum((d - mean) ** 2 for d in downs) / len(downs)
     return mean + std_k * math.sqrt(variance)
+
+
+def band_noise(values: list[float]) -> float:
+    """Amplitude of the curve's wander around its own trend line.
+
+    Fits a least-squares line to ``values`` and returns the standard deviation of
+    the residuals. Being **detrended**, it answers "how thick is the band the
+    price oscillates in?" independently of how far the curve has travelled: a
+    clean ramp scores near ``0`` however steep it is, while a flat market chopping
+    inside a range scores about a quarter of that range's height.
+
+    This is the complement of :func:`atr` (per-candle movement) and
+    :func:`adverse_tick_noise` (tick-to-tick jitter): both grow with a strong
+    trend, so neither can tell a directional market from a noisy one. Pair it with
+    :func:`efficiency_ratio` to get the full picture — amplitude *and*
+    directionality — of the global curve state.
+
+    Args:
+        values: Ordered price series, oldest first (mid closes of the window).
+
+    Returns:
+        The residual standard deviation in price points, or ``0.0`` when there are
+        fewer than three values (a line through two points has no residual).
+    """
+    n = len(values)
+    if n < 3:
+        return 0.0
+    reg = linear_regression(values)
+    # OLS residuals are zero-mean by construction, so the variance is simply the
+    # mean of their squares.
+    residuals = (v - (reg.slope * i + reg.intercept) for i, v in enumerate(values))
+    return math.sqrt(sum(residual**2 for residual in residuals) / n)
 
 
 def trend_pct(values: list[float], period: int) -> tuple[float, float]:

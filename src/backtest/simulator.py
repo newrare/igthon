@@ -36,7 +36,7 @@ from src.entry.base import EntryStrategy
 from src.execution.gates import evaluate_open_gates
 from src.execution.trading import TradeConfig
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
-from src.feed.price_buffer import Candle, EpicBuffer
+from src.feed.price_buffer import DEFAULT_MAX_CANDLES, Candle, EpicBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -405,9 +405,12 @@ class StrategySimulator:
         #    candidate pool as soon as it holds no open position (the diversity
         #    ``used_today`` filter is skipped), so the same market can be opened
         #    several times in one day.
+        #  - require_flat_book: opens in *series* — nothing while any position is
+        #    still open, then the whole basket at once (``open_five``).
         wallet_bounded = getattr(self._entry, "wallet_bounded", False)
         cooldown_min = int(getattr(self._entry, "open_cooldown_minutes", 0) or 0)
         allow_reopen = bool(getattr(self._config, "allow_same_day_reopen", True))
+        require_flat_book = bool(getattr(self._entry, "require_flat_book", False))
         target = (
             len(curves)
             if wallet_bounded
@@ -454,6 +457,7 @@ class StrategySimulator:
                 cooldown_min=cooldown_min,
                 allow_reopen=allow_reopen,
                 last_open_ts=last_open_ts,
+                require_flat_book=require_flat_book,
             )
 
         # Force-close anything still open at the end of the day.
@@ -478,21 +482,30 @@ class StrategySimulator:
         cooldown_min: int = 0,
         allow_reopen: bool = False,
         last_open_ts: datetime | None = None,
+        require_flat_book: bool = False,
     ) -> datetime | None:
         """Score every eligible epic, rank by score, open the best into free slots.
 
         Mirror of the scheduler's rolling selector: candidates are epics that are
         not already open, not used earlier today (unless ``allow_reopen``), and
-        have enough buffered history to score. They are ranked highest-score-first
-        and opened (through the same gates as ``_run_day_gated``) until the target
-        position count is reached.
+        have enough buffered history to score. They are ranked highest-score-first,
+        passed through the strategy's cross-epic filter
+        (``filter_ranked`` — a no-op for every strategy but ``open_five``, which
+        removes duplicate curve shapes) and opened (through the same gates as
+        ``_run_day_gated``) until the target position count is reached.
 
         ``cooldown_min`` (> 0) paces the opens: while less than that many minutes
         have elapsed since ``last_open_ts`` the pass is a cheap no-op (no scoring),
         and when it does open it takes at most one position — so positions are
         staggered exactly as the live cooldown does. Returns the (possibly updated)
         ``last_open_ts`` for the caller to carry to the next tick.
+
+        ``require_flat_book`` mirrors the live series model: while anything is
+        still open the pass is a no-op, so a new basket is only opened from a
+        completely empty book.
         """
+        if require_flat_book and open_positions:
+            return last_open_ts  # a new series waits for a flat book
         slots = target - len(open_positions)
         if slots <= 0:
             return last_open_ts  # target met — cheap path
@@ -521,6 +534,23 @@ class StrategySimulator:
             return last_open_ts
         ranked.sort(key=lambda item: item[0], reverse=True)
         result.buy_signals += len(ranked)
+
+        # Cross-epic filter, exactly where the live selector applies it: after the
+        # sort, before any open. Identity for every strategy but ``open_five``,
+        # which drops the candidates duplicating a better-ranked curve's shape.
+        # Rebuilt from the returned (intent, buffer) pairs so a filtered-out
+        # candidate loses its slot and the next survivor inherits it. Keyed on the
+        # intent's identity rather than its epic: the hook returns the very objects
+        # it was given, and two synthetic curves may share a label.
+        by_intent = {id(intent): (score, e, intent) for score, e, intent in ranked}
+        ranked = [
+            by_intent[id(intent)]
+            for intent, _buf in self._entry.filter_ranked(
+                [(intent, buffers[e]) for _score, e, intent in ranked]
+            )
+        ]
+        if not ranked:
+            return last_open_ts
 
         # A paced strategy opens at most one position per cooldown window.
         max_opens = 1 if cooldown_min > 0 else slots
@@ -811,8 +841,12 @@ def run_close_visual(
         open_index = random.Random(seed ^ 0x5EED).randrange(warmup, last_open)
     open_index = max(warmup, min(open_index, num_candles - 2))
 
-    # Feed the warmup window into the buffer up to (and including) the open tick.
-    buf = EpicBuffer(epic="SIM", max_candles=num_candles + 1)
+    # Feed the warmup window into the buffer up to (and including) the open candle.
+    # Capped at the LIVE buffer window: an unbounded buffer here would let the close
+    # profile place its initial stop off more history than it can ever see in
+    # production, and the divergence flatters the backtest (a longer window finds
+    # deeper supports). ``min`` keeps short curves unaffected.
+    buf = EpicBuffer(epic="SIM", max_candles=min(num_candles + 1, DEFAULT_MAX_CANDLES))
     for candle in candles[: open_index + 1]:
         buf.add(candle)
 

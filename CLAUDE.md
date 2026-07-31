@@ -51,6 +51,7 @@ src/
 │   ├── config.py           # Settings via pydantic-settings
 │   ├── scheduler.py        # APScheduler jobs (thin: orchestration only)
 │   ├── indicators.py       # Technical analysis (regression, SMA, ROC, ATR, ER)
+│   ├── similarity.py       # Curve-shape signature + cross-epic "same bet?" test
 │   ├── recorder.py         # Logging + alerts
 │   ├── api_queue.py / api_guard.py / api_error_log.py
 │   └── api/                # IG HTTP client (client.py, session.py, endpoints/)
