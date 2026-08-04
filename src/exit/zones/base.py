@@ -6,30 +6,36 @@ the one a close would actually be filled at: the **bid** for a BUY (sell to
 close), the **offer** for a SELL (buy to close).
 
 - ``level_zero`` — the break-even level (the entry offer for a BUY, the entry bid
-  for a SELL);
+  for a SELL) — the **white** line on the dashboard chart;
 - ``level_margin`` — break-even plus the epic's noise margin *in the direction of
   profit* (above break-even for a BUY, below it for a SELL): the smallest move
-  that counts as real profit rather than bid/offer churn. It is the **ceiling of
-  where the raised stop is parked**, not a zone boundary;
+  that counts as real profit rather than bid/offer churn — the **dotted blue**
+  line;
 - ``level_profit`` — the *profit trigger*, one further noise margin past the
-  margin line (``2 × level_margin − level_zero``, which mirrors itself). It is
-  the boundary past which the stop trails progressively.
+  margin line (``2 × level_margin − level_zero``, which mirrors itself) — the
+  **dotted green** line, past which the stop trails progressively.
 
-That splits the price axis into three zones, each its own responsibility and its
+That splits the price axis into four zones, each its own responsibility and its
 own :class:`StopUpdater` (so each can be reasoned about and unit-tested alone):
 
-- :class:`StopZone.UNDERWATER` — price has not cleared break-even —
-  :class:`~src.exit.zones.underwater.UnderwaterStop`;
-- :class:`StopZone.BREAKEVEN_BAND` — past break-even, not yet past the profit
-  trigger — :class:`~src.exit.zones.breakeven_band.BreakevenBandStop`. Spans from
-  break-even up to the profit trigger (i.e. *across* the margin line): the raised
-  stop is parked on a support inside the break-even→margin band, and this zone
-  keeps governing while price hovers just past the margin. Extending it past the
-  margin is what stops price from skipping a break-even→margin band that is often
-  thinner than a single live poll's move;
-- :class:`StopZone.PROFIT` — past the profit trigger —
+- :class:`StopZone.UNDERWATER` — between the live follower (the red stop line)
+  and break-even — ``CLOSE_ZONESTART``,
+  :mod:`~src.exit.zones.underwater` / :mod:`~src.exit.zones.smartgroup`. Price has
+  not cleared break-even, so the whole zone is about reducing the risk carried;
+- :class:`StopZone.BREAKEVEN_BAND` — break-even → margin — ``CLOSE_ZONEMARGE``,
+  :mod:`~src.exit.zones.breakeven_band`. The delicate band where the gain is still
+  the size of ordinary churn;
+- :class:`StopZone.SECURE` — margin → profit trigger — ``CLOSE_ZONESECURE``,
+  :mod:`~src.exit.zones.secure`. The move has cleared the noise band but is not yet
+  a sustained trend: the zone's job is to secure the acquired gain with a single
+  deliberate stop, not to trail;
+- :class:`StopZone.PROFIT` — past the profit trigger — ``CLOSE_ZONEPROFIT``,
   :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`. Real, sustained
   profit: the stop trails progressively beyond the margin line.
+
+The margin→profit region used to be swallowed by the break-even band (zone 2 ran
+all the way to the profit trigger), so no updater was ever selected for it on its
+own. It is now :class:`StopZone.SECURE`, selected independently like the others.
 
 A :class:`~src.exit.base.CloseProfile` composes the three updaters: on each tick
 it classifies the zone and delegates to the matching updater, which returns a new
@@ -62,38 +68,41 @@ class StopZone(Enum):
 
     UNDERWATER = "underwater"
     BREAKEVEN_BAND = "breakeven_band"
+    SECURE = "secure"
     PROFIT = "profit"
 
 
 def classify_zone(
     current_price: float,
     level_zero: float,
+    level_margin: float,
     level_profit: float,
     sign: float = 1.0,
 ) -> StopZone:
     """Classify the live close-out price into a :class:`StopZone`.
 
-    Three open-frozen references split the price axis (see the module docstring):
-    break-even (``level_zero``), the margin line, and the profit trigger
-    (``level_profit`` — one noise margin past the margin line):
+    Three open-frozen references split the price axis into the four zones (see the
+    module docstring): break-even (``level_zero``), the margin line
+    (``level_margin``) and the profit trigger (``level_profit`` — one further noise
+    margin past the margin line):
 
     - ``UNDERWATER`` while price has not cleared break-even;
-    - ``BREAKEVEN_BAND`` from break-even up to the profit trigger — the whole
-      region in which the stop is parked on a support inside the
-      break-even→margin band. Deliberately extends *past* the margin line so the
-      margin-zone updater still governs while price hovers just past the margin
-      (the band between break-even and margin is often thinner than a single live
-      poll's move, so gating the profit zone on the margin line alone let price
-      skip the band entirely);
+    - ``BREAKEVEN_BAND`` from break-even up to the margin line;
+    - ``SECURE`` from the margin line up to the profit trigger — the move has
+      cleared the noise band, so the acquired gain is secured with one deliberate
+      stop while the trend is not yet established;
     - ``PROFIT`` once price clears the profit trigger — real, sustained profit,
       where the stop trails progressively beyond the margin line.
 
     ``sign`` is ``+1`` for a BUY (profit is up) and ``−1`` for a SELL (profit is
     down); the comparisons are written on the signed distance so both sides
-    classify with one rule.
+    classify with one rule. Each boundary belongs to the *lower* zone: price
+    exactly on the margin line is still in the break-even band.
     """
     if sign * (current_price - level_profit) > 0:
         return StopZone.PROFIT
+    if sign * (current_price - level_margin) > 0:
+        return StopZone.SECURE
     if sign * (current_price - level_zero) > 0:
         return StopZone.BREAKEVEN_BAND
     return StopZone.UNDERWATER
@@ -315,8 +324,8 @@ class StopUpdater(ABC):
     """Decides the stop move for one price zone.
 
     Each updater is a named, independently-selectable strategy for its zone: the
-    three zones are chosen separately in ``.env`` (``CLOSE_ZONESTART`` /
-    ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT``) and composed by
+    four zones are chosen separately in ``.env`` (``CLOSE_ZONESTART`` /
+    ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONESECURE`` / ``CLOSE_ZONEPROFIT``) and composed by
     :class:`~src.exit.close_zoneprofit.CloseZoneProfit`. Updaters are registered
     per zone in :mod:`src.exit.zones` and built through :func:`build_zone_updater`.
     """

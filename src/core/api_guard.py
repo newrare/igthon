@@ -4,9 +4,14 @@ IG published limits (non-trading):
   - 30 requests / minute per account
   - 60 requests / minute per API key (application-level)
 
-Guard defaults stay safely below both limits:
-  - max_per_minute=25  (margin under the 30/min account limit)
-  - max_per_second=3   (prevents burst; 3×60=180 theoretical, capped at 25/min)
+Runtime limits (``src/main.py``) stay at or below both, the per-minute cap being
+the binding one against ``error.public-api.exceeded-api-key-allowance``:
+  - max_per_minute=30  (per-account limit, and half the per-API-key limit)
+  - max_per_second=20  (burst ceiling only; the per-minute cap always bites first)
+
+Guard defaults are stricter still, for one-off scripts that share the same key:
+  - max_per_minute=25
+  - max_per_second=3
   - max_inflight=3     (limits truly concurrent in-flight HTTP calls so a quota
                         error from the first response can block the rest before
                         they are dispatched)

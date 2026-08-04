@@ -213,7 +213,7 @@ async function toggleAutoOpen(btn) {
 // there is no full-page reload, no scroll jump and no lost UI state.
 const PAUSE_KEY     = 'ig_refresh_paused';
 const POLL_INTERVAL = 1000; // ms
-const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-week', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-actions', 'refresh-logs'];
+const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-week', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-epic-result', 'refresh-actions', 'refresh-logs'];
 const btnPause  = document.getElementById('btn-pause');
 const footer    = document.getElementById('footer-refresh');
 
@@ -563,12 +563,12 @@ function closeClosedModal() {
     document.getElementById('closed-modal').style.display = 'none';
 }
 
-// ── Win Rate / Configuration modal ────────────────────────────────────────────
-function openWinRateModal() {
-    document.getElementById('winrate-modal').style.display = 'block';
+// ── Result per epic (today) / Configuration modal ─────────────────────────────
+function openEpicResultModal() {
+    document.getElementById('epic-result-modal').style.display = 'block';
 }
-function closeWinRateModal() {
-    document.getElementById('winrate-modal').style.display = 'none';
+function closeEpicResultModal() {
+    document.getElementById('epic-result-modal').style.display = 'none';
 }
 
 // ── Buy Confirmation Modal ────────────────────────────────────────────────────
@@ -644,7 +644,7 @@ document.addEventListener('keydown', function(e) {
         if (document.getElementById('epics-modal').style.display !== 'none') closeEpicsModal();
         if (document.getElementById('positions-modal').style.display !== 'none') closePositionsModal();
         if (document.getElementById('closed-modal').style.display !== 'none') closeClosedModal();
-        if (document.getElementById('winrate-modal').style.display !== 'none') closeWinRateModal();
+        if (document.getElementById('epic-result-modal').style.display !== 'none') closeEpicResultModal();
     }
 });
 
@@ -1234,6 +1234,36 @@ async function _loadChart(epic, initial) {
             }
         }
 
+        // Trailing gap — the feed has gone silent up to NOW. The x-axis auto-ranges
+        // to the last candle, so a dead subscription (or a market that closed mid
+        // session) otherwise renders as a chart that simply ends: visually
+        // indistinguishable from one that is up to date. Extend the view to now and
+        // shade the silent stretch with the same grey band as the internal gaps, so
+        // the outage reads at a glance instead of hiding at the right edge.
+        // ``now`` goes through the same Paris-naive → local-parse convention as the
+        // candle timestamps, so the two are directly comparable.
+        const nowParis = _toParisNaive(new Date().toISOString());
+        const nowMs = new Date(nowParis).getTime();
+        const lastCandleMs = candleMs.length ? candleMs[candleMs.length - 1] : null;
+        const silenceMs = lastCandleMs === null ? 0 : nowMs - lastCandleMs;
+        const feedSilent = silenceMs > GAP_MS;
+        if (feedSilent) {
+            gapRects.push({
+                type: 'rect', xref: 'x', yref: 'paper',
+                x0: timestamps[timestamps.length - 1], x1: nowParis, y0: 0, y1: 1,
+                fillcolor: 'rgba(148,163,184,0.14)', line: { width: 0 },
+                layer: 'below'
+            });
+        }
+
+        // Silence duration, as "42 min" / "2 h 07".
+        const _fmtSilence = function(ms) {
+            const mins = Math.round(ms / 60000);
+            return mins < 60
+                ? mins + ' min'
+                : Math.floor(mins / 60) + ' h ' + _pad2(mins % 60);
+        };
+
         // Rebuild a trace's parallel (x, y, customdata) arrays with a null point
         // inserted mid-gap, so Plotly breaks the line there (markers skip nulls).
         function breakGaps(ys, cds) {
@@ -1284,6 +1314,28 @@ async function _loadChart(epic, initial) {
         // Grey bands over the offline gaps sit under everything else.
         const shapes = gapRects.slice();
         const annotations = [];
+
+        // Make the trailing silence visible: an invisible anchor point at ``now``
+        // pulls the auto-ranged x-axis out to it (a shape alone does not extend the
+        // range, and keeping autorange is what preserves double-click zoom reset),
+        // and a label inside the grey band states how long the feed has been mute.
+        if (feedSilent) {
+            traces.push({
+                x: [nowParis], y: [50],
+                type: 'scatter', mode: 'markers',
+                marker: { color: 'rgba(0,0,0,0)', size: 1 },
+                hoverinfo: 'skip', showlegend: false,
+                name: 'now'
+            });
+            annotations.push({
+                xref: 'x', x: nowParis, xanchor: 'right',
+                yref: 'paper', y: 0.5, yanchor: 'middle',
+                text: 'no data · ' + _fmtSilence(silenceMs) + '  ',
+                showarrow: false,
+                font: { color: '#94a3b8', size: 10 },
+                bgcolor: 'rgba(28,23,20,0.7)'
+            });
+        }
 
         // Potential-loss suffix for a stop line: the euro P&L the OPEN trade
         // ``t`` would realise if the bid reached ``level``. Mirrors the server's
@@ -1462,13 +1514,13 @@ async function _loadChart(epic, initial) {
             // is exactly the spread; the bid curve reaching it = break-even.
             addLevelLine(t.zero, '#cbd5e1', 'solid', 'Break-even');
             // Margin line = break-even + noise margin (frozen at open): the
-            // CEILING of where the raised stop is parked (top of the
-            // break-even→margin band), NOT a zone boundary. Cyan, dashed, to sit
+            // boundary between the break-even band (zone 2, CLOSE_ZONEMARGE) and
+            // the secure zone (zone 3, CLOSE_ZONESECURE). Cyan, dashed, sitting
             // visually between break-even and the profit trailing.
             addLevelLine(t.margin, '#22d3ee', 'dash', 'Margin');
             // Profit trigger = margin + one more noise margin (frozen at open):
-            // the boundary between the break-even band (zone 2, CLOSE_ZONEMARGE)
-            // and real profit (zone 3, CLOSE_ZONEPROFIT). Above it the stop trails
+            // the boundary between the secure zone (zone 3, CLOSE_ZONESECURE) and
+            // real profit (zone 4, CLOSE_ZONEPROFIT). Above it the stop trails
             // progressively. Teal, dashed, sitting just above the Margin line.
             addLevelLine(t.profitTrigger, '#2dd4bf', 'dash', 'Profit');
             // Two protective stops, each its own line. Prefer the real stepped

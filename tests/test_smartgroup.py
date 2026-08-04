@@ -16,11 +16,15 @@ from src.exit.zones import (
     SmartGroupStop,
     StopContext,
     candidate_stop,
+    explain_group_tightening,
     plan_group_tightening,
 )
 from src.feed.price_buffer import EpicBuffer
 
-_P = SmartGroupParams()
+# Params for the core-rule tests: the two safety haircuts are switched off so the
+# expected euros stay the raw ``(level − open) × €/point`` arithmetic of the rule
+# itself. ``TestSafetyHaircuts`` below covers them with the production defaults.
+_P = SmartGroupParams(reconcile_margin_pct=0.0)
 
 
 def _member(
@@ -33,6 +37,7 @@ def _member(
     min_stop_distance: float = 0.2,
     noise: float = 0.3,
     sign: float = 1.0,
+    exec_slip: float = 0.0,
 ) -> GroupMember:
     """A group member; ``price`` is the live close-out price (bid / offer)."""
     return GroupMember(
@@ -44,6 +49,7 @@ def _member(
         min_stop_distance=min_stop_distance,
         noise=noise,
         sign=sign,
+        exec_slip=exec_slip,
     )
 
 
@@ -231,6 +237,125 @@ class TestValuedAtTheStopItKeeps:
         assert plan_group_tightening([_winner(), naked], _P) == {}
 
 
+class TestReport:
+    """The report explains the gate — a hold must be readable, not just empty.
+
+    The plan alone cannot say *why* nothing moved, so the monitor logs the report
+    instead. What must hold: the numbers it publishes are the ones the decision was
+    actually taken on.
+    """
+
+    def test_hold_publishes_the_total_it_was_refused_on(self):
+        # +197 € winner against a −198 € loser: one euro short of the 0 € gate.
+        loser = _member(2, level_open=50.0, level_follower=30.0, price=30.5)
+        report = explain_group_tightening([_winner(), loser], _P)
+        assert not report.armed and report.plan == {}
+        assert report.total_euro == pytest.approx(-1.0)
+        assert report.gate_euro == 0.0
+        # Both members are still movable — it is the book that held, not legality.
+        assert [v.tightens for v in report.valuations] == [True, True]
+
+    def test_armed_report_matches_the_plan(self):
+        report = explain_group_tightening([_winner(), _flat_loser(2)], _P)
+        assert report.armed
+        assert report.plan == plan_group_tightening([_winner(), _flat_loser(2)], _P)
+        assert report.total_euro == pytest.approx(189.0)
+
+    def test_a_kept_stop_is_reported_at_the_level_it_keeps(self):
+        winner = _winner(level_follower=119.9)
+        report = explain_group_tightening([winner, _flat_loser(2)], _P)
+        kept = next(v for v in report.valuations if v.position_id == 1)
+        assert not kept.tightens
+        assert kept.candidate == pytest.approx(119.7)
+        assert kept.valued_at == pytest.approx(119.9)  # its own stop, not the candidate
+        assert kept.euro == pytest.approx(199.0)
+
+    def test_unpriceable_members_are_listed_not_valued(self):
+        report = explain_group_tightening(
+            [_winner(), _winner(2, euro_per_point=0.0)], _P
+        )
+        assert report.unpriceable == [2]
+        assert [v.position_id for v in report.valuations] == [1]
+
+    def test_disarming_member_is_named(self):
+        naked = _member(
+            2,
+            level_open=50.0,
+            level_follower=0.0,
+            price=49.5,
+            noise=0.0,
+            min_stop_distance=0.0,
+        )
+        report = explain_group_tightening([_winner(), naked], _P)
+        assert report.disarmed_by == 2
+        assert not report.armed and report.plan == {}
+
+
+class TestSafetyHaircuts:
+    """The book is valued net of what the exit really costs, not at the stop level.
+
+    Valuing at the stop itself is what let a +99 € winner book +64.84 € and drag
+    a "green" book into the red: the fill lands past the stop, and IG's booked
+    euros differ from our own arithmetic. Both corrections are pessimistic and
+    touch the *valuation only* — never the levels the plan places.
+    """
+
+    def test_execution_slip_values_a_long_below_its_stop(self):
+        # Candidate 119.7, 0.5 of slip → valued at 119.2 instead: 5 € less.
+        plain = _winner()
+        slipped = _winner(exec_slip=0.5)
+        assert explain_group_tightening([plain], _P).total_euro == pytest.approx(197.0)
+        assert explain_group_tightening([slipped], _P).total_euro == pytest.approx(
+            192.0
+        )
+
+    def test_execution_slip_values_a_short_above_its_stop(self):
+        # A short profits when price falls, so its adverse side is upward.
+        short = _member(
+            1,
+            level_open=100.0,
+            level_follower=105.0,
+            price=95.0,
+            sign=-1.0,
+            exec_slip=0.5,
+        )
+        report = explain_group_tightening([short], _P)
+        assert report.valuations[0].candidate == pytest.approx(95.3)
+        assert report.valuations[0].valued_at == pytest.approx(95.8)
+        assert report.total_euro == pytest.approx(42.0)
+
+    def test_execution_slip_does_not_move_the_stop_that_is_placed(self):
+        # The haircut is a valuation, not a level: the plan still parks the stop
+        # on the candidate, otherwise the book would give away real protection.
+        report = explain_group_tightening([_winner(exec_slip=0.5)], _P)
+        assert report.plan == {1: pytest.approx(119.7)}
+
+    def test_reconciliation_margin_shrinks_a_gain(self):
+        params = SmartGroupParams(reconcile_margin_pct=0.02)
+        assert explain_group_tightening(
+            [_winner()], params
+        ).total_euro == pytest.approx(197.0 * 0.98)
+
+    def test_reconciliation_margin_deepens_a_loss(self):
+        params = SmartGroupParams(reconcile_margin_pct=0.02)
+        assert explain_group_tightening(
+            [_flat_loser(1)], params
+        ).total_euro == pytest.approx(-8.0 * 1.02)
+
+    def test_both_haircuts_are_on_by_default(self):
+        params = SmartGroupParams()
+        assert params.exec_slip_k > 0
+        assert params.reconcile_margin_pct > 0
+
+    def test_a_book_green_only_on_paper_no_longer_arms(self):
+        # The live case: a winner counted at its follower carries two losers over
+        # the gate. Charge the exit what it really costs and the claim collapses.
+        winner = _winner(price=120.0, exec_slip=1.0)
+        losers = [_member(2, level_open=50.0, level_follower=30.5, price=31.0)]
+        assert explain_group_tightening([_winner(), *losers], _P).armed
+        assert not explain_group_tightening([winner, *losers], _P).armed
+
+
 class TestSmartGroupStop:
     """The updater is a pure reader of the pre-resolved group decision."""
 
@@ -261,5 +386,15 @@ class TestSmartGroupStop:
         assert SmartGroupStop.name == "smartgroup"
 
     def test_plan_delegates_to_pure_function(self):
+        # Against the *production* params (not the haircut-free ``_P``): the
+        # updater must run the rule the live book is gated on.
         members = [_winner(), _flat_loser(2)]
-        assert SmartGroupStop().plan(members) == plan_group_tightening(members, _P)
+        assert SmartGroupStop().plan(members) == plan_group_tightening(
+            members, SmartGroupParams()
+        )
+
+    def test_explain_delegates_to_pure_function(self):
+        members = [_winner(), _flat_loser(2)]
+        assert SmartGroupStop().explain(members) == explain_group_tightening(
+            members, SmartGroupParams()
+        )

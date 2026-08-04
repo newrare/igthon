@@ -262,6 +262,129 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
     return "—", "#64748b"
 
 
+# ``reason_close`` values that mean the exit was imposed from outside the close
+# plan (a clock, a human, or IG itself) rather than decided by a price level.
+_FORCED_CLOSE_REASONS = {
+    "end_of_day",
+    "manual",
+    "now",
+    "closed_externally",
+    "not_found_in_ig",
+}
+
+# A stop-out reached within this window of the open is read as "the stop was
+# sitting inside the market's own noise", not as a genuine adverse move.
+_QUICK_STOP_SECONDS = 180
+# Initial stop closer than this many spreads from the entry: same conclusion.
+_TIGHT_STOP_SPREADS = 2.0
+# A loss no bigger than this multiple of the spread cost never really moved
+# against us — it is the round trip itself that was paid.
+_SPREAD_LOSS_MULT = 1.2
+
+
+def _initial_stop_level(position: Position) -> float | None:
+    """Protective stop level the position was opened with, or ``None``.
+
+    ``level_stop`` is ratcheted in place, so the *initial* level is read from the
+    first ``stop_history`` point (seeded at open) when one exists and only falls
+    back to the current column for legacy rows without a history.
+    """
+    history = getattr(position, "stop_history", None)
+    if history:
+        first = history[0]
+        if isinstance(first, dict):
+            level = first.get("broker") or first.get("level")
+            if level:
+                return float(level)
+    if position.level_stop:
+        return float(position.level_stop)
+    return None
+
+
+def _held_seconds(position: Position) -> float | None:
+    """How long the position stayed open, in seconds (``None`` when unknown)."""
+    if position.time_open is None or position.time_close is None:
+        return None
+    day = position.date or date.today()
+    opened = datetime.combine(day, position.time_open, tzinfo=UTC)
+    closed = datetime.combine(day, position.time_close, tzinfo=UTC)
+    return (closed - opened).total_seconds()
+
+
+def _loss_explanation(position: Position, pnl: float) -> str:
+    """One-sentence, human-readable diagnosis of *why* a trade lost money.
+
+    Five archetypes, tested in order of how strongly the stored data supports
+    them (an imposed exit tells us more than a price pattern, a ratcheted stop
+    more than a bare stop-out). Returns an empty string for a winning trade —
+    a gain needs no excuse.
+    """
+    if pnl >= 0:
+        return ""
+
+    if position.reason_close in _FORCED_CLOSE_REASONS:
+        return (
+            "Forced exit — the position was closed by the clock, by hand or by IG "
+            "itself, before the close plan had reached any of its levels."
+        )
+
+    spread = float(position.pip_spread) if position.pip_spread else None
+    epp = (
+        float(position.euro_per_point)
+        if getattr(position, "euro_per_point", None)
+        else None
+    )
+    spread_cost = spread * epp if (spread and epp) else None
+    if spread_cost and abs(pnl) <= spread_cost * _SPREAD_LOSS_MULT:
+        return (
+            "Spread never earned back — price ended where it started and the loss "
+            "is essentially the cost of crossing the spread once."
+        )
+
+    history = getattr(position, "stop_history", None)
+    if history and len(history) > 1:
+        return (
+            "Gain given back — the trade moved into profit and ratcheted its stop "
+            "up, then reversed and was stopped out below break-even."
+        )
+
+    held = _held_seconds(position)
+    entry = float(position.level_open) if position.level_open else None
+    stop = _initial_stop_level(position)
+    stop_distance = (
+        abs(entry - stop) if (entry is not None and stop is not None) else None
+    )
+    too_tight = (held is not None and held <= _QUICK_STOP_SECONDS) or (
+        stop_distance is not None
+        and spread is not None
+        and stop_distance <= spread * _TIGHT_STOP_SPREADS
+    )
+    if too_tight:
+        return (
+            "Stop too tight — the protective stop sat inside the instrument's own "
+            "noise and was taken out almost immediately after the entry."
+        )
+
+    return (
+        "Market reversed after the open — the move turned against the position "
+        "right after the entry and never came back to break-even."
+    )
+
+
+def _epic_day_pnls(positions: list[Position]) -> dict[str, float]:
+    """Net today's closed positions per epic: ``{epic: realized euro P&L}``.
+
+    An epic traded twice in the day is netted into a single figure — the "Avg /
+    epic" tile measures instruments, not trades, so the two sides of a round trip
+    on the same market must not count as two independent results. The modal
+    behind the tile still lists every open/close cycle individually.
+    """
+    totals: dict[str, float] = {}
+    for p in positions:
+        totals[p.epic] = totals.get(p.epic, 0.0) + _display_pnl(p)
+    return totals
+
+
 def _display_pnl(position: Position) -> float:
     """Return the P&L to display for a closed position.
 
@@ -426,30 +549,25 @@ async def _gather_dashboard_state(request: Request) -> dict:
                 wins / len(closed_positions) if closed_positions else 0.0
             )
 
-            # Win rate KPI is computed over ALL closed positions (whole history),
-            # not just today, so it reflects the full track record. The "CLOSED"
-            # tile and the closed modal stay scoped to today.
-            all_closed = await session.scalars(
-                select(Position).where(Position.state == PositionState.CLOSE)
+            # Per-epic result for the CURRENT day: what one closed instrument
+            # earned or cost on average. A raw win rate says nothing about size —
+            # nine 1 € wins and one 40 € loss score 90 % and still lose the day —
+            # so the tile carries the average euro result per closed epic instead
+            # (an epic traded twice in the day counts once, netted), and the modal
+            # lists every open/close cycle behind it, worst first.
+            epic_pnls = list(_epic_day_pnls(closed_positions).values())
+            epic_wins = [v for v in epic_pnls if v > 0]
+            epic_losses = [v for v in epic_pnls if v < 0]
+            kpis["closed_epics"] = len(epic_pnls)
+            kpis["avg_pnl_per_epic"] = (
+                sum(epic_pnls) / len(epic_pnls) if epic_pnls else 0.0
             )
-            total_wins = 0
-            total_losses = 0
-            total_closed = 0
-            for p in all_closed:
-                # Exclude never_opened phantoms (unconfirmed orders) from the
-                # whole-history track record, same as the daily figures above.
-                if p.reason_close == "never_opened":
-                    continue
-                total_closed += 1
-                pnl_val = _display_pnl(p)
-                if pnl_val > 0:
-                    total_wins += 1
-                elif pnl_val < 0:
-                    total_losses += 1
-            kpis["total_wins"] = total_wins
-            kpis["total_losses"] = total_losses
-            kpis["total_closed"] = total_closed
-            kpis["win_rate"] = total_wins / total_closed if total_closed else 0.0
+            kpis["winning_epics"] = len(epic_wins)
+            kpis["losing_epics"] = len(epic_losses)
+            kpis["avg_epic_win"] = sum(epic_wins) / len(epic_wins) if epic_wins else 0.0
+            kpis["avg_epic_loss"] = (
+                sum(epic_losses) / len(epic_losses) if epic_losses else 0.0
+            )
 
             # Day history (last 30 days)
             thirty_ago = today - timedelta(days=30)
@@ -474,10 +592,12 @@ async def _gather_dashboard_state(request: Request) -> dict:
             "wins": 0,
             "losses": 0,
             "win_rate_today": 0.0,
-            "total_wins": 0,
-            "total_losses": 0,
-            "total_closed": 0,
-            "win_rate": 0.0,
+            "closed_epics": 0,
+            "avg_pnl_per_epic": 0.0,
+            "winning_epics": 0,
+            "losing_epics": 0,
+            "avg_epic_win": 0.0,
+            "avg_epic_loss": 0.0,
         }
 
     # "As of" time of the open P&L figures — the last successful IG position
@@ -492,6 +612,14 @@ async def _gather_dashboard_state(request: Request) -> dict:
         )
     else:
         kpis["open_pnl_as_of"] = None
+
+    # What the whole book would bank if every open position were closed at the
+    # stop the group pre-pass plans for it — always more pessimistic than the live
+    # unrealized total above (each candidate stop sits one noise cushion the wrong
+    # side of its price). None when no group-aware close profile is selected or
+    # the last pass could not value the book.
+    group_book = getattr(scheduler, "group_book", None) if scheduler else None
+    kpis["group_book_euro"] = group_book.total_euro if group_book else None
 
     kpis["all_epics_count"] = len(all_epics)
     kpis["epic_kpi_color"] = epic_kpi_color
@@ -575,3 +703,13 @@ def _bid_pct(bid: float, low: float, high: float) -> float:
 def _pnl_color(value: float) -> str:
     """Green for a non-negative P&L, red otherwise (dashboard convention)."""
     return "#4ade80" if value >= 0 else "#ef4444"
+
+
+def _unrealized_pnl_color(value: float) -> str:
+    """Colour for a P&L that is only *potential* (open positions).
+
+    Deliberately muted next to the realized convention above — dark green instead
+    of green, orange instead of red — so a glance at the KPI bar tells banked
+    money apart from money the market has not paid yet.
+    """
+    return "#15803d" if value >= 0 else "#f97316"

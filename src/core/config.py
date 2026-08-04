@@ -108,6 +108,15 @@ class Settings(BaseSettings):
     candle_retention_days: int = 7
     candle_dump_dir: str = "./dumps"
 
+    # Backtest contract table — epic → € per point, so an offline backtest can
+    # report a euro P&L. The candle archive holds prices only (no contract size,
+    # no quote currency), and a single global € / point would flatten every forex
+    # trade to 0.00 €, so the value is captured once per epic from /markets by
+    # ``python -m src.scripts.dump_euro_per_point`` and read from this file.
+    # A missing file is not an error: the backtest still reports counts and
+    # percentage returns, and names the epics it could not price.
+    backtest_contract_file: str = "./config/euro_per_point.json"
+
     # API queue — serialises and throttles all IG API calls
     queue_max_attempts: int = 3  # 3-strike budget for transient errors
     queue_retry_margin_seconds: int = 5  # margin added on top of the guard cooldown
@@ -154,21 +163,23 @@ class Settings(BaseSettings):
     # simulator, dashboard) is shared. Registered names: src/entry/__init__.py,
     # src/stops/__init__.py and src/exit/zones/__init__.py.
     #
-    # The close side is split into THREE independent zones (the single composer
+    # The close side is split into FOUR independent zones (the single composer
     # profile ``close_zoneprofit`` wires one updater per zone), each selected on
-    # its own so its behaviour can be tuned without influencing the other two:
-    #   CLOSE_ZONESTART  — open → break-even   (ZONESTART_UPDATERS)
-    #   CLOSE_ZONEMARGE  — break-even → margin (ZONEMARGE_UPDATERS)
-    #   CLOSE_ZONEPROFIT — above the margin    (ZONEPROFIT_UPDATERS)
+    # its own so its behaviour can be tuned without influencing the other three:
+    #   CLOSE_ZONESTART  — follower → break-even   (ZONESTART_UPDATERS)
+    #   CLOSE_ZONEMARGE  — break-even → margin     (ZONEMARGE_UPDATERS)
+    #   CLOSE_ZONESECURE — margin → profit trigger (ZONESECURE_UPDATERS)
+    #   CLOSE_ZONEPROFIT — above the profit trigger (ZONEPROFIT_UPDATERS)
     #
     # Each field is REQUIRED: a missing/empty or unknown value makes startup fail
     # with a clear "configure your .env" message (see
     # ``validate_strategy_selection`` in src/core/scheduler.py).
     open_strategy: str = ""  # e.g. open_ranking / open_saferanking / open_allincrease
     stop_strategy: str = ""  # e.g. stop_support / stop_atr
-    close_zonestart: str = ""  # zone open→break-even   (e.g. hold)
-    close_zonemarge: str = ""  # zone break-even→margin (e.g. hold)
-    close_zoneprofit: str = ""  # zone above margin      (e.g. trailing_ratchet)
+    close_zonestart: str = ""  # zone follower→break-even  (e.g. hold)
+    close_zonemarge: str = ""  # zone break-even→margin    (e.g. limitloose)
+    close_zonesecure: str = ""  # zone margin→profit        (e.g. breakeven_half)
+    close_zoneprofit: str = ""  # zone above profit trigger (e.g. trailing_ratchet)
 
     # Same-day re-open policy — GLOBAL to every open strategy (ALLOW_SAME_DAY_REOPEN).
     # False: an epic may be opened at most ONCE per day. Whatever the direction

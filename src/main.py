@@ -189,7 +189,7 @@ async def run_bot(
     recorder = Recorder(settings)
     session_factory = create_session_factory(settings)
     error_log = APIErrorLog(max_entries=20)
-    guard = APIGuard(max_per_minute=50, max_per_second=25)
+    guard = APIGuard(max_per_minute=30, max_per_second=20)
 
     # The .env file is the single source of truth for the open / stop / close
     # selection. Validate it up front: a missing or unknown name must not start

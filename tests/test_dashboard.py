@@ -37,6 +37,7 @@ _FRAGMENT_KEYS = {
     "epic_list_modal",
     "positions_modal",
     "closed_positions_modal",
+    "epic_result_modal",
     "actions",
     "logs_section",
 }
@@ -53,10 +54,12 @@ def _base_kpis() -> dict:
         "wins": 0,
         "losses": 0,
         "win_rate_today": 0.0,
-        "total_wins": 0,
-        "total_losses": 0,
-        "total_closed": 0,
-        "win_rate": 0.0,
+        "closed_epics": 0,
+        "avg_pnl_per_epic": 0.0,
+        "winning_epics": 0,
+        "losing_epics": 0,
+        "avg_epic_win": 0.0,
+        "avg_epic_loss": 0.0,
         "all_epics_count": 100,
         "epic_kpi_color": "#4ade80",
         "refresh_label": "Today 10:00",
@@ -117,6 +120,7 @@ def _settings() -> SimpleNamespace:
         stop_strategy="stop_support",
         close_zonestart="hold",
         close_zonemarge="hold",
+        close_zonesecure="hold",
         close_zoneprofit="trailing_ratchet",
         web_port=8000,
         # Extra knobs read by TradeConfig.from_settings (manual-open path).
@@ -264,7 +268,7 @@ class TestBuildFragments:
                 "closed_trades": 1,
                 "daily_pnl": 12.5,
                 "wins": 1,
-                "win_rate": 1.0,
+                "win_rate_today": 1.0,
             },
         )
         modal = _build_fragments(state)["closed_positions_modal"]
@@ -285,6 +289,173 @@ class TestBuildFragments:
     def test_closed_positions_modal_empty_state(self):
         modal = _build_fragments(_base_state())["closed_positions_modal"]
         assert "No closed positions" in modal
+
+
+def _closed(epic: str, name: str, pnl: float, **overrides) -> SimpleNamespace:
+    """Closed position stand-in carrying the columns the per-epic stats read."""
+    base = dict(
+        epic=epic,
+        epic_name=name,
+        date=date(2026, 6, 8),
+        time_open=time(10, 0, 0),
+        time_close=time(11, 0, 0),
+        direction="BUY",
+        level_open=18000.0,
+        level_close=18010.0,
+        level_stop=17900.0,
+        pip_spread=1.0,
+        euro_per_point=1.0,
+        quantity=1,
+        euro=pnl,
+        reason_open="auto",
+        reason_close="loose" if pnl < 0 else "win",
+        stop_history=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class TestEpicDayPnls:
+    """Per-epic daily netting feeding the "Avg / epic" tile."""
+
+    def test_positions_are_netted_per_epic(self):
+        from src.web.routes.dashboard.state import _epic_day_pnls
+
+        totals = _epic_day_pnls(
+            [
+                _closed("DAX", "DAX", -4.0),
+                _closed("DAX", "DAX", 10.0),
+                _closed("CAC", "CAC", -20.0),
+            ]
+        )
+        # Two trades on DAX count as ONE instrument result, netted.
+        assert set(totals) == {"DAX", "CAC"}
+        assert totals["DAX"] == pytest.approx(6.0)
+        assert totals["CAC"] == pytest.approx(-20.0)
+
+
+class TestLossExplanation:
+    """The five loss archetypes surfaced next to a losing epic."""
+
+    def test_no_explanation_for_a_winner(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        assert _loss_explanation(_closed("A", "A", 5.0), 5.0) == ""
+
+    def test_forced_exit(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        pos = _closed("A", "A", -20.0, reason_close="end_of_day")
+        assert "Forced exit" in _loss_explanation(pos, -20.0)
+
+    def test_spread_only_loss(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        # Spread cost = 2 points × 3 €/point = 6 €; a 5 € loss never really moved.
+        pos = _closed("A", "A", -5.0, pip_spread=2.0, euro_per_point=3.0)
+        assert "Spread never earned back" in _loss_explanation(pos, -5.0)
+
+    def test_gain_given_back_when_the_stop_ratcheted(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        pos = _closed(
+            "A",
+            "A",
+            -20.0,
+            stop_history=[
+                {"t": "2026-06-08T10:00:00Z", "level": 17900.0},
+                {"t": "2026-06-08T10:30:00Z", "level": 18010.0},
+            ],
+        )
+        assert "Gain given back" in _loss_explanation(pos, -20.0)
+
+    def test_stop_too_tight_when_stopped_out_immediately(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        pos = _closed("A", "A", -20.0, time_close=time(10, 1, 0))
+        assert "Stop too tight" in _loss_explanation(pos, -20.0)
+
+    def test_stop_too_tight_when_the_stop_sits_inside_the_spread(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        # Stop 1 point away with a 1-point spread: inside the instrument's noise.
+        pos = _closed("A", "A", -20.0, level_stop=17999.0)
+        assert "Stop too tight" in _loss_explanation(pos, -20.0)
+
+    def test_market_reversed_is_the_default(self):
+        from src.web.routes.dashboard.state import _loss_explanation
+
+        pos = _closed("A", "A", -20.0)
+        assert "Market reversed after the open" in _loss_explanation(pos, -20.0)
+
+
+class TestEpicResultModal:
+    """The per-epic result modal (opened from the "Avg / epic" tile)."""
+
+    def test_rows_ordered_worst_first_with_explanations(self):
+        state = _base_state(
+            closed_positions=[
+                _closed("IX.D.DAX.IFMM.IP", "DAX", 15.0),
+                _closed("IX.D.CAC.IFMM.IP", "CAC", -25.0),
+            ],
+            kpis={
+                **_base_kpis(),
+                "closed_epics": 2,
+                "avg_pnl_per_epic": -5.0,
+                "winning_epics": 1,
+                "losing_epics": 1,
+                "avg_epic_win": 15.0,
+                "avg_epic_loss": -25.0,
+            },
+        )
+        modal = _build_fragments(state)["epic_result_modal"]
+        assert modal.index("CAC") < modal.index("DAX")  # biggest loss first
+        assert "-25.00€" in modal and "+15.00€" in modal
+        assert "Market reversed after the open" in modal
+        assert "openChartModal('IX.D.CAC.IFMM.IP', event)" in modal
+
+    def test_one_row_per_open_close_cycle(self):
+        # Two trades on the same epic stay two lines, each with its own result.
+        state = _base_state(
+            closed_positions=[
+                _closed("IX.D.DAX.IFMM.IP", "DAX", 10.0, time_close=time(11, 0, 0)),
+                _closed("IX.D.DAX.IFMM.IP", "DAX", -4.0, time_close=time(15, 0, 0)),
+            ]
+        )
+        modal = _build_fragments(state)["epic_result_modal"]
+        assert modal.count("openChartModal('IX.D.DAX.IFMM.IP', event)") == 2
+        assert "-4.00€" in modal and "+10.00€" in modal
+        # Close times (Paris) distinguish the two lines: 11:00 UTC -> 13:00 CEST.
+        assert "13:00:00" in modal and "17:00:00" in modal
+        # Aggregate-only columns are gone.
+        assert "W / L" not in modal and "Trades" not in modal
+
+    def test_empty_state(self):
+        modal = _build_fragments(_base_state())["epic_result_modal"]
+        assert "No epic closed today" in modal
+
+    def test_tile_shows_average_per_epic_and_opens_the_modal(self):
+        state = _base_state(
+            kpis={
+                **_base_kpis(),
+                "closed_epics": 3,
+                "avg_pnl_per_epic": -1.5,
+                "winning_epics": 1,
+                "losing_epics": 2,
+                "avg_epic_win": 12.0,
+                "avg_epic_loss": -7.75,
+            }
+        )
+        kpi_bar = _build_fragments(state)["kpi_bar"]
+        assert "Avg / epic" in kpi_bar
+        assert "-1.50€" in kpi_bar
+        assert "1 up +12.00€" in kpi_bar
+        assert "2 down -7.75€" in kpi_bar
+        assert "openEpicResultModal()" in kpi_bar
+
+    def test_tile_empty_state_when_nothing_closed(self):
+        kpi_bar = _build_fragments(_base_state())["kpi_bar"]
+        assert "No epic closed today" in kpi_bar
 
 
 class TestTradeOverlay:
@@ -689,7 +860,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=35" in html
+        assert "/static/dashboard.js?v=38" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())

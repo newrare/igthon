@@ -1,4 +1,4 @@
-"""The close profile — composes a stop-distance policy with three zone updaters.
+"""The close profile — composes a stop-distance policy with four zone updaters.
 
 ``CloseZoneProfit`` is the project's single close profile. It owns nothing
 about *where* the initial stop is placed nor *how* it moves; it **composes** those
@@ -9,13 +9,14 @@ decoupled responsibilities and wires them to the persisted position:
   defaults to the recency-weighted support distance), and freezes the break-even
   (``level_zero``) and margin (break-even + one noise margin **towards profit**)
   references;
-- on every tick, it classifies the live close-out price into one of three zones
-  (see :mod:`src.exit.zones`) using break-even and the *profit trigger*
-  (a second symmetric band past the margin), and delegates to the matching
+- on every tick, it classifies the live close-out price into one of four zones
+  (see :mod:`src.exit.zones`) using break-even, the margin line and the *profit
+  trigger* (a second symmetric band past the margin), and delegates to the matching
   :class:`~src.exit.zones.base.StopUpdater`:
     * :class:`~src.exit.zones.underwater.UnderwaterStop` — short of break-even;
-    * :class:`~src.exit.zones.breakeven_band.BreakevenBandStop` — break-even up to
-      the profit trigger (across the margin line);
+    * :class:`~src.exit.zones.breakeven_band.BreakevenBandStop` — break-even →
+      margin;
+    * :class:`~src.exit.zones.secure.SecureHoldStop` — margin → profit trigger;
     * :class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop` — past the
       profit trigger (real profit).
 
@@ -54,6 +55,7 @@ from src.exit.base import (
 from src.exit.zones import (
     ZONEMARGE_UPDATERS,
     ZONEPROFIT_UPDATERS,
+    ZONESECURE_UPDATERS,
     ZONESTART_UPDATERS,
     build_zone_updater,
 )
@@ -64,7 +66,8 @@ from src.exit.zones.base import (
     classify_zone,
 )
 from src.exit.zones.breakeven_band import BreakevenBandStop
-from src.exit.zones.smartgroup import GroupMember, SmartGroupStop
+from src.exit.zones.secure import SecureHoldStop
+from src.exit.zones.smartgroup import GroupMember, GroupPlanReport, SmartGroupStop
 from src.exit.zones.trailing_ratchet import TrailingRatchetStop
 from src.exit.zones.underwater import UnderwaterStop
 from src.feed.price_buffer import EpicBuffer
@@ -130,7 +133,7 @@ def _buffer_since(buf: EpicBuffer, opened_at: datetime | None) -> EpicBuffer:
 
 @dataclass
 class CloseZoneProfit(CloseProfile):
-    """Composes a stop-distance policy with the three per-zone stop updaters."""
+    """Composes a stop-distance policy with the four per-zone stop updaters."""
 
     name = "close_zoneprofit"
 
@@ -142,18 +145,20 @@ class CloseZoneProfit(CloseProfile):
     # behaviour when built directly (tests, simulator helpers).
     stop_distance: StopDistance = field(default_factory=StopSupport)
 
-    # The three per-zone stop updaters, composed on each tick. Each is selected
+    # The four per-zone stop updaters, composed on each tick. Each is selected
     # independently from ``.env`` (see ``from_settings``); the defaults keep the
     # historical behaviour when the profile is built directly (tests, helpers).
     underwater: StopUpdater = field(default_factory=UnderwaterStop)
     breakeven_band: StopUpdater = field(default_factory=BreakevenBandStop)
+    secure: StopUpdater = field(default_factory=SecureHoldStop)
     trailing: StopUpdater = field(default_factory=TrailingRatchetStop)
 
     @classmethod
     def from_settings(cls, settings) -> CloseZoneProfit:
         # The close profile is a constant-shaped composer: the initial stop
-        # distance is selected by STOP_STRATEGY, and each of the three zones by
-        # its own CLOSE_ZONESTART / CLOSE_ZONEMARGE / CLOSE_ZONEPROFIT selector.
+        # distance is selected by STOP_STRATEGY, and each of the four zones by its
+        # own CLOSE_ZONESTART / CLOSE_ZONEMARGE / CLOSE_ZONESECURE /
+        # CLOSE_ZONEPROFIT selector.
         distance_name = getattr(settings, "stop_strategy", "stop_support")
         return cls(
             stop_distance=get_stop_distance(distance_name, settings),
@@ -162,6 +167,9 @@ class CloseZoneProfit(CloseProfile):
             ),
             breakeven_band=build_zone_updater(
                 ZONEMARGE_UPDATERS, settings.close_zonemarge, settings
+            ),
+            secure=build_zone_updater(
+                ZONESECURE_UPDATERS, settings.close_zonesecure, settings
             ),
             trailing=build_zone_updater(
                 ZONEPROFIT_UPDATERS, settings.close_zoneprofit, settings
@@ -173,7 +181,12 @@ class CloseZoneProfit(CloseProfile):
         return noise_margin(self.noise_k, atr_value)
 
     def initial_plan(
-        self, *, entry_level: float, direction: str, buf: EpicBuffer
+        self,
+        *,
+        entry_level: float,
+        direction: str,
+        buf: EpicBuffer,
+        day_extreme: float | None = None,
     ) -> OpenPlan:
         """Delegate the initial stop to the distance policy; freeze the references.
 
@@ -187,11 +200,17 @@ class CloseZoneProfit(CloseProfile):
         a BUY (filled at the offer, closed on the bid) breaks even at the entry
         offer, while a SELL (filled at the bid, closed on the offer) breaks even at
         that same bid.
+
+        ``day_extreme`` is passed straight through to the distance policy — this
+        profile makes no use of it and never inspects it.
         """
         last = buf.last
         atr_value = atr(list(buf.candles), self.atr_period)
         stop_level = self.stop_distance.initial_stop(
-            entry_level=entry_level, direction=direction, buf=buf
+            entry_level=entry_level,
+            direction=direction,
+            buf=buf,
+            day_extreme=day_extreme,
         )
         sign = _sign(direction)
         if direction == "SELL":
@@ -240,17 +259,17 @@ class CloseZoneProfit(CloseProfile):
         last = buf.last if buf is not None else None
         if last is None:
             return None
-        sign, level_zero, _margin, level_profit = self._references(
+        sign, level_zero, level_margin, level_profit = self._references(
             position, buf, atr(list(buf.candles), self.atr_period)
         )
         price = _close_out_price(current_bid, last.spread, sign)
-        return classify_zone(price, level_zero, level_profit, sign)
+        return classify_zone(price, level_zero, level_margin, level_profit, sign)
 
     @property
     def is_group_aware(self) -> bool:
         """True when the zone-1 updater manages the book as a whole (smartgroup).
 
-        Selected in zone 1, but its decision is applied in **all three** zones (see
+        Selected in zone 1, but its decision is applied in **all four** zones (see
         :meth:`evaluate`): the rule is about the book's total, so the winners are
         tightened alongside the losers that their gain protects.
         """
@@ -266,8 +285,9 @@ class CloseZoneProfit(CloseProfile):
         Reads the same live measures (spread, adverse-tick noise) that
         :meth:`evaluate` uses, so the group planner and the per-tick management
         agree on the numbers — including the close-out price and the sign, so longs
-        and shorts are valued in one pass. Returns ``None`` when the profile is not
-        group-aware or there is no candle to read a spread from.
+        and shorts are valued in one pass, and the execution haircut the book is
+        valued net of. Returns ``None`` when the profile is not group-aware or
+        there is no candle to read a spread from.
         """
         if not self.is_group_aware:
             return None
@@ -285,15 +305,25 @@ class CloseZoneProfit(CloseProfile):
             smart.params.noise_window,
             smart.params.noise_std_k,
         )
+        min_stop_distance = float(getattr(position, "min_stop_distance", 0) or 0)
+        # Execution haircut — how far past its stop the exit is assumed to fill.
+        # Scaled on the gap the ratchet itself opens between the software follower
+        # and the broker order (one spread plus a noise cushion, see
+        # ``TradingService._broker_stop_level``): the fill lands somewhere inside
+        # that gap, never on the follower. Measured here from the same live
+        # spread + noise the candidate is built on, so no execution-layer state
+        # leaks into the exit domain.
+        exec_slip = smart.params.exec_slip_k * (spread + max(noise, min_stop_distance))
         return GroupMember(
             position_id=int(position.id),
             level_open=float(position.level_open or 0),
             level_follower=float(position.level_follower or 0),
             euro_per_point=float(position.euro_per_point or 0),
             current_price=_close_out_price(current_bid, spread, sign),
-            min_stop_distance=float(getattr(position, "min_stop_distance", 0) or 0),
+            min_stop_distance=min_stop_distance,
             noise=noise,
             sign=sign,
+            exec_slip=exec_slip,
         )
 
     def plan_group(self, members: list[GroupMember]) -> dict[int, float]:
@@ -302,6 +332,19 @@ class CloseZoneProfit(CloseProfile):
             return {}
         smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
         return smart.plan(members)
+
+    def explain_group(self, members: list[GroupMember]) -> GroupPlanReport | None:
+        """The group plan **and** the book arithmetic behind it, or ``None``.
+
+        ``None`` when the profile is not group-aware (nothing decided the book). The
+        monitor logs this so a tick where no stop moves is distinguishable from the
+        pre-pass not running: the report carries the estimated book total, the gate
+        it had to clear, and how each position was valued.
+        """
+        if not self.is_group_aware:
+            return None
+        smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
+        return smart.explain(members)
 
     def evaluate(
         self,
@@ -350,10 +393,9 @@ class CloseZoneProfit(CloseProfile):
         level_open = float(position.level_open or 0)
         # Break-even, the margin frozen at open, and the derived profit trigger —
         # one further noise margin past the margin line, i.e. a second symmetric
-        # band stacked on the first. The trigger is the boundary price must clear to
-        # enter the profit-trailing zone; short of it (but past break-even) the
-        # margin-zone updater keeps parking the stop on a support inside
-        # break-even→margin.
+        # band stacked on the first. Together they cut the price axis into the four
+        # zones: break-even→margin is the margin zone, margin→trigger the secure
+        # zone, and past the trigger the profit trailing takes over.
         sign, level_zero, level_margin, level_profit = self._references(
             position, buf, atr_value
         )
@@ -379,9 +421,11 @@ class CloseZoneProfit(CloseProfile):
             group_tighten=group_tighten,
         )
 
-        zone = classify_zone(price, level_zero, level_profit, sign)
+        zone = classify_zone(price, level_zero, level_margin, level_profit, sign)
         if zone is StopZone.PROFIT:
             updater = self.trailing
+        elif zone is StopZone.SECURE:
+            updater = self.secure
         elif zone is StopZone.BREAKEVEN_BAND:
             updater = self.breakeven_band
         else:

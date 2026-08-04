@@ -81,6 +81,14 @@ def _service(close_profile=None, **config_overrides):
     client = AsyncMock()
     db = AsyncMock()
     db.add = MagicMock()
+    # ``AsyncSession.execute`` is awaitable but the ``Result`` it returns is not:
+    # ``.scalar()`` is synchronous. A bare AsyncMock hands back a coroutine there,
+    # so model the real shape — the open path reads the session extreme through it
+    # (``_session_extreme``, feeding ``day_extreme`` to the stop policy). ``None``
+    # = the day holds no candle yet, which every policy must tolerate.
+    result = MagicMock()
+    result.scalar.return_value = None
+    db.execute = AsyncMock(return_value=result)
     svc = TradingService(
         client=client,
         db_session=db,
@@ -354,3 +362,89 @@ class TestSameDayReopenPolicy:
         assert "position.epic" in sql and "position.date" in sql
         assert "state" not in sql  # a closed opening still counts as "used today"
         assert query.compile().params["date_1"] == date.today()
+
+
+class TestSessionExtreme:
+    """The day-scoped level a stop policy can anchor on (``day_extreme``).
+
+    Read from the ``candle`` table rather than the price buffer because a session
+    outruns ``buffer_max_candles``; see
+    :class:`~src.stops.stop_shape.StopShape`.
+    """
+
+    async def test_buy_aggregates_the_lowest_bid_low(self):
+        svc, _, db = _service()
+        result = MagicMock()
+        result.scalar.return_value = 7950.25
+        db.execute = AsyncMock(return_value=result)
+        assert await svc._session_extreme("X", "BUY") == 7950.25
+        sql = str(db.execute.await_args.args[0])
+        assert "min(candle.bid_low)" in sql.lower()
+
+    async def test_sell_aggregates_the_highest_offer_high(self):
+        svc, _, db = _service()
+        result = MagicMock()
+        result.scalar.return_value = 8100.5
+        db.execute = AsyncMock(return_value=result)
+        assert await svc._session_extreme("X", "SELL") == 8100.5
+        sql = str(db.execute.await_args.args[0])
+        assert "max(candle.offer_high)" in sql.lower()
+
+    async def test_filtered_on_the_epic_and_todays_utc_boundary(self):
+        svc, _, db = _service()
+        result = MagicMock()
+        result.scalar.return_value = 1.0
+        db.execute = AsyncMock(return_value=result)
+        await svc._session_extreme("MY.EPIC", "BUY")
+        query = db.execute.await_args.args[0]
+        sql = str(query)
+        assert "candle.epic" in sql and "candle.timestamp" in sql
+        params = query.compile().params
+        assert params["epic_1"] == "MY.EPIC"
+        # Same day boundary as ``Position.date`` and the same-day re-open policy.
+        assert params["timestamp_1"] == datetime.combine(
+            datetime.now(UTC).date(), datetime.min.time(), tzinfo=UTC
+        )
+
+    async def test_no_candle_today_yields_none(self):
+        svc, _, db = _service()
+        result = MagicMock()
+        result.scalar.return_value = None
+        db.execute = AsyncMock(return_value=result)
+        assert await svc._session_extreme("X", "BUY") is None
+
+    async def test_a_failed_query_degrades_instead_of_failing_the_open(self):
+        # A stop placement is never worth losing an accepted open over.
+        svc, _, db = _service()
+        db.execute = AsyncMock(side_effect=RuntimeError("db down"))
+        assert await svc._session_extreme("X", "BUY") is None
+
+    async def test_open_path_feeds_it_to_the_close_profile(self):
+        recorded = {}
+
+        class _SpyProfile(CloseZoneProfit):
+            def initial_plan(self, *, entry_level, direction, buf, day_extreme=None):
+                recorded["day_extreme"] = day_extreme
+                return super().initial_plan(
+                    entry_level=entry_level,
+                    direction=direction,
+                    buf=buf,
+                    day_extreme=day_extreme,
+                )
+
+        svc, client, db = _service(close_profile=_SpyProfile(stop_distance=StopAtr()))
+        result = MagicMock()
+        result.scalar.return_value = 7900.0
+        db.execute = AsyncMock(return_value=result)
+        client.get.side_effect = [
+            _market(),
+            {"dealStatus": "ACCEPTED", "dealId": "D1", "level": 100.0},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF"})
+
+        pos = await svc.open_from_intent(
+            EntryIntent(epic="X", direction="BUY"), _buffer_atr2()
+        )
+
+        assert pos is not None
+        assert recorded["day_extreme"] == 7900.0

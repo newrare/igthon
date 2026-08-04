@@ -19,6 +19,7 @@ from src.stops.stop_atr import StopAtr
 from src.stops.stop_hourlow import StopHourLow, noise_floor_distance, window_extreme
 from src.stops.stop_linearspeed import StopLinearSpeed, weighted_resistance
 from src.stops.stop_regression import StopRegression, residual_sigma
+from src.stops.stop_shape import StopShape, classify_shape
 from src.stops.stop_support import StopSupport, weighted_support
 
 #: Name → class map. Keys are the valid ``STOP_STRATEGY`` values.
@@ -28,6 +29,7 @@ STOP_DISTANCES: dict[str, type[StopDistance]] = {
     StopRegression.name: StopRegression,
     StopLinearSpeed.name: StopLinearSpeed,
     StopHourLow.name: StopHourLow,
+    StopShape.name: StopShape,
 }
 
 
@@ -52,6 +54,7 @@ __all__ = [
     "StopRegression",
     "StopLinearSpeed",
     "StopHourLow",
+    "StopShape",
     "StopDistance",
     "get_stop_distance",
     "weighted_support",
@@ -59,4 +62,5 @@ __all__ = [
     "residual_sigma",
     "noise_floor_distance",
     "window_extreme",
+    "classify_shape",
 ]

@@ -74,12 +74,14 @@ offer_open, offer_close, offer_high, offer_low, volume
 
 ## Components
 
-| Layer       | File                                                       | Responsibility                                                                            |
-| ----------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Archive     | [backtest_archive.py](../src/backtest/backtest_archive.py) | Read dump CSVs (no DB). `datasets()` lists weeks/epics; `load()` returns candles per epic |
-| Engine      | [backtester.py](../src/backtest/backtester.py)             | `build_days()` groups candles into trading days; `run_backtest()` replays the strategy    |
-| Replay core | [simulator.py](../src/backtest/simulator.py)               | Shared `StrategySimulator.run_days()` — the same engine the synthetic simulator uses      |
-| Web         | [backtest.py](../src/web/routes/backtest.py)               | `/backtest` page + `/api/backtest/datasets` + `/api/backtest/run`                         |
+| Layer       | File                                                            | Responsibility                                                                            |
+| ----------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Archive     | [backtest_archive.py](../src/backtest/backtest_archive.py)      | Read dump CSVs (no DB). `datasets()` lists weeks/epics; `load()` returns candles per epic |
+| Contracts   | [contract_values.py](../src/backtest/contract_values.py)        | `epic → € per point`, read from a JSON file — the euro dimension the archive lacks        |
+| Engine      | [backtester.py](../src/backtest/backtester.py)                  | Selection overlay, `build_days()`, `run_backtest()`, the euro / percentage summaries      |
+| Replay core | [simulator.py](../src/backtest/simulator.py)                    | Shared `StrategySimulator.run_days()` — the same engine the synthetic simulator uses      |
+| Web         | [backtest.py](../src/web/routes/backtest.py)                    | `/backtest` page + `/api/backtest/datasets` + `/api/backtest/run`                         |
+| Capture     | [dump_euro_per_point.py](../src/scripts/dump_euro_per_point.py) | One-off: fill the contract table from IG `/markets` so backtests stay offline             |
 
 ### Pipeline
 
@@ -103,70 +105,267 @@ single timestamp-ordered stream, so misaligned real series (different start time
 
 The replay applies the **same** rules as production: the pluggable entry
 strategy (`evaluate`), the pre-open gates
-([trading.py](../src/execution/trading.py)), the win/stop levels, and the ATR
-trailing stop. A BUY fills at the offer, the protective stop fills intra-candle
-when the bid low crosses it, and anything still open at end of day is
-force-closed.
+([trading.py](../src/execution/trading.py)), the win/stop levels, and the per-zone
+stop updates. A market order fills on the side that pays the spread, the
+protective stop fills intra-candle when the close-out price reaches it, and
+anything still open at end of day is force-closed.
+
+### Both directions are replayed
+
+A SELL intent is kept exactly when the live path keeps it — the strategy declares
+`emits_shorts` — and the shared pre-open gate is handed the same `allow_short`, so
+a two-sided strategy (`open_fade`, `open_five`, `open_linear`, `open_pullback`,
+`open_steady`) is measured on both of its sides while a long-only one still cannot
+short by accident.
+
+Everything below follows from one helper, `direction_sign()` in
+[simulator.py](../src/backtest/simulator.py) — there is no separate short code
+path:
+
+| Aspect         | BUY                                    | SELL                         |
+| -------------- | -------------------------------------- | ---------------------------- |
+| Fill           | the **offer**                          | the **bid**                  |
+| Close-out      | the **bid**                            | the **offer**                |
+| Broker stop    | fills on the **bid low**               | fills on the **offer high**  |
+| Break-even     | `level_zero` = entry offer             | `level_zero` = entry bid     |
+| P&L            | `close − open`                         | `open − close`               |
+| Break-even @BE | first close-out **above** `level_zero` | first close-out **below** it |
+
+The spread is therefore paid once, at the open, on both sides — and the close
+profile needs no special case: it already mirrors every zone for a short (see
+[exit tests](../tests/test_exit_short.py)).
 
 ## Using the web page
 
 Open **`/backtest`** (linked from the nav bar on every page):
 
-1. **Archived data** — pick a week from the dropdown. The page shows the epics
-   available that week and their candle counts. Optionally tick specific epics
-   to narrow the run (leave all unticked to backtest the whole week).
-1. **Run backtest** — choose the strategy (defaults to the live `OPEN_STRATEGY`,
-   other entries allow comparison) and the trades target, then run.
-1. **Results** — win/loss counts, win rate, total return, average win/loss, max
-   drawdown, the cumulative-return equity curve, close-reason and open-rejection
-   breakdowns, and the full trade list.
+1. **Archived data** — pick a week from the dropdown. The line below shows its
+   date range, epic count and candle count.
+1. **Run backtest** — set the six selectors (see below), then run. *Back to live*
+   puts them all back on the `.env` values.
+1. **Results** — the KPI row, the euro equity curves, close-reason and
+   open-rejection breakdowns, and the full trade list.
+
+### The six selectors — the whole configuration, not just the strategy
+
+The page exposes exactly the selectors `.env` holds, in the order the price zones
+are crossed:
+
+| Selector           | Registry              | Chooses                                |
+| ------------------ | --------------------- | -------------------------------------- |
+| `OPEN_STRATEGY`    | `ENTRY_STRATEGIES`    | the entry signal (direction only)      |
+| `STOP_STRATEGY`    | `STOP_DISTANCES`      | where the initial protective stop goes |
+| `CLOSE_ZONESTART`  | `ZONESTART_UPDATERS`  | follower → break-even                  |
+| `CLOSE_ZONEMARGE`  | `ZONEMARGE_UPDATERS`  | break-even → margin                    |
+| `CLOSE_ZONESECURE` | `ZONESECURE_UPDATERS` | margin → profit trigger                |
+| `CLOSE_ZONEPROFIT` | `ZONEPROFIT_UPDATERS` | above the profit trigger               |
+
+Each starts on the live value (marked *(live)*) and each is sent explicitly with
+the run, so a result is reproducible from its payload even after `.env` changes.
+A name absent from its registry is a **400**, never a silent fallback.
+
+#### Names the backtest refuses
+
+Some valid *live* names cannot be reproduced offline, and a backtest that replayed
+a degraded look-alike under their name would be worse than no backtest. They are
+listed in `UNTESTABLE_NAMES` ([backtester.py](../src/backtest/backtester.py)), hidden
+from the picker, and answered with a **400** — including when they are only
+inherited from `.env` rather than requested, since a plain "backtest this week"
+call must not quietly replay something else:
+
+| Selector          | Name           | Why                                                                                                                    |
+| ----------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `OPEN_STRATEGY`   | `open_manual`  | waits for a human order — there is no signal to replay                                                                 |
+| `OPEN_STRATEGY`   | `open_testing` | opens unconditionally — replaying it tests nothing                                                                     |
+| `CLOSE_ZONESTART` | `smartgroup`   | decides for the whole book from the scheduler's cross-position pre-pass (`plan_group`), which the engine does not have |
+
+When one of them *is* the live value, the page still lists it — hiding it would
+leave you wondering why the page disagrees with `.env` — but as a **disabled**
+option, so the browser falls back to a name that can actually run.
+
+Under the hood a `StrategySelection` is **overlaid** on the settings object
+(`_SettingsOverlay`) and the overlaid settings are handed to the very same
+factories the bot uses at startup (`get_entry_strategy`, `get_close_profile` →
+`CloseZoneProfit.from_settings`). Nothing is re-assembled by hand and every
+tuning parameter (ATR periods, ratios, margins) passes through untouched, so what
+runs is the configuration under test — not an approximation of it.
+
+### The run covers everything in the selection
+
+A run always replays **every epic** of the chosen week (minus the correlated
+duplicates collapsed by `dedupe_correlated_epics`) over **every one of its
+days**. There is deliberately
+no epic filter and no trade cap in the UI, so two runs of the same week differ
+only by the strategy under test — which is the only comparison that means
+anything. `BacktestConfig.target_trades` still exists for programmatic callers
+and defaults to `NO_TRADE_CAP`; on a finite archive a cap would silently truncate
+the data (the synthetic simulator needs one only because it generates days
+endlessly).
+
+`open_manual` and `open_testing` are **not offered**: the former waits for a
+human order, the latter opens unconditionally, so neither carries a signal worth
+replaying. `/api/backtest/run` returns 400 for both.
 
 Like the simulator, a run is pushed to a worker thread so the event loop (and
 the 1-second dashboard poll) stays responsive.
 
-### P&L is a percentage return, not euros
+## Results
 
-P&L is reported as the **percentage return computed from the actual fill
-prices**: `(close - open) / open`. This is deliberate — the archive holds prices
-only, not contract sizes or currency conversions, so there is no honest single
-"euro per point" that fits both an index (e.g. the DAX, where one point is worth
-several euros) and a forex pair (where one "point" is 0.0001 and a standard-lot
-point is worth ~€8–10). A fixed euro-per-point made forex moves render as
-`0.00 €` even when the trade was green. A percentage return is contract-agnostic
-and directly comparable across every instrument, so the trade table, KPIs and
-equity curve are all in percent.
+### The KPI row
+
+| KPI                 | Meaning                                                    |
+| ------------------- | ---------------------------------------------------------- |
+| **Trades**          | positions opened *and* closed during the replay            |
+| **Wins**            | trades whose close level beat their open level — see below |
+| **Losses**          | every other trade (a flat trade counts as a loss)          |
+| **Win rate**        | `wins / trades`                                            |
+| **Total euro**      | Σ `move × € per point`, over the **priced** trades         |
+| **Total euro @BE**  | the same sum under the break-even-exit scenario            |
+| **Wins/Losses @BE** | the scenario's own win/loss split, and its win rate        |
+
+**A win is purely a price comparison.** The move is signed by direction —
+`close − open` for a long, `open − close` for a short — and `win = move > 0`
+(strictly: a trade that gets back to exactly its entry is a loss). The fill already
+carries the spread (a BUY fills at the offer and closes on the bid, a SELL the
+other way round), and there is no other fee, no threshold and no slippage. The
+counts need no contract value, so they cover every trade, priced or not.
+
+### Euro P&L needs the contract table
+
+The archive holds **prices only** — no contract size, no quote currency, no deal
+size — so a euro figure cannot be derived from it. A single global "€ / point" is
+not a fix either: one DAX point is worth several euros while one EUR/USD "point"
+is 0.0001, so a shared factor flattens every forex trade to `0.00 €` (that bug is
+why this page reported percentages only for a while).
+
+The missing dimension therefore lives in a file, captured once per epic from IG:
+
+```bash
+python -m src.scripts.dump_euro_per_point            # every epic in the archive
+python -m src.scripts.dump_euro_per_point --refresh  # re-price known epics
+python -m src.scripts.dump_euro_per_point --dry-run  # show, write nothing
+```
+
+It writes `BACKTEST_CONTRACT_FILE` (default `./config/euro_per_point.json`):
+
+```json
+{
+  "generated_at": "2026-08-03T07:12:00+00:00",
+  "epics": {
+    "CC.D.CC.UNC.IP": {
+      "euro_per_point": 6.6, "quantity": 1.0, "currency": "USD",
+      "contract_size": 10.0, "conversion_rate": 0.66,
+      "name": "Cacao New York (10$)"
+    }
+  }
+}
+```
+
+`euro_per_point` is the euro value of one full point of movement **for the position
+the bot would actually open** — `minDealSize × contractSize × quote→EUR rate`,
+i.e. exactly what [tools.py](../src/utils/tools.py) `euro_per_point()` resolves at
+open — so a backtest euro is comparable with a live one. It carries the same
+caveat as the live figure: IG's `exchangeRate` is a reference rate, so expect the
+order of magnitude on a foreign quote, not the cent. The other fields are
+informational, for auditing an entry against
+`python -m src.scripts.inspect_market <epic>`.
+
+**Every call goes through the [API queue](../src/core/api_queue.py).** Pricing a
+whole archive is over a hundred `/markets` reads, well past IG's per-minute
+allowance: hitting the client directly returns `exceeded-api-key-allowance` after a
+couple of dozen epics and loses the rest. Through the queue, a quota block makes
+the worker wait for the guard cooldown and **re-queue** the call, so the run simply
+takes as long as IG's limits require and comes back complete. The file is also
+written **after every epic**, so a run stopped by Ctrl-C keeps what it captured and
+a re-run only fetches what is still missing (an epic already in the table is
+skipped unless `--refresh`).
+
+The script opens an IG session. **Prefer running it with the bot stopped**, since
+IG caps concurrent sessions. It is the only online step, and it is a one-off: once
+the file exists every backtest is offline again.
+
+An epic **missing from the table is never priced at a guessed value**: its trades
+are excluded from the euro totals and the page names them
+(`unpriced_trades` / `unpriced_epics`). Percentage returns stay in the response and
+in the trade table as the instrument-agnostic fallback. With no table at all, the
+counts and percentages still work and the euro KPIs simply read `0.00 €` with the
+exclusion notice.
+
+### The break-even-exit scenario (`@BE`)
+
+Next to the real result the page reports a counterfactual: **what if every position
+were closed the moment it went past break-even?**
+
+- while replaying, the first close-out price that goes **strictly past**
+  `level_zero` is recorded on the trade (`level_breakeven_exit`, plus its time) —
+  above it for a long, below it for a short, read from the same once-a-minute
+  close-out price the live monitor sees;
+- a candle on which the broker stop fires does **not** count: there is no way to
+  prove price went green before it reached the stop;
+- the scenario values that trade at the recorded price; a trade that never crossed
+  break-even keeps its **real** outcome. The scenario can only ever cut a trade
+  short, it never rescues a losing one.
+
+`level_zero` *is* the entry price in close-out terms (the entry offer for a long,
+the entry bid for a short — i.e. `level_open` either way), so every crosser is a
+small win by construction and `Wins @BE` is exactly the number of trades that ever
+turned green. Comparing `Total euro` with `Total euro @BE` is therefore a direct
+read on what letting winners run is worth against banking every green tick. The
+equity chart draws both curves.
 
 ## Programmatic use
 
 ```python
 from src.backtest.backtest_archive import BacktestArchive
-from src.backtest.backtester import BacktestConfig, percentage_summary, run_backtest
+from src.backtest.backtester import (
+    BacktestConfig, StrategySelection, euro_summary, percentage_summary, run_backtest,
+)
+from src.backtest.contract_values import ContractTable
 
 archive = BacktestArchive(settings.candle_dump_dir)
 candles = archive.load(weeks=["2026-W24"])           # files only — no DB
 result = run_backtest(
     settings,
     candles,
-    BacktestConfig(target_trades=100),
-    strategy_name="open_donchian",                    # defaults to OPEN_STRATEGY
+    BacktestConfig(),                                # no trade cap: whole archive
+    StrategySelection(                               # unset = live .env value
+        open_strategy="open_donchian",
+        close_zonemarge="limitloose",
+    ),
 )
+table = ContractTable.load(settings.backtest_contract_file)
+print(euro_summary(result.trades, table))            # euros, real + @BE scenario
 print(percentage_summary(result.trades))             # returns in %, price-based
 ```
 
 ## API
 
-| Method | Path                     | Body / Query                                   | Returns                                                                                           |
-| ------ | ------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `GET`  | `/api/backtest/datasets` | —                                              | `{ weeks: [{ week, total_candles, first, last, epics: [...] }] }`                                 |
-| `POST` | `/api/backtest/export`   | —                                              | `{ rows_written, files }` — snapshot DB → archive, no deletion                                    |
-| `POST` | `/api/backtest/run`      | `{ weeks, epics?, strategy?, target_trades? }` | `{ strategy, epics_loaded, candles_loaded, summary, trades }` — summary/trades report return in % |
+| Method | Path                     | Body / Query                             | Returns                                                                  |
+| ------ | ------------------------ | ---------------------------------------- | ------------------------------------------------------------------------ |
+| `GET`  | `/api/backtest/datasets` | —                                        | `{ weeks: [{ week, total_candles, first, last, epics: [...] }] }`        |
+| `POST` | `/api/backtest/export`   | —                                        | `{ rows_written, files }` — snapshot DB → archive, no deletion           |
+| `POST` | `/api/backtest/run`      | `{ weeks, epics?, ` *six selectors* ` }` | `{ strategy, selection, epics_loaded, candles_loaded, summary, trades }` |
 
-Leave `epics` empty (or tick **All epics** in the UI) to backtest every epic in
-the selected week(s).
+The run body accepts each selector under its `.env` name in lower case
+(`open_strategy`, `stop_strategy`, `close_zonestart`, `close_zonemarge`,
+`close_zonesecure`, `close_zoneprofit`); `strategy` is kept as the legacy alias of
+`open_strategy`. Any of them omitted falls back to the live value, and the response
+echoes the six names it actually replayed under `selection`.
 
-`/api/backtest/run` returns **400** when no archived candle matches the
-selection, or when the requested strategy is unknown. `/api/backtest/export`
-returns **503** if the process has no candle store (e.g. a web-only deployment).
+`epics` is a programmatic-only narrowing hook; leave it empty (as the web page
+always does) to backtest every epic in the selected week(s).
+
+`summary` carries three lenses on the same replay: the structural counts, the euro
+figures (`total_euro`, `total_euro_breakeven`, `wins_breakeven`, `equity_euro*`,
+`unpriced_*`) and the percentage figures (`total_return_pct`, `equity_pct`, …).
+Each trade carries `direction`, `return_pct`, `euro`, `euro_breakeven` (both `null`
+when its epic is unpriced) and `breakeven_time`.
+
+`/api/backtest/run` returns **400** when no archived candle matches the selection,
+or when any **resolved** selector name is unknown or untestable — including a name
+inherited from `.env` rather than requested (see *Names the backtest refuses*).
+`/api/backtest/export` returns **503** if the process has no candle store (e.g. a
+web-only deployment).
 
 ## Caveats
 
@@ -177,9 +376,19 @@ returns **503** if the process has no candle store (e.g. a web-only deployment).
   deliberately **not** read by the backtester.
 - Fills are modelled minimally (offer fill, intra-candle stop, end-of-day
   force-close). Slippage and partial fills are not simulated.
+- The **wallet gate is not modelled**: the archive holds prices, not account
+  balance or margin, so a ranker's concurrent-position count is an upper bound (see
+  `wallet_bounded` in [simulator.py](../src/backtest/simulator.py)).
+- Names the engine cannot reproduce are **refused**, not approximated — see *Names
+  the backtest refuses*. `CLOSE_ZONESTART=smartgroup` is the notable one: making it
+  backtestable means porting the scheduler's cross-position pre-pass into the replay
+  engine, and pricing the book in euros while doing it.
+- Euro figures depend on the contract table and inherit IG's reference exchange
+  rate on a foreign quote; unpriced epics are excluded and reported.
 
 ## Related
 
 - [strategies/README.md](strategies/README.md) — the pluggable strategy system.
 - [CONFIGURATION.md](CONFIGURATION.md) — trading hours and the per-position
-  `STRATEGY_EURO_LOSS` cap plus `CANDLE_RETENTION_DAYS`, `CANDLE_DUMP_DIR`.
+  `STRATEGY_EURO_LOSS` cap plus `CANDLE_RETENTION_DAYS`, `CANDLE_DUMP_DIR` and
+  `BACKTEST_CONTRACT_FILE`.

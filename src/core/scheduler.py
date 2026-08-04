@@ -16,6 +16,7 @@ heartbeat for when streaming is off or the feed goes silent. See
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -31,7 +32,9 @@ from src.core.recorder import Recorder
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
 from src.execution.gates import (
     RECOVERY_REVERT_REASON_OPEN,
+    curve_supports_revert,
     original_stop_level,
+    position_opened_at,
     reverse_direction,
     should_revert_after_stop_loss,
 )
@@ -42,6 +45,7 @@ from src.execution.trading import (
 from src.exit import (
     ZONEMARGE_UPDATERS,
     ZONEPROFIT_UPDATERS,
+    ZONESECURE_UPDATERS,
     ZONESTART_UPDATERS,
     CloseProfile,
     get_close_profile,
@@ -75,15 +79,16 @@ def validate_strategy_selection(settings: Settings) -> None:
 
     Raises:
         ValueError: when any of ``OPEN_STRATEGY`` / ``STOP_STRATEGY`` /
-            ``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT`` is
-            empty or not a registered name, or when ``ALLOW_SAME_DAY_REOPEN`` or
-            ``ALLOW_RECOVERY_REVERT`` is missing.
+            ``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONESECURE`` /
+            ``CLOSE_ZONEPROFIT`` is empty or not a registered name, or when
+            ``ALLOW_SAME_DAY_REOPEN`` or ``ALLOW_RECOVERY_REVERT`` is missing.
     """
     checks = (
         ("OPEN_STRATEGY", settings.open_strategy, ENTRY_STRATEGIES),
         ("STOP_STRATEGY", settings.stop_strategy, STOP_DISTANCES),
         ("CLOSE_ZONESTART", settings.close_zonestart, ZONESTART_UPDATERS),
         ("CLOSE_ZONEMARGE", settings.close_zonemarge, ZONEMARGE_UPDATERS),
+        ("CLOSE_ZONESECURE", settings.close_zonesecure, ZONESECURE_UPDATERS),
         ("CLOSE_ZONEPROFIT", settings.close_zoneprofit, ZONEPROFIT_UPDATERS),
     )
     problems: list[str] = []
@@ -107,6 +112,29 @@ def validate_strategy_selection(settings: Settings) -> None:
             "Invalid strategy selection — please configure your .env file:\n  - "
             + "\n  - ".join(problems)
         )
+
+
+@dataclass(frozen=True)
+class GroupBookSnapshot:
+    """Last whole-book valuation at the planned stops (``smartgroup`` pre-pass).
+
+    What the book would bank if every open position were closed at the stop the
+    group pre-pass would give it this tick — the same figure the "Group stop
+    plan" log line reports. Kept in memory only (recomputed on every monitoring
+    pass) and surfaced on the dashboard next to the live unrealized P&L, which is
+    always the more optimistic of the two.
+
+    Attributes:
+        total_euro: The book valued at the planned stops, in euros.
+        gate_euro: The threshold ``total_euro`` must exceed to arm the tightening.
+        armed: True when the gate was cleared and the stops were pushed.
+        at: UTC moment the valuation was computed.
+    """
+
+    total_euro: float
+    gate_euro: float
+    armed: bool
+    at: datetime
 
 
 # Reserved ``JobPreference`` key persisting the auto-open switch. Deliberately
@@ -347,6 +375,11 @@ class BotScheduler:
         # stored ``euro`` figures were last refreshed from IG). Surfaced on the
         # dashboard so the displayed P&L carries its "as of" time.
         self._positions_synced_at: datetime | None = None
+        # Last whole-book valuation at the planned stops, from the group pre-pass
+        # of the monitoring loop. None when there is nothing to value (no open
+        # position, no group-aware profile, or a book the pre-pass could not
+        # price / a disarmed plan whose partial sum means nothing).
+        self._group_book: GroupBookSnapshot | None = None
         # Epics that returned 403 on /prices — skipped until next hourly refresh
         self._pricing_blacklist: set[str] = set()
 
@@ -1086,6 +1119,11 @@ class BotScheduler:
         """UTC timestamp of the last successful open-position sync from IG."""
         return self._positions_synced_at
 
+    @property
+    def group_book(self) -> GroupBookSnapshot | None:
+        """Last whole-book valuation at the planned stops, or None if unavailable."""
+        return self._group_book
+
     # ------------------------------------------------------------------
     # Epic list persistence (survives restarts)
     # ------------------------------------------------------------------
@@ -1325,19 +1363,22 @@ class BotScheduler:
 
     @property
     def close_profile(self) -> CloseProfile:
-        """The close profile composed from the three zone selectors (built once).
+        """The close profile composed from the four zone selectors (built once).
 
         Independent of the entry strategy: it owns every exit decision for the
         positions opened this session. Each zone (``CLOSE_ZONESTART`` /
-        ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONEPROFIT``) is selected independently.
+        ``CLOSE_ZONEMARGE`` / ``CLOSE_ZONESECURE`` / ``CLOSE_ZONEPROFIT``) is
+        selected independently.
         """
         if self._close_profile_obj is None:
             self._close_profile_obj = get_close_profile(self._settings)
             logger.info(
-                "Close profile plugged in: '%s' (zones: start=%s margin=%s profit=%s)",
+                "Close profile plugged in: '%s' "
+                "(zones: start=%s margin=%s secure=%s profit=%s)",
                 self._close_profile_obj.name,
                 self._settings.close_zonestart,
                 self._settings.close_zonemarge,
+                self._settings.close_zonesecure,
                 self._settings.close_zoneprofit,
             )
         return self._close_profile_obj
@@ -1351,17 +1392,18 @@ class BotScheduler:
         return self._settings.open_strategy
 
     @property
-    def active_close_zone_names(self) -> tuple[str, str, str]:
-        """The three selected per-zone updater names (start, margin, profit)."""
+    def active_close_zone_names(self) -> tuple[str, str, str, str]:
+        """The four per-zone updater names (start, margin, secure, profit)."""
         return (
             self._settings.close_zonestart,
             self._settings.close_zonemarge,
+            self._settings.close_zonesecure,
             self._settings.close_zoneprofit,
         )
 
     @property
     def active_close_profile_name(self) -> str:
-        """Compact ``start/margin/profit`` label of the active close zones."""
+        """Compact ``start/margin/secure/profit`` label of the active close zones."""
         return "/".join(self.active_close_zone_names)
 
     @property
@@ -1802,6 +1844,25 @@ class BotScheduler:
 
             await self._evaluate_epic(epic, config)
 
+    @staticmethod
+    def _closeout_prices_since(
+        buf: EpicBuffer, opened_at: datetime, sign: float
+    ) -> list[float]:
+        """Close-out prices of the candles recorded since ``opened_at``, oldest first.
+
+        "Close-out" means the price the position would actually be closed at: a long
+        is closed on the **bid**, a short on the **offer** (one spread higher). Those
+        are the terms every level the exit reasons about is expressed in
+        (``level_follower`` / ``level_zero`` / the stop), so a curve built this way
+        can be compared to the stop directly on both sides — mirroring
+        ``_close_out_price`` in ``src/exit/close_zoneprofit.py``.
+        """
+        return [
+            candle.bid_close + candle.spread if sign < 0 else candle.bid_close
+            for candle in buf.candles
+            if candle.timestamp >= opened_at
+        ]
+
     def _open_lock(self, epic: str) -> asyncio.Lock:
         """Return (creating on first use) the per-epic open lock.
 
@@ -1859,6 +1920,55 @@ class BotScheduler:
             position = await trading.open_from_intent(intent, buf)
             return position, None
 
+    def _curve_supports_revert(
+        self, position: Position, buf: EpicBuffer
+    ) -> tuple[bool, str]:
+        """Gather the curve ``position`` walked since its open and judge it.
+
+        The bookkeeping rule (:func:`should_revert_after_stop_loss`) says *which*
+        stop fired; this says whether the market actually broke through it. It
+        collects what the pure :func:`curve_supports_revert` rule needs — the
+        close-out prices since the open, where price is right now, and how long the
+        position was held — and returns its verdict unchanged.
+
+        Holding time is **not** a filter in that rule (a market can sit flat for
+        twenty minutes and then break in one candle); it only separates a position
+        that died before its first candle was recorded from one whose candles are
+        missing. It comes from ``time_close`` when the close has been stamped (with
+        a day added when it lands after midnight UTC, since ``date`` is the *open*
+        day) and from the clock otherwise: both call sites decide the revert within
+        seconds of seeing the close.
+
+        Returns ``(False, reason)`` whenever the curve cannot be located at all
+        (no open time, no opening level) — an unjudgeable curve is not a licence to
+        revert.
+        """
+        opened_at = position_opened_at(position)
+        if opened_at is None:
+            return False, "Open time unknown (cannot locate the curve)"
+
+        level_open = float(position.level_open or 0)
+        if level_open <= 0:
+            return False, "Opening level unknown (cannot judge the curve)"
+
+        closed_at = datetime.now(UTC)
+        if position.time_close is not None and position.date is not None:
+            closed_at = datetime.combine(position.date, position.time_close, tzinfo=UTC)
+            if closed_at < opened_at:
+                closed_at += timedelta(days=1)
+
+        sign = -1.0 if position.direction == "SELL" else 1.0
+        last = buf.last
+        current_price = last.bid_close + (last.spread if sign < 0 else 0.0)
+        return curve_supports_revert(
+            direction=position.direction,
+            level_open=level_open,
+            original_stop=original_stop_level(position),
+            prices=self._closeout_prices_since(buf, opened_at, sign),
+            current_price=float(current_price),
+            minutes_held=max(0.0, (closed_at - opened_at).total_seconds() / 60),
+        )
+
     async def _revert_after_stop_loss(
         self,
         session: AsyncSession,
@@ -1875,9 +1985,15 @@ class BotScheduler:
         turn, instead of leaving the move alone until some entry strategy happens
         to signal it.
 
-        Which closes qualify is decided by the pure
-        :func:`~src.execution.gates.should_revert_after_stop_loss` rule (stop hit,
-        real loss, original stop, single hop). Called from the two places a
+        Which closes qualify is decided by **two** pure rules, both of which must
+        agree: :func:`~src.execution.gates.should_revert_after_stop_loss` on the
+        bookkeeping (stop hit, real loss, original stop, single hop) and
+        :func:`~src.execution.gates.curve_supports_revert` on the **curve since the
+        open** (see :meth:`_curve_supports_revert`). The second one is deliberately
+        permissive — it only drops the blatant cases, where no single candle put a
+        real chunk of the risk into the adverse move (a flat curve leaking to the
+        stop), where the market chopped its way there, or where the stop was merely
+        grazed by a wick price has already left. Called from the two places a
         position can be recorded as closed by its stop:
         :meth:`_monitor_positions` (the software backstop fired) and
         :meth:`_sync_positions` (the broker-side stop resting at IG fired and the
@@ -1925,6 +2041,16 @@ class BotScheduler:
                 "Recovery revert for %s skipped: no live price data to open %s on",
                 position.epic,
                 direction,
+            )
+            return None
+
+        supported, curve_reason = self._curve_supports_revert(position, buf)
+        if not supported:
+            logger.info(
+                "Recovery revert on %s dropped — the curve since open does not "
+                "justify it: %s",
+                position.epic,
+                curve_reason,
             )
             return None
 
@@ -2449,6 +2575,9 @@ class BotScheduler:
             positions = result.scalars().all()
 
             if not positions:
+                # Nothing to value: drop the stale book figure so the dashboard
+                # never shows a total for a book that no longer exists.
+                self._group_book = None
                 return
 
             trading = TradingService(
@@ -2483,6 +2612,7 @@ class BotScheduler:
             # An ordinary per-position profile yields an empty plan (no behaviour
             # change) since ``is_group_aware`` is False.
             group_plan: dict[int, float] = {}
+            self._group_book = None
             if self.close_profile.is_group_aware:
                 members = [
                     member
@@ -2503,7 +2633,19 @@ class BotScheduler:
                 # book look greener than it is, arming a tightening the group
                 # cannot actually afford. Skip the plan entirely for that tick.
                 if len(members) == len(positions):
-                    group_plan = self.close_profile.plan_group(members)
+                    report = self.close_profile.explain_group(members)
+                    if report is not None:
+                        group_plan = report.plan
+                        # A disarmed plan leaves ``total_euro`` a partial sum that
+                        # means nothing — only publish a full valuation.
+                        if report.disarmed_by is None:
+                            self._group_book = GroupBookSnapshot(
+                                total_euro=report.total_euro,
+                                gate_euro=report.gate_euro,
+                                armed=report.armed,
+                                at=datetime.now(UTC),
+                            )
+                        self._log_group_plan(report, resolved)
                 else:
                     logger.warning(
                         "Group stop pre-pass skipped: only %d of %d open positions "
@@ -2538,6 +2680,66 @@ class BotScheduler:
                             )
                 except Exception as exc:
                     logger.error("Error monitoring position %s: %s", position.epic, exc)
+
+    @staticmethod
+    def _log_group_plan(report, resolved: list[tuple]) -> None:
+        """Trace the whole-book stop decision taken by ``smartgroup`` this tick.
+
+        The group gate is an arithmetic claim about the **book** ("closing every
+        position at its own candidate stop still banks a net gain"), so a tick where
+        no stop moves looks exactly like the pre-pass never running. This makes the
+        difference visible: one INFO line per pass with the estimated book total,
+        the gate it had to clear, and the live unrealized total for comparison — the
+        live P&L is always the more optimistic of the two, since every candidate
+        sits one noise cushion the wrong side of its price. Per-position arithmetic
+        goes to DEBUG.
+
+        Purely observational: nothing here influences the plan.
+        """
+        epics = {p.id: p.epic for p, _bid, _buf in resolved}
+        live_euro = sum(float(p.euro or 0) for p, _bid, _buf in resolved)
+
+        if report.disarmed_by is not None:
+            logger.info(
+                "Group stop plan: DISARMED — position %s (%s) has no stop and cannot "
+                "be tightened, so the book cannot be claimed green (live %.2f€)",
+                report.disarmed_by,
+                epics.get(report.disarmed_by, "?"),
+                live_euro,
+            )
+            return
+
+        movable = sum(1 for v in report.valuations if v.tightens)
+        logger.info(
+            "Group stop plan: %s — book at planned stops %.2f€ vs gate %.2f€ "
+            "(live %.2f€), %d/%d position(s) movable%s",
+            "ARMED" if report.armed else "hold",
+            report.total_euro,
+            report.gate_euro,
+            live_euro,
+            movable,
+            len(report.valuations),
+            f", tightening {len(report.plan)}" if report.plan else "",
+        )
+        if report.unpriceable:
+            logger.warning(
+                "Group stop plan: %d position(s) not priced (no size or no open "
+                "level): %s",
+                len(report.unpriceable),
+                [epics.get(pid, pid) for pid in report.unpriceable],
+            )
+        for v in report.valuations:
+            logger.debug(
+                "Group member %s (%s): candidate=%.5f follower=%.5f -> valued at "
+                "%.5f = %.2f€ (%s)",
+                v.position_id,
+                epics.get(v.position_id, "?"),
+                v.candidate,
+                v.level_follower,
+                v.valued_at,
+                v.euro,
+                "tighten" if v.tightens else "keeps its stop",
+            )
 
     async def _sync_positions(self) -> None:
         """Reconcile DB open positions against IG's live position list.

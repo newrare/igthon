@@ -15,14 +15,25 @@ close profile — so a close profile's behaviour can be measured on its own.
 
 The simulator is deliberately blind to how the curves are produced: it only
 consumes a ``curve_provider`` callable returning ``list[Candle]`` per
-(day, epic). Broker behaviour is emulated minimally: a BUY fills at the offer,
-the protective stop fills intra-candle when the bid low crosses it, and every
-position still open at the end of a day is force-closed (end_of_day).
+(day, epic). Broker behaviour is emulated minimally: a market order fills on the
+side that pays the spread (a BUY at the offer, a SELL at the bid), the protective
+stop fills intra-candle when the close-out price reaches it (the bid low for a
+long, the offer high for a short), and every position still open at the end of a
+day is force-closed (end_of_day).
+
+**Both directions are replayed.** A SELL intent is kept exactly when the live
+path keeps it — the strategy declares ``emits_shorts`` — and the shared pre-open
+gate is given the same ``allow_short``, so a two-sided strategy is measured on
+both of its sides and a long-only one still cannot short by accident. Direction
+enters the P&L in three places, all derived from :func:`direction_sign`: the fill
+side, the close-out price (:func:`close_out_price`) and the sign of the move.
 
 Everything runs in memory — no DB, no IG API. A full run takes seconds, which
 is the point: estimate the coherence of the open/close rules without waiting
 for a real trading day.
 """
+
+from __future__ import annotations
 
 import logging
 import random
@@ -66,6 +77,85 @@ class SimulationConfig:
     spread_malus_pct: float = 0.0
 
 
+def direction_sign(direction: str | None) -> float:
+    """``+1`` when profit is up (BUY), ``−1`` when profit is down (SELL).
+
+    Same convention as :func:`src.exit.close_zoneprofit._sign`, so the replay and
+    the close profile agree on which way a position makes money.
+    """
+    return -1.0 if direction == "SELL" else 1.0
+
+
+def close_out_price(candle: Candle, direction: str | None) -> float:
+    """The price closing this position would be filled at, on ``candle``.
+
+    A BUY is closed by selling at the **bid**; a SELL is closed by buying at the
+    **offer**. Every level the close profile reasons about (break-even, margin,
+    follower) is expressed in these same terms, so comparing against this keeps
+    both sides like-for-like.
+    """
+    return candle.offer_close if direction == "SELL" else candle.bid_close
+
+
+def close_out_extreme(candle: Candle, direction: str | None) -> float:
+    """The worst close-out price reached **inside** ``candle`` for this direction.
+
+    The low of the bid for a long, the high of the offer for a short — the level
+    at which the broker's resting protective stop would have been filled.
+    """
+    return candle.offer_high if direction == "SELL" else candle.bid_low
+
+
+@dataclass(slots=True)
+class SessionExtremes:
+    """Running per-epic session extremes — the backtest's ``day_extreme`` source.
+
+    Faithful mirror of :meth:`~src.execution.trading.TradingService._session_extreme`,
+    which aggregates the ``candle`` table over the current UTC day so a stop policy
+    can anchor on a level older than the live buffer's ``buffer_max_candles``
+    ceiling (see :class:`~src.stops.stop_shape.StopShape`).
+
+    Two properties make it faithful rather than merely convenient:
+
+    - it is fed **as candles are ingested**, so the extreme covers only what had
+      already been recorded at the moment of the open — never the rest of the day.
+      Reading it off the whole ``curves`` series instead would hand the backtest a
+      level the live path cannot know, flattering every result;
+    - it is kept **outside** the ``EpicBuffer``, which is deliberately capped at
+      ``DEFAULT_MAX_CANDLES`` to stop the backtest seeing more recent history than
+      production. That cap is about the *rolling window*; the session extreme is a
+      separate, explicitly day-scoped input that live reads from the database.
+
+    Reset per simulated day by constructing a new instance, matching the live UTC
+    day boundary.
+    """
+
+    lows: list[float | None]
+    highs: list[float | None]
+
+    @classmethod
+    def for_curves(cls, count: int) -> SessionExtremes:
+        """Empty extremes for ``count`` epics — every entry unknown (``None``)."""
+        return cls(lows=[None] * count, highs=[None] * count)
+
+    def update(self, epic_index: int, candle: Candle) -> None:
+        """Fold one freshly ingested candle into the epic's running extremes."""
+        low = self.lows[epic_index]
+        self.lows[epic_index] = (
+            candle.bid_low if low is None else min(low, candle.bid_low)
+        )
+        high = self.highs[epic_index]
+        self.highs[epic_index] = (
+            candle.offer_high if high is None else max(high, candle.offer_high)
+        )
+
+    def get(self, epic_index: int, direction: str) -> float | None:
+        """The extreme on the side the stop is triggered on, or ``None`` if unseen."""
+        if direction == "SELL":
+            return self.highs[epic_index]
+        return self.lows[epic_index]
+
+
 @dataclass(slots=True)
 class SimulatedTrade:
     """One simulated open/close cycle with the same levels as a live Position."""
@@ -76,10 +166,16 @@ class SimulatedTrade:
     level_open: float
     level_zero: float
     level_loose: float
-    level_stop: float  # broker-side protective stop (trails upward)
+    level_stop: float  # broker-side protective stop (trails towards profit)
     euro_stop: float
+    # BUY or SELL. Read by the close profile (which flips break-even, the margin
+    # side and the close-out price on it) and by every P&L formula here.
+    direction: str = "BUY"
     level_margin: float = 0.0  # margin level frozen at open (read by the profile)
-    level_open_bid: float = 0.0  # bid at open (for the bid→bid % return lens)
+    # Close-out-scale price at open: the bid for a long, the offer for a short.
+    # Used by the percentage lens, where the spread is charged as an explicit
+    # malus instead of through the fill.
+    level_open_closeout: float = 0.0
     euro_per_point: float = 0.0  # € per point of movement (read by the profile)
     close_time: str | None = None
     level_close: float | None = None
@@ -87,6 +183,13 @@ class SimulatedTrade:
     euro: float | None = None
     win: bool = False
     stop_updates: int = 0
+    # First close-out price that went STRICTLY past break-even (``level_zero``),
+    # and when. Recorded once, purely observational — the position keeps running
+    # under its close profile. It backs the "what if every trade were closed the
+    # moment it turned green?" counterfactual the backtest reports next to the
+    # real result; ``None`` means the trade never got there.
+    level_breakeven_exit: float | None = None
+    time_breakeven_exit: str | None = None
     # internal monitoring state (not part of the report)
     level_follower: float = 0.0
 
@@ -97,26 +200,36 @@ class SimulationResult:
 
     trades: list[SimulatedTrade] = field(default_factory=list)
     days_simulated: int = 0
+    # Entry signals accepted by the strategy, both directions. The name predates
+    # short support and is kept because the web summaries key on it.
     buy_signals: int = 0
     rejections: Counter = field(default_factory=Counter)
     daily_pnl: list[float] = field(default_factory=list)
     spread_malus_pct: float = 0.0  # % charged per open in the percentage lens
 
     def _net_pcts(self) -> list[float]:
-        """Per-trade net return in %, bid→bid, minus the spread malus.
+        """Per-trade net return in %, close-out scale, minus the spread malus.
 
-        The fictional-points lens the dashboard asks for: gross move measured on
-        the bid scale (the offer fill is ignored here so the spread cost is *only*
-        the explicit malus), then the per-open malus is subtracted::
+        The fictional-points lens the dashboard asks for: gross move measured from
+        the open on the close-out scale (bid for a long, offer for a short — so the
+        fill's spread is ignored here and the cost is *only* the explicit malus),
+        signed by direction, then the per-open malus is subtracted::
 
-            gross_pct = (level_close - level_open_bid) / level_open_bid * 100
+            open      = level_open_closeout
+            gross_pct = sign × (level_close - open) / open × 100
             net_pct   = gross_pct - spread_malus_pct
         """
         pcts: list[float] = []
         for t in self.trades:
-            if not t.level_open_bid or t.level_close is None:
+            if not t.level_open_closeout or t.level_close is None:
                 continue
-            gross = (t.level_close - t.level_open_bid) / t.level_open_bid * 100.0
+            sign = direction_sign(t.direction)
+            gross = (
+                sign
+                * (t.level_close - t.level_open_closeout)
+                / t.level_open_closeout
+                * 100.0
+            )
             pcts.append(gross - self.spread_malus_pct)
         return pcts
 
@@ -314,6 +427,9 @@ class StrategySimulator:
         open_positions: dict[int, SimulatedTrade] = {}
         closed_today: list[SimulatedTrade] = []
         last_candles: list[Candle | None] = [None] * len(curves)
+        # Day-scoped extremes fed as candles arrive — the backtest's stand-in for
+        # the live database query behind ``day_extreme`` (see ``SessionExtremes``).
+        session = SessionExtremes.for_curves(len(curves))
         # Epics already opened today — the global ALLOW_SAME_DAY_REOPEN policy is
         # applied to per-epic strategies too (by the shared gate in _try_open).
         used_today: set[int] = set()
@@ -338,6 +454,7 @@ class StrategySimulator:
 
             buffers[e].add(candle)
             last_candles[e] = candle
+            session.update(e, candle)
 
             position = open_positions.get(e)
             if position is not None:
@@ -355,13 +472,19 @@ class StrategySimulator:
                     closed_today,
                     result,
                     used_today,
+                    session,
                 )
 
         # Force-close anything still open at the end of the day.
         for e, position in list(open_positions.items()):
             candle = last_candles[e]
             if candle is not None:
-                self._close(position, candle, candle.bid_close, "end_of_day")
+                self._close(
+                    position,
+                    candle,
+                    close_out_price(candle, position.direction),
+                    "end_of_day",
+                )
                 result.trades.append(position)
 
     def _run_day_ranker(
@@ -388,6 +511,8 @@ class StrategySimulator:
         open_positions: dict[int, SimulatedTrade] = {}
         closed_today: list[SimulatedTrade] = []
         last_candles: list[Candle | None] = [None] * len(curves)
+        # See ``SessionExtremes`` — day-scoped, fed as candles arrive, no look-ahead.
+        session = SessionExtremes.for_curves(len(curves))
         used_today: set[int] = set()  # epics already opened today (diversity rule)
 
         # Selection model knobs (see the scheduler's ``_select_and_open``):
@@ -437,6 +562,7 @@ class StrategySimulator:
             for _ts2, e, candle in group:
                 buffers[e].add(candle)
                 last_candles[e] = candle
+                session.update(e, candle)
                 position = open_positions.get(e)
                 if position is not None and self._monitor(position, candle, buffers[e]):
                     del open_positions[e]
@@ -454,6 +580,7 @@ class StrategySimulator:
                 used_today,
                 target,
                 result,
+                session,
                 cooldown_min=cooldown_min,
                 allow_reopen=allow_reopen,
                 last_open_ts=last_open_ts,
@@ -464,7 +591,12 @@ class StrategySimulator:
         for e, position in list(open_positions.items()):
             candle = last_candles[e]
             if candle is not None:
-                self._close(position, candle, candle.bid_close, "end_of_day")
+                self._close(
+                    position,
+                    candle,
+                    close_out_price(candle, position.direction),
+                    "end_of_day",
+                )
                 result.trades.append(position)
 
     def _select_and_open(
@@ -478,6 +610,7 @@ class StrategySimulator:
         used_today: set[int],
         target: int,
         result: SimulationResult,
+        session: SessionExtremes,
         *,
         cooldown_min: int = 0,
         allow_reopen: bool = False,
@@ -528,7 +661,7 @@ class StrategySimulator:
             if len(buf) < self._entry.warmup:
                 continue
             intent = self._entry.evaluate(buf.epic, buf)
-            if intent is not None and intent.direction == "BUY":
+            if intent is not None and self._accepts(intent):
                 ranked.append((intent.score, e, intent))
         if not ranked:
             return last_open_ts
@@ -571,6 +704,7 @@ class StrategySimulator:
                 closed_today,
                 result,
                 used_today,  # _try_open records the epic as used on success
+                session.get(e, intent.direction),
             ):
                 slots -= 1
                 opened += 1
@@ -580,6 +714,22 @@ class StrategySimulator:
     # ------------------------------------------------------------------ #
     # Opening                                                             #
     # ------------------------------------------------------------------ #
+
+    @property
+    def _allow_short(self) -> bool:
+        """Whether this entry may open SELL — its own ``emits_shorts`` opt-in.
+
+        Same source of truth as the scheduler (``getattr(strategy,
+        "emits_shorts", False)``): a long-only strategy cannot short by accident,
+        a two-sided one is replayed on both sides.
+        """
+        return bool(getattr(self._entry, "emits_shorts", False))
+
+    def _accepts(self, intent) -> bool:
+        """True when this intent's direction is one the entry may act on."""
+        if intent.direction == "BUY":
+            return True
+        return intent.direction == "SELL" and self._allow_short
 
     def _evaluate(
         self,
@@ -591,17 +741,21 @@ class StrategySimulator:
         closed_today: list[SimulatedTrade],
         result: SimulationResult,
         used_today: set[int] | None = None,
+        session: SessionExtremes | None = None,
     ) -> None:
         """Per-epic open path — mirror of the scheduler's ``_evaluate_epic``.
 
         The entry strategy decides direction only; the close profile picks the
-        stop in :meth:`_try_open`.
+        stop in :meth:`_try_open`. A SELL intent is kept exactly when the live
+        path keeps it — the strategy declares ``emits_shorts`` — and dropped
+        otherwise, mirroring ``if intent and (intent.direction == "BUY" or
+        allow_short)`` in the scheduler.
         """
         if len(buf) < self._entry.warmup:
             return
 
         intent = self._entry.evaluate(buf.epic, buf)
-        if intent is None or intent.direction != "BUY":
+        if intent is None or not self._accepts(intent):
             return
         result.buy_signals += 1
         self._try_open(
@@ -614,6 +768,7 @@ class StrategySimulator:
             closed_today,
             result,
             used_today,
+            session.get(epic_index, intent.direction) if session else None,
         )
 
     def _try_open(
@@ -627,12 +782,17 @@ class StrategySimulator:
         closed_today: list[SimulatedTrade],
         result: SimulationResult,
         used_today: set[int] | None = None,
+        day_extreme: float | None = None,
     ) -> bool:
         """Run the pre-open gates and open on success.
 
         The close profile (not the entry) chooses the initial protective stop
         and any take-profit via ``initial_plan`` — exactly as the live
         ``open_from_intent`` does.
+
+        ``day_extreme`` is the epic's session extreme as of *this* candle (see
+        :class:`SessionExtremes`), forwarded untouched to the close profile so a
+        session-anchored stop policy places the same level it would place live.
 
         ``used_today`` holds the epics already opened during the simulated day.
         It backs the global ``ALLOW_SAME_DAY_REOPEN`` policy (carried on
@@ -648,6 +808,7 @@ class StrategySimulator:
             direction=intent.direction,
             in_trading_hours=True,
             epic_already_open=epic_index in open_positions,
+            allow_short=self._allow_short,
             epic_traded_today=(
                 not allow_reopen and used_today is not None and epic_index in used_today
             ),
@@ -657,20 +818,29 @@ class StrategySimulator:
             result.rejections[reason.split("(")[0].strip()] += 1
             return False
 
+        # ``entry_level`` is the live bid on both sides — the same value the live
+        # open passes — and the profile derives break-even from it per direction.
         plan = self._close_profile.initial_plan(
-            entry_level=candle.bid_close, direction=intent.direction, buf=buf
+            entry_level=candle.bid_close,
+            direction=intent.direction,
+            buf=buf,
+            day_extreme=day_extreme,
         )
-        stop_distance = candle.bid_close - plan.stop_level
+        sign = direction_sign(intent.direction)
+        stop_distance = sign * (candle.bid_close - plan.stop_level)
         euro_per_point = self._sim.euro_per_point * self._sim.quantity
         euro_risk = stop_distance * euro_per_point
 
-        # A market BUY fills at the offer (same as IG's confirmation level).
+        # A market order fills on the side that costs the spread: a BUY at the
+        # offer, a SELL at the bid (same as IG's confirmation level). The position
+        # is then closed on the opposite side, so the spread is paid once, at open.
         open_positions[epic_index] = SimulatedTrade(
             epic=buf.epic,
             day=day,
             open_time=candle.timestamp.strftime("%H:%M"),
-            level_open=round(candle.offer_close, 5),
-            level_open_bid=round(candle.bid_close, 5),
+            direction=intent.direction,
+            level_open=round(candle.bid_close if sign < 0 else candle.offer_close, 5),
+            level_open_closeout=round(close_out_price(candle, intent.direction), 5),
             level_zero=round(plan.level_zero, 5),
             level_loose=round(plan.stop_level, 5),
             level_stop=round(plan.stop_level, 5),
@@ -697,18 +867,37 @@ class StrategySimulator:
 
         Returns True when the position was closed.
         """
+        # The profile is fed the live **bid** on both sides (as the live monitor
+        # does) and converts it to the close-out price itself; every level compared
+        # here is already in close-out terms, so it is derived per direction.
         current_bid = candle.bid_close
+        sign = direction_sign(position.direction)
+        current_close_out = close_out_price(candle, position.direction)
 
         # Broker-side protective stop: the close profile owns the stop level
         # (``level_follower``), so this models IG filling the *pushed* stop when
-        # the low touches it. The profile may in principle move the stop down as
-        # well as up (a zone updater could give a soft dip room), hence the level
-        # is taken as-is rather than ratcheted here.
+        # price reaches it inside the candle — the bid low for a long, the offer
+        # high for a short. The profile may in principle move the stop backwards as
+        # well as forwards (a zone updater could give a soft dip room), hence the
+        # level is taken as-is rather than ratcheted here.
         broker_stop = position.level_follower
-        if candle.bid_low <= broker_stop:
+        if sign * (close_out_extreme(candle, position.direction) - broker_stop) <= 0:
             reason = "follower" if position.stop_updates else "stop"
             self._close(position, candle, broker_stop, reason)
             return True
+
+        # Break-even crossing, for the counterfactual reported alongside the real
+        # result. Read from the close-out price the live monitor sees once a minute,
+        # and only on a candle the position survived: when the broker stop fires in
+        # the same candle there is no way to prove price went green *before* it
+        # reached the stop, so that candle does not count.
+        if (
+            position.level_breakeven_exit is None
+            and position.level_zero > 0
+            and sign * (current_close_out - position.level_zero) > 0
+        ):
+            position.level_breakeven_exit = round(current_close_out, 5)
+            position.time_breakeven_exit = candle.timestamp.strftime("%H:%M")
 
         decision = self._close_profile.evaluate(
             position,
@@ -717,7 +906,7 @@ class StrategySimulator:
             is_close_hour=candle.timestamp.hour >= self._config.hour_close,
         )
         if decision.action == ACTION_CLOSE:
-            self._close(position, candle, current_bid, decision.reason)
+            self._close(position, candle, current_close_out, decision.reason)
             return True
         if (
             decision.action == ACTION_UPDATE_STOP
@@ -736,8 +925,13 @@ class StrategySimulator:
         close_level: float,
         reason: str,
     ) -> None:
-        """Record the close and the euro P&L (same formula as ``_euro_pnl``)."""
-        move = close_level - position.level_open
+        """Record the close and the euro P&L (same formula as ``_euro_pnl``).
+
+        The move is signed by direction, exactly like the live
+        ``TradingService._euro_pnl``: a long earns on the way up, a short on the
+        way down.
+        """
+        move = direction_sign(position.direction) * (close_level - position.level_open)
         euro = move * self._sim.euro_per_point * self._sim.quantity
         position.close_time = candle.timestamp.strftime("%H:%M")
         position.level_close = round(close_level, 5)
@@ -872,7 +1066,7 @@ def run_close_visual(
         day=0,
         open_time=open_candle.timestamp.strftime("%H:%M"),
         level_open=round(open_candle.offer_close, 5),  # market BUY fills at offer
-        level_open_bid=round(open_candle.bid_close, 5),
+        level_open_closeout=round(open_candle.bid_close, 5),
         level_zero=round(plan.level_zero, 5),
         level_loose=round(plan.stop_level, 5),
         level_stop=round(plan.stop_level, 5),

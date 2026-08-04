@@ -2,15 +2,19 @@
 
 Correctness gates only (trading hours, long-only unless ``allow_short``,
 duplicate-epic suppression, same-day re-open policy) plus the recovery-revert
-rule — exit- and entry-agnostic, no I/O.
+rule — the bookkeeping half (which stop fired) and the curve half (did the market
+really break through it). Exit- and entry-agnostic, no I/O.
 """
 
+from datetime import UTC, date, datetime, time
 from types import SimpleNamespace
 
 from src.execution.gates import (
     RECOVERY_REVERT_REASON_OPEN,
+    curve_supports_revert,
     evaluate_open_gates,
     original_stop_level,
+    position_opened_at,
     reverse_direction,
     should_revert_after_stop_loss,
 )
@@ -220,3 +224,168 @@ class TestRecoveryRevertRule:
         # Single hop: a stopped-out revert does not flip back (no ping-pong).
         revert, reason = _revert(reason_open=RECOVERY_REVERT_REASON_OPEN)
         assert not revert and "no second hop" in reason
+
+
+def _curve(**overrides):
+    """A clean 5-minute break through a long's opening stop.
+
+    Level 1.10000 opened with a 1.09850 stop (risk = 0.00150), price walking
+    straight down one candle per minute and still 0.00050 past the stop when the
+    revert is decided.
+    """
+    base = {
+        "direction": "BUY",
+        "level_open": 1.10000,
+        "original_stop": 1.09850,
+        "prices": [1.09960, 1.09920, 1.09880, 1.09840, 1.09800],
+        "current_price": 1.09800,
+        "minutes_held": 5.5,
+    }
+    base.update(overrides)
+    return curve_supports_revert(**base)
+
+
+class TestPositionOpenedAt:
+    """``date`` + naive-UTC ``time_open`` back into a UTC instant."""
+
+    def test_columns_are_combined_as_utc(self):
+        position = SimpleNamespace(date=date(2026, 8, 3), time_open=time(9, 59, 30))
+        assert position_opened_at(position) == datetime(
+            2026, 8, 3, 9, 59, 30, tzinfo=UTC
+        )
+
+    def test_missing_time_is_unknown(self):
+        assert position_opened_at(SimpleNamespace(date=date(2026, 8, 3))) is None
+
+    def test_missing_date_is_unknown(self):
+        assert position_opened_at(SimpleNamespace(time_open=time(9, 0))) is None
+
+
+class TestRevertCurveFilter:
+    """Only a market that really moved deserves the opposite side.
+
+    The bookkeeping rule above establishes that the stop placed at open is what
+    fired; this one looks at the curve walked since that open, and is deliberately
+    permissive: a stop-out normally *does* revert, and only the blatant "nothing
+    happened" curves are dropped. What it looks for is a move **concentrated** in
+    one or two candles — never how long the position was held, since a flat market
+    can break in a single candle after twenty quiet minutes.
+    """
+
+    def test_clean_break_supports_the_revert(self):
+        supported, reason = _curve()
+        assert supported is True and reason == "OK"
+
+    def test_mirror_break_on_a_short_supports_the_revert(self):
+        supported, reason = _curve(
+            direction="SELL",
+            original_stop=1.10150,
+            prices=[1.10040, 1.10080, 1.10120, 1.10160, 1.10200],
+            current_price=1.10200,
+        )
+        assert supported is True and reason == "OK"
+
+    def test_flat_range_broken_by_one_candle_supports_the_revert(self):
+        # Fifteen minutes inside a 0.00010 band, then one candle straight through
+        # the stop. Holding time says "flat", the impulse says "break" — and the
+        # break is what matters: this is a prime revert.
+        flat = [1.09990 + 0.00005 * (i % 3) for i in range(15)] + [1.09800]
+        supported, reason = _curve(prices=flat, minutes_held=16)
+        assert supported is True and reason == "OK"
+
+    def test_slow_leak_to_the_stop_is_refused(self):
+        # Same destination reached in forty tiny steps: no candle carries the move,
+        # so there is nothing to ride on the other side.
+        supported, reason = _curve(prices=[1.10000 - 0.00005 * i for i in range(1, 41)])
+        assert not supported and "flat curve leaking to the stop" in reason
+
+    def test_holding_time_alone_never_refuses(self):
+        # An hour of position life with a real break in it is still a break.
+        supported, reason = _curve(minutes_held=60)
+        assert supported is True and reason == "OK"
+
+    def test_noise_that_only_taps_the_stop_is_refused(self):
+        # Flat band drifting just far enough to tap the stop, price back inside it
+        # when the revert is decided.
+        flat = [1.09990, 1.09960, 1.09985, 1.09950, 1.09980, 1.09880, 1.09860]
+        supported, reason = _curve(prices=flat, current_price=1.09865, minutes_held=7)
+        assert not supported and "grazed" in reason
+
+    def test_oscillating_curve_is_refused(self):
+        supported, reason = _curve(
+            prices=[
+                1.09990,
+                1.09930,
+                1.09990,
+                1.09920,
+                1.09980,
+                1.09910,
+                1.09970,
+                1.09900,
+                1.09960,
+                1.09890,
+                1.09950,
+                1.09800,
+            ],
+            minutes_held=12,
+        )
+        assert not supported and "chopped its way to the stop" in reason
+
+    def test_full_risk_in_profit_first_is_refused(self):
+        # The trade drifted a full risk into PROFIT, then one candle took it back
+        # through its opening stop: a 2-risk round trip is an oscillation, and the
+        # direction was right at least once.
+        supported, reason = _curve(
+            prices=[
+                1.10013,
+                1.10027,
+                1.10040,
+                1.10053,
+                1.10067,
+                1.10080,
+                1.10093,
+                1.10107,
+                1.10120,
+                1.10133,
+                1.10147,
+                1.10160,
+                1.09800,
+            ],
+            minutes_held=13,
+        )
+        assert not supported and "oscillation" in reason
+
+    def test_grazed_stop_is_refused(self):
+        # A wick took the stop out and price is already back above it.
+        supported, reason = _curve(current_price=1.09900)
+        assert not supported and "grazed" in reason
+
+    def test_price_barely_past_the_stop_is_refused(self):
+        # Less than 10% of the risk beyond the stop: not a break yet.
+        supported, reason = _curve(current_price=1.09845)
+        assert not supported and "grazed" in reason
+
+    def test_two_candle_break_is_judged_normally(self):
+        # One step is enough for the impulse and straightness tests.
+        supported, reason = _curve(prices=[1.09900, 1.09800], minutes_held=2)
+        assert supported is True and reason == "OK"
+
+    def test_stop_out_before_the_first_candle_is_accepted(self):
+        # The position died inside a minute: there is no curve to read, and a
+        # stop-out that fast is a break by definition.
+        supported, reason = _curve(prices=[1.09800], minutes_held=1)
+        assert supported is True and "stopped out within" in reason
+
+    def test_missing_candles_over_a_long_hold_are_refused(self):
+        # Same single candle, but the position was held 10 minutes: the curve is
+        # unknown (feed gap), and an unknown curve is not a licence to revert.
+        supported, reason = _curve(prices=[1.09800], minutes_held=10)
+        assert not supported and "curve unknown" in reason
+
+    def test_unknown_risk_span_is_refused(self):
+        supported, reason = _curve(original_stop=1.10000)
+        assert not supported and "Risk span" in reason
+
+    def test_missing_live_price_is_refused(self):
+        supported, reason = _curve(current_price=0.0)
+        assert not supported and "No live price" in reason

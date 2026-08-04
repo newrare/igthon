@@ -1,0 +1,1005 @@
+{
+  "generated_at": "2026-08-03T10:13:08+00:00",
+  "epics": {
+    "CC.D.BO.UNC.IP": {
+      "euro_per_point": 3.96,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 6.0,
+      "conversion_rate": 0.66,
+      "name": "Soybean Oil ($6)"
+    },
+    "CC.D.CC.UNC.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Cacao New York (10$)"
+    },
+    "CC.D.CL.UEF.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Pétrole - US Brut Léger (1$)"
+    },
+    "CC.D.LCC.UNC.IP": {
+      "euro_per_point": 11.67175,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 10.0,
+      "conversion_rate": 1.167175,
+      "name": "Cacao Londres (10£)"
+    },
+    "CC.D.LCO.UNC.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Pétrole - Brut Brent (10$)"
+    },
+    "CC.D.LKD.UNC.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Café Robusta (10$)"
+    },
+    "CC.D.LSU.UNC.IP": {
+      "euro_per_point": 33.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 50.0,
+      "conversion_rate": 0.66,
+      "name": "Sucre No 5 Londres (50$)"
+    },
+    "CC.D.NG.UNC.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Gaz naturel (10$)"
+    },
+    "CC.D.W.UNC.IP": {
+      "euro_per_point": 33.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 50.0,
+      "conversion_rate": 0.66,
+      "name": "Blé Chicago (50$)"
+    },
+    "CO.D.BO.FWM1.IP": {
+      "euro_per_point": 1.98,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 3.0,
+      "conversion_rate": 0.66,
+      "name": "Soybean Oil ($3)"
+    },
+    "CO.D.BO.FWM2.IP": {
+      "euro_per_point": 1.98,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 3.0,
+      "conversion_rate": 0.66,
+      "name": "Soybean Oil ($3)"
+    },
+    "CO.D.C.FWM2.IP": {
+      "euro_per_point": 16.5,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 25.0,
+      "conversion_rate": 0.66,
+      "name": "Maïs (25$)"
+    },
+    "CO.D.C.FWM3.IP": {
+      "euro_per_point": 16.5,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 25.0,
+      "conversion_rate": 0.66,
+      "name": "Maïs (25$)"
+    },
+    "CS.D.AUDCAD.CFD.IP": {
+      "euro_per_point": 55000.0,
+      "quantity": 1.0,
+      "currency": "CAD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.55,
+      "name": "AUD/CAD"
+    },
+    "CS.D.AUDCNH.CFD.IP": {
+      "euro_per_point": 9500.0,
+      "quantity": 1.0,
+      "currency": "CNH",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.095,
+      "name": "AUD/CNH"
+    },
+    "CS.D.AUDEUR.CFD.IP": {
+      "euro_per_point": 100000.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 100000.0,
+      "conversion_rate": 1.0,
+      "name": "AUD/EUR"
+    },
+    "CS.D.AUDGBP.CFD.IP": {
+      "euro_per_point": 116717.498694,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 100000.0,
+      "conversion_rate": 1.167175,
+      "name": "AUD/GBP"
+    },
+    "CS.D.AUDJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "AUD/JPY"
+    },
+    "CS.D.AUDNZD.CFD.IP": {
+      "euro_per_point": 36000.0,
+      "quantity": 1.0,
+      "currency": "NZD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.36,
+      "name": "AUD/NZD"
+    },
+    "CS.D.AUDSGD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "SGD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "AUD/SGD"
+    },
+    "CS.D.AUDUSD.CFD.IP": {
+      "euro_per_point": 66000.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.66,
+      "name": "AUD/USD"
+    },
+    "CS.D.CADCNH.CFD.IP": {
+      "euro_per_point": 9500.0,
+      "quantity": 1.0,
+      "currency": "CNH",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.095,
+      "name": "CAD/CNH"
+    },
+    "CS.D.CADJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "CAD/JPY"
+    },
+    "CS.D.CFDSILVER.CFM.IP": {
+      "euro_per_point": 3.3,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 5.0,
+      "conversion_rate": 0.66,
+      "name": "Argent au comptant mini (500oz)"
+    },
+    "CS.D.CFEGOLD.CEF.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Spot Gold ($1)"
+    },
+    "CS.D.CFEGOLD.CFE.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "Or au comptant (Contrat 1€)"
+    },
+    "CS.D.CHFJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "CHF/JPY"
+    },
+    "CS.D.CNHJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "CNH/JPY"
+    },
+    "CS.D.CRYPTOB10.CFD.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Crypto 10 Index"
+    },
+    "CS.D.EURAUD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "AUD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "EUR/AUD"
+    },
+    "CS.D.EURCAD.CFD.IP": {
+      "euro_per_point": 55000.0,
+      "quantity": 1.0,
+      "currency": "CAD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.55,
+      "name": "EUR/CAD"
+    },
+    "CS.D.EURCHF.CFD.IP": {
+      "euro_per_point": 60000.0,
+      "quantity": 1.0,
+      "currency": "CHF",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.6,
+      "name": "EUR/CHF"
+    },
+    "CS.D.EURCNH.CFD.IP": {
+      "euro_per_point": 9500.0,
+      "quantity": 1.0,
+      "currency": "CNH",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.095,
+      "name": "EUR/CNH"
+    },
+    "CS.D.EURGBP.CFD.IP": {
+      "euro_per_point": 116751.497916,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 100000.0,
+      "conversion_rate": 1.167515,
+      "name": "EUR/GBP"
+    },
+    "CS.D.EURJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "EUR/JPY"
+    },
+    "CS.D.EURNZD.CFD.IP": {
+      "euro_per_point": 36000.0,
+      "quantity": 1.0,
+      "currency": "NZD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.36,
+      "name": "EUR/NZD"
+    },
+    "CS.D.EURSEK.CFD.IP": {
+      "euro_per_point": 8000.0,
+      "quantity": 1.0,
+      "currency": "SEK",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.08,
+      "name": "EUR/SEK"
+    },
+    "CS.D.EURSGD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "SGD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "EUR/SGD"
+    },
+    "CS.D.EURUSD.CEF.IP": {
+      "euro_per_point": 66000.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.66,
+      "name": "EUR/USD "
+    },
+    "CS.D.EURUSD.CEFM.IP": {
+      "euro_per_point": 6600.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10000.0,
+      "conversion_rate": 0.66,
+      "name": "EUR/USD Mini"
+    },
+    "CS.D.GBPAUD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "AUD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "GBP/AUD"
+    },
+    "CS.D.GBPCAD.CFD.IP": {
+      "euro_per_point": 55000.0,
+      "quantity": 1.0,
+      "currency": "CAD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.55,
+      "name": "GBP/CAD"
+    },
+    "CS.D.GBPCHF.CFD.IP": {
+      "euro_per_point": 60000.0,
+      "quantity": 1.0,
+      "currency": "CHF",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.6,
+      "name": "GBP/CHF"
+    },
+    "CS.D.GBPEUR.CFD.IP": {
+      "euro_per_point": 100000.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 100000.0,
+      "conversion_rate": 1.0,
+      "name": "GBP/EUR"
+    },
+    "CS.D.GBPJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "GBP/JPY"
+    },
+    "CS.D.GBPNZD.CFD.IP": {
+      "euro_per_point": 36000.0,
+      "quantity": 1.0,
+      "currency": "NZD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.36,
+      "name": "GBP/NZD"
+    },
+    "CS.D.GBPSGD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "SGD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "GBP/SGD"
+    },
+    "CS.D.GBPUSD.CFD.IP": {
+      "euro_per_point": 66000.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.66,
+      "name": "GBP/USD "
+    },
+    "CS.D.NZDAUD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "AUD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "NZD/AUD"
+    },
+    "CS.D.NZDCAD.CFD.IP": {
+      "euro_per_point": 55000.0,
+      "quantity": 1.0,
+      "currency": "CAD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.55,
+      "name": "NZD/CAD"
+    },
+    "CS.D.NZDCNH.CFD.IP": {
+      "euro_per_point": 9500.0,
+      "quantity": 1.0,
+      "currency": "CNH",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.095,
+      "name": "NZD/CNH"
+    },
+    "CS.D.NZDEUR.CFD.IP": {
+      "euro_per_point": 100000.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 100000.0,
+      "conversion_rate": 1.0,
+      "name": "NZD/EUR"
+    },
+    "CS.D.NZDJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "NZD/JPY"
+    },
+    "CS.D.NZDUSD.CFD.IP": {
+      "euro_per_point": 66000.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.66,
+      "name": "NZD/USD"
+    },
+    "CS.D.SGDJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "SGD/JPY"
+    },
+    "CS.D.USDCAD.CFD.IP": {
+      "euro_per_point": 55000.0,
+      "quantity": 1.0,
+      "currency": "CAD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.55,
+      "name": "USD/CAD"
+    },
+    "CS.D.USDCHF.CFD.IP": {
+      "euro_per_point": 60000.0,
+      "quantity": 1.0,
+      "currency": "CHF",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.6,
+      "name": "USD/CHF"
+    },
+    "CS.D.USDCNH.CFD.IP": {
+      "euro_per_point": 9500.0,
+      "quantity": 1.0,
+      "currency": "CNH",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.095,
+      "name": "USD/CNH"
+    },
+    "CS.D.USDJPY.CFD.IP": {
+      "euro_per_point": 700.0,
+      "quantity": 1.0,
+      "currency": "JPY",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.007,
+      "name": "USD/JPY"
+    },
+    "CS.D.USDNOK.CFD.IP": {
+      "euro_per_point": 10000.0,
+      "quantity": 1.0,
+      "currency": "NOK",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.1,
+      "name": "USD/NOK"
+    },
+    "CS.D.USDSEK.CFD.IP": {
+      "euro_per_point": 8000.0,
+      "quantity": 1.0,
+      "currency": "SEK",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.08,
+      "name": "USD/SEK"
+    },
+    "CS.D.USDSGD.CFD.IP": {
+      "euro_per_point": 45000.0,
+      "quantity": 1.0,
+      "currency": "SGD",
+      "contract_size": 100000.0,
+      "conversion_rate": 0.45,
+      "name": "USD/SGD"
+    },
+    "EN.D.CL.FWS1.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Pétrole - US Brut Léger (10$)"
+    },
+    "EN.D.CL.FWS2.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Pétrole - US Brut Léger (10$)"
+    },
+    "EN.D.HO.FWM1.IP": {
+      "euro_per_point": 1.386,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 2.1,
+      "conversion_rate": 0.66,
+      "name": "Fuel domestique (2.10$)"
+    },
+    "EN.D.HO.FWM2.IP": {
+      "euro_per_point": 1.386,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 2.1,
+      "conversion_rate": 0.66,
+      "name": "Fuel domestique (2.10$)"
+    },
+    "EN.D.ICENG.FWS9.IP": {
+      "euro_per_point": 1.16749,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 1.0,
+      "conversion_rate": 1.16749,
+      "name": "UK Natural Gas (ñ)"
+    },
+    "EN.D.LCO.FWS4.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Pétrole - Brut Brent (10$)"
+    },
+    "IX.D.ASX.IFD.IP": {
+      "euro_per_point": 11.25,
+      "quantity": 1.0,
+      "currency": "AUD",
+      "contract_size": 25.0,
+      "conversion_rate": 0.45,
+      "name": "Australie 200 au comptant (25A$)"
+    },
+    "IX.D.ASX.IFM.IP": {
+      "euro_per_point": 2.25,
+      "quantity": 1.0,
+      "currency": "AUD",
+      "contract_size": 5.0,
+      "conversion_rate": 0.45,
+      "name": "Australie 200 au comptant (5$A)"
+    },
+    "IX.D.CAC.IDF.IP": {
+      "euro_per_point": 10.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 10.0,
+      "conversion_rate": 1.0,
+      "name": "France 40 au comptant (10€)"
+    },
+    "IX.D.CAC.IMF.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "France 40 au comptant (1€)"
+    },
+    "IX.D.DAX.FWM1.IP": {
+      "euro_per_point": 5.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 5.0,
+      "conversion_rate": 1.0,
+      "name": "Allemagne 40 (5€)"
+    },
+    "IX.D.DAX.FWS1.IP": {
+      "euro_per_point": 25.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 25.0,
+      "conversion_rate": 1.0,
+      "name": "Allemagne 40 (25€)"
+    },
+    "IX.D.DAX.IDF.IP": {
+      "euro_per_point": 25.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 25.0,
+      "conversion_rate": 1.0,
+      "name": "Allemagne 40 au comptant (25€)"
+    },
+    "IX.D.DAX.IFMM.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "Allemagne 40 au comptant (1€)"
+    },
+    "IX.D.DAX.IMF.IP": {
+      "euro_per_point": 5.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 5.0,
+      "conversion_rate": 1.0,
+      "name": "Allemagne 40 au comptant (5€)"
+    },
+    "IX.D.DOW.FWM2.IP": {
+      "euro_per_point": 1.32,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 2.0,
+      "conversion_rate": 0.66,
+      "name": "Wall Street (2$)"
+    },
+    "IX.D.DOW.FWS2.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Wall Street (10$)"
+    },
+    "IX.D.DOW.IEN.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Wall Street Cash (1$)"
+    },
+    "IX.D.DOW.IFE.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "Wall Street au comptant (1€)"
+    },
+    "IX.D.EMGMKT.IFM.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Emerging Markets Index ($10)"
+    },
+    "IX.D.EMGMKT.SING.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Emerging Markets Index ($1)"
+    },
+    "IX.D.FTSE.CFD.IP": {
+      "euro_per_point": 11.67405,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 10.0,
+      "conversion_rate": 1.167405,
+      "name": "FTSE 100 au comptant (10£)"
+    },
+    "IX.D.FTSE.FWM1.IP": {
+      "euro_per_point": 2.33481,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 2.0,
+      "conversion_rate": 1.167405,
+      "name": "FTSE 100 (2£)"
+    },
+    "IX.D.FTSE.IFE.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "FTSE 100 au comptant (1€)"
+    },
+    "IX.D.FTSE.IFM.IP": {
+      "euro_per_point": 2.33481,
+      "quantity": 1.0,
+      "currency": "GBP",
+      "contract_size": 2.0,
+      "conversion_rate": 1.167405,
+      "name": "FTSE 100 au comptant (2£)"
+    },
+    "IX.D.HANGSENG.IFM.IP": {
+      "euro_per_point": 0.9,
+      "quantity": 1.0,
+      "currency": "HKD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.09,
+      "name": "Hong Kong HS50 au comptant (10HK)"
+    },
+    "IX.D.HSTECH.FWM2.IP": {
+      "euro_per_point": 0.9,
+      "quantity": 1.0,
+      "currency": "HKD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.09,
+      "name": "Hong Kong Tech (HK10)"
+    },
+    "IX.D.HSTECH.FWM3.IP": {
+      "euro_per_point": 0.9,
+      "quantity": 1.0,
+      "currency": "HKD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.09,
+      "name": "Hong Kong Tech (HK10)"
+    },
+    "IX.D.NASDAQ.FWM1.IP": {
+      "euro_per_point": 13.2,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 20.0,
+      "conversion_rate": 0.66,
+      "name": "US Tech 100 (20$)"
+    },
+    "IX.D.NASDAQ.FWS1.IP": {
+      "euro_per_point": 66.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100.0,
+      "conversion_rate": 0.66,
+      "name": "US Tech 100 (100$)"
+    },
+    "IX.D.NASDAQ.IEN.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "US Tech 100 au comptant (1$)"
+    },
+    "IX.D.NASDAQ.IFD.IP": {
+      "euro_per_point": 66.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100.0,
+      "conversion_rate": 0.66,
+      "name": "US Tech 100 au comptant (100$)"
+    },
+    "IX.D.NASDAQ.IFE.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "US Tech 100 au comptant (1€)"
+    },
+    "IX.D.NASDAQ.IFM.IP": {
+      "euro_per_point": 13.2,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 20.0,
+      "conversion_rate": 0.66,
+      "name": "US Tech 100 au comptant (20$)"
+    },
+    "IX.D.NASDAQ.IZE.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "US Tech 100 au comptant (1€)"
+    },
+    "IX.D.NIKFUT.FWM1.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Japon 225 (1$)"
+    },
+    "IX.D.NIKFUT.FWM2.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Japon 225 (1$)"
+    },
+    "IX.D.NIKKEI.IFD.IP": {
+      "euro_per_point": 3.3,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 5.0,
+      "conversion_rate": 0.66,
+      "name": "Japon 225 au comptant (5$)"
+    },
+    "IX.D.NIKKEI.IFM.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Japon 225 au comptant (1$)"
+    },
+    "IX.D.SPTRD.FWM1.IP": {
+      "euro_per_point": 33.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 50.0,
+      "conversion_rate": 0.66,
+      "name": "US 500 (50$)"
+    },
+    "IX.D.SPTRD.FWS1.IP": {
+      "euro_per_point": 165.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 250.0,
+      "conversion_rate": 0.66,
+      "name": "US 500 (250$)"
+    },
+    "IX.D.SPTRD.IFD.IP": {
+      "euro_per_point": 165.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 250.0,
+      "conversion_rate": 0.66,
+      "name": "US 500 au comptant (250$)"
+    },
+    "IX.D.SPTRD.IFM.IP": {
+      "euro_per_point": 33.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 50.0,
+      "conversion_rate": 0.66,
+      "name": "US 500 au comptant (50$)"
+    },
+    "IX.D.SPTRD.IZE.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "US 500 au comptant (1€)"
+    },
+    "IX.D.STXE.FWM4.IP": {
+      "euro_per_point": 2.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 2.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks 50 (2€)"
+    },
+    "IX.D.STXE.FWS4.IP": {
+      "euro_per_point": 10.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 10.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks 50 (10€)"
+    },
+    "IX.D.STXE.IFD.IP": {
+      "euro_per_point": 10.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 10.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks 50 au comptant (10€)"
+    },
+    "IX.D.STXE.IFM.IP": {
+      "euro_per_point": 2.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 2.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks 50 au comptant (2€)"
+    },
+    "IX.D.STXE.MT5.IP": {
+      "euro_per_point": 10.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 10.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks 50 au comptant"
+    },
+    "IX.D.SUNCL.UME.IP": {
+      "euro_per_point": 1.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "Weekend Oil - US Crude (E1)"
+    },
+    "IX.D.SUNDAX.IFMM.IP": {
+      "euro_per_point": 2.0,
+      "quantity": 2.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "Allemagne 40 au comptant – Weekend (1€)"
+    },
+    "IX.D.SUNDOW.IEN.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Weekend Wall Street Cash ($1)"
+    },
+    "IX.D.SUNEURUSD.CEF.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Weekend EUR/USD"
+    },
+    "IX.D.SUNFUN.IFE.IP": {
+      "euro_per_point": 2.0,
+      "quantity": 2.0,
+      "currency": "EUR",
+      "contract_size": 1.0,
+      "conversion_rate": 1.0,
+      "name": "Weekend UK 100 Cash (E1)"
+    },
+    "IX.D.SUNNAS.IEN.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Weekend US Tech 100 ($1)"
+    },
+    "IX.D.StoxxBank.FNI2.IP": {
+      "euro_per_point": 50.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 50.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks Banks Index (50 EUR)"
+    },
+    "IX.D.StoxxBank.FNI3.IP": {
+      "euro_per_point": 50.0,
+      "quantity": 1.0,
+      "currency": "EUR",
+      "contract_size": 50.0,
+      "conversion_rate": 1.0,
+      "name": "EU Stocks Banks Index (50 EUR)"
+    },
+    "IX.D.TAIWAN.IFM.IP": {
+      "euro_per_point": 13.2,
+      "quantity": 2.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Taiwan Index Cash ($10)"
+    },
+    "IX.D.TOPIX.IFU.IP": {
+      "euro_per_point": 0.66,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 1.0,
+      "conversion_rate": 0.66,
+      "name": "Tokyo First Section Index Cash ($1)"
+    },
+    "MT.D.GC.FWM4.IP": {
+      "euro_per_point": 21.912,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 33.2,
+      "conversion_rate": 0.66,
+      "name": "Or (33.20$)"
+    },
+    "MT.D.GC.FWS4.IP": {
+      "euro_per_point": 66.0,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 100.0,
+      "conversion_rate": 0.66,
+      "name": "Or (100$)"
+    },
+    "MT.D.SI.FWM2.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Argent (10$)"
+    },
+    "MT.D.SI.FWM3.IP": {
+      "euro_per_point": 6.6,
+      "quantity": 1.0,
+      "currency": "USD",
+      "contract_size": 10.0,
+      "conversion_rate": 0.66,
+      "name": "Argent (10$)"
+    }
+  }
+}

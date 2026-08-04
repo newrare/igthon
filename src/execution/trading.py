@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.api.client import IGAPIError, IGClient
@@ -32,6 +32,7 @@ from src.exit.trailing import (
     decide_close_reason,
 )
 from src.feed.price_buffer import EpicBuffer
+from src.models.candle import CandleRecord
 from src.models.epic import Epic
 from src.models.position import Position, PositionState, PositionStrategy
 from src.utils.tools import (
@@ -337,6 +338,45 @@ class TradingService:
             epic_traded_today=traded_today,
         )
 
+    async def _session_extreme(self, epic: str, direction: str) -> float | None:
+        """Today's lowest bid low (BUY) / highest offer high (SELL) for ``epic``.
+
+        Read from the durable ``candle`` table rather than the live
+        :class:`~src.feed.price_buffer.EpicBuffer` because a session routinely
+        exceeds the buffer's ``buffer_max_candles`` ceiling (200 candles ≈ 3 h 20),
+        so the buffer cannot see the whole day. The extreme is taken on the side
+        the stop is triggered on, matching the reference every
+        :class:`~src.stops.base.StopDistance` compares against.
+
+        "Today" is the UTC calendar day, the same boundary ``Position.date`` and
+        the same-day re-open policy use — not a per-epic market open, which IG does
+        not expose (see the ``docs/`` note on missing ``openingHours``).
+
+        One indexed aggregate per open, on the local database only — never through
+        :class:`~src.core.api_queue.APIQueue`, which is reserved for external IG
+        calls. Returns ``None`` when the day holds no candle yet or the query
+        fails: the stop policy then degrades to the buffered history instead of the
+        open failing.
+        """
+        start = datetime.combine(datetime.now(UTC).date(), time.min, tzinfo=UTC)
+        if direction == "SELL":
+            aggregate = func.max(CandleRecord.offer_high)
+        else:
+            aggregate = func.min(CandleRecord.bid_low)
+        try:
+            result = await self._db.execute(
+                select(aggregate).where(
+                    CandleRecord.epic == epic,
+                    CandleRecord.timestamp >= start,
+                )
+            )
+            value = result.scalar()
+        except Exception:
+            # A stop placement is never worth failing an accepted open for.
+            logger.warning("Session extreme unavailable for %s", epic, exc_info=True)
+            return None
+        return float(value) if value is not None else None
+
     async def open_from_intent(
         self,
         intent: EntryIntent,
@@ -371,7 +411,10 @@ class TradingService:
             return None
 
         plan = profile.initial_plan(
-            entry_level=last.bid_close, direction=intent.direction, buf=buf
+            entry_level=last.bid_close,
+            direction=intent.direction,
+            buf=buf,
+            day_extreme=await self._session_extreme(intent.epic, intent.direction),
         )
 
         # Adapt the (intent, plan) pair to a TradingSignal. The close profile

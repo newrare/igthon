@@ -22,16 +22,36 @@ backtest is safe to run while the main process keeps recording the current week.
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import dataclass, fields
 
-from src.backtest.simulator import SimulationConfig, SimulationResult, StrategySimulator
-from src.entry import get_entry_strategy
+from src.backtest.contract_values import ContractTable
+from src.backtest.simulator import (
+    SimulationConfig,
+    SimulationResult,
+    StrategySimulator,
+    direction_sign,
+)
+from src.entry import ENTRY_STRATEGIES, get_entry_strategy
 from src.execution.trading import TradeConfig
 from src.exit import get_close_profile
+from src.exit.zones import (
+    ZONEMARGE_UPDATERS,
+    ZONEPROFIT_UPDATERS,
+    ZONESECURE_UPDATERS,
+    ZONESTART_UPDATERS,
+)
 from src.feed.price_buffer import Candle
+from src.stops import STOP_DISTANCES
 
 logger = logging.getLogger(__name__)
+
+#: Trade cap meaning "no cap" — replay every archived day of the selection.
+#: The synthetic simulator needs a trade target because it generates days
+#: endlessly; a backtest reads a finite archive, so capping would only truncate
+#: the data silently. Kept as a number (rather than ``None``) so the shared
+#: replay engine's ``len(trades) >= target`` check needs no special case.
+NO_TRADE_CAP = 1_000_000_000
 
 
 @dataclass(slots=True)
@@ -42,7 +62,9 @@ class BacktestConfig:
     profile/seed/base-price knobs are gone; the candles come from the archive.
     """
 
-    target_trades: int = 100  # stop once this many positions have closed
+    # Stop once this many positions have closed. Defaults to no cap: a backtest
+    # replays the whole selected archive (see NO_TRADE_CAP).
+    target_trades: int = NO_TRADE_CAP
     euro_per_point: float = 1.0  # contract value, € per point
     quantity: int = 1
 
@@ -58,6 +80,126 @@ class BacktestConfig:
             euro_per_point=self.euro_per_point,
             quantity=self.quantity,
         )
+
+
+#: The six ``.env`` selectors that define a run, mapped to the registry of valid
+#: names for each. A backtest exists to compare these against one another, so the
+#: page offers all six and the run applies them instead of the live configuration.
+SELECTION_REGISTRIES: dict[str, dict] = {
+    "open_strategy": ENTRY_STRATEGIES,
+    "stop_strategy": STOP_DISTANCES,
+    "close_zonestart": ZONESTART_UPDATERS,
+    "close_zonemarge": ZONEMARGE_UPDATERS,
+    "close_zonesecure": ZONESECURE_UPDATERS,
+    "close_zoneprofit": ZONEPROFIT_UPDATERS,
+}
+
+
+@dataclass(slots=True)
+class StrategySelection:
+    """One run's choice of the six decoupled selectors, each optional.
+
+    A field left at ``None`` falls back to the live ``.env`` value, so a run can
+    override a single zone and leave everything else exactly as production has it.
+    """
+
+    open_strategy: str | None = None
+    stop_strategy: str | None = None
+    close_zonestart: str | None = None
+    close_zonemarge: str | None = None
+    close_zonesecure: str | None = None
+    close_zoneprofit: str | None = None
+
+    def problems(self, settings) -> dict[str, str]:
+        """``{selector: why this run cannot be replayed}``, empty when it is clean.
+
+        Validated on the **resolved** names — the explicit override *or* the live
+        ``.env`` value it falls back to. A live value the offline engine cannot
+        reproduce has to fail as loudly as one typed into the request, otherwise a
+        plain "backtest this week" call would quietly replay something else under
+        the live configuration's name.
+        """
+        bad: dict[str, str] = {}
+        for selector, name in self.resolve(settings).items():
+            if name not in SELECTION_REGISTRIES[selector]:
+                bad[selector] = f"unknown name {name!r}"
+                continue
+            reason = untestable_reason(selector, name)
+            if reason:
+                bad[selector] = f"{name!r} is not backtestable — {reason}"
+        return bad
+
+    def apply(self, settings):
+        """A read-through view of ``settings`` with the chosen selectors replaced.
+
+        The composition layer resolves the exit from attributes on ``settings``
+        (``CloseZoneProfit.from_settings`` reads ``stop_strategy`` and the four
+        ``close_zone*`` names), and every strategy parameter is read from there
+        too. Overlaying rather than rebuilding therefore swaps exactly the six
+        decisions under test while keeping all tuning parameters intact — the
+        backtest stays a faithful replay of the live pipeline.
+        """
+        overrides = {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if getattr(self, f.name) is not None
+        }
+        return _SettingsOverlay(settings, overrides) if overrides else settings
+
+    def resolve(self, settings) -> dict[str, str]:
+        """The effective name of each selector once ``settings`` fills the gaps."""
+        effective = self.apply(settings)
+        return {name: getattr(effective, name, "") for name in SELECTION_REGISTRIES}
+
+
+#: ``selector → {name: why it is not backtestable}``. These names are valid live
+#: configuration, but the offline engine cannot reproduce what they do, so the
+#: backtest **refuses** them outright rather than replaying a degraded version
+#: under their name. The page hides them (shown disabled when they are the live
+#: value) and the API answers 400.
+UNTESTABLE_NAMES: dict[str, dict[str, str]] = {
+    "open_strategy": {
+        "open_manual": "waits for a human order — there is no signal to replay",
+        "open_testing": "opens unconditionally — replaying it tests nothing",
+    },
+    "close_zonestart": {
+        "smartgroup": (
+            "decides for the whole book from a cross-position pre-pass the "
+            "scheduler runs (plan_group), which the replay engine has no "
+            "equivalent of — a run would silently apply no group tightening"
+        ),
+    },
+}
+
+
+def untestable_reason(selector: str, name: str | None) -> str | None:
+    """Why ``name`` cannot be backtested for ``selector``, or ``None`` when it can."""
+    if not name:
+        return None
+    return UNTESTABLE_NAMES.get(selector, {}).get(name)
+
+
+def backtestable_names(selector: str) -> list[str]:
+    """Sorted names offered for ``selector``, minus the untestable ones."""
+    excluded = UNTESTABLE_NAMES.get(selector, {})
+    return sorted(set(SELECTION_REGISTRIES[selector]) - set(excluded))
+
+
+class _SettingsOverlay:
+    """Settings proxy: a handful of attributes replaced, everything else delegated.
+
+    Kept deliberately dumb (no copying, no validation) so it works with the real
+    pydantic ``Settings`` and with the ``SimpleNamespace`` stand-ins the tests use.
+    Overrides live in the instance ``__dict__``, which Python consults before
+    ``__getattr__``, so they win without any lookup logic here.
+    """
+
+    def __init__(self, base, overrides: dict[str, str]) -> None:
+        self.__dict__["_base"] = base
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name: str):
+        return getattr(self.__dict__["_base"], name)
 
 
 def _underlying(epic: str) -> str:
@@ -100,16 +242,19 @@ def dedupe_correlated_epics(
 def trade_return_pct(trade) -> float:
     """Percentage return of one trade, computed from the actual fill prices.
 
-    ``(close - open) / open * 100``. Price-based and contract-agnostic, so it is
-    directly comparable across instruments (a DAX index and a forex pair alike)
-    without any fabricated euro-per-point — which is exactly why the backtest
-    reports returns rather than euros: the archive holds prices, not contract
-    sizes or currency conversions.
+    ``sign × (close - open) / open × 100``, signed by direction so a short's
+    profit reads positive. Price-based and contract-agnostic, so it is directly
+    comparable across instruments (a DAX index and a forex pair alike) without any
+    contract value — which is what makes it the fallback lens for the epics the
+    contract table cannot price.
     """
     open_level = float(trade.level_open or 0.0)
     if not open_level or trade.level_close is None:
         return 0.0
-    return (float(trade.level_close) - open_level) / open_level * 100.0
+    move = direction_sign(getattr(trade, "direction", "BUY")) * (
+        float(trade.level_close) - open_level
+    )
+    return move / open_level * 100.0
 
 
 def percentage_summary(trades) -> dict:
@@ -139,6 +284,128 @@ def percentage_summary(trades) -> dict:
         "worst_pct": round(min(returns), 4) if returns else 0.0,
         "max_drawdown_pct": round(max_drawdown, 4),
         "equity_pct": equity,
+    }
+
+
+def _move(trade) -> float | None:
+    """Profitable movement of a closed trade, in the instrument's own units.
+
+    ``sign × (level_close - level_open)``: positive when the trade made money,
+    whichever side it was on. Returns ``None`` for a trade with no usable fill
+    pair.
+    """
+    open_level = float(trade.level_open or 0.0)
+    if not open_level or trade.level_close is None:
+        return None
+    sign = direction_sign(getattr(trade, "direction", "BUY"))
+    return sign * (float(trade.level_close) - open_level)
+
+
+def trade_euro(trade, euro_per_point: float | None) -> float | None:
+    """Euro P&L of one trade, or ``None`` when its epic has no € / point.
+
+    ``move × euro_per_point`` — the same formula the live path applies to a real
+    position (see ``TradingService._euro_pnl``), with the per-point value coming
+    from the contract table instead of a ``/markets`` call.
+    """
+    move = _move(trade)
+    if move is None or not euro_per_point:
+        return None
+    return move * euro_per_point
+
+
+def _breakeven_move(trade) -> float | None:
+    """Profitable movement under the *close at break-even crossing* scenario.
+
+    The counterfactual: the moment the close-out price goes strictly past
+    break-even the position is closed at that price, instead of being left to the
+    close profile. A trade that never crossed break-even is untouched and keeps its
+    real movement — the scenario only ever cuts a trade short, it never rescues a
+    losing one. Signed by direction like :func:`_move`.
+    """
+    if trade.level_breakeven_exit is None:
+        return _move(trade)
+    open_level = float(trade.level_open or 0.0)
+    if not open_level:
+        return None
+    sign = direction_sign(getattr(trade, "direction", "BUY"))
+    return sign * (float(trade.level_breakeven_exit) - open_level)
+
+
+def trade_euro_breakeven(trade, euro_per_point: float | None) -> float | None:
+    """Euro P&L under the break-even-exit scenario (see :func:`_breakeven_move`)."""
+    move = _breakeven_move(trade)
+    if move is None or not euro_per_point:
+        return None
+    return move * euro_per_point
+
+
+def _equity(values: list[float]) -> tuple[list[float], float]:
+    """Running total of ``values`` plus its max peak-to-trough drawdown."""
+    curve: list[float] = []
+    total = peak = drawdown = 0.0
+    for v in values:
+        total += v
+        peak = max(peak, total)
+        drawdown = max(drawdown, peak - total)
+        curve.append(round(total, 2))
+    return curve, round(drawdown, 2)
+
+
+def euro_summary(trades, table: ContractTable) -> dict:
+    """Euro-denominated stats, real and under the break-even-exit scenario.
+
+    Counts and win rates cover **every** trade (they need no contract value), but
+    a euro total can only include the trades whose epic is in the contract table.
+    ``unpriced_epics`` / ``unpriced_trades`` report what was left out, so a
+    partial table shows up as a partial euro figure rather than a wrong one.
+
+    The scenario counts (``wins_breakeven`` / ``losses_breakeven``) are derived
+    from price levels, not from the euro figures, so they cover every trade just
+    like the real counts do.
+    """
+    euros: list[float] = []
+    euros_be: list[float] = []
+    unpriced: Counter = Counter()
+    crossed = 0
+
+    for trade in trades:
+        if trade.level_breakeven_exit is not None:
+            crossed += 1
+        epp = table.euro_per_point(trade.epic)
+        if epp is None:
+            unpriced[trade.epic] += 1
+            continue
+        euro = trade_euro(trade, epp)
+        euro_be = trade_euro_breakeven(trade, epp)
+        if euro is None or euro_be is None:
+            continue
+        euros.append(euro)
+        euros_be.append(euro_be)
+
+    # Scenario outcome per trade, on levels — independent of the contract table.
+    be_moves = [_breakeven_move(t) or 0.0 for t in trades if t.level_open]
+    equity, drawdown = _equity(euros)
+    equity_be, drawdown_be = _equity(euros_be)
+
+    return {
+        "priced_trades": len(euros),
+        "unpriced_trades": sum(unpriced.values()),
+        "unpriced_epics": sorted(unpriced),
+        "contract_table_size": len(table),
+        "contract_table_generated_at": table.generated_at,
+        "total_euro": round(sum(euros), 2),
+        "best_euro": round(max(euros), 2) if euros else 0.0,
+        "worst_euro": round(min(euros), 2) if euros else 0.0,
+        "max_drawdown_euro": drawdown,
+        "equity_euro": equity,
+        # Break-even-exit scenario.
+        "breakeven_crossed": crossed,
+        "total_euro_breakeven": round(sum(euros_be), 2),
+        "wins_breakeven": sum(1 for m in be_moves if m > 0),
+        "losses_breakeven": sum(1 for m in be_moves if m <= 0),
+        "max_drawdown_euro_breakeven": drawdown_be,
+        "equity_euro_breakeven": equity_be,
     }
 
 
@@ -173,17 +440,18 @@ def run_backtest(
     settings,
     candles_by_epic: dict[str, list[Candle]],
     config: BacktestConfig,
-    strategy_name: str | None = None,
-    close_profile_name: str | None = None,
+    selection: StrategySelection | None = None,
 ) -> SimulationResult:
-    """Replay an entry strategy + close profile over archived candles.
+    """Replay one full open/stop/close selection over archived candles.
 
-    The entry strategy is resolved by name (``strategy_name`` or the configured
-    ``OPEN_STRATEGY``). The exit is the single composer profile built from settings
-    — its per-zone behaviour comes from the ``CLOSE_ZONE*`` selectors, so
-    ``close_profile_name`` is accepted for API compatibility but not used for
-    selection. The backtest thus replays exactly what the live bot would do.
+    ``selection`` overrides any of the six decoupled selectors for this run
+    (``OPEN_STRATEGY``, ``STOP_STRATEGY`` and the four ``CLOSE_ZONE*``); anything
+    it leaves unset falls back to the live ``.env`` value. The overridden settings
+    are then handed to the very same factories the bot uses at startup, so the
+    replay is the configuration under test — not the live one, and not a
+    hand-assembled approximation of it.
     """
+    effective = (selection or StrategySelection()).apply(settings)
     kept, dropped = dedupe_correlated_epics(candles_by_epic)
     if dropped:
         logger.info(
@@ -193,9 +461,9 @@ def run_backtest(
         )
     days = build_days(kept)
     simulator = StrategySimulator(
-        trade_config=TradeConfig.from_settings(settings),
-        entry=get_entry_strategy(strategy_name or settings.open_strategy, settings),
-        close_profile=get_close_profile(settings),
+        trade_config=TradeConfig.from_settings(effective),
+        entry=get_entry_strategy(effective.open_strategy, effective),
+        close_profile=get_close_profile(effective),
         sim_config=config.to_simulation_config(),
     )
     result = simulator.run_days(days)

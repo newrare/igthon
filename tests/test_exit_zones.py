@@ -1,9 +1,11 @@
 """Tests for the per-zone stop updaters and the zone classifier.
 
-The close profile splits per-tick stop management into three zones by where the
-live bid sits relative to break-even (``level_zero``) and the margin level
-(``level_margin``). Zones 1 and 2 hold the stop; zone 3 runs the momentum-gated
-ATR chandelier that trails the bid up in steps.
+The close profile splits per-tick stop management into four zones by where the
+live bid sits relative to break-even (``level_zero``), the margin level
+(``level_margin``) and the profit trigger (one further noise margin past the
+margin). Zone 1 manages the risk still carried, zone 2 the delicate band just past
+break-even, zone 3 secures the gain once the margin is cleared, and zone 4 runs the
+momentum-gated ATR chandelier that trails the bid up in steps.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -17,8 +19,11 @@ from src.exit.zones import (
     BreakevenLockParams,
     BreakevenLockStop,
     BreakevenSafeStop,
+    LimitLooseStop,
+    SecureHoldStop,
     StopContext,
     StopZone,
+    TrailingRatchetMoreStop,
     TrailingRatchetStop,
     UnderwaterStop,
     UnderwaterTrendCutStop,
@@ -83,24 +88,34 @@ def _ctx(
 
 
 class TestClassifyZone:
-    # The third argument is the PROFIT TRIGGER (level_profit), one noise margin
-    # above the margin line — the boundary above which the profit zone governs.
-    # Here: break-even=100, margin=110 → profit trigger = 2×110 − 100 = 120.
+    # Arguments are (price, break-even, MARGIN line, PROFIT TRIGGER). Here:
+    # break-even=100, margin=110 → profit trigger = 2×110 − 100 = 120. Each
+    # boundary belongs to the lower zone.
 
     def test_at_or_below_break_even_is_underwater(self):
-        assert classify_zone(99.0, 100.0, 120.0) is StopZone.UNDERWATER
-        assert classify_zone(100.0, 100.0, 120.0) is StopZone.UNDERWATER
+        assert classify_zone(99.0, 100.0, 110.0, 120.0) is StopZone.UNDERWATER
+        assert classify_zone(100.0, 100.0, 110.0, 120.0) is StopZone.UNDERWATER
 
-    def test_between_break_even_and_profit_trigger_is_band(self):
-        assert classify_zone(105.0, 100.0, 120.0) is StopZone.BREAKEVEN_BAND
-        # Above the MARGIN line (110) but below the profit trigger (120) is still
-        # the break-even band — this is what stops a bid hovering just above the
-        # margin from skipping the (thin) band into the profit zone.
-        assert classify_zone(115.0, 100.0, 120.0) is StopZone.BREAKEVEN_BAND
-        assert classify_zone(120.0, 100.0, 120.0) is StopZone.BREAKEVEN_BAND
+    def test_between_break_even_and_margin_is_the_band(self):
+        assert classify_zone(105.0, 100.0, 110.0, 120.0) is StopZone.BREAKEVEN_BAND
+        assert classify_zone(110.0, 100.0, 110.0, 120.0) is StopZone.BREAKEVEN_BAND
+
+    def test_between_margin_and_profit_trigger_is_secure(self):
+        # The region that used to be swallowed by the break-even band: it is now a
+        # zone of its own, selected by CLOSE_ZONESECURE.
+        assert classify_zone(110.1, 100.0, 110.0, 120.0) is StopZone.SECURE
+        assert classify_zone(115.0, 100.0, 110.0, 120.0) is StopZone.SECURE
+        assert classify_zone(120.0, 100.0, 110.0, 120.0) is StopZone.SECURE
 
     def test_above_profit_trigger_is_profit(self):
-        assert classify_zone(120.1, 100.0, 120.0) is StopZone.PROFIT
+        assert classify_zone(120.1, 100.0, 110.0, 120.0) is StopZone.PROFIT
+
+    def test_a_sell_mirrors_every_boundary(self):
+        # Profit is down for a short: break-even=100, margin=90 → trigger 80.
+        assert classify_zone(101.0, 100.0, 90.0, 80.0, -1.0) is StopZone.UNDERWATER
+        assert classify_zone(95.0, 100.0, 90.0, 80.0, -1.0) is StopZone.BREAKEVEN_BAND
+        assert classify_zone(85.0, 100.0, 90.0, 80.0, -1.0) is StopZone.SECURE
+        assert classify_zone(79.0, 100.0, 90.0, 80.0, -1.0) is StopZone.PROFIT
 
 
 class TestHoldingZones:
@@ -480,79 +495,192 @@ class TestBreakevenSafe:
         assert BreakevenSafeStop().propose(ctx) is None
 
 
-class TestBreakevenHalf:
-    # ``breakeven_half`` raises the stop ONCE, to a support line a quarter of the
-    # way from break-even up to the margin level, after two consecutive rising
-    # ticks whose closes both clear the margin line. It then holds that stop.
+class TestLimitLoose:
+    # ``limitloose`` (zone 2) brings the stop up to a DOUBLE adverse-noise band
+    # under the live price the moment price clears break-even — no confirmation
+    # streak, and the level may well sit short of break-even.
 
-    def test_locks_the_quarter_support_after_two_ticks_above_margin(self):
-        # level_zero=8000, level_margin=8010 → support at 8000 + 0.25×10 = 8002.5.
-        # The tail 8011 < 8012 < 8013 is two rising ticks above the 8010 margin;
-        # the bid has since pulled back into the band at 8005 (> support).
-        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+    def _noisy(self) -> EpicBuffer:
+        """A rising tape that gives back 1.0 every other candle (measurable noise)."""
+        return _buffer([8000.0 + i * 0.5 - (1.0 if i % 2 else 0.0) for i in range(30)])
+
+    def test_parks_the_stop_two_noise_bands_under_the_price(self):
+        buf = self._noisy()
         ctx = _ctx(
             buf,
             current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        noise = ctx.adverse_noise(20, 2.0)
+        assert noise > 0
+        assert LimitLooseStop().propose(ctx) == pytest.approx(8005.0 - 2 * noise)
+
+    def test_fires_on_the_first_tick_without_any_streak(self):
+        # A single tick past break-even is enough — the two closes before it went
+        # the wrong way, which every other zone-2 updater would refuse to act on.
+        buf = _buffer([8006.0, 8004.0, 8003.0, 8005.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        new_stop = LimitLooseStop().propose(ctx)
+        assert new_stop is not None
+        assert new_stop < 8005.0
+
+    def test_cushion_is_floored_at_the_broker_minimum(self):
+        # Noise smaller than IG's minimum distance → the broker floor wins, so the
+        # level is one IG would actually accept.
+        buf = _buffer([8004.9, 8005.0] * 10)
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        ctx.min_stop_distance = 3.0
+        assert LimitLooseStop().propose(ctx) == pytest.approx(8002.0)
+
+    def test_flat_tape_holds_rather_than_stopping_on_the_price(self):
+        # No adverse noise, no broker minimum → no cushion at all. A stop on the
+        # live price would be closed at once by the software backstop.
+        buf = _buffer([8000.0 + i * 0.2 for i in range(20)])
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert LimitLooseStop().propose(ctx) is None
+
+    def test_never_loosens_an_existing_stop(self):
+        buf = self._noisy()
+        ctx = _ctx(
+            buf,
+            current_bid=8005.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8004.9,  # already tighter than any noise-based level
+        )
+        assert LimitLooseStop().propose(ctx) is None
+
+    def test_mirrors_for_a_sell(self):
+        # A short's stop sits ABOVE its close-out offer, one double band away.
+        buf = _buffer([8000.0 - i * 0.5 + (1.0 if i % 2 else 0.0) for i in range(30)])
+        ctx = _ctx(
+            buf,
+            current_bid=7995.0,  # the close-out OFFER for a short
+            level_zero=8000.0,
+            level_margin=7990.0,
+            level_follower=8050.0,
+            direction="SELL",
+        )
+        noise = ctx.adverse_noise(20, 2.0)
+        assert noise > 0
+        assert LimitLooseStop().propose(ctx) == pytest.approx(7995.0 + 2 * noise)
+
+
+class TestSecureHold:
+    def test_hold_leaves_the_stop_alone(self):
+        buf = _buffer([8000.0 + i for i in range(40)])
+        ctx = _ctx(
+            buf,
+            current_bid=8015.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert SecureHoldStop().propose(ctx) is None
+
+
+class TestBreakevenHalf:
+    # ``breakeven_half`` (zone 3) secures the gain IMMEDIATELY, at the midpoint of
+    # the break-even→margin band, as soon as price trades past the margin line.
+
+    def test_secures_the_midpoint_on_the_first_tick(self):
+        # level_zero=8000, level_margin=8010 → midpoint 8005. The bid sits in the
+        # secure zone (past the 8010 margin) and there is no confirmation gate.
+        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8015.0,
             level_zero=8000.0,
             level_margin=8010.0,
             level_follower=7950.0,
         )
         new_stop = BreakevenHalfStop().propose(ctx)
-        assert new_stop == pytest.approx(8002.5)
+        assert new_stop == pytest.approx(8005.0)
         assert ctx.level_zero < new_stop < ctx.current_price
 
-    def test_holds_without_two_ticks_above_the_margin(self):
-        # The rise stays inside the band (8009 never clears the 8010 margin), so the
-        # above-margin streak gate never opens.
-        buf = _buffer([8005.0, 8006.0, 8007.0, 8008.0, 8009.0])
+    def test_level_does_not_depend_on_the_price_history(self):
+        # A tape that never rose (the position gapped into the zone) locks the very
+        # same midpoint: the level is fixed by the frozen references alone.
+        buf = _buffer([8014.0, 8013.0, 8012.0, 8011.0])
         ctx = _ctx(
             buf,
-            current_bid=8009.0,
+            current_bid=8011.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert BreakevenHalfStop().propose(ctx) == pytest.approx(8005.0)
+
+    def test_holds_when_the_midpoint_would_reach_the_price(self):
+        # Price back at 8004, below the 8005 midpoint: securing there would force an
+        # immediate exit through the software backstop → hold.
+        buf = _buffer([8005.0, 8011.0, 8012.0, 8004.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8004.0,
             level_zero=8000.0,
             level_margin=8010.0,
             level_follower=7950.0,
         )
         assert BreakevenHalfStop().propose(ctx) is None
 
-    def test_holds_when_only_one_tick_clears_the_margin(self):
-        # A single close above the margin (8011) is not two consecutive up-ticks
-        # above it — the gate needs the whole streak above the line.
-        buf = _buffer([8005.0, 8008.0, 8011.0, 8008.0])
-        ctx = _ctx(
-            buf,
-            current_bid=8008.0,
-            level_zero=8000.0,
-            level_margin=8010.0,
-            level_follower=7950.0,
-        )
-        assert BreakevenHalfStop().propose(ctx) is None
-
-    def test_holds_when_the_support_would_reach_the_bid(self):
-        # The streak above the margin has fired, but the bid has pulled all the way
-        # back to 8002 (< the 8002.5 support), so locking there would force an
-        # immediate exit → hold.
+    def test_never_loosens_an_existing_stop(self):
+        # The profit zone (or a manual raise) already left a tighter follower.
         buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
         ctx = _ctx(
             buf,
-            current_bid=8002.0,
+            current_bid=8015.0,
             level_zero=8000.0,
             level_margin=8010.0,
+            level_follower=8006.0,
+        )
+        assert BreakevenHalfStop().propose(ctx) is None
+
+    def test_holds_without_a_margin_band(self):
+        # No margin frozen on the profit side (legacy row): the fraction is
+        # meaningless, so nothing is proposed.
+        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+        ctx = _ctx(
+            buf,
+            current_bid=8015.0,
+            level_zero=8000.0,
+            level_margin=8000.0,
             level_follower=7950.0,
         )
         assert BreakevenHalfStop().propose(ctx) is None
 
-    def test_raises_only_once_while_in_the_margin_zone(self):
-        # Follower already above break-even → the single raise has been done (or the
-        # profit zone moved it); hold for the rest of the zone, never raise again.
-        buf = _buffer([8005.0, 8011.0, 8012.0, 8013.0])
+    def test_mirrors_for_a_sell(self):
+        # Short: break-even 8000, margin 7990 → midpoint 7995, below break-even.
+        buf = _buffer([7995.0, 7989.0, 7988.0, 7987.0])
         ctx = _ctx(
             buf,
-            current_bid=8005.0,
+            current_bid=7985.0,  # the close-out OFFER, past the 7990 margin
             level_zero=8000.0,
-            level_margin=8010.0,
-            level_follower=8002.5,  # already above break-even
+            level_margin=7990.0,
+            level_follower=8050.0,
+            direction="SELL",
         )
-        assert BreakevenHalfStop().propose(ctx) is None
+        assert BreakevenHalfStop().propose(ctx) == pytest.approx(7995.0)
 
 
 class TestTrailingRatchet:
@@ -712,3 +840,173 @@ class TestTrailingRatchet:
         )
         assert without is not None and with_floor is not None
         assert with_floor < without  # noise floor → stop further below the bid
+
+
+class TestTrailingRatchetMore:
+    """``trailing_ratchetmore``: keep a growing share of the run just made.
+
+    Everything ``trailing_ratchet`` does, plus a give-back cap anchored on the
+    position's best excursion and a trailing width that narrows as that excursion
+    grows. Each mechanism is isolated by zeroing the other.
+    """
+
+    #: The parent's behaviour, reproduced by disabling both additions.
+    _AS_PARENT = dict(giveback_retention=0.0, atr_k_shrink_per_atr=0.0)
+
+    def test_disabled_additions_reproduce_the_parent(self):
+        buf = _buffer([8000.0 + i for i in range(60)])
+        atr_v = atr(list(buf.candles), 14)
+        kw = dict(
+            current_bid=buf.last.bid_close,
+            level_zero=8000.0,
+            level_margin=8000.0 + 1.5 * atr_v,
+            level_follower=8000.0 - 2.5 * atr_v,
+        )
+        parent = TrailingRatchetStop().propose(_ctx(buf, **kw))
+        more = TrailingRatchetMoreStop(**self._AS_PARENT).propose(_ctx(buf, **kw))
+        assert more == parent
+
+    def test_give_back_cap_locks_half_the_peak_during_a_reversal(self):
+        # Ran to 8060 then fell hard to 8030: the parent's sharp-reversal guard
+        # holds its stop, so the whole run can be handed back. The cap keeps half of
+        # the 60-point peak — a stop at 8030 — because its anchor is the peak, not
+        # the live price or a lagging swing low.
+        buf = _buffer([8000.0 + i for i in range(61)])
+        kw = dict(
+            current_bid=8035.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        assert TrailingRatchetStop().propose(_ctx(buf, **kw)) is None
+        capped = TrailingRatchetMoreStop().propose(_ctx(buf, **kw))
+        assert capped == pytest.approx(8030.0)  # 8000 + 0.5 × 60
+
+    def test_cap_scales_with_the_retained_share(self):
+        buf = _buffer([8000.0 + i for i in range(61)])
+        kw = dict(
+            current_bid=8035.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        keep_more = TrailingRatchetMoreStop(giveback_retention=0.5).propose(
+            _ctx(buf, **kw)
+        )
+        keep_less = TrailingRatchetMoreStop(giveback_retention=0.25).propose(
+            _ctx(buf, **kw)
+        )
+        assert keep_less is not None and keep_more is not None
+        assert keep_less < keep_more  # a smaller retained share sits further back
+
+    def test_cap_is_not_armed_before_the_run_is_worth_it(self):
+        # A noisy market whose best close is barely past break-even: the peak is no
+        # run to protect (under 1 × ATR), so the cap stays out and the parent's
+        # candidates — a chandelier a full 2.5 × ATR below the bid — cannot tighten.
+        buf = _buffer([7995.0, 8001.0] * 19 + [7995.0, 7998.0, 8001.0])
+        atr_v = atr(list(buf.candles), 14)
+        ctx = _ctx(
+            buf,
+            current_bid=8001.0,
+            level_zero=8000.0,
+            level_margin=8000.5,
+            level_follower=7990.0,
+        )
+        peak = max(ctx.favourable_closes) - 8000.0  # 1 point
+        assert peak < atr_v  # precondition: below the 1 × ATR arming threshold
+        assert TrailingRatchetMoreStop(lock=_NO_FLOOR).propose(ctx) is None
+
+    def test_cap_never_lands_at_or_past_the_live_price(self):
+        # Price has collapsed back below half the peak: the cap level would sit
+        # ahead of the market (an instant close), so it is dropped.
+        buf = _buffer([8000.0 + i for i in range(61)])
+        ctx = _ctx(
+            buf,
+            current_bid=8010.0,  # half the 60-point peak = 8030, ahead of price
+            level_zero=8000.0,
+            level_margin=8005.0,
+            level_follower=7950.0,
+        )
+        assert TrailingRatchetMoreStop(lock=_NO_FLOOR).propose(ctx) is None
+
+    def test_cap_never_lands_in_the_dead_band(self):
+        # Half the peak falls short of the margin → the cap is suppressed, exactly
+        # as the parent suppresses a chandelier there.
+        buf = _buffer([8000.0 + i for i in range(61)])
+        ctx = _ctx(
+            buf,
+            current_bid=8035.0,
+            level_zero=8000.0,
+            level_margin=8040.0,  # above the 8030 cap level
+            level_follower=7950.0,
+        )
+        assert TrailingRatchetMoreStop(lock=_NO_FLOOR).propose(ctx) is None
+
+    def test_cap_never_loosens_the_stop(self):
+        # The persisted follower already sits further into profit than the cap.
+        buf = _buffer([8000.0 + i for i in range(61)])
+        ctx = _ctx(
+            buf,
+            current_bid=8035.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8032.0,  # beyond the 8030 cap level
+        )
+        assert TrailingRatchetMoreStop(lock=_NO_FLOOR).propose(ctx) is None
+
+    def test_width_narrows_as_the_run_extends(self):
+        # Same rising curve, same tick: narrowing the width as the peak grows puts
+        # the chandelier closer to the bid than the parent's constant 2.5 × ATR.
+        buf = _buffer([8000.0 + 2.0 * i for i in range(60)])
+        atr_v = atr(list(buf.candles), 14)
+        kw = dict(
+            current_bid=buf.last.bid_close,
+            level_zero=8000.0,
+            level_margin=8000.0 + 1.5 * atr_v,
+            level_follower=8000.0 - 2.5 * atr_v,
+        )
+        # Floor and cap disabled so the comparison isolates the chandelier width.
+        parent = TrailingRatchetStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        narrowed = TrailingRatchetMoreStop(
+            lock=_NO_FLOOR, giveback_retention=0.0
+        ).propose(_ctx(buf, **kw))
+        assert parent is not None and narrowed is not None
+        assert narrowed > parent  # tighter trail → stop closer to the bid
+
+    def test_width_never_narrows_past_its_floor(self):
+        # A very extended run: the shrink is clamped at ``atr_k_floor``, so the stop
+        # stays a full floor-width behind the bid instead of hugging it.
+        buf = _buffer([8000.0 + 10.0 * i for i in range(60)])
+        atr_v = atr(list(buf.candles), 14)
+        bid = buf.last.bid_close
+        ctx = _ctx(
+            buf,
+            current_bid=bid,
+            level_zero=8000.0,
+            level_margin=8000.0 + 1.5 * atr_v,
+            level_follower=8000.0 - 2.5 * atr_v,
+        )
+        updater = TrailingRatchetMoreStop(
+            lock=_NO_FLOOR, giveback_retention=0.0, atr_k_floor=1.2
+        )
+        stop = updater.propose(ctx)
+        assert stop is not None
+        # The trailing distance is floored at 1.2 × ATR (the spread / noise floors
+        # can only widen it), so the stop cannot sit closer than that to the bid.
+        assert bid - stop >= 1.2 * atr_v
+
+    def test_mirrors_for_a_sell(self):
+        # Short: the close-out offer fell from 8000.5 to 7940.5 (a 59.5-point run
+        # from the 8000 break-even), then bounced to 7965. Half of that run is
+        # 29.75, so the cap sits 29.75 ABOVE break-even — the mirror of a long.
+        buf = _buffer([8000.0 - i for i in range(61)])
+        ctx = _ctx(
+            buf,
+            current_bid=7965.0,  # the close-out OFFER
+            level_zero=8000.0,
+            level_margin=7990.0,
+            level_follower=8050.0,
+            direction="SELL",
+        )
+        capped = TrailingRatchetMoreStop().propose(ctx)
+        assert capped == pytest.approx(7970.25)

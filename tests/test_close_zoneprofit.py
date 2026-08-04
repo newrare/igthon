@@ -13,10 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.core.indicators import atr
+from src.core.indicators import adverse_tick_noise, atr
 from src.exit import CloseZoneProfit, get_close_profile
 from src.exit.base import ACTION_CLOSE, ACTION_HOLD, ACTION_UPDATE_STOP, CloseProfile
-from src.exit.zones import SmartGroupStop, StopUpdater
+from src.exit.zones import SmartGroupParams, SmartGroupStop, StopUpdater
 from src.feed.price_buffer import Candle, EpicBuffer
 from src.stops import StopAtr, StopSupport
 
@@ -28,6 +28,7 @@ def _settings(**overrides) -> SimpleNamespace:
         "stop_strategy": "stop_support",
         "close_zonestart": "hold",
         "close_zonemarge": "hold",
+        "close_zonesecure": "hold",
         "close_zoneprofit": "trailing_ratchet",
     }
     base.update(overrides)
@@ -69,6 +70,19 @@ class _FixedStop(StopUpdater):
         return self._level
 
 
+class _BufferProbe(StopUpdater):
+    """Records the buffer the composer hands the zone updater; never moves a stop."""
+
+    name = "probe"
+
+    def __init__(self) -> None:
+        self.seen: list = []
+
+    def propose(self, ctx):
+        self.seen = list(ctx.buf.candles)
+        return None
+
+
 def _position(**overrides) -> SimpleNamespace:
     base = {
         "level_open": 8000.0,
@@ -87,8 +101,10 @@ def _position(**overrides) -> SimpleNamespace:
 class TestCurrentZone:
     """``current_zone`` classifies the live bid using the open-frozen references.
 
-    Break-even=8000, margin=8010 → profit trigger = 2×8010 − 8000 = 8020.
-    Powers the dashboard manual stop-raise "hold" (which zone to pin to).
+    Break-even=8000, margin=8010 → profit trigger = 2×8010 − 8000 = 8020, so the
+    four zones are: <8000 underwater, 8000→8010 break-even band, 8010→8020 secure,
+    >8020 profit. Powers the dashboard manual stop-raise "hold" (which zone to pin
+    to).
     """
 
     def _profile(self):
@@ -101,11 +117,27 @@ class TestCurrentZone:
         zone = self._profile().current_zone(pos, 7999.0, _buffer([8000.0] * 20))
         assert zone is StopZone.UNDERWATER
 
-    def test_between_break_even_and_profit_is_breakeven_band(self):
+    def test_between_break_even_and_margin_is_breakeven_band(self):
+        from src.exit.zones import StopZone
+
+        pos = _position(level_zero=8000.0, level_margin=8010.0)
+        zone = self._profile().current_zone(pos, 8005.0, _buffer([8000.0] * 20))
+        assert zone is StopZone.BREAKEVEN_BAND
+
+    def test_between_margin_and_profit_trigger_is_secure(self):
+        # The zone that used to be swallowed by the break-even band: past the
+        # margin line, short of the profit trigger.
         from src.exit.zones import StopZone
 
         pos = _position(level_zero=8000.0, level_margin=8010.0)
         zone = self._profile().current_zone(pos, 8015.0, _buffer([8000.0] * 20))
+        assert zone is StopZone.SECURE
+
+    def test_on_the_margin_line_is_still_the_breakeven_band(self):
+        from src.exit.zones import StopZone
+
+        pos = _position(level_zero=8000.0, level_margin=8010.0)
+        zone = self._profile().current_zone(pos, 8010.0, _buffer([8000.0] * 20))
         assert zone is StopZone.BREAKEVEN_BAND
 
     def test_above_profit_trigger_is_profit(self):
@@ -142,6 +174,7 @@ class TestComposition:
     def test_from_settings_selects_each_zone_updater(self):
         from src.exit.zones import (
             BreakevenBandStop,
+            SecureHoldStop,
             TrailingRatchetStop,
             UnderwaterStop,
         )
@@ -149,11 +182,22 @@ class TestComposition:
         prof = get_close_profile(_settings())
         assert isinstance(prof.underwater, UnderwaterStop)
         assert isinstance(prof.breakeven_band, BreakevenBandStop)
+        assert isinstance(prof.secure, SecureHoldStop)
         assert isinstance(prof.trailing, TrailingRatchetStop)
+
+    def test_from_settings_selects_the_requested_secure_updater(self):
+        from src.exit.zones import BreakevenHalfStop
+
+        prof = get_close_profile(_settings(close_zonesecure="breakeven_half"))
+        assert isinstance(prof.secure, BreakevenHalfStop)
 
     def test_unknown_zone_updater_raises(self):
         with pytest.raises(ValueError):
             get_close_profile(_settings(close_zoneprofit="nope"))
+
+    def test_unknown_secure_updater_raises(self):
+        with pytest.raises(ValueError):
+            get_close_profile(_settings(close_zonesecure="nope"))
 
 
 class TestInitialPlan:
@@ -224,19 +268,17 @@ class TestEvaluateZones:
         assert decision.new_stop_level > pos.level_follower
         assert decision.new_stop_level < bid
 
-    def test_bid_above_margin_below_profit_trigger_locks_the_marge_support(self):
+    def test_bid_between_margin_and_trigger_secures_the_midpoint(self):
         # Regression (CS.D.CHFJPY.CFD.IP): the bid held just above the MARGIN line
-        # for many ticks then collapsed, yet the stop was never raised — because
-        # anything above the (thin) margin was classified PROFIT and the margin
-        # updater (breakeven_half) never ran. Now the break-even band extends up to
-        # the PROFIT TRIGGER (margin + one more noise margin), so a bid above the
-        # margin but below that trigger still routes to CLOSE_ZONEMARGE and locks
-        # the 25 % support inside the break-even→margin band.
+        # for many ticks then collapsed, yet the stop was never raised — anything
+        # above the (thin) margin was classified PROFIT while the profit trailing
+        # was still suppressed. That region is now its own zone, CLOSE_ZONESECURE,
+        # and ``breakeven_half`` secures it at once.
         #
-        # level_zero=8000, level_margin=8010 → profit trigger = 8020, and the
-        # breakeven_half support = 8000 + 0.25×(8010−8000) = 8002.5. The rising
-        # tail clears the 8010 margin so the one-shot lock arms.
-        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
+        # level_zero=8000, level_margin=8010 → profit trigger = 8020, so a bid at
+        # 8015 is in the secure zone and the stop goes to the midpoint of the
+        # break-even→margin band: 8000 + 0.5 × (8010 − 8000) = 8005.
+        prof = get_close_profile(_settings(close_zonesecure="breakeven_half"))
         buf = _buffer([8000.0 + i * 0.5 for i in range(30)])  # ends ≈ 8014.5
         pos = _position(
             level_open=8000.0,
@@ -246,34 +288,66 @@ class TestEvaluateZones:
         )
         decision = prof.evaluate(pos, current_bid=8015.0, buf=buf, is_close_hour=False)
         assert decision.action == ACTION_UPDATE_STOP
-        assert decision.new_stop_level == pytest.approx(8002.5)
+        assert decision.new_stop_level == pytest.approx(8005.0)
 
-    def test_pre_entry_spike_above_margin_does_not_arm_the_lock(self):
-        # Regression (IX.D.HSTECH.FWM2.IP): the margin-zone lock (breakeven_half)
-        # armed on a pre-entry rally, not a post-open move. The live EpicBuffer is a
-        # rolling window fed continuously, so it still held candles from BEFORE the
-        # position opened; ``_rising_above_margin`` scans the whole buffer and found
-        # a rising streak clearing the (open-frozen) margin in that pre-entry
-        # history, raising the stop even though nothing after the open ever
-        # approached the margin. ``evaluate`` now bounds the buffer to the open.
-        #
-        # Candles 0-9 (09:00-09:09, before the open) spike above margin=8010;
-        # candles 10-29 (from 09:10 on) hover ~8004-8005, never near the margin. The
-        # position opened at 09:10, so only the flat post-open window must count.
-        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
-        pre_entry = [
-            8011.0,
-            8012.0,
-            8013.0,
-            8014.0,
-            8015.0,
-            8014.0,
-            8013.0,
-            8012.0,
-            8011.0,
-            8010.0,
-        ]
-        post_entry = [8004.0, 8005.0] * 10  # 20 candles, all well below margin
+    def test_secure_zone_never_gives_back_a_tighter_follower(self):
+        prof = get_close_profile(_settings(close_zonesecure="breakeven_half"))
+        buf = _buffer([8000.0 + i * 0.5 for i in range(30)])
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=8008.0,  # already past the 8005 midpoint
+        )
+        decision = prof.evaluate(pos, current_bid=8015.0, buf=buf, is_close_hour=False)
+        assert decision.action == ACTION_HOLD
+
+    def test_bid_inside_the_band_moves_the_stop_under_the_market(self):
+        # ``limitloose`` in the margin zone: the instant price clears break-even the
+        # stop comes up to a double noise band under the live price, with no
+        # confirmation streak. Here the bid sits inside the break-even→margin band
+        # (8000 → 8010), so the margin-zone updater governs.
+        prof = get_close_profile(_settings(close_zonemarge="limitloose"))
+        # A rising tape that pulls back 1.0 every other candle, so the epic has a
+        # measurable adverse-noise band and the cushion is twice that band.
+        buf = _buffer([8000.0 + i * 0.5 - (1.0 if i % 2 else 0.0) for i in range(30)])
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        decision = prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
+        noise = adverse_tick_noise(buf.bid_closes, 20, 2.0)
+        assert noise > 0
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == pytest.approx(8005.0 - 2 * noise)
+
+    def test_flat_tape_holds_instead_of_parking_the_stop_on_the_price(self):
+        # No adverse noise and no broker minimum → no cushion. Parking the stop on
+        # the live price would have the software backstop close at once, so hold.
+        prof = get_close_profile(_settings(close_zonemarge="limitloose"))
+        buf = _buffer([8000.0 + i * 0.2 for i in range(30)])  # monotone, no pull-back
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        decision = prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
+        assert decision.action == ACTION_HOLD
+
+    def test_buffer_is_sliced_at_the_open(self):
+        # Regression (IX.D.HSTECH.FWM2.IP): the margin-zone lock armed on a
+        # PRE-ENTRY rally. The live EpicBuffer is a rolling window fed continuously,
+        # so it still holds candles recorded before the position opened, and every
+        # updater that reads price levels against the open-frozen references would
+        # judge them on history the position never traded. ``evaluate`` bounds the
+        # buffer to the open instant before handing it to the zone updater.
+        probe = _BufferProbe()
+        prof = CloseZoneProfit(breakeven_band=probe)
+        pre_entry = [8011.0 + i for i in range(10)]  # 09:00 → 09:09, before the open
+        post_entry = [8004.0, 8005.0] * 10  # 09:10 onward, 20 candles
         buf = _buffer(pre_entry + post_entry)
         pos = _position(
             level_open=8000.0,
@@ -283,44 +357,31 @@ class TestEvaluateZones:
             date=date(2024, 1, 1),
             time_open=time(9, 10),  # cuts the buffer at candle 10
         )
-        decision = prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
-        assert decision.action == ACTION_HOLD
+        prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
+        assert len(probe.seen) == len(post_entry)
+        opened_at = datetime(2024, 1, 1, 9, 10, tzinfo=UTC)
+        assert all(c.timestamp >= opened_at for c in probe.seen)
 
-    def test_pre_entry_spike_arms_the_lock_without_an_open_time(self):
-        # Companion to the regression above: the SAME buffer, but a position with no
-        # persisted open instant, so the buffer is not sliced. The pre-entry spike is
-        # then in scope and arms the lock (raise to the 25 % support = 8002.5). This
-        # documents exactly what the open-time slice suppresses.
-        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
-        pre_entry = [
-            8011.0,
-            8012.0,
-            8013.0,
-            8014.0,
-            8015.0,
-            8014.0,
-            8013.0,
-            8012.0,
-            8011.0,
-            8010.0,
-        ]
-        post_entry = [8004.0, 8005.0] * 10
-        buf = _buffer(pre_entry + post_entry)
+    def test_buffer_is_not_sliced_without_an_open_time(self):
+        # Companion to the regression above: a position with no persisted open
+        # instant cannot be sliced, so the whole rolling window stays in scope.
+        probe = _BufferProbe()
+        prof = CloseZoneProfit(breakeven_band=probe)
+        buf = _buffer([8004.0, 8005.0] * 15)
         pos = _position(
             level_open=8000.0,
             level_zero=8000.0,
             level_margin=8010.0,
             level_follower=7950.0,
         )  # no date / time_open -> no slice
-        decision = prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
-        assert decision.action == ACTION_UPDATE_STOP
-        assert decision.new_stop_level == pytest.approx(8002.5)
+        prof.evaluate(pos, current_bid=8005.0, buf=buf, is_close_hour=False)
+        assert len(probe.seen) == 30
 
     def test_bid_above_profit_trigger_enters_the_profit_zone(self):
         # Same open levels; a bid above the profit trigger (8020) is real profit →
         # the profit-trailing zone governs and ratchets the stop up above the
-        # margin, not the flat 25 % margin-zone support.
-        prof = get_close_profile(_settings(close_zonemarge="breakeven_half"))
+        # margin, not the flat secure-zone midpoint.
+        prof = get_close_profile(_settings(close_zonesecure="breakeven_half"))
         buf = _buffer([8000.0 + i for i in range(60)])  # strong rising trend
         atr_v = atr(list(buf.candles), 14)
         pos = _position(
@@ -426,6 +487,24 @@ class TestGroupPrePass:
         assert m.sign == 1.0
         assert m.current_price == 7999.0
 
+    def test_group_member_carries_the_execution_haircut(self):
+        # The exit never fills on the stop, so the member ships the distance the
+        # book must value it short by: k × (spread + cushion), with the cushion
+        # floored at IG's minimum distance exactly like the candidate's.
+        buf = _buffer([8000.0] * 20, spread=0.5)
+        pos = _position(
+            id=7,
+            level_open=8000.0,
+            level_follower=7990.0,
+            euro_per_point=10.0,
+            min_stop_distance=2.0,
+        )
+        m = self._smart().group_member(pos, 7999.0, buf)
+        assert m is not None
+        expected = SmartGroupParams().exec_slip_k * (0.5 + max(m.noise, 2.0))
+        assert m.exec_slip == pytest.approx(expected)
+        assert m.exec_slip > 0
+
     def test_plan_group_empty_when_not_group_aware(self):
         assert get_close_profile(_settings()).plan_group([]) == {}
 
@@ -479,6 +558,17 @@ class TestGroupPrePass:
     def test_evaluate_applies_group_tighten_in_the_breakeven_band(self):
         # The group decision is book-wide: a position that has cleared break-even
         # is tightened too, even though ``smartgroup`` is selected in zone 1.
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=8000.0, level_zero=8000.0, level_margin=8010.0)
+        pos.level_follower = 8002.0
+        decision = self._smart().evaluate(
+            pos, current_bid=8005.0, buf=buf, is_close_hour=False, group_tighten=8004.0
+        )
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == 8004.0
+
+    def test_evaluate_applies_group_tighten_in_the_secure_zone(self):
+        # Same rule between the margin line (8010) and the profit trigger (8020).
         buf = _buffer([8000.0 + i for i in range(40)])
         pos = _position(level_open=8000.0, level_zero=8000.0, level_margin=8010.0)
         pos.level_follower = 8002.0

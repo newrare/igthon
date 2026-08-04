@@ -109,9 +109,20 @@ class CloseProfile(ABC):
 
     @abstractmethod
     def initial_plan(
-        self, *, entry_level: float, direction: str, buf: EpicBuffer
+        self,
+        *,
+        entry_level: float,
+        direction: str,
+        buf: EpicBuffer,
+        day_extreme: float | None = None,
     ) -> OpenPlan:
-        """Choose the initial stop / target for a position about to open."""
+        """Choose the initial stop / target for a position about to open.
+
+        ``day_extreme`` is forwarded untouched to the composed
+        :class:`~src.stops.base.StopDistance`: the session extreme it carries lives
+        outside ``buf`` and only the caller can read it. Optional, so a caller with
+        no session history (tests, a curve generator) simply omits it.
+        """
 
     @abstractmethod
     def evaluate(

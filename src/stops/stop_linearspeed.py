@@ -209,7 +209,12 @@ class StopLinearSpeed(StopDistance):
         return max(raw, self.slow_min_atr_k * atr_value)
 
     def initial_stop(
-        self, *, entry_level: float, direction: str, buf: EpicBuffer
+        self,
+        *,
+        entry_level: float,
+        direction: str,
+        buf: EpicBuffer,
+        day_extreme: float | None = None,  # unused: this window fits in the buffer
     ) -> float:
         candles = list(buf.candles)
         atr_value = atr(candles, self.atr_period)

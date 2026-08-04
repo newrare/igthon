@@ -4,7 +4,6 @@ import html
 from datetime import UTC, date, datetime, time
 
 from src.core.api_error_log import APIErrorEntry
-from src.markets.market_scanner import MarketScanner
 from src.web.routes.dashboard.components import (
     render_button,
     render_card,
@@ -15,8 +14,10 @@ from src.web.routes.dashboard.state import (
     _bid_pct,
     _close_reason_label,
     _display_pnl,
+    _loss_explanation,
     _open_reason_label,
     _pnl_color,
+    _unrealized_pnl_color,
 )
 
 
@@ -164,44 +165,6 @@ def _render_action_cards(jobs: list[dict]) -> str:
             inner, cls=f"action-card{auto_cls}", attrs=f'data-action="{action}"'
         )
     return cards
-
-
-def _render_config_grid(settings) -> str:
-    """Render the strategy configuration grid.
-
-    Shared by the Configuration section and the Win-rate modal so both always
-    show the same settings from a single source of truth.
-    """
-    return f"""<div class="config-grid">
-                    <div class="config-item">
-                        <div class="config-key">Environment</div>
-                        <div class="config-value">{settings.ig_env.value.upper()}</div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-key">Open Strategy</div>
-                        <div class="config-value">{settings.open_strategy}</div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-key">Stop Strategy</div>
-                        <div class="config-value">{settings.stop_strategy}</div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-key">Close · Zone Start</div>
-                        <div class="config-value">{settings.close_zonestart}</div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-key">Close · Zone Margin</div>
-                        <div class="config-value">{settings.close_zonemarge}</div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-key">Close · Zone Profit</div>
-                        <div class="config-value">{settings.close_zoneprofit}</div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-key">Max Spread Ratio</div>
-                        <div class="config-value">{MarketScanner.DEFAULT_MAX_SPREAD_RATIO}</div>
-                    </div>
-                </div>"""
 
 
 def _render_week_summary_section(resume_records: list, today: date) -> str:
@@ -354,6 +317,67 @@ def _render_epic_list_modal(
         )}"""
 
 
+def _render_epic_result_modal(closed_positions: list, kpis: dict) -> str:
+    """Render the per-epic result modal body (today's closed trades).
+
+    One row per open/close cycle — an epic traded twice in the day shows twice,
+    each line with its own result and its own diagnosis. Ordered worst first so
+    the day reads top-down as "what cost money, then what paid"; the last row is
+    the biggest gain. Every losing line carries a one-sentence explanation (see
+    ``_loss_explanation``), which is the whole point of the list: a red number is
+    only useful once you know whether the stop was too tight or the market simply
+    turned.
+    """
+    trades = sorted(
+        ((p, _display_pnl(p)) for p in closed_positions), key=lambda t: t[1]
+    )
+
+    rows = ""
+    for position, pnl in trades:
+        color = _pnl_color(pnl)
+        explanation = _loss_explanation(position, pnl)
+        if explanation:
+            why = (
+                '<span style="color:#fca5a5;font-size:0.78rem;">'
+                f"{html.escape(explanation)}</span>"
+            )
+        else:
+            why = '<span style="color:#475569;">—</span>'
+        epic_esc = html.escape(position.epic)
+        rows += f"""
+                    <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
+                        <td class="epic-col">{epic_esc}</td>
+                        <td class="desc-col">{html.escape(position.epic_name)}</td>
+                        <td class="err-ts">{html.escape(_fmt_paris_time(position.date, position.time_open))}</td>
+                        <td class="err-ts">{html.escape(_fmt_paris_time(position.date, position.time_close))}</td>
+                        <td class="number" style="color:{color};font-weight:600;">{pnl:+.2f}€</td>
+                        <td>{why}</td>
+                    </tr>"""
+    if not rows:
+        rows = (
+            '<tr><td colspan="6" class="err-empty">No epic closed today — the '
+            "per-epic result appears once a position is closed.</td></tr>"
+        )
+
+    closed_epics = kpis.get("closed_epics", 0)
+    avg_pnl_per_epic = kpis.get("avg_pnl_per_epic", 0.0)
+    worst = trades[0] if trades else None
+    best = trades[-1] if trades else None
+    return f"""
+        <div class="guard-stat-row" style="margin-bottom:1rem;">
+            <div class="guard-stat"><span class="guard-stat-label">Epics closed</span><span class="guard-stat-value">{closed_epics}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Avg / epic</span><span class="guard-stat-value" style="color:{_pnl_color(avg_pnl_per_epic)};">{avg_pnl_per_epic:+.2f}€</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Avg winner</span><span class="guard-stat-value" style="color:#4ade80;">{kpis.get('avg_epic_win', 0.0):+.2f}€</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Avg loser</span><span class="guard-stat-value" style="color:#ef4444;">{kpis.get('avg_epic_loss', 0.0):+.2f}€</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Worst trade</span><span class="guard-stat-value" style="color:#ef4444;">{f"{html.escape(worst[0].epic_name)} {worst[1]:+.2f}€" if worst else "—"}</span></div>
+            <div class="guard-stat"><span class="guard-stat-label">Best trade</span><span class="guard-stat-value" style="color:#4ade80;">{f"{html.escape(best[0].epic_name)} {best[1]:+.2f}€" if best else "—"}</span></div>
+        </div>
+        {render_table(
+            ["Epic", "Name", "Opened", "Closed", "P&amp;L", "Why"],
+            rows,
+        )}"""
+
+
 def _build_fragments(state: dict) -> dict[str, str]:
     """Build the HTML fragments for every dynamically refreshed dashboard region.
 
@@ -496,7 +520,50 @@ def _build_fragments(state: dict) -> dict[str, str]:
         </tr>"""
 
     pnl_color = _pnl_color(kpis["daily_pnl"])
-    open_pnl_color = _pnl_color(kpis["open_pnl"])
+    # The OPEN tile shows money the market has not paid yet, so it uses the muted
+    # "potential" palette (dark green / orange) instead of the realized one.
+    open_pnl_color = _unrealized_pnl_color(kpis["open_pnl"])
+
+    # Second sub-line of the OPEN tile: the whole book valued at the stops the
+    # group pre-pass plans — the floor under the live figure above. Hidden when no
+    # group-aware close profile ran (or the book could not be valued this tick).
+    group_book_euro = kpis.get("group_book_euro")
+    if kpis["open_trades"] and group_book_euro is not None:
+        open_book_sub = (
+            '<div class="kpi-sub kpi-sub-alt" title="What the book would bank if '
+            "every open position closed at its planned stop — net of the assumed "
+            'execution slip and reconciliation margin">'
+            f'at planned stops <span style="color:{_unrealized_pnl_color(group_book_euro)};">'
+            f"{group_book_euro:+.2f}€</span></div>"
+        )
+    else:
+        open_book_sub = ""
+
+    # "Avg / epic" tile — the day's realized P&L divided by the number of epics
+    # that actually closed today. Unlike a win rate it is size-aware: a day made
+    # of many small wins and one large loss reads negative here, as it should.
+    # The sub-line contrasts the average winning epic with the average losing one,
+    # which is the ratio the modal then breaks down instrument by instrument.
+    closed_epics = kpis.get("closed_epics", 0)
+    avg_pnl_per_epic = kpis.get("avg_pnl_per_epic", 0.0)
+    if not closed_epics:
+        avg_epic_color = "#475569"
+        avg_epic_value = "—"
+        avg_epic_sub = '<div class="kpi-sub">No epic closed today</div>'
+    else:
+        avg_epic_color = _pnl_color(avg_pnl_per_epic)
+        avg_epic_value = f"{avg_pnl_per_epic:+.2f}€"
+        avg_win = kpis.get("avg_epic_win", 0.0)
+        avg_loss = kpis.get("avg_epic_loss", 0.0)
+        # Winners and losers on two separate lines: side by side the two euro
+        # figures read as a single expression, stacked they read as the two sides
+        # of the day they actually are.
+        avg_epic_sub = (
+            f'<div class="kpi-sub"><span style="color:#4ade80;">'
+            f'{kpis.get("winning_epics", 0)} up {avg_win:+.2f}€</span></div>'
+            f'<div class="kpi-sub"><span style="color:#ef4444;">'
+            f'{kpis.get("losing_epics", 0)} down {avg_loss:+.2f}€</span></div>'
+        )
 
     # Wallet KPI tile — funds available to open a position, with margin in use
     # below. Grey when the balance could not be fetched (no API / startup), red
@@ -770,17 +837,18 @@ def _build_fragments(state: dict) -> dict[str, str]:
         <div class="kpi-tile clickable" style="border-left-color:{open_pnl_color};" onclick="openPositionsModal()">
             <div class="kpi-label">OPEN</div>
             <div class="kpi-value" style="color:{open_pnl_color};">{f"{kpis['open_pnl']:+.2f}€" if kpis['open_trades'] else "—"}</div>
-            <div class="kpi-sub"><span style="color:#4ade80;">{kpis['open_trades']} position{'s' if kpis['open_trades'] != 1 else ''}</span>{f"<span style='color:#64748b;'> · IG {kpis['open_pnl_as_of']}</span>" if kpis['open_trades'] and kpis.get('open_pnl_as_of') else ""}</div>
+            <div class="kpi-sub"><span style="color:#4ade80;">{kpis['open_trades']} position{'s' if kpis['open_trades'] != 1 else ''}</span>{f"<span style='color:#64748b;'> {kpis['open_pnl_as_of']}</span>" if kpis['open_trades'] and kpis.get('open_pnl_as_of') else ""}</div>
+            {open_book_sub}
         </div>
         <div class="kpi-tile clickable" style="border-left-color:{pnl_color};" onclick="openClosedModal()">
             <div class="kpi-label">CLOSED</div>
             <div class="kpi-value" style="color:{pnl_color};">{f"{kpis['daily_pnl']:+.2f}€" if kpis['closed_trades'] else "—"}</div>
             <div class="kpi-sub"><span style="color:#4ade80;">{kpis['closed_trades']} trade{'s' if kpis['closed_trades'] != 1 else ''}</span></div>
         </div>
-        <div class="kpi-tile clickable" style="border-left-color:{'#4ade80' if kpis['win_rate'] >= 0.5 else '#ef4444'};" onclick="openWinRateModal()">
-            <div class="kpi-label">Win rate</div>
-            <div class="kpi-value" style="color:{'#4ade80' if kpis['win_rate'] >= 0.5 else '#ef4444'};">{kpis['win_rate']:.1%}</div>
-            <div class="kpi-sub"><span style="color:#4ade80;">{kpis['total_wins']} win</span>&nbsp;/&nbsp;<span style="color:#ef4444;">{kpis['total_losses']} Loose</span></div>
+        <div class="kpi-tile clickable" style="border-left-color:{avg_epic_color};" onclick="openEpicResultModal()" title="Average euro result per epic closed today — the day's realized P&amp;L split over the instruments that actually traded">
+            <div class="kpi-label">Avg / epic</div>
+            <div class="kpi-value" style="color:{avg_epic_color};">{avg_epic_value}</div>
+            {avg_epic_sub}
         </div>
         {wallet_tile}"""
 
@@ -932,6 +1000,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
         ),
         "positions_modal": positions_modal,
         "closed_positions_modal": closed_positions_modal,
+        "epic_result_modal": _render_epic_result_modal(closed_positions, kpis),
         "actions": _render_action_cards(state.get("jobs", [])),
         "logs_section": _render_logs_section(state.get("log_entries") or []),
     }

@@ -1,4 +1,4 @@
-"""The exit domain on the SHORT side — one direction-aware profile, three zones.
+"""The exit domain on the SHORT side — one direction-aware profile, four zones.
 
 A SELL is managed by the very same :class:`~src.exit.close_zoneprofit.
 CloseZoneProfit` as a BUY, with every reference mirrored: the stop sits above
@@ -32,7 +32,8 @@ def _settings(**overrides) -> SimpleNamespace:
     base = {
         "stop_strategy": "stop_support",
         "close_zonestart": "hold",
-        "close_zonemarge": "breakeven_half",
+        "close_zonemarge": "hold",
+        "close_zonesecure": "breakeven_half",
         "close_zoneprofit": "trailing_ratchet",
     }
     base.update(overrides)
@@ -118,17 +119,22 @@ class TestInitialPlan:
 
 
 class TestZoneClassification:
-    """The three zones stack downwards: break-even 100, margin 97, trigger 94."""
+    """The four zones stack downwards: break-even 100, margin 97, trigger 94."""
 
     def test_offer_above_break_even_is_underwater(self):
         buf = _buffer([101.0] * 20)
         zone = _profile().current_zone(_position(), _bid_for(101.0), buf)
         assert zone is StopZone.UNDERWATER
 
-    def test_offer_between_break_even_and_trigger_is_the_band(self):
+    def test_offer_between_break_even_and_margin_is_the_band(self):
+        buf = _buffer([98.0] * 20)
+        zone = _profile().current_zone(_position(), _bid_for(98.0), buf)
+        assert zone is StopZone.BREAKEVEN_BAND
+
+    def test_offer_between_margin_and_trigger_is_the_secure_zone(self):
         buf = _buffer([96.0] * 20)
         zone = _profile().current_zone(_position(), _bid_for(96.0), buf)
-        assert zone is StopZone.BREAKEVEN_BAND
+        assert zone is StopZone.SECURE
 
     def test_offer_below_the_profit_trigger_is_the_profit_zone(self):
         buf = _buffer([93.0] * 20)
@@ -187,57 +193,69 @@ class TestBackstop:
 
 
 class TestMarginZone:
-    """``breakeven_half`` locks a quarter of the band — the live regression.
+    """``limitloose`` pulls the stop down behind the market, above the offer."""
 
-    Break-even 100, margin 97 → the support line sits at ``100 − 0.25 × 3 = 99.25``,
-    a hair of locked profit for a short, and it arms once the offer has printed two
-    consecutive falling closes below the margin line.
-    """
+    # A drifting tape inside the band (break-even 100 → margin 97) that gives back
+    # 1.0 every other candle, so the epic has a measurable adverse-noise band. For a
+    # short the adverse direction is UP, so those give-backs are up-moves.
+    _BAND = [99.0 - i * 0.05 + (1.0 if i % 2 else 0.0) for i in range(30)]
 
-    # 25 flat candles inside the band, a confirmed push past the margin, then a
-    # pull-back into the band — where this zone runs.
-    _PUSH = [99.0] * 25 + [98.0, 96.5, 96.0, 97.0, 98.0]
-
-    def test_locks_the_quarter_support_after_two_ticks_past_the_margin(self):
-        buf = _buffer(self._PUSH)
-        decision = _profile().evaluate(
-            _position(), _bid_for(98.0), buf, is_close_hour=False
+    def test_pulls_the_stop_down_to_a_double_noise_band_above_the_offer(self):
+        buf = _buffer(self._BAND)
+        offer = buf.last.offer_close
+        decision = _profile(close_zonemarge="limitloose").evaluate(
+            _position(), _bid_for(offer), buf, is_close_hour=False
         )
         assert decision.action == ACTION_UPDATE_STOP
-        assert decision.new_stop_level == pytest.approx(99.25)
+        # Above the live offer (a short's stop sits above price) but far tighter
+        # than the 105 stop the position opened with.
+        assert offer < decision.new_stop_level < 105.0
+
+    def test_hold_leaves_the_stop_alone(self):
+        buf = _buffer(self._BAND)
+        offer = buf.last.offer_close
+        decision = _profile().evaluate(
+            _position(), _bid_for(offer), buf, is_close_hour=False
+        )
+        assert decision.action == ACTION_HOLD
+
+
+class TestSecureZone:
+    """``breakeven_half`` secures the midpoint at once — the live regression.
+
+    Break-even 100, margin 97 → the stop goes to ``100 − 0.5 × 3 = 98.5`` as soon as
+    the offer trades past the 97 margin line, with no confirmation streak.
+
+    This is the scenario shorts used to sit through untouched: price below the
+    margin but short of the 94 profit trigger was classified as the break-even band
+    and nothing moved the stop.
+    """
+
+    # 25 flat candles inside the band, then a push past the 97 margin line.
+    _PUSH = [99.0] * 25 + [98.0, 97.0, 96.5, 96.0]
+
+    def test_secures_the_midpoint_at_once(self):
+        buf = _buffer(self._PUSH)
+        decision = _profile().evaluate(
+            _position(), _bid_for(96.0), buf, is_close_hour=False
+        )
+        assert decision.action == ACTION_UPDATE_STOP
+        assert decision.new_stop_level == pytest.approx(98.5)
         # Locked below break-even (real profit for a short) and above the live
         # offer, so the position is not closed on the spot.
-        assert decision.new_stop_level < 100.0
-        assert decision.new_stop_level > 98.0
+        assert 96.0 < decision.new_stop_level < 100.0
 
-    def test_holds_while_the_push_has_not_cleared_the_margin(self):
-        # Same shape, but the excursion stops at 97.5 — inside the noise band.
-        buf = _buffer([99.0] * 25 + [98.5, 98.0, 97.5, 98.0])
-        decision = _profile().evaluate(
-            _position(), _bid_for(98.0), buf, is_close_hour=False
-        )
-        assert decision.action == ACTION_HOLD
-
-    def test_locks_only_once(self):
+    def test_never_loosens_an_existing_stop(self):
         buf = _buffer(self._PUSH)
-        # Follower already pulled past break-even by the earlier lock -> hold.
-        pos = _position(level_follower=99.25)
-        decision = _profile().evaluate(pos, _bid_for(98.0), buf, is_close_hour=False)
-        assert decision.action == ACTION_HOLD
-
-    def test_holds_when_the_support_would_sit_through_the_market(self):
-        # Offer back at 99.5, above the 99.25 support: locking there would close
-        # the trade on the next tick, so the updater waits.
-        buf = _buffer([99.0] * 25 + [98.0, 96.5, 96.0, 98.5, 99.5])
-        decision = _profile().evaluate(
-            _position(), _bid_for(99.5), buf, is_close_hour=False
-        )
+        # Follower already tighter than the midpoint (lower, for a short) -> hold.
+        pos = _position(level_follower=98.0)
+        decision = _profile().evaluate(pos, _bid_for(96.0), buf, is_close_hour=False)
         assert decision.action == ACTION_HOLD
 
     def test_mirrors_the_long_lock(self):
         # The same path reflected about the entry gives the mirrored stop.
         short = _profile().evaluate(
-            _position(), _bid_for(98.0), _buffer(self._PUSH), is_close_hour=False
+            _position(), _bid_for(96.0), _buffer(self._PUSH), is_close_hour=False
         )
         # Reflect the BID series (a long's close-out price) about the entry, so
         # the offers this helper records are one spread above it.
@@ -246,7 +264,7 @@ class TestMarginZone:
             direction="BUY", level_zero=100.0, level_margin=103.0, level_follower=95.0
         )
         long = _profile().evaluate(
-            long_pos, 102.0, _buffer(long_offers), is_close_hour=False
+            long_pos, 104.0, _buffer(long_offers), is_close_hour=False
         )
         assert long.action == short.action == ACTION_UPDATE_STOP
         assert long.new_stop_level == pytest.approx(200.0 - short.new_stop_level)

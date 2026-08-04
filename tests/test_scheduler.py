@@ -24,6 +24,7 @@ from src.entry.open_five import OpenFive
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_steady import OpenSteady
+from src.exit.zones import GroupPlanReport
 from src.feed.price_buffer import Candle, PriceBuffer
 from src.models.database import Base
 from src.models.job_preference import JobPreference
@@ -74,11 +75,17 @@ class TestActiveSelection:
         sched._settings.stop_strategy = "stop_support"
         sched._settings.close_zonestart = "hold"
         sched._settings.close_zonemarge = "hold"
+        sched._settings.close_zonesecure = "hold"
         sched._settings.close_zoneprofit = "trailing_ratchet"
         assert sched.active_strategy_name == "open_donchian"
         assert sched.active_stop_distance_name == "stop_support"
-        assert sched.active_close_zone_names == ("hold", "hold", "trailing_ratchet")
-        assert sched.active_close_profile_name == "hold/hold/trailing_ratchet"
+        assert sched.active_close_zone_names == (
+            "hold",
+            "hold",
+            "hold",
+            "trailing_ratchet",
+        )
+        assert sched.active_close_profile_name == "hold/hold/hold/trailing_ratchet"
 
 
 class TestOpenEpicGuarded:
@@ -184,6 +191,7 @@ class TestValidateStrategySelection:
             stop_strategy="stop_support",
             close_zonestart="hold",
             close_zonemarge="hold",
+            close_zonesecure="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
             allow_recovery_revert=False,
@@ -198,6 +206,7 @@ class TestValidateStrategySelection:
             stop_strategy="stop_support",
             close_zonestart="hold",
             close_zonemarge="hold",
+            close_zonesecure="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=None,
             allow_recovery_revert=False,
@@ -211,6 +220,7 @@ class TestValidateStrategySelection:
             stop_strategy="stop_support",
             close_zonestart="hold",
             close_zonemarge="hold",
+            close_zonesecure="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=True,
             allow_recovery_revert=True,
@@ -224,6 +234,7 @@ class TestValidateStrategySelection:
             stop_strategy="stop_support",
             close_zonestart="hold",
             close_zonemarge="hold",
+            close_zonesecure="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
             allow_recovery_revert=None,
@@ -237,6 +248,7 @@ class TestValidateStrategySelection:
             stop_strategy="",
             close_zonestart="",
             close_zonemarge="",
+            close_zonesecure="",
             close_zoneprofit="",
             allow_same_day_reopen=False,
             allow_recovery_revert=False,
@@ -248,6 +260,7 @@ class TestValidateStrategySelection:
         assert "STOP_STRATEGY" in message
         assert "CLOSE_ZONESTART" in message
         assert "CLOSE_ZONEMARGE" in message
+        assert "CLOSE_ZONESECURE" in message
         assert "CLOSE_ZONEPROFIT" in message
 
     def test_unknown_name_is_rejected(self):
@@ -256,6 +269,7 @@ class TestValidateStrategySelection:
             stop_strategy="stop_support",
             close_zonestart="hold",
             close_zonemarge="hold",
+            close_zonesecure="hold",
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
             allow_recovery_revert=False,
@@ -596,18 +610,22 @@ def intent_strategy_emits_shorts(scheduler) -> bool:
     return getattr(scheduler._strategy, "emits_shorts", False)
 
 
-def _candle(ts: datetime) -> Candle:
-    """A minimal candle stamped at ``ts`` for buffer freshness tests."""
+def _candle(ts: datetime, bid: float = 1.0) -> Candle:
+    """A minimal spread-less candle stamped at ``ts``, flat at ``bid``.
+
+    ``bid`` shapes the curve the recovery-revert filter reads; the freshness tests
+    only care about ``ts`` and leave it at its default.
+    """
     return Candle(
         timestamp=ts,
-        bid_open=1.0,
-        bid_close=1.0,
-        bid_high=1.0,
-        bid_low=1.0,
-        offer_open=1.0,
-        offer_close=1.0,
-        offer_high=1.0,
-        offer_low=1.0,
+        bid_open=bid,
+        bid_close=bid,
+        bid_high=bid,
+        bid_low=bid,
+        offer_open=bid,
+        offer_close=bid,
+        offer_high=bid,
+        offer_low=bid,
     )
 
 
@@ -1588,15 +1606,45 @@ class TestRecoveryRevert:
     opposite side at once (see ``BotScheduler._revert_after_stop_loss``). The
     reverse open goes through the shared guarded path with the long-only and
     same-day-re-open gates lifted, and is capped at one hop.
+
+    Two rules must agree: the bookkeeping one (which stop fired — covered by
+    ``tests/test_execution_gates.py``) and the curve one (did the market actually
+    break through it). The wiring of the second is what is checked here: the
+    scheduler must build the curve **since the open** from the live buffer and drop
+    the revert when it is a drift, a chop or a grazed stop.
     """
 
-    def _scheduler(self, session_factory, *, allow: bool = True) -> BotScheduler:
+    #: Fixed open instant, so the candle timestamps and ``time_open`` line up
+    #: without depending on the wall clock.
+    OPENED_AT = datetime(2026, 8, 3, 9, 59, 30, tzinfo=UTC)
+
+    #: A clean break: five 1-minute candles walking straight from the opening
+    #: level (1.10000) through the stop placed at open (1.09850).
+    CLEAN_BREAK = [1.09960, 1.09920, 1.09880, 1.09840, 1.09800]
+
+    def _scheduler(
+        self,
+        session_factory,
+        *,
+        allow: bool = True,
+        curve: list[float] | None = None,
+        first_candle_minute: int = 0,
+    ) -> BotScheduler:
         scheduler = _streaming_scheduler(session_factory, MagicMock())
         scheduler._settings.allow_recovery_revert = allow  # real bool, not a Mock
         # Skip building a real close profile from the MagicMock settings.
         scheduler._close_profile_obj = MagicMock()
-        # One live candle so the revert has a price to open on.
-        scheduler._buffer.add_candle("E", _candle(datetime.now(UTC)))
+        # The curve the revert filter reads: one candle per minute from the open.
+        # ``first_candle_minute`` shifts the whole series (negative = candles that
+        # predate the open, which the filter must not count).
+        for offset, bid in enumerate(self.CLEAN_BREAK if curve is None else curve):
+            scheduler._buffer.add_candle(
+                "E",
+                _candle(
+                    self.OPENED_AT + timedelta(minutes=first_candle_minute + offset),
+                    bid,
+                ),
+            )
         return scheduler
 
     def _stub_open(self, scheduler) -> list[dict]:
@@ -1620,13 +1668,19 @@ class TestRecoveryRevert:
         scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
         return calls
 
-    @staticmethod
-    def _stopped_out(**overrides) -> Position:
-        """A long closed at a loss on the stop placed at open."""
+    @classmethod
+    def _stopped_out(cls, *, held_minutes: float = 5.5, **overrides) -> Position:
+        """A long closed at a loss on the stop placed at open, after a clean break.
+
+        ``held_minutes`` sets ``time_close``, i.e. how long the walk to the stop
+        took — the drift test of the curve filter reads it.
+        """
         fields = {
             "epic": "E",
             "epic_name": "E",
-            "date": date.today(),
+            "date": cls.OPENED_AT.date(),
+            "time_open": cls.OPENED_AT.time(),
+            "time_close": (cls.OPENED_AT + timedelta(minutes=held_minutes)).time(),
             "direction": "BUY",
             "state": PositionState.CLOSE,
             "reason_open": "auto",
@@ -1669,7 +1723,11 @@ class TestRecoveryRevert:
         assert reverse.reason_open == "recovery_revert"
 
     async def test_short_stopped_out_reverts_to_a_long(self, session_factory):
-        scheduler = self._scheduler(session_factory)
+        # Mirror curve: a clean break UP through the short's stop (1.10150).
+        scheduler = self._scheduler(
+            session_factory,
+            curve=[1.10040, 1.10080, 1.10120, 1.10160, 1.10200],
+        )
         calls = self._stub_open(scheduler)
         position = self._stopped_out(
             direction="SELL",
@@ -1736,6 +1794,111 @@ class TestRecoveryRevert:
             )
 
         assert reverse is None and calls == []
+
+    async def test_slow_leak_to_the_stop_does_not_revert(self, session_factory):
+        # The epic leaked down to the stop in forty tiny steps: no candle carries
+        # the move, so there is nothing to ride on the other side.
+        drift = [1.10000 - 0.00005 * i for i in range(1, 41)]
+        scheduler = self._scheduler(session_factory, curve=drift)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(held_minutes=41),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_flat_range_broken_by_one_candle_reverts(self, session_factory):
+        # Fifteen quiet minutes then one candle through the stop: the holding time
+        # says "flat", the candle says "break" — and the break is what counts.
+        flat = [1.09990 + 0.00005 * (i % 3) for i in range(15)] + [1.09800]
+        scheduler = self._scheduler(session_factory, curve=flat)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(held_minutes=16),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is not None and [c["direction"] for c in calls] == ["SELL"]
+
+    async def test_oscillating_curve_does_not_revert(self, session_factory):
+        # Chop that eventually bumps into the stop: no direction to take.
+        chop = [
+            1.09990,
+            1.09930,
+            1.09990,
+            1.09920,
+            1.09980,
+            1.09910,
+            1.09970,
+            1.09900,
+            1.09960,
+            1.09890,
+            1.09950,
+            1.09800,
+        ]
+        scheduler = self._scheduler(session_factory, curve=chop)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(held_minutes=12),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_grazed_stop_does_not_revert(self, session_factory):
+        # A wick took the stop out (1.09850) and price is already back above it.
+        grazed = [1.09960, 1.09920, 1.09880, 1.09840, 1.09900]
+        scheduler = self._scheduler(session_factory, curve=grazed)
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session, self._stopped_out(), scheduler._build_trade_config()
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_curve_before_the_open_is_not_counted(self, session_factory):
+        # The buffer holds only candles that predate the open (feed gap since):
+        # the curve is unknown, which is not a licence to revert.
+        scheduler = self._scheduler(
+            session_factory, curve=[1.09800], first_candle_minute=-10
+        )
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(held_minutes=10),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is None and calls == []
+
+    async def test_stop_out_before_the_first_candle_reverts(self, session_factory):
+        # Stopped out inside a minute: there is no curve to read yet, and a stop-out
+        # that fast is a break — the missing candles must not block the revert.
+        scheduler = self._scheduler(session_factory, curve=[1.09800])
+        calls = self._stub_open(scheduler)
+
+        async with session_factory() as session:
+            reverse = await scheduler._revert_after_stop_loss(
+                session,
+                self._stopped_out(held_minutes=1),
+                scheduler._build_trade_config(),
+            )
+
+        assert reverse is not None and [c["direction"] for c in calls] == ["SELL"]
 
     async def test_gate_refusal_is_not_an_error(self, session_factory):
         scheduler = self._scheduler(session_factory)
@@ -2016,7 +2179,16 @@ class TestGroupStopPrePass:
         profile = MagicMock()
         profile.is_group_aware = True
         profile.group_member = MagicMock(side_effect=lambda p, bid, buf: p.id)
-        profile.plan_group = MagicMock(return_value={1: 1.5, 2: 2.5})
+        profile.explain_group = MagicMock(
+            return_value=GroupPlanReport(
+                plan={1: 1.5, 2: 2.5},
+                total_euro=12.0,
+                gate_euro=0.0,
+                armed=True,
+                valuations=[],
+                unpriceable=[],
+            )
+        )
         scheduler._close_profile_obj = profile
 
         seen: list[tuple[str, float | None]] = []
@@ -2055,7 +2227,7 @@ class TestGroupStopPrePass:
 
         await scheduler._monitor_positions()
 
-        assert profile.plan_group.call_args.args[0] == [1, 2]
+        assert profile.explain_group.call_args.args[0] == [1, 2]
         assert sorted(seen) == [("A", 1.5), ("B", 2.5)]
 
     async def test_an_unpriceable_position_skips_the_whole_plan(
@@ -2072,7 +2244,7 @@ class TestGroupStopPrePass:
 
         await scheduler._monitor_positions()
 
-        profile.plan_group.assert_not_called()
+        profile.explain_group.assert_not_called()
         assert sorted(seen) == [("A", None), ("B", None)]
 
 

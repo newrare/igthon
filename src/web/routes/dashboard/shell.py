@@ -7,10 +7,7 @@ from src.web.routes.dashboard.components import (
     render_confirm_modal,
     render_modal,
 )
-from src.web.routes.dashboard.fragments import (
-    _build_fragments,
-    _render_config_grid,
-)
+from src.web.routes.dashboard.fragments import _build_fragments
 
 
 # The open / stop / close selection is chosen exclusively in ``.env`` (the single
@@ -46,14 +43,14 @@ def _render_stop_distance_name(current: str) -> str:
 
 
 def _render_close_profile_name(current: str) -> str:
-    """Read-only title-bar chip for the active close zones (start/margin/profit)."""
+    """Read-only title-bar chip for the close zones (start/margin/secure/profit)."""
     return _render_selection_name(
         current,
         icon="shield",
         cls="dashboard-title-exit",
         title=(
             "Active close zones (exit) — set CLOSE_ZONESTART / CLOSE_ZONEMARGE / "
-            "CLOSE_ZONEPROFIT in .env"
+            "CLOSE_ZONESECURE / CLOSE_ZONEPROFIT in .env"
         ),
     )
 
@@ -216,10 +213,17 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                 ),
             ),
             render_modal(
-                modal_id="winrate-modal",
-                close_fn="closeWinRateModal",
-                title='<i data-lucide="settings" class="lc-icon"></i> Configuration',
-                body=_render_config_grid(settings),
+                modal_id="epic-result-modal",
+                close_fn="closeEpicResultModal",
+                title=(
+                    '<i data-lucide="bar-chart-3" class="lc-icon"></i> '
+                    "Result per epic — Today"
+                ),
+                refresh_id="refresh-epic-result",
+                body=(
+                    '<div id="frag-epic_result_modal">'
+                    f'{frags["epic_result_modal"]}</div>'
+                ),
             ),
         ]
     )
@@ -271,7 +275,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=13">
+    <link rel="stylesheet" href="/static/style.css?v=14">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -292,7 +296,7 @@ def _render_dashboard(settings, state: dict) -> str:
         <i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>
         {_render_close_profile_name(
             f"{settings.close_zonestart}/{settings.close_zonemarge}/"
-            f"{settings.close_zoneprofit}"
+            f"{settings.close_zonesecure}/{settings.close_zoneprofit}"
         )}
     </div>
 
@@ -439,6 +443,6 @@ def _render_dashboard(settings, state: dict) -> str:
 </div>
 
 <script src="/static/tables.js?v=1"></script>
-<script src="/static/dashboard.js?v=35"></script>
+<script src="/static/dashboard.js?v=38"></script>
 </body>
 </html>"""

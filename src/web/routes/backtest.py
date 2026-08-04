@@ -2,9 +2,17 @@
 
 Companion to ``/simulator`` (which uses synthetic curves). This page lists the
 weeks of real candles available in the on-disk archive (produced by the candle
-retention dump), lets the user pick a week / strategy, and replays the project's
-real open/close rules over that data — reporting win/loss counts and a euro P&L
-estimate.
+retention dump), lets the user pick a week and a **full open/stop/close
+selection**, and replays the project's real rules over that data.
+
+The page exposes the same six decoupled selectors as ``.env`` —
+``OPEN_STRATEGY``, ``STOP_STRATEGY`` and the four ``CLOSE_ZONE*`` zones — because
+comparing those combinations against one another is the entire point of a
+backtest. Anything left on *live* keeps the configured value.
+
+A run always covers **every epic** of the selected week and **all** of its days:
+there is no epic filter and no trade cap in the UI, so two runs of the same week
+differ only by the selection under test.
 
 The whole path reads only archive files (no DB, no IG API), so a backtest can be
 run while the main process keeps recording the current week.
@@ -20,13 +28,20 @@ from pydantic import BaseModel, Field
 
 from src.backtest.backtest_archive import BacktestArchive
 from src.backtest.backtester import (
+    SELECTION_REGISTRIES,
     BacktestConfig,
+    StrategySelection,
+    backtestable_names,
     dedupe_correlated_epics,
+    euro_summary,
     percentage_summary,
     run_backtest,
+    trade_euro,
+    trade_euro_breakeven,
     trade_return_pct,
+    untestable_reason,
 )
-from src.entry import ENTRY_STRATEGIES
+from src.backtest.contract_values import ContractTable
 
 router = APIRouter()
 
@@ -51,13 +66,60 @@ def _archive(request: Request) -> BacktestArchive:
     return BacktestArchive(request.app.state.settings.candle_dump_dir)
 
 
+def _contract_table(request: Request) -> ContractTable:
+    """Load the epic → € / point table the euro figures are priced with.
+
+    An unset path yields an empty table (no euro figures, counts and percentages
+    unaffected) — the same graceful degradation as a table that has never been
+    generated.
+    """
+    path = getattr(request.app.state.settings, "backtest_contract_file", None)
+    return ContractTable.load(path)
+
+
+#: Label shown above each selector, in the order the price zones are crossed.
+SELECTOR_LABELS: dict[str, str] = {
+    "open_strategy": "Open strategy",
+    "stop_strategy": "Stop distance",
+    "close_zonestart": "Zone start (→ break-even)",
+    "close_zonemarge": "Zone marge (BE → margin)",
+    "close_zonesecure": "Zone secure (→ profit)",
+    "close_zoneprofit": "Zone profit (beyond)",
+}
+
+
 class BacktestRequest(BaseModel):
-    """Validated parameters for a backtest run."""
+    """Validated parameters for a backtest run.
+
+    The six selectors mirror the ``.env`` names one-for-one; each is optional and
+    falls back to the live configuration. ``strategy`` is the legacy alias of
+    ``open_strategy`` and is still accepted.
+
+    ``epics`` narrows the run to specific epics; the web page never sets it (a
+    run always covers the whole week) but it stays available for programmatic
+    callers. There is no trade cap: the whole selection is replayed.
+    """
 
     weeks: list[str] = Field(default_factory=list, max_length=104)
     epics: list[str] = Field(default_factory=list, max_length=200)
     strategy: str | None = Field(None, pattern="^[a-z_]+$")
-    target_trades: int = Field(100, ge=1, le=2000)
+    open_strategy: str | None = Field(None, pattern="^[a-z_]+$")
+    stop_strategy: str | None = Field(None, pattern="^[a-z_]+$")
+    close_zonestart: str | None = Field(None, pattern="^[a-z_]+$")
+    close_zonemarge: str | None = Field(None, pattern="^[a-z_]+$")
+    close_zonesecure: str | None = Field(None, pattern="^[a-z_]+$")
+    close_zoneprofit: str | None = Field(None, pattern="^[a-z_]+$")
+
+    def selection(self) -> StrategySelection:
+        """The run's selector overrides, ``None`` where the live value applies."""
+        return StrategySelection(
+            open_strategy=self.open_strategy or self.strategy,
+            stop_strategy=self.stop_strategy,
+            close_zonestart=self.close_zonestart,
+            close_zonemarge=self.close_zonemarge,
+            close_zonesecure=self.close_zonesecure,
+            close_zoneprofit=self.close_zoneprofit,
+        )
 
 
 @router.get("/api/backtest/datasets")
@@ -114,15 +176,21 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
     The load + replay is pure CPU/IO work pushed to a worker thread so the event
     loop (and the 1 s dashboard poll) stays responsive.
     """
-    if body.strategy is not None and body.strategy not in ENTRY_STRATEGIES:
+    settings = request.app.state.settings
+    selection = body.selection()
+    # Validated on the resolved names, so an untestable *live* value fails here
+    # too instead of being replayed as a degraded look-alike.
+    problems = selection.problems(settings)
+    if problems:
+        detail = "; ".join(f"{k}: {v}" for k, v in sorted(problems.items()))
         return JSONResponse(
-            {"error": f"Unknown strategy: {body.strategy}"}, status_code=400
+            {"error": f"Unusable selection — {detail}"}, status_code=400
         )
 
-    settings = request.app.state.settings
-    strategy_name = body.strategy or settings.open_strategy
     archive = _archive(request)
-    config = BacktestConfig(target_trades=body.target_trades)
+    table = _contract_table(request)
+    # No trade cap: replay every day of the selected week(s).
+    config = BacktestConfig()
 
     def _load_and_run():
         candles = archive.load(weeks=body.weeks or None, epics=body.epics or None)
@@ -130,7 +198,7 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
         # same bet is not counted several times; run_backtest dedupes too, this
         # mirror is only to report what was kept/dropped to the UI.
         kept, dropped = dedupe_correlated_epics(candles)
-        result = run_backtest(settings, candles, config, strategy_name)
+        result = run_backtest(settings, candles, config, selection)
         candles_loaded = sum(len(c) for c in kept.values())
         return result, len(kept), dropped, candles_loaded
 
@@ -143,10 +211,13 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
             {"error": "No archived candles match the selection."}, status_code=400
         )
 
-    # Report P&L as percentage return computed from the real fill prices —
-    # comparable across instruments, no fabricated euro-per-point. Keep only the
-    # contract-agnostic structural stats from the euro summary (counts, win rate,
-    # gate/close reason breakdowns) and merge in the percentage magnitudes.
+    # Three lenses on the same replay, in one summary:
+    #   - structural counts (trades / wins / losses / win rate) — no contract
+    #     value needed, so they always cover every trade;
+    #   - euros, priced per epic from the contract table (see euro_summary) —
+    #     both the real result and the break-even-exit scenario;
+    #   - percentage returns, kept as the instrument-agnostic fallback for the
+    #     epics the contract table cannot price.
     base = result.summary()
     summary = {
         "trades": base["trades"],
@@ -158,10 +229,13 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
         "rejections": base["rejections"],
         "close_reasons": base["close_reasons"],
         **percentage_summary(result.trades),
+        **euro_summary(result.trades, table),
     }
+    resolved = selection.resolve(settings)
     return JSONResponse(
         {
-            "strategy": strategy_name,
+            "strategy": resolved["open_strategy"],
+            "selection": resolved,
             "epics_loaded": epics_loaded,
             "epics_dropped": epics_dropped,
             "candles_loaded": candles_loaded,
@@ -169,6 +243,7 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
             "trades": [
                 {
                     "epic": t.epic,
+                    "direction": t.direction,
                     "day": t.day,
                     "open_time": t.open_time,
                     "close_time": t.close_time,
@@ -176,6 +251,11 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
                     "level_close": t.level_close,
                     "reason": t.reason_close,
                     "return_pct": round(trade_return_pct(t), 4),
+                    "euro": _rounded(trade_euro(t, table.euro_per_point(t.epic))),
+                    "euro_breakeven": _rounded(
+                        trade_euro_breakeven(t, table.euro_per_point(t.epic))
+                    ),
+                    "breakeven_time": t.time_breakeven_exit,
                     "win": t.win,
                     "stop_updates": t.stop_updates,
                 }
@@ -185,50 +265,55 @@ async def api_backtest_run(request: Request, body: BacktestRequest) -> JSONRespo
     )
 
 
-def _stepper(
-    label: str,
-    field_id: str,
-    *,
-    value: str = "",
-    minimum: str = "",
-    maximum: str = "",
-    step: str = "1",
-) -> str:
-    """A numeric input flanked by −/+ stepper buttons (shares ``.stepper`` CSS)."""
-    attrs = f'id="{field_id}" step="{step}"'
-    if value:
-        attrs += f' value="{value}"'
-    if minimum != "":
-        attrs += f' min="{minimum}"'
-    if maximum != "":
-        attrs += f' max="{maximum}"'
-    return f"""<label>{label}
-        <div class="stepper">
-            <button type="button" class="step-btn" tabindex="-1"
-                onclick="stepField('{field_id}', -1)">&minus;</button>
-            <input type="number" {attrs}>
-            <button type="button" class="step-btn" tabindex="-1"
-                onclick="stepField('{field_id}', 1)">+</button>
-        </div>
-    </label>"""
+def _rounded(value: float | None) -> float | None:
+    """Round a euro figure for the JSON payload, preserving ``None`` (unpriced)."""
+    return None if value is None else round(value, 2)
+
+
+def _selector_field(selector: str, live_value: str) -> str:
+    """One ``<select>`` for a selector, pre-set to the live ``.env`` value.
+
+    The live name is marked so a run's baseline is obvious. When the live value is
+    one the offline engine cannot reproduce (``UNTESTABLE_NAMES``, e.g.
+    ``smartgroup``) it is still listed — hiding it would leave the operator
+    wondering why the page disagrees with ``.env`` — but as a **disabled** option,
+    so the browser falls back to a valid name and the run states what it replayed.
+    """
+    choices = backtestable_names(selector)
+    reason = untestable_reason(selector, live_value)
+    options = ""
+    if live_value and (reason or live_value not in choices):
+        note = "not backtestable" if reason else "unknown name"
+        options += (
+            f'<option value="{live_value}" disabled title="{reason or ""}">'
+            f"{live_value} (live — {note})</option>"
+        )
+    options += "".join(
+        f'<option value="{name}"{" selected" if name == live_value else ""}>'
+        f"{name}{' (live)' if name == live_value else ''}</option>"
+        for name in choices
+    )
+    return f"""<label>{SELECTOR_LABELS[selector]}
+            <select id="bt-{selector}" class="bt-selector"
+                data-selector="{selector}">{options}</select>
+        </label>"""
 
 
 @router.get("/backtest", response_class=HTMLResponse)
 async def backtest_page(request: Request) -> HTMLResponse:
-    """Render the backtest page (archive picker + strategy replay)."""
-    live_strategy = request.app.state.settings.open_strategy
-    strategy_options = "".join(
-        f'<option value="{name}"{" selected" if name == live_strategy else ""}>'
-        f"{name}{' (live)' if name == live_strategy else ''}</option>"
-        for name in sorted(ENTRY_STRATEGIES)
+    """Render the backtest page (archive picker + full selection replay)."""
+    settings = request.app.state.settings
+    selector_fields = "\n        ".join(
+        _selector_field(selector, getattr(settings, selector, "") or "")
+        for selector in SELECTION_REGISTRIES
     )
-    bt_target = _stepper(
-        "Trades target",
-        "bt-target",
-        value="100",
-        minimum="1",
-        maximum="2000",
-        step="10",
+    table = _contract_table(request)
+    contract_note = (
+        f"{len(table)} epic(s) priced in the contract table"
+        + (f" (captured {table.generated_at[:16]})" if table.generated_at else "")
+        if len(table)
+        else "No € / point table yet — run <code>python -m "
+        "src.scripts.dump_euro_per_point</code> to get euro figures"
     )
     return HTMLResponse(f"""<!DOCTYPE html>
 <html>
@@ -266,20 +351,18 @@ async def backtest_page(request: Request) -> HTMLResponse:
             </div>
         </div>
         <div class="section-body">
-            <p class="bt-hint">Pick a week of archived candles, then (optionally)
-            narrow it to specific epics — leave them all unchecked (or use
-            <em>All epics</em>) to backtest the whole week. The archive is built by
+            <p class="bt-hint">Pick a week of archived candles — a run always
+            covers <strong>every epic</strong> of that week. The archive is built by
             the candle retention dump; <strong>Snapshot DB now</strong> also copies
             the current database candles (including the last 7 days not yet purged)
             into the archive so you can backtest recent data.</p>
             <div class="bt-controls">
                 <label>Week
-                    <select id="bt-week" onchange="renderEpics()"></select>
+                    <select id="bt-week" onchange="renderWeekMeta()"></select>
                 </label>
             </div>
             <div id="bt-week-meta" class="bt-meta"></div>
             <div id="bt-export-meta" class="bt-meta"></div>
-            <div id="bt-epics" class="bt-epics"></div>
         </div>
     </div>
 
@@ -290,18 +373,23 @@ async def backtest_page(request: Request) -> HTMLResponse:
         </div>
         <div class="section-body">
             <p class="bt-hint">Replays the bot's real opening/closing rules
-            (signal, pre-open gates, win/stop levels, ATR trailing stop) over the
-            selected week until the trade target is reached. Correlated duplicate
-            contracts (e.g. the three DAX contracts) are collapsed to one.</p>
+            (signal, pre-open gates, win/stop levels, per-zone stop updates) over
+            <strong>every day</strong> of the selected week. Correlated duplicate
+            contracts (e.g. the three DAX contracts) are collapsed to one. The six
+            selectors below are the same ones <code>.env</code> holds — each starts
+            on the live value, change any of them to test a combination.</p>
             <div class="bt-controls">
-                <label>Strategy
-                    <select id="bt-strategy">{strategy_options}</select>
-                </label>
-                {bt_target}
+                {selector_fields}
+            </div>
+            <div class="bt-controls" style="padding-top:0;">
                 <button class="nav-btn" id="bt-run-btn" onclick="runBacktest()">
                     <i data-lucide="play" class="lc-icon"></i> Run backtest
                 </button>
+                <button class="nav-btn" onclick="resetSelectors()">
+                    <i data-lucide="rotate-ccw" class="lc-icon"></i> Back to live
+                </button>
             </div>
+            <div class="bt-meta">{contract_note}</div>
             <div id="bt-status" class="bt-meta"></div>
             <div id="bt-results" style="display:none;">
                 <div class="kpi-bar" id="bt-kpis"></div>
@@ -319,8 +407,9 @@ async def backtest_page(request: Request) -> HTMLResponse:
                         <h3>Trades</h3>
                         <div class="bt-trades-wrap">
                         <table><thead><tr>
-                            <th>#</th><th>Epic</th><th>Open</th><th>Close</th>
-                            <th>Reason</th><th>Return %</th>
+                            <th>#</th><th>Epic</th><th>Way</th><th>Open</th>
+                            <th>Close</th><th>Reason</th><th>Return %</th>
+                            <th>Euro</th><th>Euro @BE</th>
                         </tr></thead>
                         <tbody id="bt-trades"></tbody></table>
                         </div>
@@ -348,30 +437,14 @@ async def backtest_page(request: Request) -> HTMLResponse:
 .bt-controls input:focus, .bt-controls select:focus {{
     outline:none; border-color:var(--primary); }}
 .bt-controls select {{ cursor:pointer; }}
-.stepper {{ display:flex; align-items:stretch; width:9rem; }}
-.stepper input {{ width:100%; text-align:center; border-radius:0 !important;
-    border-left:none !important; border-right:none !important; }}
-.stepper input::-webkit-outer-spin-button,
-.stepper input::-webkit-inner-spin-button {{ -webkit-appearance:none; margin:0; }}
-.stepper input[type=number] {{ -moz-appearance:textfield; appearance:textfield; }}
-.step-btn {{ background:var(--surface-2); border:1px solid var(--border);
-    color:var(--text-muted); width:1.9rem; flex-shrink:0; cursor:pointer;
-    font-size:1rem; line-height:1; font-family:var(--mono);
-    transition:background var(--transition), color var(--transition); }}
-.step-btn:first-child {{ border-radius:var(--radius-sm) 0 0 var(--radius-sm); }}
-.step-btn:last-child {{ border-radius:0 var(--radius-sm) var(--radius-sm) 0; }}
-.step-btn:hover {{ background:var(--primary); color:#120e0c; border-color:var(--primary); }}
 .bt-controls .nav-btn {{ min-width:11rem; justify-content:center; }}
 .bt-controls .nav-btn:disabled {{ opacity:0.5; cursor:not-allowed; }}
 .bt-meta {{ font-size:0.75rem; color:var(--text-muted); padding:0.2rem 0 0.6rem;
     display:flex; align-items:center; gap:0.5rem; }}
+.bt-meta code {{ font-family:var(--mono); color:var(--text); }}
+/* Multi-line meta (run summary + warnings): one flex child that stacks inside. */
+.bt-meta .bt-lines {{ display:flex; flex-direction:column; gap:0.25rem; }}
 .bt-hint {{ font-size:0.78rem; color:var(--text-muted); margin:0.4rem 0 0; }}
-.bt-epics {{ display:flex; flex-wrap:wrap; gap:0.5rem; margin-top:0.4rem; }}
-.bt-epics label {{ display:flex; align-items:center; gap:0.4rem; font-size:0.72rem;
-    font-family:var(--mono); color:var(--text-muted); background:var(--surface-2);
-    border:1px solid var(--border); border-radius:var(--radius-sm);
-    padding:0.25rem 0.55rem; cursor:pointer; }}
-.bt-epics input {{ accent-color:var(--primary); cursor:pointer; }}
 .bt-tables {{ display:grid; grid-template-columns:1fr 2fr; gap:1.2rem;
     margin-top:1.2rem; }}
 .bt-tables h3 {{ font-size:0.8rem; color:var(--primary); margin:0 0 0.4rem;
@@ -402,18 +475,25 @@ function pct(v, signed) {{
     return n + "%";
 }}
 
-function stepField(id, dir) {{
-    const el = document.getElementById(id);
-    const step = parseFloat(el.step) || 1;
-    const min = el.min !== "" ? parseFloat(el.min) : -Infinity;
-    const max = el.max !== "" ? parseFloat(el.max) : Infinity;
-    let v = parseFloat(el.value);
-    if (isNaN(v)) v = min !== -Infinity ? min : 0;
-    v = Math.min(max, Math.max(min, v + dir * step));
-    el.value = Number.isInteger(step) ? v : parseFloat(v.toFixed(2));
+// Format a euro figure; null means "this epic has no € / point in the table".
+function eur(v, signed) {{
+    if (v === null || v === undefined) return "—";
+    return (signed && v > 0 ? "+" : "") + v.toFixed(2) + " €";
 }}
 
 function fmtDate(iso) {{ return iso ? iso.replace("T", " ").slice(0, 16) : "—"; }}
+
+// Put every selector back on the live .env value the page was rendered with.
+// A live value that is not backtestable is a disabled option, so fall back to
+// the first selectable name instead of leaving an unusable selection in place.
+function resetSelectors() {{
+    document.querySelectorAll(".bt-selector").forEach(sel => {{
+        const options = Array.from(sel.options);
+        const target = options.find(o => o.text.endsWith("(live)"))
+            || options.find(o => !o.disabled);
+        if (target) sel.value = target.value;
+    }});
+}}
 
 async function exportData() {{
     const btn = document.getElementById("bt-export-btn");
@@ -454,36 +534,24 @@ async function loadDatasets() {{
         weekSel.innerHTML = "";
         meta.textContent = "No archived weeks yet — the retention dump has not " +
             "produced any candle files.";
-        document.getElementById("bt-epics").innerHTML = "";
         return;
     }}
     weekSel.innerHTML = DATASETS.map(d =>
         `<option value="${{d.week}}">${{d.week}} — ${{d.epics.length}} epics, ` +
         `${{d.total_candles}} candles</option>`).join("");
-    renderEpics();
+    renderWeekMeta();
 }}
 
-function renderEpics() {{
+// Coverage line for the selected week. Every epic is always replayed, so this
+// is informational only — there is no epic picker.
+function renderWeekMeta() {{
     const week = document.getElementById("bt-week").value;
     const d = DATASETS.find(x => x.week === week);
     const meta = document.getElementById("bt-week-meta");
-    const box = document.getElementById("bt-epics");
-    if (!d) {{ meta.textContent = ""; box.innerHTML = ""; return; }}
+    if (!d) {{ meta.textContent = ""; return; }}
     meta.innerHTML = `<strong>${{d.week}}</strong>: ${{fmtDate(d.first)}} → ` +
         `${{fmtDate(d.last)}}, ${{d.epics.length}} epics, ${{d.total_candles}} candles ` +
-        `(leave epics unchecked to backtest them all)`;
-    const allToggle =
-        `<label style="border-color:var(--primary);color:var(--text);">` +
-        `<input type="checkbox" id="bt-epic-all" onchange="toggleAllEpics(this)"> ` +
-        `<strong>All epics</strong></label>`;
-    box.innerHTML = allToggle + d.epics.map(e =>
-        `<label><input type="checkbox" class="bt-epic" value="${{e.epic}}"> ` +
-        `${{e.epic}} <span style="color:var(--text-dim);">(${{e.count}})</span></label>`
-    ).join("");
-}}
-
-function toggleAllEpics(master) {{
-    document.querySelectorAll(".bt-epic").forEach(el => {{ el.checked = master.checked; }});
+        `(all epics are backtested)`;
 }}
 
 function kpi(label, value, color) {{
@@ -505,8 +573,6 @@ async function runBacktest() {{
 
     const week = document.getElementById("bt-week").value;
     if (!week) {{ status.textContent = "No archived week selected."; return; }}
-    const epics = Array.from(document.querySelectorAll(".bt-epic:checked"))
-        .map(el => el.value);
 
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Backtesting…';
@@ -518,12 +584,13 @@ async function runBacktest() {{
         lucide.createIcons();
     }};
 
-    const body = {{
-        weeks: [week],
-        epics: epics,
-        strategy: document.getElementById("bt-strategy").value,
-        target_trades: parseInt(document.getElementById("bt-target").value) || 100,
-    }};
+    // No epics / no trade cap: the whole week, every epic, every day. Every
+    // selector is sent explicitly, so the run is reproducible from the payload
+    // alone even if .env changes afterwards.
+    const body = {{weeks: [week]}};
+    document.querySelectorAll(".bt-selector").forEach(sel => {{
+        body[sel.dataset.selector] = sel.value;
+    }});
 
     let data;
     try {{
@@ -544,30 +611,57 @@ async function runBacktest() {{
     const s = data.summary;
     const dropped = (data.epics_dropped && data.epics_dropped.length)
         ? ` — deduped ${{data.epics_dropped.length}} correlated contract(s)` : "";
-    status.innerHTML = `strategy=<strong>${{data.strategy}}</strong> — ` +
+    const sel = data.selection || {{}};
+    const chain = ["open_strategy", "stop_strategy", "close_zonestart",
+        "close_zonemarge", "close_zonesecure", "close_zoneprofit"]
+        .map(k => sel[k]).filter(Boolean).join(" › ");
+    // An unpriced epic is silence in the euro totals — say so rather than letting
+    // a partial figure read as the whole result.
+    const unpriced = s.unpriced_trades
+        ? ` — <span style="color:#fbbf24;">${{s.unpriced_trades}} trade(s) have no ` +
+          `€ / point (${{s.unpriced_epics.join(", ")}}) and are excluded from the ` +
+          `euro totals</span>`
+        : "";
+    status.innerHTML = `<div class="bt-lines"><div><strong>${{chain}}</strong> — ` +
         `${{data.epics_loaded}} epics, ${{data.candles_loaded}} candles, ` +
-        `${{s.days_simulated}} days, ${{s.buy_signals}} BUY signals${{dropped}}`;
+        `${{s.days_simulated}} days, ${{s.buy_signals}} entry signals${{dropped}}` +
+        `${{unpriced}}</div></div>`;
     results.style.display = "block";
 
-    const pnlColor = s.total_return_pct >= 0 ? "#4ade80" : "#f87171";
+    const euroColor = s.total_euro >= 0 ? "#4ade80" : "#f87171";
+    const beColor = s.total_euro_breakeven >= 0 ? "#4ade80" : "#f87171";
+    const beRate = s.trades ? s.wins_breakeven / s.trades : 0;
     document.getElementById("bt-kpis").innerHTML =
         kpi("Trades", s.trades, "#e2e8f0") +
         kpi("Wins", s.wins, "#4ade80") +
         kpi("Losses", s.losses, "#f87171") +
         kpi("Win rate", (s.win_rate * 100).toFixed(1) + "%",
             s.win_rate >= 0.5 ? "#4ade80" : "#fbbf24") +
-        kpi("Total return", pct(s.total_return_pct, true), pnlColor) +
-        kpi("Avg win", pct(s.avg_win_pct, true), "#4ade80") +
-        kpi("Avg loss", pct(s.avg_loss_pct, true), "#f87171") +
-        kpi("Max drawdown", pct(s.max_drawdown_pct), "#fbbf24");
+        kpi("Total euro", eur(s.total_euro, true), euroColor) +
+        kpi("Total euro @BE", eur(s.total_euro_breakeven, true), beColor) +
+        kpi("Wins @BE", s.wins_breakeven, "#4ade80") +
+        kpi("Losses @BE", s.losses_breakeven, "#f87171") +
+        kpi("Win rate @BE", (beRate * 100).toFixed(1) + "%",
+            beRate >= 0.5 ? "#4ade80" : "#fbbf24");
 
-    Plotly.newPlot("bt-equity-chart", [{{
-        y: s.equity_pct, mode: "lines", name: "Cumulative return (%)",
-        line: {{color: s.total_return_pct >= 0 ? "#4ade80" : "#f87171", width: 1.8}},
-        fill: "tozeroy", fillcolor: "rgba(96,165,250,0.08)",
-    }}], {{...PLOTLY_LAYOUT, height: 300,
-        xaxis: {{title: "Closed trades"}},
-        yaxis: {{title: "Cumulative return (%)"}}}},
+    // Both euro curves on one axis: the real exit against the "close the moment
+    // it turns green" scenario, so the cost/benefit of holding is visible.
+    Plotly.newPlot("bt-equity-chart", [
+        {{
+            y: s.equity_euro, mode: "lines", name: "Real exit (€)",
+            line: {{color: euroColor, width: 1.8}},
+            fill: "tozeroy", fillcolor: "rgba(96,165,250,0.08)",
+        }},
+        {{
+            y: s.equity_euro_breakeven, mode: "lines",
+            name: "Break-even exit (€)",
+            line: {{color: "#60a5fa", width: 1.4, dash: "dot"}},
+        }},
+    ], {{...PLOTLY_LAYOUT, height: 300,
+        showlegend: true,
+        legend: {{orientation: "h", y: 1.12, x: 0}},
+        xaxis: {{title: "Closed trades (priced)"}},
+        yaxis: {{title: "Cumulative P&L (€)"}}}},
         {{displayModeBar: false, responsive: true}});
 
     const fill = (id, obj) => {{
@@ -579,14 +673,25 @@ async function runBacktest() {{
     fill("bt-reasons", s.close_reasons);
     fill("bt-rejections", s.rejections);
 
+    const sign = v => (v === null || v === undefined)
+        ? "#94a3b8" : (v >= 0 ? "#4ade80" : "#f87171");
     document.getElementById("bt-trades").innerHTML = data.trades.map((t, i) => {{
-        const c = t.return_pct >= 0 ? "#4ade80" : "#f87171";
+        const way = t.direction === "SELL"
+            ? '<span style="color:#f87171;">SELL</span>'
+            : '<span style="color:#4ade80;">BUY</span>';
         return `<tr><td class="number">${{i + 1}}</td>` +
             `<td>${{t.epic}}</td>` +
+            `<td>${{way}}</td>` +
             `<td>${{t.open_time}} @ ${{t.level_open}}</td>` +
             `<td>${{t.close_time}} @ ${{t.level_close}}</td>` +
             `<td>${{t.reason}}</td>` +
-            `<td class="number" style="color:${{c}};">${{pct(t.return_pct, true)}}</td></tr>`;
+            `<td class="number" style="color:${{sign(t.return_pct)}};">` +
+            `${{pct(t.return_pct, true)}}</td>` +
+            `<td class="number" style="color:${{sign(t.euro)}};">` +
+            `${{eur(t.euro, true)}}</td>` +
+            `<td class="number" style="color:${{sign(t.euro_breakeven)}};" ` +
+            `title="${{t.breakeven_time || "never crossed break-even"}}">` +
+            `${{eur(t.euro_breakeven, true)}}</td></tr>`;
     }}).join("");
     lucide.createIcons();
 }}

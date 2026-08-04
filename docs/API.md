@@ -134,8 +134,8 @@ ______________________________________________________________________
 
 IG enforces per-account rate limits. All calls are routed through `APIQueue` + `APIGuard`:
 
-- **50 requests/minute** (configurable via `QUEUE_MAX_ATTEMPTS`)
-- **25 requests/second**
+- **30 requests/minute** (the IG per-account limit; also half the per-API-key limit)
+- **20 requests/second** (burst ceiling — the per-minute cap always bites first)
 - Quota blocks trigger automatic wait + resume
 
 See [src/core/api_guard.py](../src/core/api_guard.py).

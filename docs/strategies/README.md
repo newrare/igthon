@@ -10,8 +10,8 @@ decisions, which are themselves **fully decoupled** and each selected by name:
   without touching the entry idea or the exit management.
 - **Closing** lives in `src/exit/` — a `CloseProfile` composes the stop distance at
   open (`initial_plan()`) and, on every tick (`evaluate()`), classifies the live
-  close-out price (the bid for a BUY, the offer for a SELL) into one of three
-  zones (underwater / break-even band / real profit) and delegates the
+  close-out price (the bid for a BUY, the offer for a SELL) into one of four
+  zones (underwater / break-even band / secure / real profit) and delegates the
   hold/close/ratchet decision to the matching stop updater in `src/exit/zones/`.
   The zones are **direction-aware**: the same updaters and the same `CLOSE_ZONE*`
   selectors manage a short, mirrored (see
@@ -32,9 +32,9 @@ distance and exit are plugged in:
 - the simulator, the dashboard, the charts
 
 Entry, stop distance and exit are each selected **by name** in the configuration.
-The exit is split into three independently-selected **zones** (open→break-even,
-break-even→margin, above-margin) so each zone's stop behaviour is tuned without
-influencing the others. The `.env` file is the **single source of truth**: every
+The exit is split into four independently-selected **zones** (follower→break-even,
+break-even→margin, margin→profit trigger, above the profit trigger) so each zone's
+stop behaviour is tuned without influencing the others. The `.env` file is the **single source of truth**: every
 selection is **required** (there is no default in `config.py`, no database
 persistence and no runtime switching from the dashboard). If any is missing or
 unknown the bot and the dashboard refuse to start with a clear error.
@@ -43,9 +43,10 @@ unknown the bot and the dashboard refuse to start with a clear error.
 # .env
 OPEN_STRATEGY=open_projection
 STOP_STRATEGY=stop_support
-CLOSE_ZONESTART=hold              # zone open → break-even
-CLOSE_ZONEMARGE=hold             # zone break-even → margin
-CLOSE_ZONEPROFIT=trailing_ratchet  # zone above the margin
+CLOSE_ZONESTART=hold               # zone follower → break-even
+CLOSE_ZONEMARGE=hold               # zone break-even → margin
+CLOSE_ZONESECURE=hold              # zone margin → profit trigger
+CLOSE_ZONEPROFIT=trailing_ratchet  # zone above the profit trigger
 ALLOW_SAME_DAY_REOPEN=false         # global open policy (see below)
 ALLOW_RECOVERY_REVERT=true          # global open policy (see below)
 ```
@@ -107,6 +108,44 @@ around with it.
   a choppy market cannot ping-pong the account through an endless BUY/SELL/BUY
   sequence.
 
+**Which curves qualify** — the conditions above only identify *which stop* fired,
+which is not enough: the same "loss on the original stop" bookkeeping covers a
+market that broke through the level and a market that never went anywhere.
+Reverting into the second one buys a spread in the direction of nothing. So the
+curve **since that position's own open** is read too, by the second pure rule
+`curve_supports_revert` in [src/execution/gates.py](../../src/execution/gates.py).
+
+That filter is deliberately **permissive**: the revert is the default answer to a
+stop-out and only the blatant "nothing happened" curves are dropped. Its main
+question is *where the adverse move is concentrated* — a break puts a visible chunk
+of the stop distance into a **single candle**, a flat range rubbing against the
+stop or a slow leak down to it never does. **Holding time is not a criterion**: a
+market can sit flat for twenty minutes and then break in one candle, which is a
+prime revert, while the same stop-out reached in a hundred tiny steps is not.
+Every threshold is a fraction of the trade's own risk (`|level_open − original_stop|`) or a ratio, so it means the same thing on a forex pair and on an
+index:
+
+| Rejected shape   | Test                                                                                                           | Why it is not a revert                                                                               |
+| ---------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **grazed stop**  | price no longer past the stop by `REVERT_MIN_BREAK_RATIO` (10% of the risk) when the revert is decided         | a wick took the stop out and the market is already back on the other side of it                      |
+| **no impulse**   | biggest single-candle adverse move below `REVERT_MIN_IMPULSE_RATIO` (20% of the risk)                          | the stop distance was covered in dribs and drabs — a flat or slowly-leaking market                   |
+| **violent chop** | path efficiency below `REVERT_MIN_EFFICIENCY_K` (1.2) × the `1/√n` a random walk of the same length would show | candles big enough to pass the impulse test can still add up to a market that went nowhere           |
+| **swing**        | ran more than `REVERT_MAX_FAVOURABLE_RATIO` (100% of the risk) **in profit** first                             | the direction was right at least once — the stop-out is the tail of an oscillation, not a wrong call |
+
+The curve is the close-out price of each 1-minute candle since the open (bid for a
+long, bid + spread for a short — the terms the stop levels are in), and the walk
+starts at the opening level itself, so a position whose very first candle crashed
+through the stop still shows its impulse. Below two candles there is no shape to
+read at all: that is accepted only when the position genuinely died within those
+couple of minutes (a stop-out that fast is a break), and refused otherwise — a
+silent feed means the curve is unknown, not flat. Both rules refuse rather than
+guess whenever an input is missing (no open time, no opening level, no live price).
+
+These thresholds are **constants in the module**, like every other strategy
+parameter — only the on/off selector lives in `.env`. Each refusal is logged at
+INFO with the shape that caused it (`Recovery revert on … dropped — the curve since open does not justify it: …`), so a run can be reviewed for over- or
+under-filtering.
+
 **How it opens.** Through the same guarded path as any other open (`entry` →
 `EntryIntent` → `TradingService.open_from_intent`), so the reverse trade is sized
 and stopped by the selected `STOP_STRATEGY` and managed by the same close zones.
@@ -117,7 +156,8 @@ epic was traded seconds ago). Everything else still applies — it is an
 duplicate-epic and "market closes soon" gates apply too. The reverse position is
 stamped `reason_open = recovery_revert`.
 
-It is wired in `BotScheduler._revert_after_stop_loss`, called from the two places
+It is wired in `BotScheduler._revert_after_stop_loss` (which builds the curve for
+the filter in `_curve_supports_revert`), called from the two places
 a stop-out becomes visible: the monitor tick (software backstop) and the position
 sync (broker stop filled at IG). The **backtest simulator does not model it** —
 a simulated run reports the entry strategy alone.
@@ -126,16 +166,17 @@ a simulated run reports the entry strategy alone.
 
 Registered in [src/entry/\_\_init\_\_.py](../../src/entry/__init__.py):
 
-| Name              | File                           | Doc                                      | Style                                                            |
-| ----------------- | ------------------------------ | ---------------------------------------- | ---------------------------------------------------------------- |
-| `open_donchian`   | `src/entry/open_donchian.py`   | [open_donchian.md](open_donchian.md)     | Breakout gated by trend efficiency                               |
-| `open_projection` | `src/entry/open_projection.py` | [open_projection.md](open_projection.md) | Breakout + multi-model projection gate                           |
-| `open_ranking`    | `src/entry/open_ranking.py`    | [open_ranking.md](open_ranking.md)       | Cross-epic ranker, one rolling position                          |
-| `open_testing`    | `src/entry/open_testing.py`    | [open_testing.md](open_testing.md)       | Diagnostic: open max markets/day at random                       |
-| `open_fade`       | `src/entry/open_fade.py`       | [open_fade.md](open_fade.md)             | **Two-sided** ranker: fade an extended trend at the channel edge |
-| `open_pullback`   | `src/entry/open_pullback.py`   | [open_pullback.md](open_pullback.md)     | **Two-sided** ranker: join a clean trend on a pause              |
-| `open_steady`     | `src/entry/open_steady.py`     | [open_steady.md](open_steady.md)         | **Two-sided** ranker: the most regular 10-minute curve           |
-| `open_five`       | `src/entry/open_five.py`       | [open_five.md](open_five.md)             | **Two-sided** ranker: a series of 5 distinct curve shapes        |
+| Name                | File                             | Doc                                          | Style                                                            |
+| ------------------- | -------------------------------- | -------------------------------------------- | ---------------------------------------------------------------- |
+| `open_donchian`     | `src/entry/open_donchian.py`     | [open_donchian.md](open_donchian.md)         | Breakout gated by trend efficiency                               |
+| `open_projection`   | `src/entry/open_projection.py`   | [open_projection.md](open_projection.md)     | Breakout + multi-model projection gate                           |
+| `open_ranking`      | `src/entry/open_ranking.py`      | [open_ranking.md](open_ranking.md)           | Cross-epic ranker, one rolling position                          |
+| `open_testing`      | `src/entry/open_testing.py`      | [open_testing.md](open_testing.md)           | Diagnostic: open max markets/day at random                       |
+| `open_fade`         | `src/entry/open_fade.py`         | [open_fade.md](open_fade.md)                 | **Two-sided** ranker: fade an extended trend at the channel edge |
+| `open_pullback`     | `src/entry/open_pullback.py`     | [open_pullback.md](open_pullback.md)         | **Two-sided** ranker: join a clean trend on a pause              |
+| `open_steady`       | `src/entry/open_steady.py`       | [open_steady.md](open_steady.md)             | **Two-sided** ranker: the most regular 10-minute curve           |
+| `open_five`         | `src/entry/open_five.py`         | [open_five.md](open_five.md)                 | **Two-sided** ranker: a series of 5 distinct curve shapes        |
+| `open_ultraranking` | `src/entry/open_ultraranking.py` | [open_ultraranking.md](open_ultraranking.md) | `open_saferanking` + a hard veto on a directionless market       |
 
 ## Available stop-distance policies
 
@@ -148,31 +189,35 @@ Registered in [src/stops/\_\_init\_\_.py](../../src/stops/__init__.py):
 | `stop_regression`  | `src/stops/stop_regression.py`  | —                                          | Choppiness-scaled residual-noise band below the entry                       |
 | `stop_linearspeed` | `src/stops/stop_linearspeed.py` | [stop_linearspeed.md](stop_linearspeed.md) | **Two-sided**: noise margin when the last 10 min accelerate, else structure |
 | `stop_hourlow`     | `src/stops/stop_hourlow.py`     | [stop_hourlow.md](stop_hourlow.md)         | **Two-sided**: stop at the last hour's lowest low / highest high            |
+| `stop_shape`       | `src/stops/stop_shape.py`       | [stop_shape.md](stop_shape.md)             | **Two-sided**: picks WHICH recent level to anchor on from the curve's shape |
 
 ## Available close profiles
 
 Registered in [src/exit/\_\_init\_\_.py](../../src/exit/__init__.py):
 
-| Name               | File                           | Doc                                        | Style                                              |
-| ------------------ | ------------------------------ | ------------------------------------------ | -------------------------------------------------- |
-| `close_zoneprofit` | `src/exit/close_zoneprofit.py` | [close_zoneprofit.md](close_zoneprofit.md) | Composes a stop distance + three per-zone updaters |
+| Name               | File                           | Doc                                        | Style                                             |
+| ------------------ | ------------------------------ | ------------------------------------------ | ------------------------------------------------- |
+| `close_zoneprofit` | `src/exit/close_zoneprofit.py` | [close_zoneprofit.md](close_zoneprofit.md) | Composes a stop distance + four per-zone updaters |
 
 ## Available zone updaters
 
 Registered per zone in [src/exit/zones/\_\_init\_\_.py](../../src/exit/zones/__init__.py);
 each zone selector takes a name from its own registry.
 
-| Selector           | Name               | File                                 | Style                                                                     |
-| ------------------ | ------------------ | ------------------------------------ | ------------------------------------------------------------------------- |
-| `CLOSE_ZONESTART`  | `hold`             | `src/exit/zones/underwater.py`       | Keep the stop posted at open, untouched                                   |
-| `CLOSE_ZONESTART`  | `trendcut`         | `src/exit/zones/underwater.py`       | Cut a clean, confirmed adverse trend at a fraction of `-1R`               |
-| `CLOSE_ZONESTART`  | `timedlift`        | `src/exit/zones/timedlift.py`        | Re-read the recent floor every 10 min and move the stop in behind it      |
-| `CLOSE_ZONESTART`  | `smartgroup`       | `src/exit/zones/smartgroup.py`       | Book-wide: park **every** stop on `price − noise` once the group is green |
-| `CLOSE_ZONEMARGE`  | `hold`             | `src/exit/zones/breakeven_band.py`   | Keep the stop where it is across the break-even band                      |
-| `CLOSE_ZONEMARGE`  | `breakeven_lock`   | `src/exit/zones/breakeven_band.py`   | Park the stop behind a confirmed swing low past break-even                |
-| `CLOSE_ZONEMARGE`  | `breakeven_safe`   | `src/exit/zones/breakeven_band.py`   | Same lock, gated on a stricter safety confirmation                        |
-| `CLOSE_ZONEMARGE`  | `breakeven_half`   | `src/exit/zones/breakeven_band.py`   | Lock half of the acquired move                                            |
-| `CLOSE_ZONEPROFIT` | `trailing_ratchet` | `src/exit/zones/trailing_ratchet.py` | Momentum-gated ATR chandelier trailing price in steps                     |
+| Selector           | Name                   | File                                 | Style                                                                                   |
+| ------------------ | ---------------------- | ------------------------------------ | --------------------------------------------------------------------------------------- |
+| `CLOSE_ZONESTART`  | `hold`                 | `src/exit/zones/underwater.py`       | Keep the stop posted at open, untouched                                                 |
+| `CLOSE_ZONESTART`  | `trendcut`             | `src/exit/zones/underwater.py`       | Cut a clean, confirmed adverse trend at a fraction of `-1R`                             |
+| `CLOSE_ZONESTART`  | `timedlift`            | `src/exit/zones/timedlift.py`        | Re-read the recent floor every 10 min and move the stop in behind it                    |
+| `CLOSE_ZONESTART`  | `smartgroup`           | `src/exit/zones/smartgroup.py`       | Book-wide: park **every** stop on `price − noise` once the group is green               |
+| `CLOSE_ZONEMARGE`  | `hold`                 | `src/exit/zones/breakeven_band.py`   | Keep the stop where it is across the break-even band                                    |
+| `CLOSE_ZONEMARGE`  | `breakeven_lock`       | `src/exit/zones/breakeven_band.py`   | Park the stop behind a confirmed swing low past break-even                              |
+| `CLOSE_ZONEMARGE`  | `breakeven_safe`       | `src/exit/zones/breakeven_band.py`   | Same lock, gated on a stricter safety confirmation                                      |
+| `CLOSE_ZONEMARGE`  | `limitloose`           | `src/exit/zones/breakeven_band.py`   | Move the stop at once to a double noise band under the market                           |
+| `CLOSE_ZONESECURE` | `hold`                 | `src/exit/zones/secure.py`           | Keep whatever stop the lower zones left                                                 |
+| `CLOSE_ZONESECURE` | `breakeven_half`       | `src/exit/zones/secure.py`           | Secure the midpoint of the break-even→margin band at once                               |
+| `CLOSE_ZONEPROFIT` | `trailing_ratchet`     | `src/exit/zones/trailing_ratchet.py` | Momentum-gated ATR chandelier trailing price in steps                                   |
+| `CLOSE_ZONEPROFIT` | `trailing_ratchetmore` | `src/exit/zones/trailing_ratchet.py` | Same, plus a give-back cap on the peak gain and a width that narrows as the run extends |
 
 ## Contract
 

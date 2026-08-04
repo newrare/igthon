@@ -80,6 +80,7 @@ OPEN_STRATEGY=open_testing
 STOP_STRATEGY=stop_support
 CLOSE_ZONESTART=hold
 CLOSE_ZONEMARGE=hold
+CLOSE_ZONESECURE=hold
 CLOSE_ZONEPROFIT=trailing_ratchet
 ```
 

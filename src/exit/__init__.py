@@ -8,16 +8,17 @@ it so the same exit manages it for its whole life.
 
 There is a single close profile,
 :class:`~src.exit.close_zoneprofit.CloseZoneProfit`. It is a **composer**: it wires
-a swappable initial stop distance (:mod:`src.stops`, ``STOP_STRATEGY``) with three
+a swappable initial stop distance (:mod:`src.stops`, ``STOP_STRATEGY``) with four
 **independently-selectable** per-zone stop updaters (:mod:`src.exit.zones`), one
 per price zone:
 
-- ``CLOSE_ZONESTART``  → open → break-even   (``ZONESTART_UPDATERS``);
-- ``CLOSE_ZONEMARGE``  → break-even → margin (``ZONEMARGE_UPDATERS``);
-- ``CLOSE_ZONEPROFIT`` → above the margin    (``ZONEPROFIT_UPDATERS``).
+- ``CLOSE_ZONESTART``  → follower → break-even  (``ZONESTART_UPDATERS``);
+- ``CLOSE_ZONEMARGE``  → break-even → margin    (``ZONEMARGE_UPDATERS``);
+- ``CLOSE_ZONESECURE`` → margin → profit trigger (``ZONESECURE_UPDATERS``);
+- ``CLOSE_ZONEPROFIT`` → above the profit trigger (``ZONEPROFIT_UPDATERS``).
 
 Each zone's behaviour is thus a one-line ``.env`` change and can be tuned without
-influencing the other two. Adding a per-zone behaviour is a new
+influencing the other three. Adding a per-zone behaviour is a new
 :class:`~src.exit.zones.base.StopUpdater` registered in the relevant zone registry.
 """
 
@@ -28,6 +29,7 @@ from src.exit.close_zoneprofit import CloseZoneProfit
 from src.exit.zones import (
     ZONEMARGE_UPDATERS,
     ZONEPROFIT_UPDATERS,
+    ZONESECURE_UPDATERS,
     ZONESTART_UPDATERS,
 )
 
@@ -36,8 +38,9 @@ def get_close_profile(settings) -> CloseProfile:
     """Build the close profile from settings.
 
     There is a single composer profile; the exit behaviour is chosen through the
-    three per-zone selectors (``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` /
-    ``CLOSE_ZONEPROFIT``) and the initial stop distance (``STOP_STRATEGY``).
+    four per-zone selectors (``CLOSE_ZONESTART`` / ``CLOSE_ZONEMARGE`` /
+    ``CLOSE_ZONESECURE`` / ``CLOSE_ZONEPROFIT``) and the initial stop distance
+    (``STOP_STRATEGY``).
     """
     return CloseZoneProfit.from_settings(settings)
 
@@ -45,6 +48,7 @@ def get_close_profile(settings) -> CloseProfile:
 __all__ = [
     "ZONESTART_UPDATERS",
     "ZONEMARGE_UPDATERS",
+    "ZONESECURE_UPDATERS",
     "ZONEPROFIT_UPDATERS",
     "CloseZoneProfit",
     "CloseDecision",

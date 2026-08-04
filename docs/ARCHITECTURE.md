@@ -45,7 +45,7 @@ igthon/
 │   │   ├── base.py            # CloseProfile → OpenPlan / CloseDecision
 │   │   ├── trailing.py        # Pure close maths (decide_close_reason, trailing stop)
 │   │   ├── close_zoneprofit.py# Reference profile: per-zone stop management
-│   │   └── zones/             # Per-zone stop updaters (underwater / band / profit)
+│   │   └── zones/             # Per-zone stop updaters (underwater / band / secure / profit)
 │   ├── execution/          # MAINS — turn decisions into broker/DB effects
 │   │   ├── gates.py        # Pure pre-open gates
 │   │   └── trading.py      # TradingService: order placement, close, reconcile
@@ -84,17 +84,21 @@ a close profile can be measured on synthetic price paths with no entry involved.
 
 Selection is one line each in `.env` — the single source of truth, all required
 (no default, no DB persistence, no runtime switching): `OPEN_STRATEGY` /
-`STOP_STRATEGY` and the three per-zone close selectors `CLOSE_ZONESTART` /
-`CLOSE_ZONEMARGE` / `CLOSE_ZONEPROFIT` (the close side is split into three
-independently-tuned zones — open→break-even, break-even→margin, above-margin).
+`STOP_STRATEGY` and the four per-zone close selectors `CLOSE_ZONESTART` /
+`CLOSE_ZONEMARGE` / `CLOSE_ZONESECURE` / `CLOSE_ZONEPROFIT` (the close side is
+split into four independently-tuned zones — follower→break-even,
+break-even→margin, margin→profit trigger, above the profit trigger).
 The same file carries `ALLOW_SAME_DAY_REOPEN`, a global open policy (required
 too): whether an epic may be opened more than once in the same day, in either
 direction. It is enforced by the shared pre-open gate and the rolling selector,
 so every entry strategy obeys it. `ALLOW_RECOVERY_REVERT` (required as well) is
 the second global open policy: when a position is stopped out at a loss on the
-stop it was **opened with**, the bot immediately opens the opposite side on the
-same epic to follow the reversal. The rule is pure
-(`execution/gates.should_revert_after_stop_loss`) and composed in
+stop it was **opened with** *and* the curve it walked since its open shows a real
+move (at least one candle carrying a visible chunk of the risk, price still past
+the stop), the bot immediately opens the opposite side on the same epic to follow
+the reversal. Both rules are pure
+(`execution/gates.should_revert_after_stop_loss` and
+`execution/gates.curve_supports_revert`) and composed in
 `core/scheduler.BotScheduler._revert_after_stop_loss`, so it belongs to neither
 the entry nor the exit domain — it only reacts to a close and asks the shared open
 path for the reverse side.
@@ -191,7 +195,7 @@ All calls to the IG REST API are routed through `APIQueue` (`core/api_queue.py`)
 
 ```
 APIQueue (single async worker)
-  └─ respects APIGuard limits (50 req/min, 25 req/s)
+  └─ respects APIGuard limits (30 req/min, 20 req/s)
   └─ retries transient failures (3 attempts, exponential backoff)
   └─ waits on quota blocks and resumes automatically
 ```

@@ -30,6 +30,7 @@ from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_slope import OpenSlope
 from src.entry.open_steady import OpenSteady
 from src.entry.open_testing import OpenTesting
+from src.entry.open_ultraranking import OpenUltraRanking
 
 #: Name → class map. Keys are the valid ``OPEN_STRATEGY`` values.
 ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
@@ -47,6 +48,7 @@ ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenSlope.name: OpenSlope,
     OpenSteady.name: OpenSteady,
     OpenTesting.name: OpenTesting,
+    OpenUltraRanking.name: OpenUltraRanking,
 }
 
 
@@ -81,6 +83,7 @@ __all__ = [
     "OpenSlope",
     "OpenSteady",
     "OpenTesting",
+    "OpenUltraRanking",
     "EntryIntent",
     "EntryStrategy",
     "get_entry_strategy",

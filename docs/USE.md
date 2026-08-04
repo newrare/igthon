@@ -262,12 +262,13 @@ Key settings:
 # constant on its entry/stop/exit class (src/entry/, src/stops/, src/exit/).
 # These are the single source of truth and are REQUIRED — there is no default
 # and no runtime switching; the bot refuses to start if any is missing or
-# unknown. The exit is split into three independently-selected zones
-# (open→break-even, break-even→margin, above-margin).
+# unknown. The exit is split into four independently-selected zones
+# (follower→break-even, break-even→margin, margin→profit trigger, above it).
 OPEN_STRATEGY=open_projection
 STOP_STRATEGY=stop_support
 CLOSE_ZONESTART=hold
 CLOSE_ZONEMARGE=hold
+CLOSE_ZONESECURE=hold
 CLOSE_ZONEPROFIT=trailing_ratchet
 
 # Global open policy (also REQUIRED, applies to every entry strategy):

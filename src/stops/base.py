@@ -44,10 +44,23 @@ class StopDistance(ABC):
 
     @abstractmethod
     def initial_stop(
-        self, *, entry_level: float, direction: str, buf: EpicBuffer
+        self,
+        *,
+        entry_level: float,
+        direction: str,
+        buf: EpicBuffer,
+        day_extreme: float | None = None,
     ) -> float:
         """Absolute initial protective stop level.
 
         Below ``entry_level`` for a BUY, above it for a SELL. This distance
         drives both the risk-based sizing and the stop attached to the IG order.
+
+        ``day_extreme`` is the **whole session's** lowest bid low (BUY) or highest
+        offer high (SELL), read from outside ``buf`` because a session routinely
+        exceeds the buffer's ``buffer_max_candles`` ceiling. It is optional and
+        ``None`` when unavailable, so a policy that wants it must degrade to what
+        the buffer holds rather than fail the open; policies anchored on a window
+        that fits in the buffer ignore it entirely. See
+        :class:`~src.stops.stop_shape.StopShape`, the only policy that reads it.
         """

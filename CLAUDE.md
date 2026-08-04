@@ -63,7 +63,7 @@ src/
 │   ├── base.py · stop_support.py · stop_atr.py
 ├── exit/                   # FERMETURE — CloseProfile (owns stop/target/trailing)
 │   ├── base.py · trailing.py · close_zoneprofit.py
-│   └── zones/              # per-zone stop updaters (underwater, breakeven_band, trailing_ratchet)
+│   └── zones/              # per-zone stop updaters (underwater, breakeven_band, secure, trailing_ratchet)
 ├── execution/              # MAINS — gates.py (pre-open gates), trading.py (TradingService)
 ├── backtest/               # OUTILS — simulator, backtester, archive, curve_generator
 ├── models/                 # DATA — SQLAlchemy ORM (database.py + tables)
@@ -82,17 +82,18 @@ tests/                      # one test file per module + isolated entry/exit/ris
   exit: `initial_plan()` chooses the protective stop at open (which drives
   sizing) and `evaluate()` makes every per-tick decision (hold / close / ratchet
   stop). The single composer profile (`close_zoneprofit`) splits the exit into
-  **three price zones** — open→break-even, break-even→margin, above-margin — each
-  managed by a `StopUpdater` (`src/exit/zones/`) **selected independently** so a
-  zone can be tuned without influencing the others. New closing scenarios are new
-  updater modules registered in the relevant zone registry.
+  **four price zones** — follower→break-even, break-even→margin, margin→profit
+  trigger, above the profit trigger — each managed by a `StopUpdater`
+  (`src/exit/zones/`) **selected independently** so a zone can be tuned without
+  influencing the others. New closing scenarios are new updater modules
+  registered in the relevant zone registry.
 - They are **composed at runtime** by `core/scheduler.py` + `execution/` and are
   linked only through the persisted `Position.close_profile`. Each can be
   swapped or unit-tested in isolation. Selection is the `.env` file — the
   **single source of truth**, all **required** (no default in `config.py`, no DB
   persistence, no runtime switching): `OPEN_STRATEGY` / `STOP_STRATEGY` and the
-  three per-zone close selectors `CLOSE_ZONESTART` / `CLOSE_ZONEMARGE` /
-  `CLOSE_ZONEPROFIT`.
+  four per-zone close selectors `CLOSE_ZONESTART` / `CLOSE_ZONEMARGE` /
+  `CLOSE_ZONESECURE` / `CLOSE_ZONEPROFIT`.
 
 ______________________________________________________________________
 

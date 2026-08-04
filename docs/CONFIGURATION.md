@@ -74,10 +74,11 @@ ______________________________________________________________________
 
 ## Candle persistence
 
-| Variable                | Default   | Description                                                                                                     |
-| ----------------------- | --------- | --------------------------------------------------------------------------------------------------------------- |
-| `CANDLE_RETENTION_DAYS` | `7`       | Days of candles kept in DB before per-week CSV archive + deletion                                               |
-| `CANDLE_DUMP_DIR`       | `./dumps` | Directory for per-week candle archives (`candles_<year>-W<week>.csv`), read by the [backtester](BACKTESTING.md) |
+| Variable                 | Default                        | Description                                                                                                                                                                                |
+| ------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CANDLE_RETENTION_DAYS`  | `7`                            | Days of candles kept in DB before per-week CSV archive + deletion                                                                                                                          |
+| `CANDLE_DUMP_DIR`        | `./dumps`                      | Directory for per-week candle archives (`candles_<year>-W<week>.csv`), read by the [backtester](BACKTESTING.md)                                                                            |
+| `BACKTEST_CONTRACT_FILE` | `./config/euro_per_point.json` | `epic → € per point` table giving the [backtester](BACKTESTING.md) its euro P&L. Filled once by `python -m src.scripts.dump_euro_per_point`; a missing file only disables the euro figures |
 
 ______________________________________________________________________
 
@@ -132,7 +133,15 @@ through the level the trade was built on, so the bot turns around with it. Only 
 genuine stop hit at the original level qualifies (`stop` / `loose` /
 `closed_externally`) — a win, a manual close, an end-of-day close or a stop-out on
 a *ratcheted* stop never reverts — and the chain is capped at one hop, so a
-stopped-out revert is not reverted back. The revert lifts the long-only gate and
+stopped-out revert is not reverted back. On top of that, the **curve since the
+open** must show a real move, though the filter there is permissive and only drops
+the blatant cases: a stop distance covered in tiny steps with no single candle
+carrying the move (flat curve or slow leak), a market that chopped its way to the
+stop, a trade that first ran a full risk in profit, or a stop merely grazed by a
+wick. Holding time is not a criterion — twenty flat minutes then one candle through
+the stop is a prime revert (thresholds are constants in
+[src/execution/gates.py](../src/execution/gates.py), not env variables — see
+[strategies/README.md](strategies/README.md)). The revert lifts the long-only gate and
 `ALLOW_SAME_DAY_REOPEN`, but it stays an automatic open: the auto-open switch, the
 duplicate-epic gate and the "market closes soon" gate all apply, and the reverse
 trade is sized/stopped by the configured `STOP_STRATEGY` and close zones. See

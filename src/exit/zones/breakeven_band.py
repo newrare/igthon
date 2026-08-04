@@ -1,7 +1,10 @@
-"""Zone 2 updaters — price is in the noise band just past break-even.
+"""Zone 2 updaters — price is in the noise band between break-even and the margin.
 
 The close-out price sits past break-even (``level_zero``) but has not yet cleared
-the margin level (``level_zero`` plus one noise margin in the profit direction).
+the margin level (``level_zero`` plus one noise margin in the profit direction —
+the dotted blue line). Past the margin the position leaves this zone for
+:mod:`src.exit.zones.secure`.
+
 This is the delicate region: parking the stop a hair past break-even here is
 exactly where ordinary bid/offer noise alone would trigger it for ~zero profit
 (the "everything exits at 0 €" pathology that a naive break-even pin caused live).
@@ -9,7 +12,7 @@ exactly where ordinary bid/offer noise alone would trigger it for ~zero profit
 Four updaters live here, selected by ``CLOSE_ZONEMARGE``:
 
 - :class:`BreakevenBandStop` (``hold``) — leave the initial stop untouched; the
-  stop only ever moves once price clears the margin level (zone 3);
+  stop only ever moves once price clears the margin level;
 - :class:`BreakevenLockStop` (``breakeven_lock``) — pull the stop in behind the
   recent swing low **once the move has genuinely held past break-even** (a
   persistence-and-noise gate), so a normal pull-back cannot immediately knock it
@@ -23,12 +26,11 @@ Four updaters live here, selected by ``CLOSE_ZONEMARGE``:
   then holds that stop for the rest of the margin zone. Taking the nearer of the
   two keeps the stop closer to break-even (the safer, harder-to-knock level), and
   which reference wins varies by epic (euro-per-point and price range differ).
-- :class:`BreakevenHalfStop` (``breakeven_half``) — a single, **one-shot** lock at
-  a fixed **support line a quarter of the way** from break-even to the margin
-  level (25 % of the break-even→margin gap, so close to break-even). It arms once
-  price has posted **two consecutive favourable ticks past the margin line** — a
-  push that has genuinely cleared the noise band — then moves the stop to that
-  support line once and holds it for the rest of the margin zone.
+- :class:`LimitLooseStop` (``limitloose``) — **immediately**, on the very first
+  tick spent in the zone, bring the stop up just behind the market: a double
+  adverse-noise band under the live price. It does not wait for a confirmation and
+  it does not care whether the resulting level is profitable — reaching break-even
+  is enough to stop carrying the full open risk.
 
 All four are direction-agnostic: they reason in profit terms through
 :class:`~src.exit.zones.base.StopContext` (``gain`` / ``beyond`` / ``offset`` and
@@ -80,10 +82,11 @@ class BreakevenLockStop(StopUpdater):
       fixed spread offset, so ordinary noise cannot reach it.
 
     The stop is a *lock*, not a trailing. Once the bid clears the margin level the
-    position enters zone 3 and the profit trailing
-    (:class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`) takes over,
-    using the *same* lock as its floor (via ``breakeven_lock_level``) so the
-    follower keeps climbing on one continuous curve across the two zones.
+    position leaves this zone for the secure zone
+    (:mod:`src.exit.zones.secure`), and past the profit trigger for the profit
+    trailing (:class:`~src.exit.zones.trailing_ratchet.TrailingRatchetStop`), which
+    uses the *same* lock as its floor (via ``breakeven_lock_level``) so the follower
+    keeps climbing on one continuous curve across the zones.
     """
 
     name = "breakeven_lock"
@@ -113,7 +116,7 @@ class BreakevenSafeStop(StopUpdater):
     A single, deliberate move for the margin zone — the sibling
     :class:`BreakevenLockStop` anchors behind a real swing low, this one locks a
     small fixed gain and then leaves the stop alone. On every tick price is in the
-    band (past break-even, not yet past the profit trigger):
+    band (past break-even, not yet past the margin line):
 
     - it **moves the stop only once**. Once the follower has been pulled past
       break-even — by this updater's own earlier move, or by the profit zone on a
@@ -244,103 +247,59 @@ class BreakevenSafeStop(StopUpdater):
 
 
 @dataclass
-class BreakevenHalfStop(StopUpdater):
-    """One-shot lock at a support line a quarter of the way across the margin band.
+class LimitLooseStop(StopUpdater):
+    """Bring the stop up behind the market as soon as price clears break-even.
 
-    A single, deliberate move for the margin zone — a sibling of
-    :class:`BreakevenSafeStop` with a simpler, level-fixed rule:
+    The rule the margin zone is *for*, stated plainly: **the instant** price trades
+    past break-even, the position must stop carrying the full risk it opened with.
+    So on the very first tick spent in the zone the stop is moved to
 
-    - the **support line** is parked at a fixed fraction (:attr:`support_fraction`,
-      ``0.25``) of the break-even→margin gap, i.e. a quarter of the way from
-      break-even (``level_zero``) towards the margin level (``level_margin``). It
-      sits close to break-even — the safer, harder-to-knock level — while still
-      locking a sliver of the noise band. Because ``level_margin`` is itself frozen
-      on the profit side of break-even, the same interpolation lands above
-      break-even for a BUY and below it for a SELL;
-    - it arms once price has posted :attr:`confirm_ticks` **consecutive favourable
-      ticks whose closes all sit past the margin line**. Requiring the confirming
-      ticks to clear the margin (not merely move our way) is the persistence gate:
-      the push has run clear of the noise band before the stop moves, so ordinary
-      bid/offer churn inside the band cannot arm it. The excursion past the margin
-      is read from the recorded close-out prices, so the move still applies on the
-      pull-back tick that brings price back into the band (where this updater runs);
-    - it **moves the stop only once**. Once the follower has been pulled past
-      break-even — by this updater's own earlier move, or by the profit zone on a
-      prior excursion — the margin-zone stop is done and every later tick holds it;
-    - it only fires when the support line sits **strictly behind the live price**.
-      The profile's software backstop closes as soon as price reaches the follower,
-      so a lock at/past the price would force an immediate exit at ~break-even;
-      when price has pulled back past the support line the updater holds and waits.
+    ``price − noise_mult × adverse_tick_noise`` (below the price for a BUY, above
+    it for a SELL)
 
-    The move is **tighten-only**: a follower already further into profit than the
-    support line is never given back.
+    — a **double** noise band of the epic being traded, the same band
+    :mod:`~src.exit.zones.smartgroup` and the profit trailing measure, so the level
+    is one ordinary tick churn cannot reach. It is *loose* on purpose: it is a
+    limit on the loss still carried, not a profit lock, so it may well land short of
+    break-even. Unlike its siblings here it waits for no confirmation streak — the
+    move past break-even *is* the trigger — and it keeps following price down the
+    band, tighten-only, for as long as the zone holds it.
+
+    Two guards keep it from becoming the "everything exits at 0 €" pin:
+
+    - the cushion is floored at IG's :attr:`~src.exit.zones.base.StopContext.
+      min_stop_distance` so the broker would accept the level, and a cushion that
+      collapses to nothing (flat tape, no broker minimum) holds instead of parking
+      the stop on the live price, which the profile's software backstop would close
+      on the spot;
+    - it is **tighten-only** — a follower already further into profit (the profit
+      zone on a prior excursion, a manual raise) is never given back.
     """
 
-    name = "breakeven_half"
+    name = "limitloose"
 
-    #: Where the support line sits, as a fraction of the break-even→margin gap
-    #: (``0 < f < 1``). ``0.25`` parks it at the first quarter, close to break-even.
-    support_fraction: float = 0.25
-    #: Consecutive favourable ticks past the margin line that arm the single move.
-    confirm_ticks: int = 2
+    #: Adverse-tick-noise band (same measure as the profit trailing floor and the
+    #: group pre-pass): ``noise_mult ×`` this band is the gap kept under the price.
+    noise_window: int = 20
+    noise_std_k: float = 2.0
+    noise_mult: float = 2.0  # the "double margin" of the epic's own noise
 
     def propose(self, ctx: StopContext) -> float | None:
-        # Single move: once the follower sits past break-even (this updater's own
-        # earlier move, or the profit zone on a prior excursion) the margin-zone
-        # stop is set for good — hold it for the rest of the zone.
-        if ctx.gain(ctx.level_follower) > 0:
-            return None
-
-        # The band must exist (margin frozen on the profit side) for the support
-        # fraction to mean anything.
-        if ctx.gain(ctx.level_margin) <= 0:
-            return None
-
-        # Arm only after a streak of favourable ticks that has cleared the margin.
-        if not self._confirmed_past_margin(
-            ctx.favourable_closes, ctx.favourable(ctx.level_margin), self.confirm_ticks
-        ):
-            return None
-
-        support = ctx.level_zero + self.support_fraction * (
-            ctx.level_margin - ctx.level_zero
+        cushion = max(
+            self.noise_mult * ctx.adverse_noise(self.noise_window, self.noise_std_k),
+            ctx.min_stop_distance,
         )
-
-        # The lock must sit strictly behind the live price: the profile's software
-        # backstop closes as soon as price reaches the follower, so a level at/past
-        # the price forces an immediate exit at ~break-even. Hold until price clears
-        # it.
-        if not ctx.beyond(ctx.current_price, support):
+        # No measurable cushion (flat tape, no broker minimum): a stop on the live
+        # price is closed instantly by the software backstop. Hold instead.
+        if cushion <= 0:
             return None
+
+        target = ctx.offset(ctx.current_price, -cushion)
 
         # Tighten-only. The composer applies the returned level verbatim (no guard
         # of its own), so never returning a level short of the current follower is
         # this updater's own responsibility.
-        if ctx.level_follower > 0 and not ctx.beyond(support, ctx.level_follower):
+        if ctx.level_follower > 0 and not ctx.beyond(target, ctx.level_follower):
             return None
 
-        return support
-
-    @staticmethod
-    def _confirmed_past_margin(
-        closes: list[float], level_margin: float, ticks: int
-    ) -> bool:
-        """True when the buffer holds ``ticks`` consecutive favourable ticks past
-        the margin.
-
-        Scans the sign-normalised closes (:attr:`~src.exit.zones.base.StopContext.
-        favourable_closes`, where rising always means "into profit") for any window
-        of ``ticks + 1`` strictly increasing values whose ``ticks`` resulting closes
-        all sit past ``level_margin`` (itself sign-normalised). Existence anywhere in
-        the buffer (not just the last ticks) is what lets the lock still fire on the
-        pull-back tick that brings price back into the band.
-        """
-        if ticks < 1 or len(closes) < ticks + 1:
-            return False
-        for i in range(len(closes) - ticks):
-            window = closes[i : i + ticks + 1]
-            rising = all(b > a for a, b in zip(window, window[1:]))
-            past = all(c > level_margin for c in window[1:])
-            if rising and past:
-                return True
-        return False
+        return target

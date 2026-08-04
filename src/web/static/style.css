@@ -350,6 +350,16 @@ a.kpi-tile:hover {
   margin-top: 0.2rem;
 }
 
+/* Secondary sub-line (e.g. the OPEN tile's book value at the planned stops):
+   smaller and dimmer than .kpi-sub so it reads as a footnote to it. */
+.kpi-sub-alt {
+  font-size: 0.58rem;
+  /* --text-dim is barely legible on the tile background at this size: the
+     footnote is smaller than .kpi-sub, so it needs the *brighter* muted tone. */
+  color: var(--text-muted);
+  margin-top: 0.1rem;
+}
+
 /* ── Section cards ──────────────────────────────────────────── */
 .section {
   background: var(--surface);

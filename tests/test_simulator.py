@@ -6,18 +6,20 @@ curves; these tests check that runs are deterministic, internally consistent
 the ``/simulator`` API.
 """
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from src.backtest.simulator import (
+    SessionExtremes,
     SimulationConfig,
     run_close_visual,
     run_open_visual,
     run_simulation,
 )
-from src.feed.price_buffer import PriceBuffer
+from src.feed.price_buffer import Candle, PriceBuffer
 from src.web.app import create_app
 
 
@@ -31,6 +33,7 @@ def _settings() -> SimpleNamespace:
         stop_strategy="stop_support",
         close_zonestart="hold",
         close_zonemarge="hold",
+        close_zonesecure="hold",
         close_zoneprofit="trailing_ratchet",
         strategy_close_margin_minutes=5,
         strategy_atr_period=14,
@@ -276,3 +279,65 @@ class TestSimulatorRoutes:
             "/api/simulator/open-strategy", params={"strategy": "nope"}
         )
         assert resp.status_code == 400
+
+
+def _candle(bid_low: float, offer_high: float) -> Candle:
+    return Candle(
+        timestamp=datetime(2024, 1, 1, 9, 0, tzinfo=UTC),
+        bid_open=bid_low,
+        bid_close=bid_low,
+        bid_high=offer_high,
+        bid_low=bid_low,
+        offer_open=offer_high,
+        offer_close=offer_high,
+        offer_high=offer_high,
+        offer_low=bid_low,
+    )
+
+
+class TestSessionExtremes:
+    """The backtest's stand-in for the live ``day_extreme`` database query.
+
+    Mirrors ``TradingService._session_extreme``; the property that makes it
+    faithful rather than merely convenient is that it is fed as candles arrive, so
+    it can never expose a level the live path would not yet know.
+    """
+
+    def test_starts_unknown_for_every_epic(self):
+        session = SessionExtremes.for_curves(3)
+        assert [session.get(e, "BUY") for e in range(3)] == [None, None, None]
+        assert [session.get(e, "SELL") for e in range(3)] == [None, None, None]
+
+    def test_buy_keeps_the_lowest_bid_low(self):
+        session = SessionExtremes.for_curves(1)
+        for low in (8000.0, 7950.0, 8010.0):
+            session.update(0, _candle(low, low + 1))
+        assert session.get(0, "BUY") == 7950.0
+
+    def test_sell_keeps_the_highest_offer_high(self):
+        session = SessionExtremes.for_curves(1)
+        for high in (8000.0, 8100.0, 8050.0):
+            session.update(0, _candle(high - 1, high))
+        assert session.get(0, "SELL") == 8100.0
+
+    def test_epics_are_tracked_independently(self):
+        session = SessionExtremes.for_curves(2)
+        session.update(0, _candle(7000.0, 7001.0))
+        session.update(1, _candle(9000.0, 9001.0))
+        assert session.get(0, "BUY") == 7000.0
+        assert session.get(1, "BUY") == 9000.0
+
+    def test_carries_no_look_ahead(self):
+        # The extreme must only ever reflect what has already been ingested: a
+        # deeper low arriving later cannot retroactively widen an earlier open.
+        session = SessionExtremes.for_curves(1)
+        session.update(0, _candle(8000.0, 8001.0))
+        at_open = session.get(0, "BUY")
+        session.update(0, _candle(7000.0, 7001.0))
+        assert at_open == 8000.0
+        assert session.get(0, "BUY") == 7000.0
+
+    def test_a_fresh_instance_resets_the_day(self):
+        session = SessionExtremes.for_curves(1)
+        session.update(0, _candle(7000.0, 7001.0))
+        assert SessionExtremes.for_curves(1).get(0, "BUY") is None
