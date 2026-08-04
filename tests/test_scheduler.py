@@ -391,6 +391,43 @@ class TestAutoOpenSwitch:
         assert scheduler.auto_open_enabled is True
         assert scheduler._auto_open_day is None  # self-healed, not re-checked daily
 
+    async def test_end_day_blocks_openings_then_closes_everything(
+        self, session_factory, monkeypatch
+    ):
+        # The dashboard "End day" button: openings must be blocked BEFORE the book
+        # is closed, so the analysis loop cannot reopen while it is being emptied.
+        scheduler = _make_scheduler(session_factory)
+        order: list[str] = []
+
+        async def _close_all() -> int:
+            order.append("close")
+            assert scheduler.auto_open_enabled is False
+            return 4
+
+        monkeypatch.setattr(scheduler, "_reconcile_pnl", AsyncMock())
+        monkeypatch.setattr(
+            scheduler,
+            "_build_trade_config",
+            lambda: SimpleNamespace(),
+        )
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService",
+            lambda *a, **k: SimpleNamespace(close_all_positions=_close_all),
+        )
+        original_set = scheduler.set_auto_open
+
+        async def _tracked(enabled: bool) -> None:
+            order.append(f"auto_open={enabled}")
+            await original_set(enabled)
+
+        monkeypatch.setattr(scheduler, "set_auto_open", _tracked)
+
+        closed = await scheduler.end_day()
+
+        assert closed == 4
+        assert order == ["auto_open=False", "close"]
+        assert scheduler.auto_open_enabled is False
+
     async def test_choice_is_persisted(self, session_factory):
         scheduler = _make_scheduler(session_factory)
         await scheduler.set_auto_open(False)
@@ -522,6 +559,93 @@ class TestRecordJobRun:
         assert pref.last_run_at is not None
         # The user's automatic preference must not be clobbered by a run stamp.
         assert pref.auto is True
+
+
+class TestDailyStartupJobs:
+    """Daily maintenance runs once a day on startup, not on a nightly cron.
+
+    ``daily_reset`` and ``dump_and_purge_candles`` have no cron trigger anymore:
+    they fire as one-shot startup jobs guarded by the ``last_run_at`` stamp, so
+    restarting the server repeatedly runs them exactly once per calendar day.
+    """
+
+    async def test_registered_as_startup_date_jobs(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        scheduler.start()
+        try:
+            # No recurring cron for either action…
+            assert scheduler._scheduler.get_job("daily_reset") is None
+            assert scheduler._scheduler.get_job("dump_and_purge_candles") is None
+            # …but a one-shot startup job for each, left active (never paused).
+            for job_id in ("startup_daily_reset", "startup_candle_purge"):
+                job = scheduler._scheduler.get_job(job_id)
+                assert job is not None
+                assert job.next_run_time is not None
+        finally:
+            scheduler.stop()
+
+    async def test_runs_when_never_run(self, session_factory):
+        scheduler = _make_scheduler(session_factory)
+        stub = AsyncMock()
+        await scheduler._run_once_today("daily_reset", stub)
+        stub.assert_awaited_once()
+
+    async def test_skips_when_already_run_today(self, session_factory):
+        async with session_factory() as session:
+            session.add(
+                JobPreference(
+                    action="daily_reset",
+                    auto=False,
+                    updated_at=datetime.now(UTC),
+                    last_run_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+
+        scheduler = _make_scheduler(session_factory)
+        stub = AsyncMock()
+        await scheduler._run_once_today("daily_reset", stub)
+        stub.assert_not_awaited()
+
+    async def test_runs_again_the_next_day(self, session_factory):
+        async with session_factory() as session:
+            session.add(
+                JobPreference(
+                    action="dump_and_purge_candles",
+                    auto=False,
+                    updated_at=datetime.now(UTC),
+                    last_run_at=datetime.now(UTC) - timedelta(days=1),
+                )
+            )
+            await session.commit()
+
+        scheduler = _make_scheduler(session_factory)
+        stub = AsyncMock()
+        await scheduler._run_once_today("dump_and_purge_candles", stub)
+        stub.assert_awaited_once()
+
+    async def test_failure_leaves_the_day_unstamped(self, session_factory):
+        """A failed pass records nothing, so the next restart retries it."""
+        scheduler = _make_scheduler(session_factory)
+        stub = AsyncMock(side_effect=RuntimeError("boom"))
+        await scheduler._run_once_today("daily_reset", stub)
+
+        async with session_factory() as session:
+            assert await session.get(JobPreference, "daily_reset") is None
+
+    async def test_daily_reset_reloads_todays_candles(self, session_factory):
+        """The buffer is cleared, then refilled from the DB — no blind restart."""
+        scheduler = _make_scheduler(session_factory)
+        scheduler._tradable_epics = ["CS.D.EURUSD.CFD.IP"]
+        scheduler._rehydrate_buffer = AsyncMock()
+
+        await scheduler._daily_reset()
+
+        scheduler._buffer.clear.assert_called_once()
+        scheduler._rehydrate_buffer.assert_awaited_once_with(["CS.D.EURUSD.CFD.IP"])
+        async with session_factory() as session:
+            pref = await session.get(JobPreference, "daily_reset")
+        assert pref is not None and pref.last_run_at is not None
 
 
 class TestRunCatchUp:

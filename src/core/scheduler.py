@@ -16,6 +16,7 @@ heartbeat for when streaming is off or the feed goes silent. See
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -58,7 +59,6 @@ from src.models.day import Day, DayState
 from src.models.epic import Epic
 from src.models.job_preference import JobPreference
 from src.models.position import Position, PositionState
-from src.models.resume import Resume
 from src.stops import STOP_DISTANCES
 
 if TYPE_CHECKING:
@@ -163,8 +163,14 @@ AUTO_OPEN_REFUSAL = "Auto-open disabled for today"
 # refresh or recompute from the database are enabled: re-running them late is
 # harmless. Frequent recurring jobs (collect/monitor/sync/reconcile/hourly
 # refresh) self-heal on their next tick and are never caught up; ``end_of_day``
-# (would force-close live positions) and ``daily_reset`` (would wipe the buffer
-# already rehydrated for today) are deliberately excluded.
+# (would force-close live positions) is deliberately excluded.
+#
+# ``toggleable`` (optional, default True) marks jobs that own a recurring cron
+# trigger and can therefore be switched between automatic and manual from the
+# dashboard. The others have no APScheduler cron at all — ``end_of_day`` is a
+# manual button, ``daily_reset`` and ``dump_and_purge_candles`` run once a day on
+# startup (see ``_register_startup_jobs``) — so they carry no auto/manual switch:
+# only their Run button makes sense.
 JOB_DEFINITIONS: list[dict[str, str | bool]] = [
     {
         "action": "refresh_epic_list",
@@ -189,19 +195,6 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "name": "Collect & Analyze",
         "description": "Fetch latest prices, compute signals, open positions on BUY.",
         "schedule": "Every 30s · 08–17 · Mon–Fri",
-        "danger": "safe",
-    },
-    {
-        "action": "trend_select",
-        "job_id": "trend_select",
-        "name": "Trend Select (backstop)",
-        "description": (
-            "Backstop for the rolling cross-epic selection (also runs every "
-            "analysis tick): re-ranks tradable epics and tops the portfolio up "
-            "to its target open-position count. Active only with a cross-epic "
-            "ranker entry (e.g. open_ranking); a no-op for per-epic entries."
-        ),
-        "schedule": "Hourly · 09–16 · Mon–Fri",
         "danger": "safe",
     },
     {
@@ -233,6 +226,7 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "description": "Force close ALL open positions immediately (manual only).",
         "schedule": "Manual only",
         "danger": "danger",
+        "toggleable": False,
     },
     {
         "action": "reconcile_pnl",
@@ -255,32 +249,28 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "catch_up": True,
     },
     {
-        "action": "weekly_summary",
-        "job_id": "weekly_summary",
-        "name": "Weekly Summary",
-        "description": "Generate per-epic direction summaries for the current week.",
-        "schedule": "Friday 18:30",
-        "danger": "safe",
-        "catch_up": True,
-    },
-    {
         "action": "daily_reset",
         "job_id": "daily_reset",
         "name": "Daily Reset",
-        "description": "Clear the price buffer — all in-memory candle history is lost.",
-        "schedule": "Daily 00:00",
+        "description": (
+            "Drop stale candles from the price buffer, then reload today's "
+            "candles from the database. Runs once a day on server startup."
+        ),
+        "schedule": "On startup · once a day",
         "danger": "warn",
+        "toggleable": False,
     },
     {
         "action": "dump_and_purge_candles",
         "job_id": "dump_and_purge_candles",
         "name": "Dump & Purge Candles",
         "description": (
-            "Export candles past the retention window to CSV, then delete them."
+            "Export candles past the retention window to CSV, then delete them. "
+            "Runs once a day on server startup."
         ),
-        "schedule": "Daily 02:00",
+        "schedule": "On startup · once a day",
         "danger": "warn",
-        "catch_up": True,
+        "toggleable": False,
     },
 ]
 
@@ -328,7 +318,7 @@ class BotScheduler:
         self._strategy: EntryStrategy | None = None
         self._close_profile_obj: CloseProfile | None = None
         # Serialises the rolling cross-epic selection: it is invoked both by the
-        # 30-second analysis loop and the hourly backstop job, which could
+        # 30-second analysis loop and by a manual dashboard open, which could
         # otherwise both see "0 open" and double-open. The lock + an in-band
         # open-count re-check keep the target position count exact.
         self._select_lock = asyncio.Lock()
@@ -434,19 +424,10 @@ class BotScheduler:
             name="Collect prices and analyze",
         )
 
-        # Hourly cross-epic selection: kept registered but currently a no-op
-        # (see ``_hourly_trend_select``) — the reference entry opens per-epic.
-        # The slot is retained so a future cross-epic entry strategy can restore
-        # hourly selection without changing the schedule.
-        self._scheduler.add_job(
-            self._hourly_trend_select,
-            "cron",
-            day_of_week="mon-fri",
-            hour="9-16",
-            minute=0,
-            id="trend_select",
-            name="Hourly trend-template selection",
-        )
+        # No separate hourly cross-epic selection job: ``_collect_and_analyze``
+        # already calls ``_select_and_open`` on every 30-second tick over the same
+        # market hours, so an hourly backstop covered nothing the loop had not
+        # covered thirty seconds earlier.
 
         # Position monitoring: HEARTBEAT ONLY. The real trigger is the arrival of a
         # candle from the feed (see ``on_candle`` / ``_register_candle_listener``),
@@ -519,36 +500,11 @@ class BotScheduler:
             name="Daily summary",
         )
 
-        # Weekly summary: Friday 18:30
-        self._scheduler.add_job(
-            self._weekly_summary,
-            "cron",
-            day_of_week="fri",
-            hour=18,
-            minute=30,
-            id="weekly_summary",
-            name="Weekly summary",
-        )
-
-        # Buffer reset at midnight
-        self._scheduler.add_job(
-            self._daily_reset,
-            "cron",
-            hour=0,
-            minute=0,
-            id="daily_reset",
-            name="Daily buffer reset",
-        )
-
-        # Candle retention: dump + purge old candles nightly (off-market hours)
-        self._scheduler.add_job(
-            self._dump_and_purge_candles,
-            "cron",
-            hour=2,
-            minute=0,
-            id="dump_and_purge_candles",
-            name="Dump and purge old candles",
-        )
+        # No cron for the daily maintenance pair (buffer reset, candle dump +
+        # purge): both are once-a-day housekeeping, not clock-critical work, and
+        # a nightly cron fired while 24h markets (forex/CFD) were still trading.
+        # They now run once per calendar day shortly after startup — see
+        # ``_register_startup_jobs``.
 
         self._scheduler.start()
         self._running = True
@@ -575,27 +531,8 @@ class BotScheduler:
             name="Streaming feed health check",
         )
 
-        # One-shot startup discovery, registered AFTER the pause loop so it stays
-        # active and actually fires: an immediate epic crawl + tradable refresh so
-        # a mid-session launch doesn't wait until the next 07:30 / hour boundary.
-        # These are ``date`` jobs (not in JOB_DEFINITIONS), so the manual-mode
-        # pause loop above and the dashboard toggles never touch them; APScheduler
-        # drops each once it has run. (Previously added before the pause loop, so
-        # they were paused and the promised discovery never happened.)
-        self._scheduler.add_job(
-            self._refresh_epic_list,
-            "date",
-            run_date=datetime.now(UTC) + timedelta(seconds=15),
-            id="startup_epic_refresh",
-            name="Epic list refresh on startup",
-        )
-        self._scheduler.add_job(
-            self._refresh_tradable_epics,
-            "date",
-            run_date=datetime.now(UTC) + timedelta(seconds=30),
-            id="startup_tradable_refresh",
-            name="Tradable epic refresh on startup",
-        )
+        self._register_startup_jobs()
+
         # Drive position management from the price feed rather than from the clock.
         self._register_candle_listener()
         self._warn_if_warmup_exceeds_buffer()
@@ -605,6 +542,105 @@ class BotScheduler:
             "startup discovery scheduled — enable jobs via web dashboard",
             len(self._all_epics),
         )
+
+    def _register_startup_jobs(self) -> None:
+        """Register the one-shot ``date`` jobs that run shortly after startup.
+
+        Called from ``start()`` AFTER the manual-mode pause loop so these jobs stay
+        active and actually fire. They are not in ``JOB_DEFINITIONS``, so the
+        dashboard toggles never touch them; APScheduler drops each once it has run.
+        (They were once added before the pause loop, so they were paused and the
+        promised startup work never happened.)
+
+        Two families, in firing order:
+
+        1. **Discovery** (+15 s / +30 s) — an immediate epic crawl and tradable
+           refresh so a mid-session launch doesn't wait for the next 07:30 / hour
+           boundary. Every run is useful, so they carry no daily guard.
+        2. **Daily maintenance** (+45 s / +60 s) — the buffer reset and the candle
+           dump + purge, which replace their old midnight/02:00 crons. These are
+           once-a-day tasks, so they are wrapped in ``_run_once_today``: restarting
+           the server five times in an afternoon runs them exactly once. They fire
+           last because both depend on the epic set the discovery jobs refresh.
+        """
+        now = datetime.now(UTC)
+        self._scheduler.add_job(
+            self._refresh_epic_list,
+            "date",
+            run_date=now + timedelta(seconds=15),
+            id="startup_epic_refresh",
+            name="Epic list refresh on startup",
+        )
+        self._scheduler.add_job(
+            self._refresh_tradable_epics,
+            "date",
+            run_date=now + timedelta(seconds=30),
+            id="startup_tradable_refresh",
+            name="Tradable epic refresh on startup",
+        )
+        self._scheduler.add_job(
+            self._startup_daily_reset,
+            "date",
+            run_date=now + timedelta(seconds=45),
+            id="startup_daily_reset",
+            name="Daily buffer reset on startup (once a day)",
+        )
+        self._scheduler.add_job(
+            self._startup_dump_and_purge_candles,
+            "date",
+            run_date=now + timedelta(seconds=60),
+            id="startup_candle_purge",
+            name="Candle dump and purge on startup (once a day)",
+        )
+
+    async def _startup_daily_reset(self) -> None:
+        """Startup wrapper: run the daily buffer reset unless it already ran today."""
+        await self._run_once_today("daily_reset", self._daily_reset)
+
+    async def _startup_dump_and_purge_candles(self) -> None:
+        """Startup wrapper: run the candle dump + purge once per calendar day."""
+        await self._run_once_today(
+            "dump_and_purge_candles", self._dump_and_purge_candles
+        )
+
+    async def _run_once_today(
+        self, action: str, run: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Run a daily maintenance job unless it already ran today.
+
+        The guard is the ``last_run_at`` stamp each job persists through
+        ``_record_job_run``, compared on the UTC calendar day. A job that failed
+        (and therefore recorded nothing) is retried on the next restart, which is
+        the behaviour wanted for housekeeping: better twice than never.
+        """
+        last_run = await self._last_job_run(action)
+        today = datetime.now(UTC).date()
+        if last_run is not None and last_run.date() == today:
+            logger.info(
+                "Startup job '%s' already ran today (%s) — skipped",
+                action,
+                last_run.isoformat(),
+            )
+            return
+        logger.info("Startup job '%s': running today's pass", action)
+        try:
+            await run()
+        except Exception as exc:
+            logger.error("Startup job '%s' failed: %s", action, exc)
+
+    async def _last_job_run(self, action: str) -> datetime | None:
+        """Return the UTC timestamp of a job's last successful run, if any."""
+        try:
+            async with self._session_factory() as session:
+                row = await session.get(JobPreference, action)
+        except Exception as exc:
+            logger.warning("Could not read last run for '%s': %s", action, exc)
+            return None
+        if row is None or row.last_run_at is None:
+            return None
+        stamp = row.last_run_at
+        # Always persisted in UTC; some drivers (SQLite) hand it back naive.
+        return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=UTC)
 
     def _register_candle_listener(self) -> None:
         """Subscribe position monitoring to candle arrivals from the feed.
@@ -728,8 +764,9 @@ class BotScheduler:
         A block is scoped to the calendar day it was set on: once the day has
         rolled over the switch self-heals back to authorised, so a "no more
         trades today" decision never silently carries into the next session. The
-        reset lives here rather than in the midnight ``daily_reset`` job because
-        that job is user-toggleable (and manual by default) — it may never run.
+        reset lives here rather than in the ``daily_reset`` job because that job
+        only runs on a server startup — a bot left running for days would never
+        clear the block.
         """
         if not self._auto_open_enabled and self._auto_open_day != date.today():
             self._auto_open_enabled = True
@@ -775,6 +812,8 @@ class BotScheduler:
                     "schedule": schedule,
                     "danger": entry["danger"],
                     "auto": bool(job and job.next_run_time is not None),
+                    # No cron behind the job → no auto/manual switch to show.
+                    "toggleable": bool(entry.get("toggleable", True)),
                 }
             )
         return statuses
@@ -912,6 +951,8 @@ class BotScheduler:
         try:
             async with self._session_factory() as session:
                 for entry in JOB_DEFINITIONS:
+                    if not entry.get("toggleable", True):
+                        continue  # no cron behind it — nothing to persist
                     existing = await session.get(JobPreference, entry["action"])
                     if existing:
                         existing.auto = auto
@@ -1010,10 +1051,12 @@ class BotScheduler:
             logger.info("Catch-up complete: %d missed job(s) replayed", replayed)
 
     async def _record_job_run(self, action: str) -> None:
-        """Persist the last successful-run time for a catch-up-eligible job.
+        """Persist the last successful-run time of a job.
 
         Called at the end of each eligible job (scheduled or manually triggered)
-        so ``run_catch_up`` can tell a missed slot from one already covered.
+        so ``run_catch_up`` can tell a missed slot from one already covered, and
+        so ``_run_once_today`` can tell a startup job that already ran today from
+        one still owed its daily pass.
         """
         now = datetime.now(UTC)
         try:
@@ -1049,10 +1092,6 @@ class BotScheduler:
         """Manually run one collect-and-analyze cycle."""
         await self._collect_and_analyze()
 
-    async def trigger_trend_select(self) -> None:
-        """Manually run one hourly trend-template selection pass."""
-        await self._hourly_trend_select()
-
     async def trigger_monitor_positions(self) -> None:
         """Manually run one position monitoring pass."""
         await self._monitor_positions()
@@ -1077,12 +1116,8 @@ class BotScheduler:
         """Manually rebuild the last 30 days of Day summaries from IG history."""
         return await self._resync_day_history()
 
-    async def trigger_weekly_summary(self) -> None:
-        """Manually generate per-epic weekly summaries."""
-        await self._weekly_summary()
-
     async def trigger_daily_reset(self) -> None:
-        """Manually clear the price buffer."""
+        """Manually run the daily buffer reset (clear + reload today's candles)."""
         await self._daily_reset()
 
     async def trigger_dump_and_purge_candles(self) -> None:
@@ -2148,18 +2183,6 @@ class BotScheduler:
                 elif reason:
                     logger.debug("Cannot open %s: %s", epic, reason)
 
-    async def _hourly_trend_select(self) -> None:
-        """Backstop / manual trigger for the rolling cross-epic selection.
-
-        The selection runs continuously in the 30-second analysis loop
-        (``_collect_and_analyze``) — that is what re-opens a fresh position the
-        moment the previous one closes. This hourly job (and its dashboard *Run*
-        button) simply invokes the same guarded routine, so a missed tick or a
-        manual trigger still tops the portfolio back up to its target. A no-op
-        for per-epic entries.
-        """
-        await self._select_and_open()
-
     async def _select_and_open(self) -> None:
         """Maintain the rolling cross-epic portfolio at its target size.
 
@@ -2196,7 +2219,7 @@ class BotScheduler:
         and it has enough buffered candles (``len(buf) >= strategy.warmup``). The
         candle count is the warm-up — the bid curve must be long enough to score.
 
-        The lock serialises concurrent callers (analysis loop + hourly backstop)
+        The lock serialises concurrent callers (analysis loop, manual triggers)
         and the open-count is re-checked inside it, so the target is never
         overshot.
         """
@@ -2786,7 +2809,16 @@ class BotScheduler:
         P&L with IG's authoritative figures.
         """
         logger.info("End of day: closing all positions")
+        await self._force_close_all()
 
+    async def _force_close_all(self) -> int:
+        """Close every open position at market price and reconcile the P&L.
+
+        Shared by the ``end_of_day`` action and the dashboard "End day" button;
+        returns the number of positions closed so the caller can report it. The
+        reconcile replaces the just-recorded estimates with IG's authoritative
+        figures.
+        """
         config = self._build_trade_config()
 
         async with self._session_factory() as session:
@@ -2795,8 +2827,24 @@ class BotScheduler:
 
         self._recorder.info(f"End of day: {closed} positions force-closed")
 
-        # Replace the just-recorded estimates with IG's authoritative figures.
         await self._reconcile_pnl()
+        return closed
+
+    async def end_day(self) -> int:
+        """Stop trading for the day: block openings, then close the whole book.
+
+        The dashboard's hard stop. Openings are blocked *first* so the analysis
+        loop cannot slip a new position in while the book is being closed, then
+        every live position is force-closed. Returns the number of positions
+        closed.
+        """
+        logger.info("End day requested: blocking openings and closing everything")
+        await self.set_auto_open(False)
+        closed = await self._force_close_all()
+        self._recorder.info(
+            f"Day ended by the user — {closed} position(s) closed, no further opening"
+        )
+        return closed
 
     async def _reconcile_pnl(self) -> None:
         """Reconcile today's realized P&L with IG's authoritative transactions."""
@@ -2965,66 +3013,24 @@ class BotScheduler:
             "total": round(total_euro, 2),
         }
 
-    async def _weekly_summary(self) -> None:
-        """Generate per-epic direction summaries for the week."""
-        today = date.today()
-        week_str = today.strftime("%Y-W%W")
-
-        async with self._session_factory() as session:
-            for epic in self._all_epics:
-                # Count winning BUY signals this week
-                result = await session.execute(
-                    select(Position).where(
-                        Position.epic == epic,
-                        Position.state == PositionState.CLOSE,
-                    )
-                )
-                positions = result.scalars().all()
-                # Filter to this week
-                week_positions = [
-                    p
-                    for p in positions
-                    if p.date and p.date.strftime("%Y-W%W") == week_str
-                ]
-
-                if not week_positions:
-                    continue
-
-                wins = sum(1 for p in week_positions if (p.win or 0) > 0)
-                total = len(week_positions)
-                direction = "BUY" if wins > total / 2 else "SELL"
-
-                # Upsert Resume
-                res_result = await session.execute(
-                    select(Resume).where(
-                        Resume.epic == epic,
-                        Resume.week == week_str,
-                    )
-                )
-                resume = res_result.scalar_one_or_none()
-
-                if resume:
-                    resume.direction = direction
-                    resume.day = today
-                else:
-                    resume = Resume(
-                        epic=epic,
-                        day=today,
-                        week=week_str,
-                        direction=direction,
-                    )
-                    session.add(resume)
-
-            await session.commit()
-
-        logger.info("Weekly summary generated for week %s", week_str)
-        await self._record_job_run("weekly_summary")
-
     async def _daily_reset(self) -> None:
-        """Clear the price buffer at midnight for a clean start of the new
-        trading day."""
+        """Drop stale candles from the price buffer, once per trading day.
+
+        Runs once a day shortly after the server starts (see
+        ``_register_startup_jobs``) instead of on a midnight cron: the old cron
+        fired while 24h markets (forex/CFD) were still trading and left the
+        strategy running on a truncated window until the feed had refilled the
+        warm-up.
+
+        The clear is immediately followed by a reload of today's candles from the
+        ``candle`` table, so a mid-session restart keeps the history it already
+        had — only genuinely stale rows are dropped.
+        """
         self._buffer.clear()
         logger.info("Daily reset: price buffer cleared")
+        if self._tradable_epics and self._candle_store is not None:
+            await self._rehydrate_buffer(self._tradable_epics)
+        await self._record_job_run("daily_reset")
 
     async def _dump_and_purge_candles(self) -> None:
         """Export candles past the retention window to disk, then delete them."""

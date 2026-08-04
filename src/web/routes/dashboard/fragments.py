@@ -81,48 +81,99 @@ def _render_logs_section(entries: list[dict]) -> str:
         </div>"""
 
 
-def _render_auto_open_banner(enabled: bool) -> str:
-    """Render the big auto-open switch (authorise / block automatic openings).
+# The open / stop / close selection is chosen exclusively in ``.env`` (the single
+# source of truth) — the dashboard only *displays* the active names, read-only.
+# Rendered as flat inline labels (no pill, no border, no hover) precisely so they
+# never read as buttons the user could click to change the selection.
+def _render_selection_name(name: str, *, icon: str, cls: str, title: str) -> str:
+    """Render one active selection name as a read-only title-bar label."""
+    return (
+        f'<span class="{cls}" title="{title}">'
+        f'<i data-lucide="{icon}" class="lc-icon"></i>'
+        f'<span class="strategy-name">{html.escape(name or "—")}</span>'
+        "</span>"
+    )
 
-    Deliberately loud: it is the one control that decides whether the bot may
-    still take a new trade today, so it reads as a full-width banner that turns
-    red the moment openings are blocked. Rebuilt from the server state on every
-    poll, so the displayed state can never drift from the scheduler's.
+
+def _render_selection_chips(selection: dict) -> str:
+    """Render the entry → stop → close labels shown next to the bot title."""
+    return "".join(
+        [
+            _render_selection_name(
+                selection.get("open_strategy") or "—",
+                icon="cpu",
+                cls="dashboard-title-strategy",
+                title="Active entry (open) strategy — set OPEN_STRATEGY in .env",
+            ),
+            '<i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>',
+            _render_selection_name(
+                selection.get("stop_strategy") or "—",
+                icon="ruler",
+                cls="dashboard-title-stop",
+                title="Active stop policy (initial stop) — set STOP_STRATEGY in .env",
+            ),
+            '<i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>',
+            _render_selection_name(
+                selection.get("close_zones") or "—",
+                icon="shield",
+                cls="dashboard-title-exit",
+                title=(
+                    "Active close zones (exit) — set CLOSE_ZONESTART / "
+                    "CLOSE_ZONEMARGE / CLOSE_ZONESECURE / CLOSE_ZONEPROFIT in .env"
+                ),
+            ),
+        ]
+    )
+
+
+def _render_title_bar(enabled: bool, selection: dict) -> str:
+    """Render the merged title bar: bot identity + the auto-open switch.
+
+    One single-line bar carries the bot name, the active entry/stop/close
+    selection and the two day controls (block openings / end the day). Its colour
+    *is* the auto-open state — green while the bot may still take a trade, red
+    (pulsing) the moment openings are blocked — so the state needs no wording of
+    its own: the lock icon (whose tooltip spells it out) plus the bar colour say
+    it, and the row stays one line high. Rebuilt from the server state on every
+    poll, so what is displayed can never drift from the scheduler's.
     """
     if enabled:
         state_cls, icon, state_label = "on", "unlock", "Openings allowed"
-        detail = (
-            "The bot may open new positions (BUY or SELL) whenever the active "
-            "entry strategy signals one."
-        )
         btn_label, btn_icon = "Block for today", "hand"
     else:
         state_cls, icon, state_label = "off", "lock", "Openings blocked"
-        detail = (
-            "No automatic opening until tomorrow, whatever the entry strategy. "
-            "Positions already open keep running, and manual Buy / Sell still work."
-        )
         btn_label, btn_icon = "Allow openings", "play"
     return f"""
-        <div class="autoopen autoopen-{state_cls}" id="autoopen-banner">
-            <i data-lucide="{icon}" class="lc-icon autoopen-icon"></i>
-            <div class="autoopen-text">
-                <span class="autoopen-state" id="autoopen-state">{state_label}</span>
-                <span class="autoopen-detail" id="autoopen-detail">{detail}</span>
+        <div class="dashboard-title autoopen-{state_cls}" id="autoopen-banner">
+            <i data-lucide="bot" class="lc-icon dashboard-title-bot"></i>
+            <h1>IG Trading Bot</h1>
+            <span class="dashboard-title-sep">·</span>
+            {_render_selection_chips(selection)}
+            <div class="dashboard-title-actions">
+                <span class="autoopen-state" id="autoopen-state" title="{state_label}">
+                    <i data-lucide="{icon}" class="lc-icon autoopen-icon"></i>
+                </span>
+                <button class="autoopen-btn" id="autoopen-btn" onclick="toggleAutoOpen(this)"
+                        title="Authorise or block every automatic opening for the current day — open positions keep running and manual Buy / Sell still work">
+                    <i data-lucide="{btn_icon}" class="lc-icon"></i> {btn_label}
+                </button>
+                <button class="autoopen-btn endday-btn" id="endday-btn" onclick="endDay(this)"
+                        title="End the day now: close EVERY open position immediately and block any further automatic opening">
+                    <i data-lucide="power" class="lc-icon"></i> End day
+                </button>
             </div>
-            <button class="autoopen-btn" id="autoopen-btn" onclick="toggleAutoOpen(this)"
-                    title="Authorise or block every automatic opening for the current day">
-                <i data-lucide="{btn_icon}" class="lc-icon"></i> {btn_label}
-            </button>
         </div>"""
 
 
 def _render_action_cards(jobs: list[dict]) -> str:
     """Render the job cards for the Actions section.
 
-    Each card carries an auto/manual switch and a Run button (visible only in
-    manual mode). ``danger`` selects the Run-button colour and whether a
-    confirmation prompt is shown before triggering.
+    Each card carries a Run button (visible only in manual mode) and, for jobs
+    backed by a cron trigger, an auto/manual switch. Jobs flagged
+    ``toggleable=False`` (manual-only or startup-only work) get no switch: there
+    is no schedule to turn on or off, so the toggle would only ever fail.
+    ``danger`` selects the Run-button colour and whether a confirmation prompt is
+    shown before triggering.
     """
     if not jobs:
         return '<div class="action-empty">Scheduler not available.</div>'
@@ -135,12 +186,26 @@ def _render_action_cards(jobs: list[dict]) -> str:
         schedule = html.escape(str(j["schedule"]))
         danger = j["danger"] if j["danger"] in ("safe", "warn", "danger") else "safe"
         auto = bool(j["auto"])
+        toggleable = bool(j.get("toggleable", True))
         needs_confirm = "true" if danger in ("warn", "danger") else "false"
         run_style = "display:none;" if auto else ""
         mode_cls = "auto" if auto else "manual"
         mode_txt = "Automatic" if auto else "Manual"
         checked = "checked" if auto else ""
         auto_cls = " is-auto" if auto else ""
+        switch = (
+            f"""<label class="switch" title="Automatic / Manual">
+                            <input type="checkbox" {checked} onchange="toggleJobMode('{action}', this)">
+                            <span class="switch-slider"></span>
+                        </label>"""
+            if toggleable
+            else ""
+        )
+        mode_row = (
+            f'<div class="action-card-mode {mode_cls}">{mode_txt}</div>'
+            if toggleable
+            else ""
+        )
         run_btn = render_button(
             "&#9654; Run",
             cls=f"action-btn {danger} run-btn",
@@ -150,14 +215,11 @@ def _render_action_cards(jobs: list[dict]) -> str:
         inner = f"""
                     <div class="action-card-head">
                         <span class="action-card-name">{name}</span>
-                        <label class="switch" title="Automatic / Manual">
-                            <input type="checkbox" {checked} onchange="toggleJobMode('{action}', this)">
-                            <span class="switch-slider"></span>
-                        </label>
+                        {switch}
                     </div>
                     <div class="action-card-desc">{desc}</div>
                     <div class="action-card-schedule"><i data-lucide="clock" class="lc-icon"></i> {schedule}</div>
-                    <div class="action-card-mode {mode_cls}">{mode_txt}</div>
+                    {mode_row}
                     {run_btn}
                     <div class="action-status"></div>
                 """
@@ -165,44 +227,6 @@ def _render_action_cards(jobs: list[dict]) -> str:
             inner, cls=f"action-card{auto_cls}", attrs=f'data-action="{action}"'
         )
     return cards
-
-
-def _render_week_summary_section(resume_records: list, today: date) -> str:
-    """Render the weekly direction summary fragment for the current week."""
-    week_str = today.strftime("%Y-W%W")
-    if not resume_records:
-        return (
-            f'<div style="color:#64748b;padding:1.5rem;text-align:center;font-size:0.85rem;">'
-            f"No weekly summary for {week_str} — run Weekly Summary job on Friday after market close."
-            f"</div>"
-        )
-    buy_count = sum(1 for r in resume_records if r.direction == "BUY")
-    sell_count = sum(1 for r in resume_records if r.direction == "SELL")
-    rows = ""
-    for r in resume_records:
-        direction = r.direction or "—"
-        dir_color = (
-            "#4ade80"
-            if direction == "BUY"
-            else "#ef4444" if direction == "SELL" else "#94a3b8"
-        )
-        day_str = r.day.strftime("%d/%m") if r.day else "—"
-        rows += f"""
-                <tr>
-                    <td class="epic-col">{html.escape(r.epic)}</td>
-                    <td style="color:{dir_color};font-weight:600;">{html.escape(direction)}</td>
-                    <td class="err-ts">{html.escape(day_str)}</td>
-                </tr>"""
-    table = render_table(
-        ["Epic", "Direction", "Updated"], rows, style="max-width:480px;"
-    )
-    return f"""<div style="display:flex;align-items:center;gap:1.5rem;margin-bottom:0.8rem;font-size:0.82rem;">
-            <span style="color:#64748b;">Week {html.escape(week_str)}</span>
-            <span style="color:#4ade80;"><strong>{buy_count}</strong> BUY</span>
-            <span style="color:#ef4444;"><strong>{sell_count}</strong> SELL</span>
-            <span style="color:#94a3b8;">{len(resume_records)} epic{"s" if len(resume_records) != 1 else ""}</span>
-        </div>
-        {table}"""
 
 
 def _render_day_history_section(day_records: list, today: date) -> str:
@@ -386,7 +410,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
     (``/api/dashboard-fragments``). Keeping a single source of truth here means
     the page and the incremental updates can never drift apart.
 
-    Fragment ids: ``auto_open_banner``, ``kpi_bar``, ``market_rows``,
+    Fragment ids: ``title_bar``, ``kpi_bar``, ``market_rows``,
     ``queue_modal`` (which now also carries the IG API guard detail),
     ``positions_modal``.
     """
@@ -980,14 +1004,12 @@ def _build_fragments(state: dict) -> dict[str, str]:
 
     _today = date.today()
     return {
-        "auto_open_banner": _render_auto_open_banner(
-            bool(state.get("auto_open_enabled", True))
+        "title_bar": _render_title_bar(
+            bool(state.get("auto_open_enabled", True)),
+            state.get("selection") or {},
         ),
         "kpi_bar": kpi_bar,
         "market_rows": market_rows,
-        "week_summary": _render_week_summary_section(
-            state.get("resume_records") or [], _today
-        ),
         "day_history": _render_day_history_section(
             state.get("day_records") or [], _today
         ),

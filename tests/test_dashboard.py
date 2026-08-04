@@ -28,10 +28,9 @@ _ROUTER_MOD = sys.modules["src.web.routes.dashboard.router"]
 # ── Fixtures / builders ─────────────────────────────────────────────────────
 
 _FRAGMENT_KEYS = {
-    "auto_open_banner",
+    "title_bar",
     "kpi_bar",
     "market_rows",
-    "week_summary",
     "day_history",
     "queue_modal",
     "epic_list_modal",
@@ -809,15 +808,24 @@ class TestRenderDashboard:
         assert "Live — updating every 1 s" in html
 
     def test_title_displays_active_strategy_names_readonly(self):
-        html = _render_dashboard(_settings(), _base_state())
+        # The names come from the state snapshot (the title bar is a live
+        # fragment now), sourced from .env in ``_selection_names``.
+        state = _base_state(
+            selection={
+                "open_strategy": "open_donchian",
+                "stop_strategy": "stop_support",
+                "close_zones": "hold/hold/hold/trailing_ratchet",
+            }
+        )
+        html = _render_dashboard(_settings(), state)
         # The .env selection is the single source of truth: the title bar only
         # DISPLAYS the active open/stop/close names, read-only — there is no
         # dropdown and no runtime switching.
         assert 'class="strategy-name"' in html
         assert "open_donchian" in html
         assert "stop_support" in html
-        # The close side shows the three per-zone selections (start/margin/profit).
-        assert "hold/hold/trailing_ratchet" in html
+        # The close side shows the four per-zone selections.
+        assert "hold/hold/hold/trailing_ratchet" in html
         assert 'class="strategy-select"' not in html
         assert "switchStrategy(" not in html
 
@@ -860,7 +868,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=38" in html
+        assert "/static/dashboard.js?v=41" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -898,16 +906,19 @@ class TestRenderDashboard:
         assert "setAllJobs(true, this)" in html
         assert "setAllJobs(false, this)" in html
 
-    def test_auto_open_banner_allowed_state(self):
+    def test_title_bar_allowed_state(self):
         html = _render_dashboard(_settings(), _base_state())
-        banner = _build_fragments(_base_state())["auto_open_banner"]
+        bar = _build_fragments(_base_state())["title_bar"]
         # The fragment container must be in the shell so the poll can refresh it.
-        assert 'id="frag-auto_open_banner"' in html
-        assert "autoopen-on" in banner
-        assert "Openings allowed" in banner
+        assert 'id="frag-title_bar"' in html
+        assert "autoopen-on" in bar
+        # The state has no wording in the bar (no room): the lock icon + the bar
+        # colour carry it and the tooltip spells it out.
+        assert 'title="Openings allowed"' in bar
+        assert ">Openings allowed<" not in bar
         # The button offers the opposite action (block), wired to the toggle.
-        assert "Block for today" in banner
-        assert "toggleAutoOpen(this)" in banner
+        assert "Block for today" in bar
+        assert "toggleAutoOpen(this)" in bar
         # The handler the markup calls must actually exist in the served script.
         js = (
             Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
@@ -915,14 +926,79 @@ class TestRenderDashboard:
         assert "function toggleAutoOpen(" in js
         assert "/api/auto-open/" in js
 
-    def test_auto_open_banner_blocked_state(self):
+    def test_title_bar_blocked_state(self):
         state = _base_state(auto_open_enabled=False)
-        banner = _build_fragments(state)["auto_open_banner"]
-        assert "autoopen-off" in banner
-        assert "Openings blocked" in banner
-        # It must be explicit that this does not touch live positions.
-        assert "Positions already open keep running" in banner
-        assert "Allow openings" in banner
+        bar = _build_fragments(state)["title_bar"]
+        assert "autoopen-off" in bar
+        assert 'title="Openings blocked"' in bar
+        assert "Allow openings" in bar
+
+    def test_title_bar_keeps_both_day_buttons_on_one_row(self):
+        # Both controls sit in the same nowrap group as the state icon, so they
+        # stay on the bar's line instead of pushing a second row.
+        bar = _build_fragments(_base_state())["title_bar"]
+        actions = bar.split('class="dashboard-title-actions"')[1]
+        assert "Block for today" in actions
+        assert "End day" in actions
+
+    def test_selection_names_are_not_rendered_as_buttons(self):
+        # The .env selection is read-only: plain labels, never <button>/<select>
+        # and no clickable affordance in the markup.
+        state = _base_state(
+            selection={
+                "open_strategy": "open_ranking",
+                "stop_strategy": "stop_atr",
+                "close_zones": "hold/hold/hold/trailing_ratchet",
+            }
+        )
+        bar = _build_fragments(state)["title_bar"]
+        chips = bar.split('class="dashboard-title-actions"')[0]
+        assert "<button" not in chips
+        assert "<select" not in chips
+        assert "onclick" not in chips
+        assert 'class="dashboard-title-strategy"' in chips
+        # The flat (non-pill) look is driven by CSS: no background/border there.
+        css = (
+            Path(__file__).resolve().parents[1] / "src/web/static/style.css"
+        ).read_text()
+        block = css.split(".dashboard-title-strategy,")[1].split("}")[0]
+        assert "background: none;" in block
+        assert "border: none;" in block
+        assert "cursor: default;" in block
+
+    def test_title_bar_merges_identity_and_selection(self):
+        # The bot title and the active .env selection now live in the same bar as
+        # the auto-open switch — there is no separate title block any more.
+        state = _base_state(
+            selection={
+                "open_strategy": "open_ranking",
+                "stop_strategy": "stop_atr",
+                "close_zones": "hold/hold/hold/trailing_ratchet",
+            }
+        )
+        bar = _build_fragments(state)["title_bar"]
+        assert "IG Trading Bot" in bar
+        assert "open_ranking" in bar
+        assert "stop_atr" in bar
+        assert "hold/hold/hold/trailing_ratchet" in bar
+        html = _render_dashboard(_settings(), state)
+        assert html.count("IG Trading Bot</h1>") == 1
+
+    def test_title_bar_carries_end_day_button(self):
+        bar = _build_fragments(_base_state())["title_bar"]
+        assert "End day" in bar
+        assert "endDay(this)" in bar
+        js = (
+            Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
+        ).read_text()
+        assert "async function endDay(" in js
+        assert "/api/end-day" in js
+
+    def test_python_commands_section_removed(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert "Python Commands" not in html
+        assert "python -m src.main" not in html
+        assert 'data-sid="commands"' not in html
 
 
 # ── /api/dashboard-fragments endpoint ────────────────────────────────────────
@@ -1241,8 +1317,48 @@ class TestAutoOpenEndpoint:
             frags = (await client.get("/api/dashboard-fragments")).json()
             status = (await client.get("/api/status")).json()
         assert frags["auto_open"] is False
-        assert "autoopen-off" in frags["fragments"]["auto_open_banner"]
+        assert "autoopen-off" in frags["fragments"]["title_bar"]
         assert status["auto_open"] is False
+
+
+class TestEndDayEndpoint:
+    """``POST /api/end-day`` — close the whole book and stop opening today."""
+
+    def _app_with_end_day(self, *, closed: int = 3, boom: bool = False):
+        app = create_app(settings=_settings(), buffer=PriceBuffer())
+        calls: list[str] = []
+
+        async def _end_day() -> int:
+            calls.append("end_day")
+            if boom:
+                raise RuntimeError("IG unreachable")
+            return closed
+
+        app.state.scheduler = SimpleNamespace(end_day=_end_day, auto_open_enabled=True)
+        return app, calls
+
+    async def test_closes_positions_and_blocks_openings(self):
+        app, calls = self._app_with_end_day(closed=2)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/end-day")
+        assert resp.status_code == 200
+        assert resp.json() == {"closed": 2, "auto_open": False}
+        assert calls == ["end_day"]
+
+    async def test_failure_returns_500(self):
+        app, _ = self._app_with_end_day(boom=True)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/end-day")
+        assert resp.status_code == 500
+        assert "IG unreachable" in resp.json()["error"]
+
+    async def test_no_scheduler_returns_503(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/end-day")
+        assert resp.status_code == 503
 
 
 class TestManualOpenEndpoint:

@@ -137,17 +137,36 @@ async def set_auto_open(request: Request, mode: str) -> JSONResponse:
     return JSONResponse({"auto_open": mode == "on"})
 
 
+@router.post("/api/end-day")
+async def end_day(request: Request) -> JSONResponse:
+    """End the trading day now: close every open position and block openings.
+
+    The hard stop next to the auto-open switch. Unlike ``/api/auto-open/off``
+    (which leaves live positions running) this force-closes the whole book at
+    market price first, then blocks every automatic opening for the rest of the
+    day. Awaited rather than backgrounded so the dashboard can report how many
+    positions were actually closed.
+    """
+    scheduler = request.app.state.scheduler
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    try:
+        closed = await scheduler.end_day()
+    except Exception as exc:
+        logger.error("End day failed: %s", exc)
+        return JSONResponse({"error": f"End day failed: {exc}"}, status_code=500)
+    return JSONResponse({"closed": closed, "auto_open": False})
+
+
 _ACTIONS = {
     "refresh_epic_list",
     "refresh_tradable_epics",
     "collect_and_analyze",
-    "trend_select",
     "monitor_positions",
     "sync_positions",
     "end_of_day",
     "reconcile_pnl",
     "daily_summary",
-    "weekly_summary",
     "daily_reset",
     "dump_and_purge_candles",
 }

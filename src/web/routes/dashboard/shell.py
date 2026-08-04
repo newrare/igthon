@@ -1,58 +1,11 @@
 """Full-page dashboard shell (skeleton embedding the dynamic fragments)."""
 
-import html
-
 from src.web.routes.dashboard.components import (
     render_button,
     render_confirm_modal,
     render_modal,
 )
 from src.web.routes.dashboard.fragments import _build_fragments
-
-
-# The open / stop / close selection is chosen exclusively in ``.env`` (the single
-# source of truth) — the dashboard only *displays* the active names, read-only.
-def _render_selection_name(name: str, *, icon: str, cls: str, title: str) -> str:
-    """Render one active selection name as a read-only title-bar chip."""
-    return (
-        f'<span class="{cls}" title="{title}">'
-        f'<i data-lucide="{icon}" class="lc-icon"></i>'
-        f'<span class="strategy-name">{html.escape(name or "—")}</span>'
-        "</span>"
-    )
-
-
-def _render_strategy_name(current: str) -> str:
-    """Read-only title-bar chip for the active entry (open) strategy."""
-    return _render_selection_name(
-        current,
-        icon="cpu",
-        cls="dashboard-title-strategy",
-        title="Active entry (open) strategy — set OPEN_STRATEGY in .env",
-    )
-
-
-def _render_stop_distance_name(current: str) -> str:
-    """Read-only title-bar chip for the active stop policy."""
-    return _render_selection_name(
-        current,
-        icon="ruler",
-        cls="dashboard-title-stop",
-        title="Active stop policy (initial stop) — set STOP_STRATEGY in .env",
-    )
-
-
-def _render_close_profile_name(current: str) -> str:
-    """Read-only title-bar chip for the close zones (start/margin/secure/profit)."""
-    return _render_selection_name(
-        current,
-        icon="shield",
-        cls="dashboard-title-exit",
-        title=(
-            "Active close zones (exit) — set CLOSE_ZONESTART / CLOSE_ZONEMARGE / "
-            "CLOSE_ZONESECURE / CLOSE_ZONEPROFIT in .env"
-        ),
-    )
 
 
 def _render_modals(settings, frags: dict[str, str]) -> str:
@@ -275,7 +228,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=14">
+    <link rel="stylesheet" href="/static/style.css?v=16">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -285,23 +238,10 @@ def _render_dashboard(settings, state: dict) -> str:
 
     {_render_connection_banner(state)}
 
-    <!-- Main title — entry (open) → stop distance (initial stop) → close (exit) -->
-    <div class="dashboard-title">
-        <i data-lucide="bot" class="lc-icon"></i>
-        <h1>IG Trading Bot</h1>
-        <span class="dashboard-title-sep">·</span>
-        {_render_strategy_name(settings.open_strategy)}
-        <i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>
-        {_render_stop_distance_name(settings.stop_strategy)}
-        <i data-lucide="arrow-right" class="lc-icon dashboard-title-arrow"></i>
-        {_render_close_profile_name(
-            f"{settings.close_zonestart}/{settings.close_zonemarge}/"
-            f"{settings.close_zonesecure}/{settings.close_zoneprofit}"
-        )}
-    </div>
-
-    <!-- Auto-open switch — authorises or blocks every automatic opening today -->
-    <div id="frag-auto_open_banner">{frags['auto_open_banner']}</div>
+    <!-- Title bar — bot identity, entry (open) → stop → close (exit) selection,
+         and the day controls (block openings / end day). Its colour is the
+         auto-open state, so it doubles as the auto-open switch. -->
+    <div id="frag-title_bar">{frags['title_bar']}</div>
 
     <!-- KPI Bar -->
     <div class="kpi-updated">Live data · updated <span id="refresh-kpi">—</span></div>
@@ -331,18 +271,6 @@ def _render_dashboard(settings, state: dict) -> str:
                     <tbody id="frag-market_rows">{frags['market_rows']}</tbody>
                 </table>
             </div>
-        </div>
-    </div>
-
-    <!-- Weekly Summary -->
-    <div class="section">
-        <div class="section-header" data-sid="week">
-            <span class="section-title"><i data-lucide="calendar" class="lc-icon"></i> Weekly Summary</span>
-            <span class="section-refresh">updated <span id="refresh-week">—</span></span>
-            <button class="section-toggle">&#8722;</button>
-        </div>
-        <div class="section-body">
-            <div id="frag-week_summary">{frags['week_summary']}</div>
         </div>
     </div>
 
@@ -379,39 +307,6 @@ def _render_dashboard(settings, state: dict) -> str:
         </div>
     </div>
 
-    <!-- Python Commands (bottom) -->
-    <div class="section">
-        <div class="section-header" data-sid="commands">
-            <span class="section-title"><i data-lucide="clipboard-list" class="lc-icon"></i> Python Commands</span>
-            <span class="section-refresh">updated <span id="refresh-commands">—</span></span>
-            <button class="section-toggle">&#8722;</button>
-        </div>
-        <div class="section-body">
-            <div class="command-list">
-                <div class="command">
-                    <div class="command-name">python -m src.main</div>
-                    <div class="command-desc">Start the bot (scheduler only, no web UI)</div>
-                </div>
-                <div class="command">
-                    <div class="command-name">python -m src.main --web</div>
-                    <div class="command-desc">Start the bot + this web dashboard on port {settings.web_port}</div>
-                </div>
-                <div class="command">
-                    <div class="command-name">python -m src.main --analyze-only</div>
-                    <div class="command-desc">Single analysis pass, print signals, no trading</div>
-                </div>
-                <div class="command">
-                    <div class="command-name">python -m src.main --web --log-level DEBUG</div>
-                    <div class="command-desc">Bot + web + verbose debug logging</div>
-                </div>
-                <div class="command">
-                    <div class="command-name">python -m src.main --analyze-only --epics IX.D.DAX.IFMM.IP</div>
-                    <div class="command-desc">Analyze a specific epic only</div>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <!-- Server Logs -->
     <div class="section">
         <div class="section-header" data-sid="logs">
@@ -443,6 +338,6 @@ def _render_dashboard(settings, state: dict) -> str:
 </div>
 
 <script src="/static/tables.js?v=1"></script>
-<script src="/static/dashboard.js?v=38"></script>
+<script src="/static/dashboard.js?v=41"></script>
 </body>
 </html>"""

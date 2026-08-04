@@ -12,7 +12,6 @@ from src.core.api_queue import Priority
 from src.models.day import Day
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
-from src.models.resume import Resume
 from src.utils.tools import euro_per_point
 
 logger = logging.getLogger(__name__)
@@ -406,6 +405,18 @@ def _display_pnl(position: Position) -> float:
     return stored or 0.0
 
 
+def _selection_names(settings) -> dict[str, str]:
+    """Return the active entry / stop / close names for the title-bar chips."""
+    return {
+        "open_strategy": settings.open_strategy,
+        "stop_strategy": settings.stop_strategy,
+        "close_zones": (
+            f"{settings.close_zonestart}/{settings.close_zonemarge}/"
+            f"{settings.close_zonesecure}/{settings.close_zoneprofit}"
+        ),
+    }
+
+
 async def _gather_dashboard_state(request: Request) -> dict:
     """Collect every piece of live state the dashboard renders.
 
@@ -461,7 +472,6 @@ async def _gather_dashboard_state(request: Request) -> dict:
     open_positions: list[Position] = []
     closed_positions: list[Position] = []
     day_records: list[Day] = []
-    resume_records: list[Resume] = []
     epic_db_map: dict[str, Epic] = {}
     if session_factory:
         async with session_factory() as session:
@@ -575,13 +585,6 @@ async def _gather_dashboard_state(request: Request) -> dict:
                 select(Day).where(Day.date >= thirty_ago).order_by(Day.date.desc())
             )
             day_records = list(day_res)
-
-            # Week resume for current week
-            week_str = today.strftime("%Y-W%W")
-            resume_res = await session.scalars(
-                select(Resume).where(Resume.week == week_str).order_by(Resume.epic)
-            )
-            resume_records = list(resume_res)
     else:
         kpis = {
             "available_epics": len(epics),
@@ -676,12 +679,16 @@ async def _gather_dashboard_state(request: Request) -> dict:
         "open_positions": open_positions,
         "closed_positions": closed_positions,
         "day_records": day_records,
-        "resume_records": resume_records,
         "bot_paused": scheduler.is_paused if scheduler else None,
         # Auto-open switch: True when the bot may open by itself. Defaults to
         # True with no scheduler so the banner never claims a block that is not
         # actually in force (the web app runs even in degraded mode).
         "auto_open_enabled": scheduler.auto_open_enabled if scheduler else True,
+        # Active open / stop / close selection, read straight from .env (the
+        # single source of truth). Part of the state — and not of the static
+        # shell — because the title bar carrying these chips is now the
+        # auto-open switch itself, re-rendered on every poll.
+        "selection": _selection_names(request.app.state.settings),
         "scheduler_available": scheduler is not None,
         "jobs": scheduler.jobs_status() if scheduler else [],
         "log_entries": log_entries,

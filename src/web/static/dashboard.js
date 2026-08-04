@@ -140,24 +140,23 @@ async function setAllJobs(auto, btn) {
     }
 }
 
-// ── Auto-open switch (big banner above the KPI bar) ─────────────────────────
+// ── Auto-open switch (merged into the title bar) ─────────────────────────────
 // Authorises or blocks every AUTOMATIC opening for the current day, whatever the
 // entry strategy selected in .env. Open positions keep running and the manual
-// Buy / Sell buttons stay usable.
+// Buy / Sell buttons stay usable. The title bar itself is the switch: it turns
+// green when openings are allowed and red when they are blocked.
 //
-// The banner is server-rendered on every poll (_render_auto_open_banner), which
-// stays the source of truth; the strings below mirror it only so the flip is
-// instant instead of waiting for the next poll — and so the banner still updates
-// when live refreshes are paused.
+// The bar is server-rendered on every poll (_render_title_bar), which stays the
+// source of truth; the strings below mirror it only so the flip is instant
+// instead of waiting for the next poll — and so the bar still updates when live
+// refreshes are paused.
 const AUTOOPEN_TEXT = {
     on: {
         state:  'Openings allowed',
-        detail: 'The bot may open new positions (BUY or SELL) whenever the active entry strategy signals one.',
         btn:    '<i data-lucide="hand" class="lc-icon"></i> Block for today',
     },
     off: {
         state:  'Openings blocked',
-        detail: 'No automatic opening until tomorrow, whatever the entry strategy. Positions already open keep running, and manual Buy / Sell still work.',
         btn:    '<i data-lucide="play" class="lc-icon"></i> Allow openings',
     },
 };
@@ -168,16 +167,16 @@ function _applyAutoOpenUI(allowed) {
     const text = AUTOOPEN_TEXT[allowed ? 'on' : 'off'];
     banner.classList.toggle('autoopen-on', allowed);
     banner.classList.toggle('autoopen-off', !allowed);
-    const icon   = banner.querySelector('.autoopen-icon');
-    const state  = document.getElementById('autoopen-state');
-    const detail = document.getElementById('autoopen-detail');
-    const btn    = document.getElementById('autoopen-btn');
+    const icon = banner.querySelector('.autoopen-icon');
+    const wrap = document.getElementById('autoopen-state');
+    const btn  = document.getElementById('autoopen-btn');
+    // The state has no wording of its own in the bar (space): the lock icon and
+    // the bar colour carry it, its wrapper's tooltip spells it out.
+    if (wrap) wrap.title = text.state;
     // lucide swaps <i data-lucide> for an inline <svg>, so the icon element must
     // be rebuilt (not just re-attributed) and re-rendered.
     if (icon) icon.outerHTML = '<i data-lucide="' + (allowed ? 'unlock' : 'lock') + '" class="lc-icon autoopen-icon"></i>';
-    if (state)  state.textContent  = text.state;
-    if (detail) detail.textContent = text.detail;
-    if (btn)    btn.innerHTML      = text.btn;
+    if (btn) btn.innerHTML = text.btn;
     lucide.createIcons();
 }
 
@@ -207,13 +206,50 @@ async function toggleAutoOpen(btn) {
     }
 }
 
+// ── End day (close everything now + block any further opening) ───────────────
+// The hard stop: force-closes EVERY open position at market price and blocks
+// automatic openings for the rest of the day. Irreversible on the position side,
+// so it always asks first.
+async function endDay(btn) {
+    if (!confirm('End the day now?\n\nEvery open position is closed immediately at '
+                 + 'market price and the bot stops opening new ones today.')) return;
+    const label = btn.innerHTML;
+    btn.disabled  = true;
+    btn.innerHTML = '<i data-lucide="loader-circle" class="lc-icon lc-spin"></i> Closing…';
+    lucide.createIcons();
+    try {
+        const res  = await fetch('/api/end-day', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+            _applyAutoOpenUI(false);
+            const closed = data.closed || 0;
+            showToast(
+                'Day ended',
+                closed + ' position' + (closed === 1 ? '' : 's') + ' closed — no further opening today',
+                'warning',
+            );
+        } else {
+            showToast('End day', data.error || 'Failed to end the day', 'error');
+        }
+    } catch (e) {
+        showToast('End day', 'Network error', 'error');
+    } finally {
+        // A poll may have re-rendered the title bar (and with it this button)
+        // while the close was running — restore the live node, not the orphan.
+        const live = document.getElementById('endday-btn') || btn;
+        live.disabled  = false;
+        live.innerHTML = label;
+        lucide.createIcons();
+    }
+}
+
 // ── Live fragment polling (single request → in-place section updates) ────────
 // One request every POLL_INTERVAL returns the HTML for every dynamic region.
 // Only the fragments whose markup actually changed are swapped into the DOM, so
 // there is no full-page reload, no scroll jump and no lost UI state.
 const PAUSE_KEY     = 'ig_refresh_paused';
 const POLL_INTERVAL = 1000; // ms
-const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-week', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-epic-result', 'refresh-actions', 'refresh-logs'];
+const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-epic-result', 'refresh-actions', 'refresh-logs'];
 const btnPause  = document.getElementById('btn-pause');
 const footer    = document.getElementById('footer-refresh');
 
@@ -337,11 +373,10 @@ async function _poll() {
     }
 }
 
-// Static sections (config, actions, commands) never change between polls — stamp
-// them once with the page-load time; the live sections are stamped on each poll.
+// Stamp every live section with the page-load time so no "updated —" placeholder
+// survives until the first poll answers.
 (function _initStamps() {
     const t = new Date().toLocaleTimeString('fr-FR', { hour12: false });
-    ['refresh-commands'].forEach(function(id) { _stamp(id, t); });
     LIVE_STAMPS.forEach(function(id) { _stamp(id, t); });
 })();
 

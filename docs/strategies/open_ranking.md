@@ -63,9 +63,8 @@ composite falls below the optional `min_score` floor.
 ## Rolling selection (scheduler)
 
 The selection runs **every analysis tick (~30 s)** during market hours — that is
-what re-opens a fresh position the moment the previous one closes. The hourly
-`trend_select` job (and its dashboard *Run* button) is a backstop that calls the
-same routine. Each invocation:
+what re-opens a fresh position the moment the previous one closes. Each
+invocation:
 
 1. waits until `STRATEGY_RANKING_OPEN_AFTER_MINUTES` past market open — the "one
    hour of livestream" warm-up before the first open of the day (a mid-day
@@ -76,7 +75,7 @@ same routine. Each invocation:
    BUY candidates by score (highest first), and opens the best ones that pass the
    shared open gates **and** the wallet check until the target is reached.
 
-A lock serialises the tick loop and the hourly backstop, and the open-count is
+A lock serialises the tick loop and any manual trigger, and the open-count is
 re-checked inside it, so the target is never overshot.
 
 **Diagnostics when nothing opens.** A pass that ranked BUY candidates and had a
