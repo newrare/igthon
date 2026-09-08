@@ -868,7 +868,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=41" in html
+        assert "/static/dashboard.js?v=42" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -1001,6 +1001,73 @@ class TestRenderDashboard:
         assert 'data-sid="commands"' not in html
 
 
+# ── Market-table sort persistence & chart modal chrome ───────────────────────
+
+
+def _static(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "src/web/static" / name).read_text()
+
+
+class TestSortPersistence:
+    """A live poll must not throw away the column the user sorted on.
+
+    The market table re-renders every second (server order); before this the
+    chosen sort survived less than a second. The sort state is kept on the
+    ``<table>`` element — which the poll never replaces, it only swaps the
+    ``<tbody>`` markup — and re-applied after each swap.
+    """
+
+    def test_tables_js_exposes_the_reapply_hook(self):
+        js = _static("tables.js")
+        assert "window.reapplyTableSorts = reapplyTableSorts" in js
+        # Re-applying keeps the direction instead of toggling it.
+        assert "keepDirection" in js
+
+    def test_engine_reapplies_sorts_after_a_fragment_swap(self):
+        js = _static("dashboard.js")
+        assert "window.reapplyTableSorts()" in js
+
+    def test_page_loads_the_current_tables_script(self):
+        # Bump ``?v=`` whenever tables.js changes or browsers serve a stale copy.
+        html = _render_dashboard(_settings(), _base_state())
+        assert "/static/tables.js?v=2" in html
+
+    def test_chart_carousel_follows_the_visible_row_order(self):
+        # The carousel snapshots the source table in DOM order, so with the sort
+        # preserved the ‹ › arrows walk the epics in the user's chosen order.
+        js = _static("dashboard.js")
+        assert "tr.clickable-row" in js
+
+
+class TestChartModalChrome:
+    """The chart modal states the spread and offers a gain-only manual close."""
+
+    def test_spread_badge_is_rendered(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-modal-spread"' in html
+
+    def test_spread_badge_is_filled_from_the_chart_payload(self):
+        js = _static("dashboard.js")
+        assert "_renderChartSpread(data.spread)" in js
+
+    def test_close_button_starts_hidden(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-close-btn"' in html
+        assert "closeChartPosition(this)" in html
+
+    def test_close_button_requires_a_strictly_positive_pnl(self):
+        # The button banks a gain; at break-even or in the red the close profile
+        # decides, so it must stay hidden.
+        js = _static("dashboard.js")
+        assert "pnl === null || pnl <= 0" in js
+
+    def test_close_from_the_chart_tolerates_having_no_table_row(self):
+        # closePosition() is shared with the positions table, where it dims the
+        # row; called from the modal header there is no row to dim.
+        js = _static("dashboard.js")
+        assert "if (row) row.style.opacity" in js
+
+
 # ── /api/dashboard-fragments endpoint ────────────────────────────────────────
 
 
@@ -1008,6 +1075,25 @@ class TestRenderDashboard:
 def app():
     """Minimal app: real (empty) price buffer, no DB / scheduler / guard."""
     return create_app(settings=_settings(), buffer=PriceBuffer())
+
+
+class TestChartEndpoint:
+    async def test_chart_payload_carries_the_dealing_spread(self, app):
+        # The chart states what a round trip on the market costs, read from the
+        # background-refreshed spread cache (never awaited here).
+        app.state.spread_cost_cache = {
+            "IX.D.DAX.IFMM.IP": (datetime.now(UTC), 2.5, 1.25)
+        }
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get("/api/chart/IX.D.DAX.IFMM.IP")).json()
+        assert data["spread"] == {"euro": 2.5, "points": 1.25}
+
+    async def test_chart_payload_spread_is_none_when_uncached(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get("/api/chart/CS.D.EURUSD.MINI.IP")).json()
+        assert data["spread"] is None
 
 
 class TestFragmentsEndpoint:
@@ -1506,3 +1592,240 @@ class TestManualOpenEndpoint:
                 f"/api/positions/open/{epic}", json={"direction": "HOLD"}
             )
         assert resp.status_code == 400
+
+
+# ── Market reading panel (/api/reading/{epic} + its triggers) ─────────────────
+
+
+class _ReadingSession:
+    """Session stub whose ``scalars`` returns a fixed list of rows."""
+
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    async def __aenter__(self) -> "_ReadingSession":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def scalars(self, _query):
+        return SimpleNamespace(first=lambda: self._rows[0] if self._rows else None)
+
+
+def _reading_app(bids: list[float], rows: list | None = None) -> tuple[object, str]:
+    """App with one warmed-up epic in the buffer (and optionally an open row)."""
+    epic = "IX.D.DAX.IFMM.IP"
+    buffer = PriceBuffer()
+    for bid in bids:
+        buffer.add_candle(epic, _candle(bid))
+    app = create_app(settings=_settings(), buffer=buffer)
+    if rows is not None:
+        app.state.session_factory = lambda: _ReadingSession(rows)
+    return app, epic
+
+
+class TestReadingEndpoint:
+    """``GET /api/reading/{epic}`` — the panel's only data source."""
+
+    async def test_untracked_epic_is_a_404(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.get("/api/reading/CS.D.EURUSD.CFD.IP")
+        assert res.status_code == 404
+
+    async def test_payload_carries_the_headline_and_sections(self):
+        app, epic = _reading_app([18000.0 + i for i in range(40)])
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/reading/{epic}")).json()
+        assert data["epic"] == epic
+        assert data["minutes"] == 40
+        assert [chip["label"] for chip in data["headline"]][0] == "Regime"
+        titles = [section["title"] for section in data["sections"]]
+        assert "Trend per horizon" in titles
+        assert "Readable levels" in titles
+
+    async def test_spread_is_read_from_the_cache_not_the_api(self):
+        app, epic = _reading_app([18000.0] * 40)
+        app.state.spread_cost_cache = {epic: (datetime.now(UTC), 2.5, 1.25)}
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/reading/{epic}")).json()
+        momentum = next(
+            section for section in data["sections"] if section["title"] == "Momentum"
+        )
+        spread = next(row for row in momentum["rows"] if row["label"] == "Spread")
+        assert "2.50 €" in spread["detail"]
+
+    async def test_an_open_position_adds_the_since_open_section(self):
+        position = SimpleNamespace(
+            epic="IX.D.DAX.IFMM.IP",
+            epic_name="Germany 40",
+            direction="BUY",
+            date=datetime(2026, 6, 9, tzinfo=UTC).date(),
+            time_open=time(9, 55),
+            level_open=18000.0,
+            level_zero=18001.0,
+            level_margin=18010.0,
+            level_follower=17990.0,
+            euro_per_point=1.0,
+        )
+        app, epic = _reading_app([18000.0 + i for i in range(40)], rows=[position])
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/reading/{epic}")).json()
+        assert data["sections"][0]["title"] == "Open position (BUY)"
+        assert data["name"] == "Germany 40"
+
+
+class TestReadingPanelChrome:
+    """The panel must be reachable from the dashboard and from a chart."""
+
+    def test_page_loads_the_reading_script(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert "/static/reading.js?v=1" in html
+
+    def test_chart_modal_header_offers_the_reading_button(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert "openReadingModal(_chartModalEpic, event)" in html
+
+    def test_market_rows_offer_a_reading_button_per_epic(self):
+        state = _base_state(
+            market_summary=[
+                {
+                    "epic": "IX.D.DAX.IFMM.IP",
+                    "bid": 18000.0,
+                    "dots": 30,
+                    "high": 18100.0,
+                    "low": 17900.0,
+                    "spread_cost": 2.5,
+                }
+            ]
+        )
+        rows = _build_fragments(state)["market_rows"]
+        assert "openReadingModal('IX.D.DAX.IFMM.IP', event)" in rows
+
+    def test_open_position_rows_offer_a_reading_button(self):
+        position = SimpleNamespace(
+            id=7,
+            epic="IX.D.DAX.IFMM.IP",
+            epic_name="Germany 40",
+            date=date(2026, 6, 9),
+            time_open=time(9, 55),
+            level_open=18000.0,
+            level_win=18100.0,
+            level_stop=17950.0,
+            quantity=1,
+            euro=12.5,
+            strategy=None,
+        )
+        frags = _build_fragments(_base_state(open_positions=[position]))
+        assert "openReadingModal('IX.D.DAX.IFMM.IP', event)" in frags["positions_modal"]
+
+    def test_script_reads_the_api_and_refreshes_itself(self):
+        js = _static("reading.js")
+        assert "'/api/reading/' + encodeURIComponent(epic)" in js
+        assert "READING_REFRESH_MS" in js
+        # A late answer for a previous epic must not paint over the current one.
+        assert "if (_readingEpic !== epic) return;" in js
+
+    def test_script_escapes_every_value_it_injects(self):
+        js = _static("reading.js")
+        assert "div.textContent" in js
+
+
+class TestCatalogEndpoint:
+    """The static market catalog: progress read-out and manual crawl trigger."""
+
+    @staticmethod
+    def _progress(**overrides):
+        """A CatalogProgress-shaped snapshot the route can serialise."""
+        from src.markets.catalog_crawler import CatalogProgress
+
+        values = {
+            "running": False,
+            "nodes_total": 120,
+            "nodes_pending": 8,
+            "nodes_done": 110,
+            "nodes_error": 2,
+            "markets": 4211,
+            "nodes_visited": 30,
+            "markets_added": 400,
+            "started_at": datetime(2026, 9, 8, 21, 0, tzinfo=UTC),
+            "finished_at": None,
+            "last_error": "quota",
+        }
+        values.update(overrides)
+        return CatalogProgress(**values)
+
+    async def test_reports_catalog_and_frontier_counts(self, app):
+        app.state.scheduler = SimpleNamespace(
+            catalog_progress=AsyncMock(return_value=self._progress())
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/catalog")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["markets"] == 4211
+        assert data["nodes_pending"] == 8
+        # 8 nodes still pending → the crawl was interrupted, not finished.
+        assert data["complete"] is False
+        assert data["started_at"].startswith("2026-09-08T21:00")
+
+    async def test_complete_when_the_frontier_is_drained(self, app):
+        app.state.scheduler = SimpleNamespace(
+            catalog_progress=AsyncMock(
+                return_value=self._progress(nodes_pending=0, nodes_done=118)
+            )
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get("/api/catalog")).json()
+        assert data["complete"] is True
+
+    async def test_no_scheduler_returns_503(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/catalog")
+        assert resp.status_code == 503
+
+    async def test_crawl_is_a_registered_manual_action(self, app):
+        triggered = asyncio.Event()
+
+        async def _crawl() -> None:
+            triggered.set()
+
+        app.state.scheduler = SimpleNamespace(trigger_crawl_market_catalog=_crawl)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/actions/crawl_market_catalog")
+        assert resp.status_code == 200
+        await asyncio.wait_for(triggered.wait(), timeout=1)
+
+    def test_action_card_is_manual_only(self):
+        """No cron behind the crawl → a Run button, no auto/manual switch."""
+        from src.core.scheduler import JOB_DEFINITIONS
+
+        entry = next(
+            e for e in JOB_DEFINITIONS if e["action"] == "crawl_market_catalog"
+        )
+        assert entry["toggleable"] is False
+        frags = _build_fragments(
+            _base_state(
+                jobs=[
+                    {
+                        "action": "crawl_market_catalog",
+                        "name": entry["name"],
+                        "description": entry["description"],
+                        "schedule": entry["schedule"],
+                        "danger": entry["danger"],
+                        "auto": False,
+                        "toggleable": False,
+                    }
+                ]
+            )
+        )
+        assert "runAction('crawl_market_catalog'" in frags["actions"]
+        assert "toggleJobMode('crawl_market_catalog'" not in frags["actions"]

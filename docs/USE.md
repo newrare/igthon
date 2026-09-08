@@ -106,9 +106,80 @@ Start: `python -m src.main --web`
 | `http://localhost:8000/api/dashboard-fragments` | JSON: HTML fragments for every live region (poll) |
 | `http://localhost:8000/api/status`              | JSON: bot status, tracked epics                   |
 | `http://localhost:8000/api/prices/{epic}`       | JSON: last 50 candles for an epic                 |
+| `http://localhost:8000/api/reading/{epic}`      | JSON: full market reading of an epic (panel data) |
+| `http://localhost:8000/api/catalog`             | JSON: market-catalog size + crawl progress        |
 | `http://localhost:8000/positions/`              | JSON: position list (all or filtered)             |
 | `http://localhost:8000/positions/summary`       | JSON: today's P&L summary                         |
 | `http://localhost:8000/docs`                    | Auto-generated Swagger UI                         |
+
+### Market catalog (full instrument list)
+
+The daily epic discovery only sees what `SCANNER_SEARCH_TERMS` matches. The
+**complete** list of instruments IG offers is built separately by walking IG's
+market-navigation tree into the `market_catalog` table — a static reference list
+that the daily discovery never prunes.
+
+Launch it from the dashboard: **Actions → Crawl Market Catalog** (manual only, no
+schedule), or from the terminal:
+
+```bash
+# Crawl / resume (goes through the API queue at background priority)
+python -m src.scripts.crawl_catalog
+
+# Where does it stand? (no IG session, no API call)
+python -m src.scripts.crawl_catalog --status
+
+# Bounded run, or re-walk the whole tree from the root
+python -m src.scripts.crawl_catalog --max-nodes 200
+python -m src.scripts.crawl_catalog --reset
+
+# Prune whole subtrees by node name (repeatable)
+python -m src.scripts.crawl_catalog --exclude Options --exclude Bonds
+```
+
+**The crawl is resumable, so hitting the API quota is harmless.** Every node is
+persisted as `pending` before it is visited and flipped to `done` in the same
+transaction that stores its children and markets:
+
+- quota block, HTTP 5xx, network drop, Ctrl-C → the node stays `pending`, the run
+  stops there, and the **next run starts on that exact node**. Nothing already
+  fetched is fetched again;
+- a node IG rejects for good (4xx) is marked `error` and skipped, so one bad
+  branch can never block the catalog;
+- markets are upserted, never deleted — `last_seen_at` distinguishes a market IG
+  has dropped from a current one.
+
+Practically: launch it in the evening and re-launch it (button or command) until
+it reports `complete`. Check progress any time with `--status` or
+`GET /api/catalog`:
+
+```
+catalog running: 4211 markets · 118/126 nodes done, 8 pending, 0 error
+```
+
+Beware: the CLI opens its own IG session (IG allows a limited number of
+concurrent ones), so prefer it while the bot is stopped — otherwise use the
+dashboard button, which reuses the bot's session and its queue.
+
+### Market reading panel
+
+The **gauge icon** opens the read-only reading of a market: regime, trend per
+horizon (5 / 15 / 30 / 60 min) with its chart angle, candle pressure, the four
+noise measures, readable supports / resistances, the round numbers around the
+price — and, when a position is open on the epic, everything measured since the
+open (gain, best/worst excursion, give-back, stop room). It refreshes every 5
+seconds while open and closes with `Escape`.
+
+It is reachable from three places:
+
+- the **Market Data** table — one icon per epic, next to Buy / Sell;
+- the **Open Positions** modal — next to Close, where the since-open section is;
+- any **chart** — the *Reading* button in the chart modal header, and on the
+  standalone `/charts/{epic}` page.
+
+Data comes from `/api/reading/{epic}`, which only reads the in-memory buffer and
+one position row: no IG API call, so opening the panel never costs quota. See
+[READING.md](READING.md) for what each measure means.
 
 ### Live updates
 

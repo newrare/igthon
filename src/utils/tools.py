@@ -218,6 +218,31 @@ def funds_needed_for_one_buy(market_data: dict) -> float | None:
     return epp * price * margin_pct / 100
 
 
+def euro_per_point_for_one_buy(market_data: dict) -> float | None:
+    """Euro value of one full point of price movement for a *minimum-size* BUY.
+
+    The per-epic conversion factor behind every euro figure the bot can quote
+    **before** a position exists: ``euros = price_distance * euro_per_point``. It
+    resolves the same quantity the open path uses (``dealingRules.minDealSize``)
+    and the instrument's quote currency, then defers to :func:`euro_per_point`.
+
+    Returns ``None`` — never ``0`` — when the contract size or currency data is
+    missing, so a caller renders the figure as unknown instead of as a free
+    trade. Like every figure derived from :func:`euro_per_point` on a foreign
+    quote, this is an ESTIMATE (IG's ``exchangeRate`` is a reference rate).
+    """
+    instrument = market_data.get("instrument", {})
+    dealing_rules = market_data.get("dealingRules", {})
+
+    currency = (instrument.get("currencies") or [{}])[0].get("code")
+    min_deal = _to_float(
+        dealing_rules.get("minDealSize", {}).get("value", 1), default=1.0
+    )
+    quantity = max(int(min_deal), 1)
+
+    return euro_per_point(market_data, quantity, currency) or None
+
+
 def stop_loss_eur_for_one_buy(market_data: dict) -> float | None:
     """Estimate the EUR loss if a minimum-size BUY is stopped out.
 
@@ -235,7 +260,6 @@ def stop_loss_eur_for_one_buy(market_data: dict) -> float | None:
     when the contract size, price or stop rule is missing, so the caller can
     render the figure as unknown rather than a misleading ``0``.
     """
-    instrument = market_data.get("instrument", {})
     snapshot = market_data.get("snapshot", {})
     dealing_rules = market_data.get("dealingRules", {})
 
@@ -257,13 +281,7 @@ def stop_loss_eur_for_one_buy(market_data: dict) -> float | None:
     if stop_distance <= 0:
         return None
 
-    currency = (instrument.get("currencies") or [{}])[0].get("code")
-    min_deal = _to_float(
-        dealing_rules.get("minDealSize", {}).get("value", 1), default=1.0
-    )
-    quantity = max(int(min_deal), 1)
-
-    epp = euro_per_point(market_data, quantity, currency)
+    epp = euro_per_point_for_one_buy(market_data)
     if not epp:
         return None
     return epp * stop_distance

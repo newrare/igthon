@@ -54,7 +54,9 @@
         return seen > 0;
     }
 
-    function sortTable(table, col, th) {
+    // ``keepDirection`` re-applies the current sort instead of toggling it —
+    // used when a live poll replaced the rows underneath an active sort.
+    function sortTable(table, col, th, keepDirection) {
         const tbody = table.tBodies[0];
         if (!tbody) return;
         const rows = Array.from(tbody.rows);
@@ -66,7 +68,9 @@
         const forced = th.dataset ? th.dataset.type : undefined;
         const numeric = forced ? forced === 'num' : columnIsNumeric(rows, col);
 
-        const asc = table.__sortCol === col ? !table.__sortAsc : true;
+        const asc = keepDirection
+            ? table.__sortAsc !== false
+            : table.__sortCol === col ? !table.__sortAsc : true;
         table.__sortCol = col;
         table.__sortAsc = asc;
         const dir = asc ? 1 : -1;
@@ -117,6 +121,29 @@
         const col = Array.prototype.indexOf.call(th.parentElement.children, th);
         sortTable(table, col, th);
     });
+
+    // Re-apply every active sort. The live dashboard poll replaces a table's
+    // <tbody> markup (server order) roughly once a second; without this the user
+    // would lose the column they sorted on a second after clicking it. The sort
+    // state lives on the <table> element, which the poll never replaces, so the
+    // chosen order survives every refresh — and the rows stay live.
+    //
+    // Also keeps the chart carousel honest: it snapshots the epics in DOM order
+    // when a row is clicked, so browsing with ‹ › follows the visible sort.
+    function reapplyTableSorts(root) {
+        const scope = root && root.querySelectorAll ? root : document;
+        scope.querySelectorAll('table').forEach(function (table) {
+            const col = table.__sortCol;
+            if (col === undefined || col === null) return;
+            const thead = table.tHead;
+            if (!thead || !thead.rows.length) return;
+            const row = thead.rows[thead.rows.length - 1];
+            const th = row.children[col];
+            if (!th) return;
+            sortTable(table, col, th, true);
+        });
+    }
+    window.reapplyTableSorts = reapplyTableSorts;
 
     // Give headers the sortable affordance (cursor + arrow placeholder). Uses
     // the header row nearest the body so grouped headers behave sensibly.

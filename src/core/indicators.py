@@ -138,18 +138,46 @@ def atr(candles: list[Candle], period: int = 14) -> float:
     Returns:
         ATR in price points, or 0.0 if there is insufficient data.
     """
-    if period < 1 or len(candles) < period + 1:
+    return atr_from_series(
+        [c.bid_high for c in candles],
+        [c.bid_low for c in candles],
+        [c.bid_close for c in candles],
+        period,
+    )
+
+
+def atr_from_series(
+    highs: list[float], lows: list[float], closes: list[float], period: int = 14
+) -> float:
+    """Average True Range computed on already-extracted OHLC series.
+
+    Same maths as :func:`atr`, which delegates here; this form exists because the
+    curve-reading layer measures amplitude on a *chosen* price side (mid, bid or
+    offer) and so cannot pass bid-only candles (see :mod:`src.core.reading`).
+
+    Args:
+        highs: Ordered highs (oldest first).
+        lows: Ordered lows, same length as ``highs``.
+        closes: Ordered closes, same length as ``highs``.
+        period: Number of true-range values to average.
+
+    Returns:
+        ATR in price points, or 0.0 if there is insufficient data.
+    """
+    n = min(len(highs), len(lows), len(closes))
+    if period < 1 or n < period + 1:
         return 0.0
 
     true_ranges: list[float] = []
-    for prev, current in zip(candles[-period - 1 :], candles[-period:]):
-        prev_close = prev.bid_close
-        tr = max(
-            current.bid_high - current.bid_low,
-            abs(current.bid_high - prev_close),
-            abs(current.bid_low - prev_close),
+    for i in range(n - period, n):
+        prev_close = closes[i - 1]
+        true_ranges.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - prev_close),
+                abs(lows[i] - prev_close),
+            )
         )
-        true_ranges.append(tr)
 
     return sum(true_ranges) / period
 
@@ -198,6 +226,48 @@ def adverse_tick_noise(
     mean = sum(downs) / len(downs)
     variance = sum((d - mean) ** 2 for d in downs) / len(downs)
     return mean + std_k * math.sqrt(variance)
+
+
+def retracement_depth(closes: list[float], window: int = 30) -> float:
+    """Deepest pull-back the series gave back from a running peak over ``window``.
+
+    Where :func:`adverse_tick_noise` measures what **one** step gives back, this
+    measures what a *sequence* of them gives back: the maximum drawdown from the
+    running maximum inside the window. The two answer different questions and a
+    trailing stop needs both — a retracement of six candles losing 1.5 points each
+    is a 9-point pull-back that the single-step measure reports as 1.5. A stop
+    floored only on the step measure is therefore parked inside the market's normal
+    swing amplitude and gets taken out by an ordinary retracement, while the trade
+    is still running (observed live on CS.D.EURCAD.CFD.IP, 2026-08-04).
+    ``atr`` does not cover it either: it spans each bar's own high-low range, not
+    the multi-bar excursion.
+
+    The window bounds the measure's memory: a freak pull-back inflates it for
+    ``window`` steps and then rolls out on its own.
+
+    The series must be **sign-normalised** so that rising always means going into
+    profit (see :attr:`~src.exit.zones.base.StopContext.favourable_closes`); the
+    result is then the give-back a stop of that side has to survive, whichever side
+    the position is on.
+
+    Args:
+        closes: Ordered close-out prices (oldest first), one per candle.
+        window: Number of most-recent steps to measure over.
+
+    Returns:
+        The deepest give-back in price points (never negative), or ``0.0`` when
+        there are fewer than two values or the series only ever rose.
+    """
+    if window < 1 or len(closes) < 2:
+        return 0.0
+
+    recent = closes[-(window + 1) :]
+    peak = recent[0]
+    deepest = 0.0
+    for value in recent[1:]:
+        peak = max(peak, value)
+        deepest = max(deepest, peak - value)
+    return deepest
 
 
 def band_noise(values: list[float]) -> float:
@@ -303,3 +373,115 @@ def efficiency_ratio(values: list[float], period: int) -> float:
     net = abs(window[-1] - window[0])
     path = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
     return net / path if path > 0 else 0.0
+
+
+def sma(values: list[float], period: int) -> float:
+    """Simple Moving Average of the last ``period`` values.
+
+    Args:
+        values: Ordered list of numeric values (oldest first).
+        period: Averaging window.
+
+    Returns:
+        The mean of the last ``period`` values, or 0.0 when there are fewer than
+        ``period`` values (an average computed on a short window would silently
+        compare two different lookbacks in a crossover test).
+    """
+    if period < 1 or len(values) < period:
+        return 0.0
+    window = values[-period:]
+    return sum(window) / period
+
+
+def ema(values: list[float], period: int) -> float:
+    """Exponential Moving Average of ``values`` with the standard ``2/(n+1)`` factor.
+
+    Seeded with the SMA of the first ``period`` values, then rolled forward over
+    the rest of the series — so the result depends on the whole history passed in,
+    not only on the last ``period`` values. Compared with :func:`sma` it reacts
+    faster to the latest candles, which is what makes an EMA pair the usual
+    crossover detector for a *turn* rather than for an established trend.
+
+    Args:
+        values: Ordered list of numeric values (oldest first).
+        period: EMA period.
+
+    Returns:
+        The EMA of the last value, or 0.0 when there are fewer than ``period``
+        values.
+    """
+    if period < 1 or len(values) < period:
+        return 0.0
+    alpha = 2.0 / (period + 1)
+    current = sum(values[:period]) / period
+    for value in values[period:]:
+        current += alpha * (value - current)
+    return current
+
+
+def rsi(values: list[float], period: int = 14) -> float:
+    """Wilder's Relative Strength Index over ``period`` steps (0-100).
+
+    Ratio of average gain to average loss, smoothed the way Wilder defined it
+    (each new step keeps ``(period-1)/period`` of the running average). Unlike a
+    slope or a ROC it is **bounded**, so the same thresholds read the same on every
+    epic: conventionally above 70 the market is stretched upward, below 30
+    downward, and 50 is balance.
+
+    It answers a question no trend measure does — *how much of the recent movement
+    was in one direction, relative to the movement against it* — which is why it is
+    the natural "is this move exhausted?" complement to
+    :func:`efficiency_ratio` (path directionality) and :func:`trend_pct` (size).
+
+    Args:
+        values: Ordered list of numeric values (oldest first).
+        period: Smoothing period; needs ``period + 1`` values.
+
+    Returns:
+        RSI in [0, 100]. Returns the neutral 50.0 when there is insufficient data,
+        and 100.0 when the window never moved down.
+    """
+    if period < 1 or len(values) < period + 1:
+        return 50.0
+
+    deltas = [b - a for a, b in zip(values, values[1:])]
+    gains = [max(0.0, d) for d in deltas]
+    losses = [max(0.0, -d) for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    return 100.0 - 100.0 / (1 + avg_gain / avg_loss)
+
+
+def slope_angle(slope: float, steps: int, price_range: float) -> float:
+    """Regression slope expressed as the **angle a human reads on the chart**.
+
+    A raw slope is in price units per candle, so it is unusable as a "how steep is
+    it?" figure: 0.3 is vertical on a forex pair and flat on an index. Normalising
+    it into a percentage (:func:`trend_pct`) fixes the cross-epic comparison but
+    still says nothing about steepness *relative to what this market does* — a
+    0.5 % ramp is a wall on a quiet pair and a ripple on a volatile one.
+
+    This normalises against the window's own vertical extent instead: the angle of
+    the fit line drawn on a chart whose width is the window and whose height is
+    ``price_range``, i.e. exactly the picture on the dashboard. ``45°`` means the
+    fit climbs the full window range across the full window; ``0°`` is flat;
+    the sign follows the slope.
+
+    Args:
+        slope: Least-squares slope, in price units per step.
+        steps: Number of steps the window spans (``len(window)``).
+        price_range: Vertical extent of the window (its high − low).
+
+    Returns:
+        The angle in degrees, in ``(-90, 90)``; 0.0 for a degenerate window.
+    """
+    if steps < 1 or price_range <= 0:
+        return 0.0
+    return math.degrees(math.atan(slope * steps / price_range))

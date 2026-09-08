@@ -16,6 +16,7 @@ import pytest
 from src.core.indicators import adverse_tick_noise, atr
 from src.exit import CloseZoneProfit, get_close_profile
 from src.exit.base import ACTION_CLOSE, ACTION_HOLD, ACTION_UPDATE_STOP, CloseProfile
+from src.exit.stop_watch import TouchWatchParams
 from src.exit.zones import SmartGroupParams, SmartGroupStop, StopUpdater
 from src.feed.price_buffer import Candle, EpicBuffer
 from src.stops import StopAtr, StopSupport
@@ -428,6 +429,117 @@ class TestCloseTriggers:
         )
         assert decision.action == ACTION_CLOSE
         assert decision.reason == "stop"
+
+
+class TestTouchWatcher:
+    """The backstop's touch watcher (pure rule in ``tests/test_stop_watch.py``).
+
+    Here: the composer's seam — that a graze of the follower holds instead of
+    closing, that the bounds are measured from the live candle, and that the
+    watcher never defers a touch on a stop which locks nothing.
+    """
+
+    @staticmethod
+    def _buf() -> EpicBuffer:
+        """Rising in +3 / −1 steps, so the adverse-noise band is 1.5 points.
+
+        Down-steps over the window are 1 every other candle → mean 0.5, σ 0.5 →
+        ``mean + 2σ = 1.5``. The watch band is then ``0.5 × 1.5 = 0.75`` (tighter
+        than the 2.0 broker gap and, at 20 points locked, than the 5.0 gain cap).
+        """
+        closes, value = [8000.0], 8000.0
+        for i in range(40):
+            value += 3.0 if i % 2 == 0 else -1.0
+            closes.append(value)
+        return _buffer(closes)
+
+    def _decide(self, bid: float, *, follower: float = 8020.0, **profile_kw):
+        buf = self._buf()
+        assert adverse_tick_noise(buf.bid_closes, 20, 2.0) == pytest.approx(1.5)
+        assert buf.last.bid_close > follower  # the last minute closed above the stop
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=follower,
+        )
+        profile = CloseZoneProfit.from_settings(_settings())
+        for key, value in profile_kw.items():
+            setattr(profile, key, value)
+        return profile.evaluate(pos, current_bid=bid, buf=buf, is_close_hour=False)
+
+    def test_graze_inside_the_band_holds(self):
+        # 0.2 point under the follower, band 0.75, and the last minute closed above
+        # it → the touch is watched, not executed. Nothing else is decided either.
+        decision = self._decide(8019.8)
+        assert decision.action == ACTION_HOLD
+        assert decision.new_stop_level is None
+
+    def test_deep_break_closes(self):
+        # 1.5 points under the follower, past the 0.75 band → a real move.
+        decision = self._decide(8018.5)
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "stop"
+
+    def test_touch_on_a_stop_locking_nothing_closes_at_once(self):
+        # A follower 1 point past break-even locks less than one noise band (1.5):
+        # there is no acquired gain to risk, so the touch closes as it always did.
+        decision = self._decide(8000.9, follower=8001.0)
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "stop"
+
+    def test_touch_below_break_even_closes_at_once(self):
+        decision = self._decide(7989.5, follower=7990.0)
+        assert decision.action == ACTION_CLOSE
+
+    def test_disabled_watcher_closes_on_the_first_touch(self):
+        decision = self._decide(8019.8, touch_watch=TouchWatchParams(band_noise_k=0.0))
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "stop"
+
+    def test_a_minute_closing_beyond_the_follower_ends_the_watch(self):
+        # Same graze depth, but the last completed candle closed UNDER the follower:
+        # a graze does not survive a minute close.
+        buf = self._buf()
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=buf.last.bid_close + 0.5,
+        )
+        decision = CloseZoneProfit.from_settings(_settings()).evaluate(
+            pos, current_bid=buf.last.bid_close + 0.3, buf=buf, is_close_hour=False
+        )
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "stop"
+
+    def test_mirrors_for_a_sell(self):
+        # Short: break-even 8000, follower 7980 (20 points locked), the close-out
+        # offer rising back through it. Same band, mirrored.
+        closes, value = [8000.0], 8000.0
+        for i in range(40):
+            value -= 3.0 if i % 2 == 0 else -1.0
+            closes.append(value)
+        buf = _buffer(closes)
+        pos = _position(
+            level_open=8000.0,
+            level_zero=8000.0,
+            level_margin=7990.0,
+            level_follower=7980.0,
+            direction="SELL",
+        )
+        profile = CloseZoneProfit.from_settings(_settings())
+        spread = buf.last.spread
+        # ``current_bid`` is the live bid; the close-out price of a short is one
+        # spread above it, which is what the watcher compares to the follower.
+        graze = profile.evaluate(
+            pos, current_bid=7980.2 - spread, buf=buf, is_close_hour=False
+        )
+        assert graze.action == ACTION_HOLD
+        broken = profile.evaluate(
+            pos, current_bid=7981.5 - spread, buf=buf, is_close_hour=False
+        )
+        assert broken.action == ACTION_CLOSE
 
 
 class TestGroupPrePass:

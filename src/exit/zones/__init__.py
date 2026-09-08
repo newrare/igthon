@@ -10,6 +10,11 @@ independently in ``.env``:
 - ``CLOSE_ZONESECURE`` → :data:`ZONESECURE_UPDATERS` (margin → profit trigger);
 - ``CLOSE_ZONEPROFIT`` → :data:`ZONEPROFIT_UPDATERS` (above the profit trigger).
 
+One updater is registered in **three** of the registries at once:
+:class:`~src.exit.zones.adaptive.AdaptiveReadStop` (``adaptive``) reads the market
+since the open and decides hold-or-close, which is a question the first three zones
+share — only the price of closing changes between them.
+
 :class:`~src.exit.close_zoneprofit.CloseZoneProfit` composes one updater from each
 registry via :func:`build_zone_updater`. Adding a new per-zone behaviour is a new
 :class:`~src.exit.zones.base.StopUpdater` subclass registered in the relevant
@@ -18,11 +23,13 @@ registry below — the other zones are untouched.
 
 from __future__ import annotations
 
+from src.exit.zones.adaptive import AdaptiveReadStop, Situation
 from src.exit.zones.base import (
     BreakevenLockParams,
     StopContext,
     StopUpdater,
     StopZone,
+    ZoneDecision,
     breakeven_lock_level,
     build_zone_updater,
     classify_zone,
@@ -45,6 +52,7 @@ from src.exit.zones.smartgroup import (
     plan_group_tightening,
 )
 from src.exit.zones.timedlift import UnderwaterTimedLiftStop
+from src.exit.zones.trailing_noise import TrailingNoiseStop
 from src.exit.zones.trailing_ratchet import (
     TrailingRatchetMoreStop,
     TrailingRatchetStop,
@@ -54,6 +62,7 @@ from src.exit.zones.underwater import UnderwaterStop, UnderwaterTrendCutStop
 #: Zone 1 (follower → break-even). Name → class; keys are valid ``CLOSE_ZONESTART``.
 ZONESTART_UPDATERS: dict[str, type[StopUpdater]] = {
     UnderwaterStop.name: UnderwaterStop,
+    AdaptiveReadStop.name: AdaptiveReadStop,
     UnderwaterTrendCutStop.name: UnderwaterTrendCutStop,
     UnderwaterTimedLiftStop.name: UnderwaterTimedLiftStop,
     SmartGroupStop.name: SmartGroupStop,
@@ -62,6 +71,7 @@ ZONESTART_UPDATERS: dict[str, type[StopUpdater]] = {
 #: Zone 2 (break-even → margin). Name → class; keys are valid ``CLOSE_ZONEMARGE``.
 ZONEMARGE_UPDATERS: dict[str, type[StopUpdater]] = {
     BreakevenBandStop.name: BreakevenBandStop,
+    AdaptiveReadStop.name: AdaptiveReadStop,
     BreakevenLockStop.name: BreakevenLockStop,
     BreakevenSafeStop.name: BreakevenSafeStop,
     LimitLooseStop.name: LimitLooseStop,
@@ -70,6 +80,7 @@ ZONEMARGE_UPDATERS: dict[str, type[StopUpdater]] = {
 #: Zone 3 (margin → profit trigger). Keys are valid ``CLOSE_ZONESECURE``.
 ZONESECURE_UPDATERS: dict[str, type[StopUpdater]] = {
     SecureHoldStop.name: SecureHoldStop,
+    AdaptiveReadStop.name: AdaptiveReadStop,
     BreakevenHalfStop.name: BreakevenHalfStop,
 }
 
@@ -77,12 +88,16 @@ ZONESECURE_UPDATERS: dict[str, type[StopUpdater]] = {
 ZONEPROFIT_UPDATERS: dict[str, type[StopUpdater]] = {
     TrailingRatchetStop.name: TrailingRatchetStop,
     TrailingRatchetMoreStop.name: TrailingRatchetMoreStop,
+    TrailingNoiseStop.name: TrailingNoiseStop,
 }
 
 __all__ = [
     "StopContext",
     "StopUpdater",
     "StopZone",
+    "ZoneDecision",
+    "AdaptiveReadStop",
+    "Situation",
     "BreakevenLockParams",
     "breakeven_lock_level",
     "classify_zone",
@@ -106,6 +121,7 @@ __all__ = [
     "BreakevenHalfStop",
     "TrailingRatchetStop",
     "TrailingRatchetMoreStop",
+    "TrailingNoiseStop",
     "ZONESTART_UPDATERS",
     "ZONEMARGE_UPDATERS",
     "ZONESECURE_UPDATERS",

@@ -124,12 +124,13 @@ async def _refresh_account_balance(app_state, api_queue) -> None:
         app_state.account_balance_refreshing = False
 
 
-def _spread_cost_map(request: Request, epics: list[str]) -> dict[str, float]:
-    """Return cached ``{epic: euro cost of crossing the spread once at min size}``.
+def _spread_map(request: Request, epics: list[str]) -> dict[str, dict[str, float]]:
+    """Return the cached dealing spread of ``epics`` as ``{epic: {points, euro}}``.
 
-    The figure is ``(offer - bid) * euro_per_point(minDealSize, currency)`` — what
-    a single minimum-size round trip pays away to the broker's spread, the simplest
-    gauge of how expensive a market is to trade. The bid/offer used is the live
+    ``euro`` is ``(offer - bid) * euro_per_point(minDealSize, currency)`` — what a
+    single minimum-size round trip pays away to the broker's spread, the simplest
+    gauge of how expensive a market is to trade — and ``points`` is the raw
+    ``offer - bid`` price distance it comes from. The bid/offer used is the live
     dealing spread from the market ``snapshot``, NOT the historical-candle close
     (whose bid and offer are often equal, which is where the misleading ``0`` came
     from).
@@ -140,7 +141,7 @@ def _spread_cost_map(request: Request, epics: list[str]) -> dict[str, float]:
     returns whatever is already cached.
     """
     app_state = request.app.state
-    cache: dict[str, tuple[datetime, float]] = getattr(
+    cache: dict[str, tuple[datetime, float, float]] = getattr(
         app_state, "spread_cost_cache", {}
     )
     app_state.spread_cost_cache = cache
@@ -150,7 +151,14 @@ def _spread_cost_map(request: Request, epics: list[str]) -> dict[str, float]:
     ]
     if stale:
         _schedule_spread_cost_refresh(app_state, stale)
-    return {e: cache[e][1] for e in epics if e in cache}
+    return {
+        e: {"euro": cache[e][1], "points": cache[e][2]} for e in epics if e in cache
+    }
+
+
+def _spread_cost_map(request: Request, epics: list[str]) -> dict[str, float]:
+    """Return cached ``{epic: euro cost of crossing the spread once at min size}``."""
+    return {e: v["euro"] for e, v in _spread_map(request, epics).items()}
 
 
 def _schedule_spread_cost_refresh(app_state, stale: list[str]) -> None:
@@ -174,7 +182,7 @@ def _schedule_spread_cost_refresh(app_state, stale: list[str]) -> None:
 
 async def _refresh_spread_cost(app_state, api_queue, epics: list[str]) -> None:
     """Fetch market details for ``epics`` and update the spread-cost cache."""
-    cache: dict[str, tuple[datetime, float]] = app_state.spread_cost_cache
+    cache: dict[str, tuple[datetime, float, float]] = app_state.spread_cost_cache
     inflight: set[str] = app_state.spread_cost_inflight
     try:
         for start in range(0, len(epics), _MARKET_BATCH_SIZE):
@@ -205,7 +213,8 @@ async def _refresh_spread_cost(app_state, api_queue, epics: list[str]) -> None:
                 min_size = float(rules.get("minDealSize", {}).get("value", 1) or 1)
                 currency = (instrument.get("currencies") or [{}])[0].get("code", "EUR")
                 epp = euro_per_point(detail, min_size, currency)
-                cache[epic] = (now, (offer - bid) * epp)
+                points = offer - bid
+                cache[epic] = (now, points * epp, points)
     finally:
         inflight.difference_update(epics)
 
@@ -253,6 +262,14 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
         "closed_externally": ("IG / external", "#a78bfa"),
         "not_found_in_ig": ("Not found (IG)", "#94a3b8"),
         "never_opened": ("Never opened", "#64748b"),
+        # Decided by the ``adaptive`` zone updater from the reading of the market
+        # since the open (see src/exit/zones/adaptive.py): the position was closed
+        # because the move it was opened for stopped happening, not because a
+        # price level was reached.
+        "reversal": ("Reversal read", "#f97316"),
+        "flat_cut": ("Flat — cut", "#ef4444"),
+        "flat_breakeven": ("Flat — no loss", "#94a3b8"),
+        "flat_profit": ("Flat — gain taken", "#4ade80"),
     }
     if reason in mapping:
         return mapping[reason]

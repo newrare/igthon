@@ -50,13 +50,16 @@ src/
 ├── core/                   # INFRA — shared plumbing (no trading decisions)
 │   ├── config.py           # Settings via pydantic-settings
 │   ├── scheduler.py        # APScheduler jobs (thin: orchestration only)
-│   ├── indicators.py       # Technical analysis (regression, SMA, ROC, ATR, ER)
+│   ├── indicators.py       # Technical analysis (regression, SMA/EMA, RSI, ATR, ER)
+│   ├── levels.py           # Readable levels (swing pivots, clusters, round numbers)
+│   ├── reading.py          # CurveReading / PositionReading — read-only market facade
 │   ├── similarity.py       # Curve-shape signature + cross-epic "same bet?" test
 │   ├── recorder.py         # Logging + alerts
 │   ├── api_queue.py / api_guard.py / api_error_log.py
 │   └── api/                # IG HTTP client (client.py, session.py, endpoints/)
 ├── feed/                   # FLUX — streaming, market_data, price_buffer, candle_store
 ├── markets/                # MARCHÉS — market_scanner (build the epic list)
+│                           # + catalog_crawler (static full catalog, resumable crawl)
 ├── entry/                  # OUVERTURE — EntryStrategy → EntryIntent (direction only)
 │   ├── base.py · open_donchian.py · open_projection.py · open_ranking.py
 ├── stops/                  # ARRÊT — StopDistance.initial_stop() (drives sizing)
@@ -64,6 +67,7 @@ src/
 ├── exit/                   # FERMETURE — CloseProfile (owns stop/target/trailing)
 │   ├── base.py · trailing.py · close_zoneprofit.py
 │   └── zones/              # per-zone stop updaters (underwater, breakeven_band, secure, trailing_ratchet)
+│                           # + adaptive: reads the market since open, holds or closes (zones 1-3)
 ├── execution/              # MAINS — gates.py (pre-open gates), trading.py (TradingService)
 ├── backtest/               # OUTILS — simulator, backtester, archive, curve_generator
 ├── models/                 # DATA — SQLAlchemy ORM (database.py + tables)

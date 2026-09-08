@@ -95,6 +95,28 @@ class EpicBuffer:
         """List of spread values (oldest to newest)."""
         return [c.spread for c in self.candles]
 
+    def since(self, moment: datetime | None) -> "EpicBuffer":
+        """A copy of this buffer holding only candles recorded from ``moment`` on.
+
+        The live buffer is a rolling window fed continuously by the feed, so it
+        also holds candles from *before* whatever event a caller measures against
+        (a position's open, most often). Any rule that reads price *levels* — a
+        swing low, a "has it held past break-even?" test, a since-open excursion —
+        must not see that pre-event history, or an earlier rally answers a question
+        about a trade that had not started yet (observed live; see
+        ``src.exit.close_zoneprofit._buffer_since``).
+
+        ``moment`` of ``None`` returns the buffer unchanged, which callers use for
+        "no slicing wanted / instant unknown".
+        """
+        if moment is None:
+            return self
+        sliced = EpicBuffer(epic=self.epic, max_candles=self.max_candles)
+        for candle in self.candles:
+            if candle.timestamp >= moment:
+                sliced.add(candle)
+        return sliced
+
     def __len__(self) -> int:
         return len(self.candles)
 

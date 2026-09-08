@@ -29,7 +29,11 @@ from urllib.parse import quote
 
 from src.core.api.client import IGAPIError, IGClient
 from src.core.config import Settings
-from src.utils.tools import funds_needed_for_one_buy, stop_loss_eur_for_one_buy
+from src.utils.tools import (
+    euro_per_point_for_one_buy,
+    funds_needed_for_one_buy,
+    stop_loss_eur_for_one_buy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,13 @@ class MarketInfo:
     # Estimated EUR loss if that minimum-size BUY is stopped out at IG's minimum
     # stop distance, or None when the contract/price/stop-rule data is missing.
     stop_loss_eur: float | None = None
+    # Euro value of one full point of price movement for that same minimum-size
+    # BUY, or None when the contract-size/currency data is missing. This is the
+    # conversion factor that turns any *price* distance into euros before a
+    # position exists, so a caller holding a candidate stop level (the rolling
+    # selector's risk-ladder estimate) can price its real risk instead of relying
+    # on ``stop_loss_eur``, which only ever prices IG's minimum stop distance.
+    euro_per_point: float | None = None
     # Today's market close, in UTC, parsed from IG's ``instrument.openingHours``
     # when it is present AND the timezone offset is known (so it can be resolved
     # to UTC with confidence). None otherwise — callers then fall back to the
@@ -811,6 +822,7 @@ class MarketScanner:
                 instrument_type=str(instrument.get("type") or ""),
                 funds_needed=funds_needed_for_one_buy(detail),
                 stop_loss_eur=stop_loss_eur_for_one_buy(detail),
+                euro_per_point=euro_per_point_for_one_buy(detail),
                 market_close_utc=parse_market_close_utc(instrument),
             )
         except (KeyError, TypeError, ValueError) as exc:

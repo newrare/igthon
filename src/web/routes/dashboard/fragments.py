@@ -445,6 +445,12 @@ def _build_fragments(state: dict) -> dict[str, str]:
                 onclick=f"event.stopPropagation(); closePosition({p.id}, '{epic_esc}', this)",
                 title="Close this position manually",
             )
+            read_btn = render_button(
+                '<i data-lucide="gauge" class="lc-icon"></i>',
+                cls="reading-btn",
+                onclick=f"openReadingModal('{epic_esc}', event)",
+                title="Read this position: gain, excursions, stop room, market state",
+            )
             pos_rows_html += f"""
                     <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
                         <td class="err-ts">{html.escape(t_open)}</td>
@@ -456,8 +462,8 @@ def _build_fragments(state: dict) -> dict[str, str]:
                         <td class="number">{qty}</td>
                         <td class="number" style="color:{pnl_color};">{pnl_str}</td>
                         <td class="err-ts">{html.escape(strategy_str)}</td>
-                        <td style="text-align:center;">
-                            {close_btn}
+                        <td style="text-align:center;white-space:nowrap;">
+                            {close_btn} {read_btn}
                         </td>
                     </tr>"""
     else:
@@ -522,6 +528,15 @@ def _build_fragments(state: dict) -> dict[str, str]:
                 'onmouseleave="hideFundsTooltip()"'
             ),
         )
+        # Opens the market-reading panel (static/reading.js) instead of the chart:
+        # the numbers behind the curve — regime, trends per horizon, candle
+        # pressure, noise, readable levels — for this epic.
+        read_btn = render_button(
+            '<i data-lucide="gauge" class="lc-icon"></i>',
+            cls="reading-btn",
+            onclick=f"openReadingModal('{epic_esc}', event)",
+            title="Read this market: regime, trends, noise, levels",
+        )
         market_rows += f"""
         <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
             <td class="epic-col">{epic_esc}</td>
@@ -539,7 +554,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
             </td>
             <td class="number">{s['dots']}</td>
             <td style="text-align:center;white-space:nowrap;">
-                {buy_btn} {sell_btn}
+                {buy_btn} {sell_btn} {read_btn}
             </td>
         </tr>"""
 

@@ -31,6 +31,7 @@ from src.exit.trailing import (
     compute_trailing_stop,
     decide_close_reason,
 )
+from src.exit.zones.base import DayBook
 from src.feed.price_buffer import EpicBuffer
 from src.models.candle import CandleRecord
 from src.models.epic import Epic
@@ -2014,6 +2015,7 @@ class TradingService:
         buf: EpicBuffer | None = None,
         *,
         group_tighten: float | None = None,
+        day_book: DayBook | None = None,
     ) -> bool:
         """Decoupled close path: let the position's close profile decide.
 
@@ -2027,6 +2029,11 @@ class TradingService:
         profile's portfolio pre-pass (``smartgroup``), computed once per monitor
         tick across the whole book and passed straight to the profile; ``None``
         for the ordinary per-position path.
+
+        ``day_book`` is the day's running result and flat-cut bill, opened once
+        per monitor pass and passed straight to the profile too (see
+        :meth:`~src.exit.base.CloseProfile.evaluate`); ``None`` for a caller that
+        does not track it.
 
         Returns:
             True if the position was closed, False otherwise.
@@ -2054,6 +2061,7 @@ class TradingService:
             buf,
             is_close_hour=await self._is_epic_close_hour(position.epic),
             group_tighten=group_tighten,
+            day_book=day_book,
         )
         # A hard close (backstop / end-of-day) is always honoured, even while a
         # manual stop override is active — the user's placed stop IS the follower

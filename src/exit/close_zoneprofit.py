@@ -21,7 +21,10 @@ decoupled responsibilities and wires them to the persisted position:
       profit trigger (real profit).
 
 The close-only concerns it keeps for itself are the two hard triggers: the
-end-of-day force close and the software backstop aligned with the live stop.
+end-of-day force close and the software backstop aligned with the live stop. That
+backstop is not a bare comparison: a touch of the follower goes through the **touch
+watcher** (:mod:`src.exit.stop_watch`), which grants a graze one minute to be
+disowned while capping what a wrong bet can cost.
 
 **BUY and SELL share this one profile.** Direction enters in exactly three
 places — the side of break-even the margin is frozen on, the close-out price the
@@ -52,6 +55,7 @@ from src.exit.base import (
     OpenPlan,
     noise_margin,
 )
+from src.exit.stop_watch import TouchWatchParams, touch_closes_position
 from src.exit.zones import (
     ZONEMARGE_UPDATERS,
     ZONEPROFIT_UPDATERS,
@@ -60,6 +64,7 @@ from src.exit.zones import (
     build_zone_updater,
 )
 from src.exit.zones.base import (
+    DayBook,
     StopContext,
     StopUpdater,
     StopZone,
@@ -122,13 +127,7 @@ def _buffer_since(buf: EpicBuffer, opened_at: datetime | None) -> EpicBuffer:
 
     ``opened_at`` of ``None`` (columns absent) returns the buffer unchanged.
     """
-    if opened_at is None:
-        return buf
-    sliced = EpicBuffer(epic=buf.epic, max_candles=buf.max_candles)
-    for candle in buf.candles:
-        if candle.timestamp >= opened_at:
-            sliced.add(candle)
-    return sliced
+    return buf.since(opened_at)
 
 
 @dataclass
@@ -139,6 +138,11 @@ class CloseZoneProfit(CloseProfile):
 
     atr_period: int = 14
     noise_k: float = 1.5  # noise margin = noise_k × ATR (spread is not a factor)
+
+    # Touch watcher: a graze of the follower gets one minute to be disowned, at the
+    # risk of a capped share of the gain already locked (see src/exit/stop_watch.py).
+    # ``TouchWatchParams(band_noise_k=0)`` restores the close-on-first-touch backstop.
+    touch_watch: TouchWatchParams = field(default_factory=TouchWatchParams)
 
     # Initial-stop placement (swappable via STOP_STRATEGY). Defaults to the
     # support distance so ``CloseZoneProfit()`` keeps its historical
@@ -179,6 +183,50 @@ class CloseZoneProfit(CloseProfile):
     def _noise_margin(self, atr_value: float) -> float:
         """Noise margin (see :func:`~src.exit.base.noise_margin`)."""
         return noise_margin(self.noise_k, atr_value)
+
+    def _touch_closes(
+        self,
+        position,
+        price: float,
+        buf: EpicBuffer,
+        level_follower: float,
+        sign: float,
+    ) -> bool:
+        """Whether a touch of the follower closes the position now — see
+        :func:`~src.exit.stop_watch.touch_closes_position`.
+
+        Everything the rule needs is measured here from the live candle: the noise
+        band on the **unsliced** buffer (an amplitude measure, like the ATR), the
+        spread, and IG's minimum stop distance. Returns ``True`` on anything
+        missing, so a degraded input can only make the backstop *more* eager.
+        """
+        last = buf.last
+        level_zero = float(position.level_zero or 0)
+        if last is None or level_zero <= 0:
+            return True
+        params = self.touch_watch
+        closes = buf.offer_closes if sign < 0 else buf.bid_closes
+        noise = adverse_tick_noise(
+            [sign * c for c in closes], params.noise_window, params.noise_std_k
+        )
+        return touch_closes_position(
+            price=price,
+            level_follower=level_follower,
+            level_zero=level_zero,
+            # Only *completed* candles reach the buffer, so this is the last minute
+            # close — the graze's one-minute deadline.
+            last_close_out=self._bar_close_out(last, sign),
+            spread=float(last.spread or 0),
+            min_stop_distance=float(getattr(position, "min_stop_distance", 0) or 0),
+            noise=noise,
+            sign=sign,
+            params=params,
+        )
+
+    @staticmethod
+    def _bar_close_out(candle, sign: float) -> float:
+        """The candle's close-out close: its bid close (BUY) / offer close (SELL)."""
+        return candle.offer_close if sign < 0 else candle.bid_close
 
     def initial_plan(
         self,
@@ -354,6 +402,7 @@ class CloseZoneProfit(CloseProfile):
         *,
         is_close_hour: bool,
         group_tighten: float | None = None,
+        day_book: DayBook | None = None,
     ) -> CloseDecision:
         """End-of-day / backstop first, then classify the zone and delegate.
 
@@ -362,6 +411,11 @@ class CloseZoneProfit(CloseProfile):
         :class:`~src.exit.zones.base.StopContext` and left ``None`` otherwise. It
         is a **whole-book** decision, so it is honoured in every zone, not only in
         the zone-1 slot it is selected from.
+
+        ``day_book`` is the day's running result and flat-cut bill (see
+        :class:`~src.exit.zones.base.DayBook`); it is threaded into the same context
+        for the updaters that price an exit against the day's result (``adaptive``)
+        and ignored by every other one.
         """
         if is_close_hour:
             return CloseDecision(action=ACTION_CLOSE, reason="end_of_day")
@@ -384,7 +438,15 @@ class CloseZoneProfit(CloseProfile):
         # software close for ~atr_period minutes while the follower is live. (#9)
         level_follower = float(position.level_follower or 0)
         if level_follower > 0 and sign * (price - level_follower) <= 0:
-            return CloseDecision(action=ACTION_CLOSE, reason="stop")
+            # A touch is not always a turn: the watcher grants a graze one minute
+            # to be disowned, bounded by a share of the gain the follower already
+            # locks (see :mod:`src.exit.stop_watch`). It never defers a touch on a
+            # stop that locks nothing, and never past the order resting at IG.
+            if self._touch_closes(position, price, buf, level_follower, sign):
+                return CloseDecision(action=ACTION_CLOSE, reason="stop")
+            # Graze: hold the position AND the stop — nothing is decided on a tick
+            # spent under the follower.
+            return CloseDecision(action=ACTION_HOLD)
 
         atr_value = atr(list(buf.candles), self.atr_period)
         if atr_value <= 0:
@@ -416,9 +478,18 @@ class CloseZoneProfit(CloseProfile):
             spread=spread,
             euro_per_point=float(position.euro_per_point or 0),
             buf=_buffer_since(buf, _opened_at(position)),
+            # The unsliced buffer, for amplitude measures only (same rationale as
+            # the ATR above): see ``StopContext.full_buf``.
+            full_buf=buf,
             direction=direction,
             min_stop_distance=float(getattr(position, "min_stop_distance", 0) or 0),
             group_tighten=group_tighten,
+            # The open instant and the day's banked result: neither is derivable
+            # from the curve, and both are what a reading-driven updater needs to
+            # judge the position rather than the price (see
+            # :mod:`src.exit.zones.adaptive`).
+            opened_at=_opened_at(position),
+            day_book=day_book if day_book is not None else DayBook(),
         )
 
         zone = classify_zone(price, level_zero, level_margin, level_profit, sign)
@@ -431,7 +502,17 @@ class CloseZoneProfit(CloseProfile):
         else:
             updater = self.underwater
 
-        new_stop = updater.propose(ctx)
+        decision = updater.decide(ctx)
+
+        # A zone may conclude that the *position*, not the stop, is what should go
+        # (see :class:`~src.exit.zones.base.ZoneDecision`). That verdict is taken
+        # before any stop arithmetic: it is a decision about whether the trade is
+        # still worth holding, so a group tightening — which only ever moves a
+        # stop — has nothing to add to it.
+        if decision.close_reason is not None:
+            return CloseDecision(action=ACTION_CLOSE, reason=decision.close_reason)
+
+        new_stop = decision.stop_level
 
         # A group-aware zone-1 updater (``smartgroup``) decides for the WHOLE book,
         # not just for the positions still under water: once the group is green net

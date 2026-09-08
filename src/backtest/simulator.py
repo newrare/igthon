@@ -40,19 +40,20 @@ import random
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from itertools import groupby
 
 from src.entry.base import EntryStrategy
 from src.execution.gates import evaluate_open_gates
 from src.execution.trading import TradeConfig
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
+from src.exit.zones.base import DayBook
 from src.feed.price_buffer import DEFAULT_MAX_CANDLES, Candle, EpicBuffer
 
 logger = logging.getLogger(__name__)
 
 # Curves are stamped on arbitrary consecutive fictional days.
-_BASE_DAY = datetime(2024, 1, 1)
+_BASE_DAY = datetime(2024, 1, 1, tzinfo=UTC)
 
 CurveProvider = Callable[[int, int], list[Candle]]
 
@@ -190,6 +191,14 @@ class SimulatedTrade:
     # real result; ``None`` means the trade never got there.
     level_breakeven_exit: float | None = None
     time_breakeven_exit: str | None = None
+    # The open instant, split exactly like the live ``Position`` row stores it: a
+    # calendar date plus a naive UTC time-of-day. ``CloseZoneProfit`` reads these
+    # two attributes (``_opened_at``) to bound the buffer to the position's life,
+    # so every *since the open* measure — ``minutes_open``, the MFE, the average
+    # speed since the open — reads the same thing in a replay as it does live.
+    # Without them the whole day's buffer passed for the position's own history.
+    date: date | None = None
+    time_open: time | None = None
     # internal monitoring state (not part of the report)
     level_follower: float = 0.0
 
@@ -458,7 +467,12 @@ class StrategySimulator:
 
             position = open_positions.get(e)
             if position is not None:
-                if self._monitor(position, candle, buffers[e]):
+                if self._monitor(
+                    position,
+                    candle,
+                    buffers[e],
+                    self._day_book(closed_today),
+                ):
                     del open_positions[e]
                     closed_today.append(position)
                     result.trades.append(position)
@@ -564,7 +578,9 @@ class StrategySimulator:
                 last_candles[e] = candle
                 session.update(e, candle)
                 position = open_positions.get(e)
-                if position is not None and self._monitor(position, candle, buffers[e]):
+                if position is not None and self._monitor(
+                    position, candle, buffers[e], self._day_book(closed_today)
+                ):
                     del open_positions[e]
                     closed_today.append(position)
                     result.trades.append(position)
@@ -838,6 +854,8 @@ class StrategySimulator:
             epic=buf.epic,
             day=day,
             open_time=candle.timestamp.strftime("%H:%M"),
+            date=candle.timestamp.date(),
+            time_open=candle.timestamp.time(),
             direction=intent.direction,
             level_open=round(candle.bid_close if sign < 0 else candle.offer_close, 5),
             level_open_closeout=round(close_out_price(candle, intent.direction), 5),
@@ -857,13 +875,34 @@ class StrategySimulator:
     # Monitoring / closing                                                #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _day_book(closed_today: list[SimulatedTrade]) -> DayBook:
+        """The simulated day's book — the live monitor pass's figure.
+
+        Mirrors ``Scheduler._open_day_book``: an exit rule that prices a close
+        against the day's result (``adaptive``) must see the same running total —
+        and the same already-spent flat-cut budget — in a backtest as it would
+        live, or the backtest measures a different strategy.
+        """
+        return DayBook.from_closes(
+            (trade.reason_close, trade.euro) for trade in closed_today
+        )
+
     def _monitor(
-        self, position: SimulatedTrade, candle: Candle, buf: EpicBuffer
+        self,
+        position: SimulatedTrade,
+        candle: Candle,
+        buf: EpicBuffer,
+        day_book: DayBook | None = None,
     ) -> bool:
         """Mirror of ``TradingService.manage_position`` + the broker-side stop.
 
         The close profile owns the per-tick decision (close / ratchet / hold);
         the broker-side stop models IG filling the pushed stop intra-candle.
+
+        ``day_book`` is what the simulated day has already banked and already spent
+        on flat cuts, passed straight to the profile like the live monitor pass
+        does.
 
         Returns True when the position was closed.
         """
@@ -904,6 +943,7 @@ class StrategySimulator:
             current_bid,
             buf,
             is_close_hour=candle.timestamp.hour >= self._config.hour_close,
+            day_book=day_book,
         )
         if decision.action == ACTION_CLOSE:
             self._close(position, candle, current_close_out, decision.reason)
@@ -1065,6 +1105,8 @@ def run_close_visual(
         epic="SIM",
         day=0,
         open_time=open_candle.timestamp.strftime("%H:%M"),
+        date=open_candle.timestamp.date(),
+        time_open=open_candle.timestamp.time(),
         level_open=round(open_candle.offer_close, 5),  # market BUY fills at offer
         level_open_closeout=round(open_candle.bid_close, 5),
         level_zero=round(plan.level_zero, 5),

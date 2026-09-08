@@ -60,6 +60,7 @@ class Priority(IntEnum):
     URGENT = 0  # open / close a position
     HIGH = 5
     NORMAL = 10  # price collection, market reads
+    LOW = 20  # background bulk work (market-catalog crawl) — always yields
 
 
 class QueueStatus(StrEnum):

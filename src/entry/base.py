@@ -17,6 +17,7 @@ Strategies are selected by name through the registry in :mod:`src.entry`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from src.feed.price_buffer import EpicBuffer
@@ -133,6 +134,14 @@ class EntryStrategy(ABC):
     # since the most recent open, so positions are spaced out instead of fired in
     # a burst.
     open_cooldown_minutes: int = 0
+    # When True the rolling selector prices every ranked candidate in euros
+    # (estimated worst-case loss = its candidate stop distance x the epic's
+    # euro-per-point, floored by IG's minimum stop distance) and hands the
+    # ranking to :meth:`filter_by_risk` together with the day's realised P&L.
+    # False (default) skips that whole estimation pass, which costs one
+    # ``initial_plan`` per candidate. See
+    # :class:`~src.entry.open_progressive.OpenProgressive`.
+    uses_risk_ladder: bool = False
 
     @property
     @abstractmethod
@@ -180,5 +189,38 @@ class EntryStrategy(ABC):
         and would fill the basket with one bet taken several times. That is a
         pairwise property, invisible to a per-epic score. See
         :meth:`~src.entry.open_five.OpenFive.filter_ranked`.
+        """
+        return ranked
+
+    def filter_by_risk(
+        self,
+        ranked: list[tuple[EntryIntent, EpicBuffer]],
+        *,
+        risks: Mapping[str, float | None],
+        realised_today: float,
+    ) -> list[tuple[EntryIntent, EpicBuffer]]:
+        """Money-side filter on the ranking — identity by default.
+
+        Consulted only when the strategy declares ``uses_risk_ladder`` and only
+        for a ``cross_epic_selection`` ranker, right after :meth:`filter_ranked`
+        and before any order is placed. It is the one hook that sees **euros**:
+        :meth:`evaluate` reads a price curve and knows nothing of what a stop-out
+        on that epic would cost, nor of what the day has already earned.
+
+        Args:
+            ranked: Candidates, already sorted highest-score-first.
+            risks: Estimated worst-case euro loss per epic — the candidate stop
+                distance times the epic's euro-per-point, floored by IG's padded
+                minimum stop distance. An epic maps to ``None`` (or is absent)
+                when the figure cannot be resolved; a filter must then decide
+                explicitly rather than assume a cost.
+            realised_today: Euros already **banked** today — the sum of today's
+                closed positions. Unrealised P&L is deliberately excluded: an
+                open position is not a gain until it is closed.
+
+        Returns:
+            The accepted candidates, in the order they should be opened. As with
+            :meth:`filter_ranked` the list may be shortened or reordered but must
+            never be extended.
         """
         return ranked

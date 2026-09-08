@@ -344,6 +344,13 @@ function _applyFragments(frags) {
         }
     }
     if (changed) lucide.createIcons();
+    // A swapped fragment comes back in the server's own order, which would wipe
+    // the column the user clicked to sort on (the market table re-renders every
+    // second). Re-apply the active sorts so the chosen order — and the chart
+    // carousel order derived from it — survives every refresh.
+    if (changed && typeof window.reapplyTableSorts === 'function') {
+        window.reapplyTableSorts();
+    }
     _reapplyLogFilter();
 }
 
@@ -826,8 +833,10 @@ async function closePosition(positionId, epic, btn) {
             btn.style.color      = '#f0fdf4';
             const pnlStr = data.pnl !== undefined ? ' P&L ' + (data.pnl >= 0 ? '+' : '') + data.pnl.toFixed(2) + '€' : '';
             showToast('Position closed', epic + ' @ ' + data.level + pnlStr, 'success');
-            // Disable the row to prevent double-close
-            btn.closest('tr').style.opacity = '0.45';
+            // Disable the row to prevent double-close (no row when the close was
+            // triggered from the chart modal's header button).
+            const row = btn.closest('tr');
+            if (row) row.style.opacity = '0.45';
         } else {
             btn.textContent      = '✗';
             btn.style.background = '#991b1b';
@@ -946,6 +955,9 @@ function _showChartEpic(epic) {
     container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
     const pnlEl = document.getElementById('chart-modal-pnl');
     if (pnlEl) pnlEl.style.display = 'none';
+    const spreadEl = document.getElementById('chart-modal-spread');
+    if (spreadEl) spreadEl.style.display = 'none';
+    _updateChartCloseBtn();  // hides it until the new epic's trade is known
     _updateChartNav();
 }
 
@@ -1151,6 +1163,75 @@ function _renderChartPnl(trades) {
     }
 }
 
+// Paint the dealing-spread badge: what one round trip on this market costs at
+// minimum deal size (same figure as the market table's "Spread (€)" column),
+// plus the raw offer − bid price distance it is derived from. Hidden when the
+// spread cache has nothing for the epic yet (it fills in on a later refresh).
+function _renderChartSpread(spread) {
+    const el = document.getElementById('chart-modal-spread');
+    if (!el) return;
+    const euro   = spread && typeof spread.euro === 'number' ? spread.euro : null;
+    const points = spread && typeof spread.points === 'number' ? spread.points : null;
+    if (euro === null && points === null) {
+        el.style.display = 'none';
+        return;
+    }
+    const parts = [];
+    if (euro !== null) {
+        parts.push('<span style="color:#f59e0b;font-weight:600;">'
+            + euro.toFixed(2) + ' €</span>');
+    }
+    if (points !== null) {
+        parts.push('<span style="color:#94a3b8;">' + _fmtPoints(points) + ' pts</span>');
+    }
+    el.innerHTML = '<span style="color:#94a3b8;">Spread</span> ' + parts.join(' · ');
+    el.style.display = 'block';
+}
+
+// Price distances span forex (0.00012) to indices (12.5), so keep enough
+// decimals to stay readable without printing float noise.
+function _fmtPoints(value) {
+    const abs = Math.abs(value);
+    const dp = abs >= 10 ? 1 : abs >= 1 ? 2 : abs >= 0.1 ? 3 : 5;
+    return value.toFixed(dp);
+}
+
+// Show the header "Close" button only while the epic on screen has an OPEN trade
+// whose running P&L is strictly positive — the button exists to bank a gain, so
+// it stays hidden at break-even or in the red (the close profile owns those).
+// The label carries the P&L that would be realised by clicking it.
+function _updateChartCloseBtn() {
+    const btn = document.getElementById('chart-close-btn');
+    if (!btn) return;
+    // A close is being confirmed / sent: leave the button exactly as the close
+    // flow left it, so the 3 s chart refresh can't wipe its in-flight state.
+    if (btn.dataset.busy === '1') return;
+    const t = _chartOpenTrade;
+    const pnl = t && typeof t.pnl === 'number' && isFinite(t.pnl) ? t.pnl : null;
+    if (!t || t.state !== 'open' || pnl === null || pnl <= 0) {
+        btn.style.display = 'none';
+        return;
+    }
+    btn.style.display = '';
+    btn.disabled = false;
+    // Clear any ✓/✗ feedback colours left by a previous close attempt.
+    btn.style.background = '';
+    btn.style.color = '';
+    btn.textContent = 'Close +' + pnl.toFixed(2) + ' €';
+}
+
+// Manual exit of the position currently shown on the chart, reusing the same
+// confirm + toast flow as the positions table.
+async function closeChartPosition(btn) {
+    if (!_chartOpenTrade || !_chartModalEpic) return;
+    btn.dataset.busy = '1';
+    try {
+        await closePosition(_chartOpenTrade.id, _chartModalEpic, btn);
+    } finally {
+        delete btn.dataset.busy;
+    }
+}
+
 // Fetch the whole-day curve for ``epic`` and (re)draw it. ``initial`` paints the
 // "Loading…"/error placeholders and uses Plotly.newPlot; a refresh keeps the
 // current chart visible and uses Plotly.react for a flicker-free in-place update.
@@ -1175,6 +1256,7 @@ async function _loadChart(epic, initial) {
         // now). Present only on trade-less "global" charts; drawn very discreetly.
         const projection = (!trades.length && data.projection) ? data.projection : null;
         _renderChartPnl(trades);
+        _renderChartSpread(data.spread);
         const rawBids = candles.map(function(c) { return c.bid; });
         // Offer (ask) curve. A long is filled on the offer, so level_open/zero sit
         // on this curve, not the bid one; without it the entry marker floats a
@@ -1236,6 +1318,7 @@ async function _loadChart(epic, initial) {
         _chartLo = lo;
         _chartRange = range;
         _chartOpenTrade = trades.find(function(t) { return t.state === 'open'; }) || null;
+        _updateChartCloseBtn();
 
         // Candle timestamps as epoch ms (parsed in the browser's local tz; all
         // values use the same convention so differences and round-trips are
@@ -1654,6 +1737,7 @@ function closeChartModal() {
     _chartEpicIndex = -1;
     _chartOpenTrade = null;
     _clearStopButtons();
+    _updateChartCloseBtn();
     _setChartZoomed(false);
     document.getElementById('chart-modal').style.display = 'none';
     Plotly.purge(document.getElementById('chart-container'));

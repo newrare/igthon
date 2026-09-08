@@ -23,6 +23,7 @@ from src.exit.zones import (
     SecureHoldStop,
     StopContext,
     StopZone,
+    TrailingNoiseStop,
     TrailingRatchetMoreStop,
     TrailingRatchetStop,
     UnderwaterStop,
@@ -1010,3 +1011,143 @@ class TestTrailingRatchetMore:
         )
         capped = TrailingRatchetMoreStop().propose(ctx)
         assert capped == pytest.approx(7970.25)
+
+
+class TestTrailingNoise:
+    """``trailing_noise``: hold the stop a full retracement behind the price.
+
+    ``trailing_ratchet`` floors its trailing distance on single-candle measures
+    (ATR, adverse tick noise), so a market that gives back the same amount over
+    five or six candles leaves the stop **inside** its own swing amplitude. This
+    updater keeps every proposal at least ``retrace_mult ×`` the deepest recent
+    give-back away from price.
+    """
+
+    @staticmethod
+    def _oscillating_buffer() -> EpicBuffer:
+        """Drifting up inside a 10-point band, ending on a rising tail.
+
+        Five closes of +3 then five of −2, four times over: a net up-drift whose
+        every retracement is 10 points deep while no single step gives back more
+        than 2. The three rising closes appended at the end arm the chandelier's
+        momentum gate, which is exactly when the live failure happened — the stop is
+        pushed at the top of a micro-swing that then turns.
+        """
+        closes = [8000.0]
+        for step in ([3.0] * 5 + [-2.0] * 5) * 4 + [3.0, 3.0, 3.0]:
+            closes.append(closes[-1] + step)
+        return _buffer(closes)
+
+    _KW = dict(level_zero=8000.0, level_margin=8005.0, level_follower=7980.0)
+
+    def test_disabled_clearance_reproduces_the_parent(self):
+        buf = self._oscillating_buffer()
+        kw = dict(current_bid=buf.last.bid_close, **self._KW)
+        parent = TrailingRatchetStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        same = TrailingNoiseStop(lock=_NO_FLOOR, retrace_mult=0.0).propose(
+            _ctx(buf, **kw)
+        )
+        assert parent is not None
+        assert same == pytest.approx(parent)
+
+    def test_stop_is_held_a_full_retracement_behind_the_bid(self):
+        # The band's retracements are 10 points deep, so the stop sits exactly 10
+        # below the bid — where the parent leaves it ~6.9 below, inside the band.
+        buf = self._oscillating_buffer()
+        bid = buf.last.bid_close
+        kw = dict(current_bid=bid, **self._KW)
+        parent = TrailingRatchetStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        widened = TrailingNoiseStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        assert parent is not None and widened is not None
+        assert widened == pytest.approx(bid - 10.0)
+        assert widened < parent  # the clearance only ever moves the stop away
+
+    def test_an_ordinary_pull_back_can_no_longer_reach_the_stop(self):
+        # The premature-exit scenario, stated as the invariant that fixes it: a
+        # repeat of the deepest retracement of the window reaches the parent's stop
+        # (the trade is closed on noise) but not this one.
+        buf = self._oscillating_buffer()
+        bid = buf.last.bid_close
+        depth = 10.0
+        kw = dict(current_bid=bid, **self._KW)
+        parent = TrailingRatchetStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        widened = TrailingNoiseStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        assert parent is not None and widened is not None
+        assert bid - depth < parent  # an ordinary give-back closes the parent
+        assert bid - depth >= widened  # it never reaches this updater's stop
+
+    def test_a_deeper_fall_still_reaches_the_stop(self):
+        # The legitimate fast close is untouched: the threshold is the market's own
+        # amplitude, so a fall deeper than every retracement of the window sits past
+        # the stop and the profile's backstop closes the position.
+        buf = self._oscillating_buffer()
+        bid = buf.last.bid_close
+        widened = TrailingNoiseStop(lock=_NO_FLOOR).propose(
+            _ctx(buf, current_bid=bid, **self._KW)
+        )
+        assert widened is not None
+        assert bid - 12.0 < widened  # a 12-point break is past the stop
+
+    def test_holds_when_the_clearance_undoes_the_tightening(self):
+        # A follower already tighter than price − clearance: pulling the level back
+        # would loosen it, which the ratchet forbids → hold, the existing (safer)
+        # follower keeps protecting the position.
+        buf = self._oscillating_buffer()
+        bid = buf.last.bid_close
+        kw = dict(current_bid=bid, level_zero=8000.0, level_margin=8005.0)
+        assert (
+            TrailingNoiseStop(lock=_NO_FLOOR).propose(
+                _ctx(buf, level_follower=bid - 5.0, **kw)
+            )
+            is None
+        )
+
+    def test_the_floor_candidate_is_pulled_back_too(self):
+        # The clearance governs the whole zone, not only the chandelier: the bid
+        # oscillated in a 15-point band (5 closes up, 5 down) then plateaued at its
+        # top, so the momentum gate fails and the support-anchored floor is what
+        # proposes the level — it is still held the full retracement behind price,
+        # even though that lands it short of the margin line (documented: a level a
+        # whole retracement away from price is out of noise's reach by construction,
+        # which is what the dead-band rule exists to guarantee).
+        closes = [7995.0, 7998.0, 8005.0]
+        for step in ([3.0] * 5 + [-3.0] * 5) * 2:
+            closes.append(closes[-1] + step)
+        closes += [8020.0] * 12
+        buf = _buffer(closes)
+        ctx = _ctx(
+            buf,
+            current_bid=8020.0,
+            level_zero=8000.0,
+            level_margin=8010.0,
+            level_follower=7950.0,
+        )
+        depth = ctx.retracement(30)
+        assert depth == pytest.approx(15.0)  # the 8020 → 8005 legs
+        floor = TrailingRatchetStop().propose(ctx)
+        widened = TrailingNoiseStop().propose(ctx)
+        assert floor == pytest.approx(8012.0)  # only 8 points behind the bid
+        assert widened == pytest.approx(8020.0 - depth)
+        assert widened < ctx.level_margin  # short of the margin, deliberately
+        assert widened > ctx.level_zero  # still locks a slice of the gain
+
+    def test_mirrors_for_a_sell(self):
+        # Short: the close-out offer drifts DOWN in a 10-point band (−3 legs, +2
+        # give-backs), so the clearance is held 10 points ABOVE the offer.
+        closes = [8000.0]
+        for step in ([-3.0] * 5 + [2.0] * 5) * 4 + [-3.0, -3.0, -3.0]:
+            closes.append(closes[-1] + step)
+        buf = _buffer(closes)
+        offer = buf.last.offer_close
+        kw = dict(
+            current_bid=offer,  # a short's close-out price
+            level_zero=8000.0,
+            level_margin=7995.0,
+            level_follower=8020.0,
+            direction="SELL",
+        )
+        parent = TrailingRatchetStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        widened = TrailingNoiseStop(lock=_NO_FLOOR).propose(_ctx(buf, **kw))
+        assert parent is not None and widened is not None
+        assert widened == pytest.approx(offer + 10.0)
+        assert widened > parent  # away from profit for a short = higher

@@ -104,6 +104,13 @@ The market-scanner spread gate is no longer an env variable — it is a class
 constant (`MarketScanner.DEFAULT_MAX_SPREAD_RATIO`), tuned in
 `src/markets/market_scanner.py`.
 
+`SCANNER_SEARCH_TERMS` caps what the daily discovery can ever see: it only
+matches instrument names, and `GET /markets?searchTerm=` has no pagination (IG
+truncates the answer). The exhaustive list of what the broker offers is built
+separately, from IG's navigation tree, into the `market_catalog` table — see
+[USE.md § Market catalog](USE.md#market-catalog-full-instrument-list). No env
+variable drives it: it is a manual action.
+
 ### Position sizing
 
 | Variable                     | Default  | Description                        |

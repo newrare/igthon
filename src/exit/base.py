@@ -28,6 +28,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from src.exit.zones.base import DayBook
 from src.feed.price_buffer import EpicBuffer
 
 #: A position should stay open; nothing to do this tick.
@@ -133,12 +134,22 @@ class CloseProfile(ABC):
         *,
         is_close_hour: bool,
         group_tighten: float | None = None,
+        day_book: DayBook | None = None,
     ) -> CloseDecision:
         """Decide what to do with an open position on this tick.
 
         ``group_tighten`` is the pre-resolved stop level from a group-aware
         profile's portfolio pre-pass (see :meth:`plan_group`); profiles that make
         only per-position decisions ignore it.
+
+        ``day_book`` is what the day has **banked so far** and what the flat cut
+        has already spent (:class:`~src.exit.zones.base.DayBook`), opened once per
+        monitor pass by the caller and advanced as positions close. It is the only
+        figure an exit rule cannot read off the curve, and it is what makes "is
+        closing this stagnating position affordable?" answerable (see
+        :mod:`src.exit.zones.adaptive`). ``None`` for the callers that do not track
+        it — a profile must then behave as if nothing were banked, never as if the
+        loss were free.
         """
 
     @property

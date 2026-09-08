@@ -56,11 +56,85 @@ updater that computes in that normalised space converts its answer back with
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
-from src.core.indicators import adverse_tick_noise
+from src.core.indicators import adverse_tick_noise, retracement_depth
+from src.core.reading import PositionReading
 from src.feed.price_buffer import Candle, EpicBuffer
+
+#: ``reason_close`` of a provisional row whose order never confirmed at IG. Not a
+#: trade, so it never enters the day's accounting (mirrors the dashboard).
+_PHANTOM_CLOSE_REASON = "never_opened"
+#: ``reason_close`` written by the under-water flat cut. Its losses are charged to
+#: a dedicated budget rather than to the day's result (see :class:`DayBook`).
+FLAT_CUT_CLOSE_REASON = "flat_cut"
+
+
+@dataclass(frozen=True, slots=True)
+class DayBook:
+    """What the day has banked so far, and what the flat cut has already spent.
+
+    The one input an exit rule cannot read off a curve. It exists because a rule
+    that closes a stagnating position at a loss (see
+    :class:`~src.exit.zones.adaptive.AdaptiveReadStop`) is only defensible while
+    the day can absorb it — and "can absorb it" is an arithmetic claim about the
+    **whole day**, not about the position in front of the updater.
+
+    The two figures are kept apart on purpose. Charging the cuts against a single
+    net total leaks: each cut lowers the net, the next budget is a share of the
+    lowered net, and the series ``0.35 × net`` telescopes until the cuts have eaten
+    **the entire** banked gain (measured live on 2026-08-28: five cuts totalling
+    −51.52 € against the +38.60 € that was banked when the first one fired). So
+    :attr:`realized_euro` is the day's result *without* the flat cuts — a base that
+    the rule cannot erode — and :attr:`flat_cut_euro` is the running bill charged
+    against a fixed share of it.
+
+    Advanced with :meth:`after_close` as positions close, so several positions
+    closing **inside the same monitor pass** each see the budget the previous one
+    left, instead of all spending the same opening snapshot.
+
+    Attributes:
+        realized_euro: Net euros banked today on closed positions, **excluding**
+            the flat cuts and the ``never_opened`` phantoms. Can be negative.
+        flat_cut_euro: Euros already spent today on flat cuts, as a positive
+            number.
+    """
+
+    realized_euro: float = 0.0
+    flat_cut_euro: float = 0.0
+
+    def after_close(self, reason: str | None, euro: float | None) -> DayBook:
+        """The book once a position has closed for ``reason`` at ``euro``.
+
+        The exit domain owns which reasons spend which budget, so a caller only
+        has to hand over the close it just recorded.
+        """
+        value = float(euro or 0.0)
+        if reason == _PHANTOM_CLOSE_REASON:
+            return self
+        if reason == FLAT_CUT_CLOSE_REASON:
+            # A flat cut in profit costs nothing; only the losses are billed.
+            return DayBook(self.realized_euro, self.flat_cut_euro + max(0.0, -value))
+        return DayBook(self.realized_euro + value, self.flat_cut_euro)
+
+    @classmethod
+    def from_closes(cls, closes) -> DayBook:
+        """Build the book from ``(reason_close, euro)`` pairs of today's closes."""
+        book = cls()
+        for reason, euro in closes:
+            book = book.after_close(reason, euro)
+        return book
+
+    def flat_cut_budget(self, ratio: float) -> float:
+        """Euros the flat cut may still spend today: ``ratio × gains − already spent``.
+
+        A hard cumulative cap, not a per-decision test: whatever the sequence of
+        cuts, together they can never cost more than ``ratio`` of what the day
+        banked without them. Never negative.
+        """
+        return max(0.0, ratio * max(0.0, self.realized_euro) - self.flat_cut_euro)
 
 
 class StopZone(Enum):
@@ -138,12 +212,63 @@ class StopContext:
     #: Read by the updaters that place a stop relative to the live price, so they
     #: never propose a level closer than the broker would accept.
     min_stop_distance: float = 0.0
+    #: The **unsliced** rolling buffer, pre-open candles included, when the caller
+    #: has one (the close profile bounds :attr:`buf` to the position's open, see
+    #: ``_buffer_since``). Only *amplitude* measures read this — a volatility-like
+    #: quantity wants history and must be warm from the first tick, exactly the
+    #: reason ``CloseZoneProfit`` computes ATR on the full buffer. Every *level*
+    #: gate keeps reading :attr:`buf`: a swing low or a "held past break-even"
+    #: test must never see a pre-entry excursion. ``None`` falls back to
+    #: :attr:`buf`.
+    full_buf: EpicBuffer | None = None
     #: Pre-resolved group decision for this position, set only by the portfolio
     #: pre-pass of a group-aware zone-1 updater (``smartgroup``): the absolute
     #: stop level this position should tighten to this tick, or ``None`` to hold.
     #: The group maths runs upstream (once per monitor tick across the whole book,
     #: see :mod:`src.exit.zones.smartgroup`) so the updater itself stays pure.
     group_tighten: float | None = None
+    #: Instant the position opened (UTC), when the caller knows it. Only used to
+    #: build :meth:`reading` — :attr:`buf` is already bounded to it by the close
+    #: profile, but a :class:`~src.core.reading.PositionReading` slices the
+    #: *unbounded* buffer itself so it can expose both views at once.
+    opened_at: datetime | None = None
+    #: The day's running result and flat-cut bill (see :class:`DayBook`), empty
+    #: when the caller does not track it. Read by
+    #: :class:`~src.exit.zones.adaptive.AdaptiveReadStop` to decide whether closing
+    #: a stagnating position at a loss is affordable *today*.
+    day_book: DayBook = field(default_factory=DayBook)
+    #: Lazily-built market reading, memoised for the tick (see :meth:`reading`).
+    _reading: PositionReading | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def reading(self) -> PositionReading:
+        """The position's :class:`~src.core.reading.PositionReading` for this tick.
+
+        The shared reading facade (``src/core/reading.py``) — the same one the
+        dashboard's *read this market* view shows — expressed in this position's
+        own profit terms: its ``curve`` measures only what happened **since the
+        open**, its ``market`` keeps the full history for the amplitude measures,
+        and every gain field is counted from break-even.
+
+        Built from the unsliced buffer (:attr:`full_buf`) plus :attr:`opened_at`,
+        so the reading does its own slicing and both views are correct; it falls
+        back to :attr:`buf` when no unsliced buffer was provided. Memoised, so an
+        updater may read fifty fields off it without rebuilding anything.
+        """
+        if self._reading is None:
+            self._reading = PositionReading(
+                self.full_buf if self.full_buf is not None else self.buf,
+                direction=self.direction,
+                level_zero=self.level_zero,
+                level_open=self.level_open or None,
+                current_price=self.current_price,
+                opened_at=self.opened_at,
+                level_margin=self.level_margin,
+                level_follower=self.level_follower or None,
+                euro_per_point=self.euro_per_point,
+            )
+        return self._reading
 
     # ---- direction-aware primitives -------------------------------------------
     # Every zone rule is the same trade for a long and a short; only the sign of
@@ -206,6 +331,24 @@ class StopContext:
         down-steps) the right measure on both sides.
         """
         return adverse_tick_noise(self.favourable_closes, window, std_k)
+
+    def retracement(self, window: int) -> float:
+        """Deepest multi-candle give-back of the close-out series, in price units.
+
+        The companion of :meth:`adverse_noise`: that one measures a single adverse
+        step, this one the worst *cumulative* pull-back over the window (see
+        :func:`~src.core.indicators.retracement_depth`). Sign-normalised like
+        :attr:`favourable_closes`, so it is the give-back this position's own side
+        has to survive — a down-move for a long, an up-move for a short.
+
+        Read from :attr:`full_buf` when the caller provided it: this is an
+        amplitude measure, so it wants the pre-open history (a position open for
+        five minutes has shown no pull-back of its own, and would otherwise be
+        managed as if the market had none).
+        """
+        buf = self.full_buf if self.full_buf is not None else self.buf
+        closes = buf.offer_closes if self.sign < 0 else buf.bid_closes
+        return retracement_depth([self.sign * c for c in closes], window)
 
     def bar_close(self, candle: Candle) -> float:
         """The candle's close-out close — bid close (BUY) / offer close (SELL)."""
@@ -320,6 +463,39 @@ def breakeven_lock_level(ctx: StopContext, params: BreakevenLockParams) -> float
     return ctx.absolute(level)
 
 
+@dataclass(frozen=True, slots=True)
+class ZoneDecision:
+    """What a zone updater decides on one tick — move the stop, close, or hold.
+
+    Most updaters only ever move a stop, which is why
+    :meth:`StopUpdater.propose` (a bare level, or ``None`` to hold) remains the
+    primitive every zone is written against. Some rules, though, conclude that the
+    *position* is what should go, not the stop: a reading of the market since the
+    open can show that the move the trade was built on has stopped happening (see
+    :class:`~src.exit.zones.adaptive.AdaptiveReadStop`). Expressing that as a stop
+    parked just behind the live price would work only by accident — it goes through
+    the touch watcher, fills a spread away, and reads in the history as a stop-out
+    rather than as a decision. So a zone updater may return this instead.
+
+    Exactly one of the two fields is meaningful: ``close_reason`` set means "close
+    the position now, for this reason" and ``stop_level`` is ignored; otherwise
+    ``stop_level`` is the level to ratchet to, ``None`` to hold.
+
+    Attributes:
+        stop_level: New absolute stop level to ratchet to, or ``None`` to hold.
+        close_reason: Close reason (persisted on the position as
+            ``reason_close``) when the zone wants the position closed now.
+    """
+
+    stop_level: float | None = None
+    close_reason: str | None = None
+
+    @property
+    def is_close(self) -> bool:
+        """True when this decision closes the position rather than moving a stop."""
+        return self.close_reason is not None
+
+
 class StopUpdater(ABC):
     """Decides the stop move for one price zone.
 
@@ -350,6 +526,18 @@ class StopUpdater(ABC):
         position's own direction (:meth:`StopContext.beyond`) — higher for a BUY,
         lower for a SELL. The composer applies what is returned verbatim.
         """
+
+    def decide(self, ctx: StopContext) -> ZoneDecision:
+        """Full decision for this tick — a stop move, a close, or a hold.
+
+        The composer (:class:`~src.exit.close_zoneprofit.CloseZoneProfit`) calls
+        **this**, not :meth:`propose`. The default wraps :meth:`propose`, so every
+        stop-only updater keeps working unchanged; an updater that can also decide
+        to close the position overrides it (see
+        :class:`~src.exit.zones.adaptive.AdaptiveReadStop`) and keeps
+        :meth:`propose` as the stop-only view of the same decision.
+        """
+        return ZoneDecision(stop_level=self.propose(ctx))
 
 
 def build_zone_updater(

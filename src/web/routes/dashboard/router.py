@@ -16,10 +16,12 @@ from src.models.position import Position, PositionState
 from src.utils.tools import _to_float, euro_per_point, margin_factor_pct
 from src.web.routes.dashboard.fragments import _build_fragments
 from src.web.routes.dashboard.pages import _render_tradable_list_page
+from src.web.routes.dashboard.reading_view import build_reading_view
 from src.web.routes.dashboard.shell import _render_dashboard
 from src.web.routes.dashboard.state import (
     _PARIS,
     _gather_dashboard_state,
+    _spread_map,
     _to_float_or_none,
     force_account_balance_refresh,
 )
@@ -160,6 +162,7 @@ async def end_day(request: Request) -> JSONResponse:
 
 _ACTIONS = {
     "refresh_epic_list",
+    "crawl_market_catalog",
     "refresh_tradable_epics",
     "collect_and_analyze",
     "monitor_positions",
@@ -183,6 +186,40 @@ async def run_action(request: Request, action: str) -> JSONResponse:
     fn = getattr(scheduler, f"trigger_{action}")
     asyncio.create_task(fn())
     return JSONResponse({"status": "triggered", "action": action})
+
+
+@router.get("/api/catalog")
+async def api_catalog(request: Request) -> JSONResponse:
+    """JSON API: static market catalog size and crawl-frontier progress.
+
+    Read-only counters, so the dashboard can tell a finished catalog from one the
+    quota interrupted mid-crawl (``pending`` nodes left) without touching IG.
+    """
+    scheduler = request.app.state.scheduler
+    if not scheduler:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    progress = await scheduler.catalog_progress()
+    return JSONResponse(
+        {
+            "running": progress.running,
+            "complete": progress.complete,
+            "markets": progress.markets,
+            "nodes_total": progress.nodes_total,
+            "nodes_pending": progress.nodes_pending,
+            "nodes_done": progress.nodes_done,
+            "nodes_error": progress.nodes_error,
+            "nodes_visited": progress.nodes_visited,
+            "markets_added": progress.markets_added,
+            "started_at": (
+                progress.started_at.isoformat() if progress.started_at else None
+            ),
+            "finished_at": (
+                progress.finished_at.isoformat() if progress.finished_at else None
+            ),
+            "last_error": progress.last_error,
+            "summary": progress.summary(),
+        }
+    )
 
 
 @router.get("/api/jobs")
@@ -576,8 +613,63 @@ async def api_chart(request: Request, epic: str) -> JSONResponse:
             except Exception as exc:  # pragma: no cover - projection is best-effort
                 logger.debug("Chart projection failed for %s: %s", epic, exc)
 
+    # Live dealing spread of the epic, so the chart states what a round trip on
+    # this market costs (the same figure as the market table's "Spread (€)"
+    # column, plus the raw price distance it is derived from). Read from the
+    # background-refreshed cache — never awaited here.
+    spread = _spread_map(request, [epic]).get(epic)
+
     return JSONResponse(
-        {"epic": epic, "candles": candles, "trades": trades, "projection": projection}
+        {
+            "epic": epic,
+            "candles": candles,
+            "trades": trades,
+            "projection": projection,
+            "spread": spread,
+        }
+    )
+
+
+@router.get("/api/reading/{epic}")
+async def api_reading(request: Request, epic: str) -> JSONResponse:
+    """JSON API: the full curve reading of an epic, for the reading panel.
+
+    Everything comes from the in-memory :class:`~src.feed.price_buffer.PriceBuffer`
+    plus one indexed row read, so this is safe to call from the UI on demand: it
+    never touches the IG API and never awaits the call queue (the dashboard poll
+    rule, see ``docs/DATAFLOW.md``). When the epic holds an open position, the
+    panel gains a since-open section and the whole reading switches to that trade's
+    close-out side.
+    """
+    buf = request.app.state.buffer.get(epic)
+    if not buf or not len(buf):
+        return JSONResponse({"error": "Epic not tracked"}, status_code=404)
+
+    position = None
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is not None:
+        async with session_factory() as session:
+            position = (
+                await session.scalars(
+                    select(Position)
+                    .where(
+                        Position.epic == epic,
+                        Position.state == PositionState.OPEN,
+                    )
+                    .order_by(Position.id.desc())
+                )
+            ).first()
+
+    name = position.epic_name if position is not None else ""
+    return JSONResponse(
+        build_reading_view(
+            buf,
+            epic=epic,
+            name=name,
+            position=position,
+            # Cached dealing spread — a background refresh at worst, never awaited.
+            spread=_spread_map(request, [epic]).get(epic),
+        )
     )
 
 

@@ -18,12 +18,26 @@ stop responsibilities rather than owning them:
     `hold` or `breakeven_half` (secure the midpoint of the break-even→margin band
     at once);
   - `CLOSE_ZONEPROFIT` — past the profit trigger: `trailing_ratchet`
-    (momentum-gated ATR chandelier that follows price in steps) or
+    (momentum-gated ATR chandelier that follows price in steps),
     `trailing_ratchetmore` (the same, but it also caps how much of the peak gain
-    can be given back and narrows the trail as the run extends).
+    can be given back and narrows the trail as the run extends — measured worse,
+    see below), or `trailing_noise` (the same, but no stop is ever left closer to
+    price than the deepest retracement the market has just shown).
 
 The full list of selectable updaters per zone is in
 [README.md](README.md#available-zone-updaters).
+
+One updater spans several zones: **`adaptive`** is selectable in
+`CLOSE_ZONESTART`, `CLOSE_ZONEMARGE` and `CLOSE_ZONESECURE` at once. Instead of
+placing a stop it reads the market **since the open** and decides *hold or close*
+— per epic, per situation — with the same reading priced differently in each zone.
+It is documented on its own page: [close_adaptive.md](close_adaptive.md).
+
+A zone updater can therefore return a **close verdict** and not only a stop level
+(`ZoneDecision` in `src/exit/zones/base.py`); the composer turns it into an
+`ACTION_CLOSE` before any stop arithmetic, since a decision about whether the
+trade is still worth holding has nothing to gain from a group tightening. Every
+stop-only updater is untouched — the default `decide()` wraps `propose()`.
 
 ## The four zones
 
@@ -234,6 +248,173 @@ it behave exactly like `trailing_ratchet`.
 > replay totals differ from the booked ones (2026-08-03: 967 € replayed vs 1427 €
 > booked). Only the variant-vs-variant comparison, run on identical emulation, is
 > meaningful — and it is stable in sign across all six days.
+
+### `trailing_noise` — never park the stop inside the market's own swing
+
+`trailing_ratchet` floors its trailing distance on two measures that are both
+**single-candle**: `atr_k × ATR` (one bar's high-low range) and
+`noise_mult × adverse_tick_noise` (what one close gives back versus the previous).
+Neither sees a **multi-candle** retracement. A market drifting up inside an
+8-point band gives those 8 points back over five or six candles of ~1.5 points
+each: the step measure reports 1.5, the ATR about as little, so the chandelier is
+placed *inside* the amplitude the market oscillates at. And because it is
+momentum-gated (two rising closes arm it), it is pushed there precisely at the top
+of each micro-swing — right before the swing turns. The next ordinary retracement
+closes the trade while the move is still running.
+
+> **Observed live (2026-08-04, `CS.D.EURCAD.CFD.IP`).** The bid oscillated in a
+> band for 40 minutes while drifting up; the follower ratcheted to the middle of
+> that band and the position closed at +45 € on a pull-back that was in no way a
+> reversal — price went on to add roughly two thirds of the day's range.
+
+`trailing_noise` is the same updater — same support-anchored floor, same
+momentum-gated chandelier, same sharp-reversal hold, same tighten-only discipline
+— with **one** addition, a *retracement clearance*:
+
+```
+stop = min(stop_proposed_by_trailing_ratchet,
+           price − retrace_mult × retracement_depth(last retrace_window candles))
+                                                    # max() for a SELL
+```
+
+where `retracement_depth` is the deepest give-back from a running peak inside the
+window ([`src/core/indicators.py`](../../src/core/indicators.py)) — the
+multi-candle companion of `adverse_tick_noise`, which only measures one step.
+
+| Constant         | Default | Effect                                                             |
+| ---------------- | ------- | ------------------------------------------------------------------ |
+| `retrace_window` | `30`    | Candles scanned for the deepest give-back (≈ the last half hour)   |
+| `retrace_mult`   | `1.0`   | Multiple of it held between price and the stop; `0` = parent again |
+
+That is the separation the premature exits call for:
+
+- a pull-back of **ordinary** amplitude can no longer reach the stop, so the trade
+  is not closed by the noise it was opened to ride;
+- a fall **deeper than every retracement of the window** is a change of regime: it
+  reaches the stop and the backstop closes at once. The legitimate fast exit is
+  untouched, because the threshold is measured on the market rather than fixed.
+
+Two deliberate consequences:
+
+- the clearance only moves a level **away** from price, never towards it, so no
+  level is more fragile than the parent's; when the pull-back would take the level
+  back past the current follower the updater holds (the ratchet still forbids
+  loosening);
+- the level may land **short of the margin line**, which the parent forbids for
+  its chandelier. It is safe here for the same reason the support-anchored floor is
+  allowed there — the dead-band rule exists to keep a stop out of noise's reach,
+  and "a full retracement behind price" *is* that test, measured rather than
+  assumed. In practice it means that early in the profit zone, where the whole
+  gain is worth less than one retracement, this updater reduces the risk carried
+  instead of locking a gain the next swing would take straight back.
+
+The clearance is an **amplitude** measure, so — like the ATR, and unlike every
+level gate — it reads the *unsliced* buffer (`StopContext.full_buf`): a position
+open for five minutes has shown no pull-back of its own and would otherwise be
+managed as if the market had none.
+
+> **Measured (2026-08-04) — neutral to slightly negative, keep `trailing_ratchet`.**
+> Every real position closed over the seven archived days (2026-07-27 → 2026-08-04,
+> 182 trades) was replayed candle by candle from its own open, once per variant,
+> everything else identical (same persisted references, same stop placed at open,
+> same three other zones, same intra-candle stop fill at the follower). Result on
+> that replay basis: **−1282 € with `trailing_ratchet` and −1335 € with
+> `trailing_noise`** (1 trade improved, 8 degraded, 173 unchanged).
+>
+> A sweep of `retrace_mult` ∈ {0.5, 1, 1.5, 2, 3} × `retrace_window` ∈ {30, 60}
+> scatters between −207 € and +337 € with no monotone trend, and the best cell
+> (`mult=2, window=30`) owes +261 € of its +337 € to **one single trade**. Nothing
+> in there earns a selection.
+>
+> The reason it barely fires: only 63 of the 182 positions ever reach the profit
+> zone (206 stop proposals in total there), and the median retracement depth
+> (0.5 pt) is **below** the median trailing distance the chandelier already keeps
+> (0.95 pt) — on three quarters of the zone-4 ticks the parent is *already* wider
+> than the deepest recent pull-back, so there is nothing to widen.
+>
+> The premature exit that motivated it is not fixed either, and the trace says why.
+> On `CS.D.EURCAD.CFD.IP` (2026-08-04, booked +45 €) the chandelier posted the stop
+> 5.0 pips under the bid at 12:06 UTC, when the deepest retracement of the previous
+> 30 minutes was 1.9 pips; the give-back that hit it two candles later was 5.7 pips
+> — **deeper than every retracement of the window**, i.e. a legitimate reversal by
+> this updater's own criterion. Price then recovered and ran on. Pull-back amplitude
+> measured at the decision instant does not separate "noise" from "reversal" here;
+> only the recovery that followed did, and that is not knowable in time.
+>
+> The other lever was measured on the same harness and is worse: requiring the
+> candle to **close** beyond the follower before the software backstop fires (the
+> broker order still resting hard at follower − spread − 0.5 × ATR) gives
+> **−1798 €**, i.e. −516 € against the baseline. It does catch a few big tails
+> (14 trades, +1119 €) but pays a haircut on every other stop-out (152 trades,
+> −1635 €).
+
+## The touch watcher — a graze is not a turn
+
+The software backstop closed the position on the **first** sample where the
+close-out price reached the follower. That is one point of a noisy series: a stop
+parked behind a running move gets brushed by pull-backs that recover within the
+minute, and the trade is booked out of a move that then continues. Widening the
+trail does not fix it (`trailing_noise` above measured neutral) because the
+give-back that reaches the stop is usually *deeper* than any recent retracement —
+what distinguishes a graze is not its amplitude but the fact that price **comes
+back**, which is only knowable a moment later.
+
+So the fix is at the touch, not at the trail
+([`src/exit/stop_watch.py`](../../src/exit/stop_watch.py)). On a touch:
+
+```
+band = min(band_noise_k × adverse_tick_noise,      # an ordinary adverse step
+           spread + max(noise, min_stop_distance), # never past the IG order
+           band_gain_frac × gain locked by the follower)
+
+close now   if the follower locks ≤ min_gain_noise × noise   (nothing acquired to risk)
+close now   if the price is more than `band` beyond the follower   (a real break)
+close now   if the last COMPLETED minute closed beyond the follower  (the graze held)
+otherwise   hold — the touch is a graze, and neither the position nor the stop moves
+```
+
+| Constant         | Default | Effect                                                                   |
+| ---------------- | ------- | ------------------------------------------------------------------------ |
+| `band_noise_k`   | `0.5`   | Watch band as a multiple of the noise band; `0` disables the watcher     |
+| `band_gain_frac` | `0.25`  | Hard cap: a watch may risk at most this share of the gain already locked |
+| `min_gain_noise` | `1.0`   | Noise bands of locked gain required before any touch is watched          |
+
+Three bounds, each load-bearing:
+
+- **it only protects an acquired gain** — a touch on the stop placed at open, or on
+  any stop still short of break-even plus one noise band, closes exactly as before.
+  The watcher can never widen a loss, only risk a slice of something already won;
+- **the give-back is capped** — at a quarter of the locked gain by default, so a
+  watch that turns out wrong costs a known fraction of the gain, never an open-ended
+  slide. This is what separates it from a blind confirmation delay (measured at
+  −516 €, see below);
+- **it lasts one minute** — `EpicBuffer` holds only completed candles, so the touch
+  is granted the minute it happens in and judged on that minute's close.
+
+> **Measured (2026-08-04) — it pays.** Same 182 real positions over 2026-07-27 →
+> 2026-08-04, replayed with the **real profile** driven like the live monitor
+> (several polls inside each minute, the buffer holding only completed candles), the
+> watcher off then on, identical fill rule (the follower plus at most the watch
+> band): **−1097 € off, −655 € on, +442 €.** 8 trades improved for +710 €, 64
+> degraded for −267 €, 110 unchanged; mean holding time +3 min.
+>
+> The shape is the point, and it is the mirror image of `trailing_ratchetmore`: the
+> premium is small and spread wide (−162 € over 179 trades, ≈ −0.9 € each) while the
+> payoff is concentrated in the tail (+604 € on 3 trades — `IX.D.DOW.IFE.IP`
+> +28 € → +272 €, `CC.D.CC.UNC.IP` +340 € → +563 €, `CO.D.C.FWM2.IP` +17 € → +153 €).
+> This system's P&L is carried by its few largest winners, so paying a bounded
+> premium to stop truncating them is the right side of the trade.
+>
+> A parameter grid confirms the two caps are what make it work, and every cell is
+> positive: watching **every** touch (no gain gate) costs −275 € to −565 €, gating on
+> a locked gain flips it to +191 €, adding the 25 % give-back cap reaches +545 €, and
+> requiring a full noise band of locked gain +689 € (measured on the coarser
+> per-minute harness, hence higher than the +442 € above).
+>
+> Caveats: the net is carried by 3 of 182 trades, so a 7-day sample cannot prove the
+> edge — only that the cost side is bounded and that no cell of the grid was
+> negative. The replay also fills the software close at the decision level, whereas
+> live the poll cadence and the resting broker order both shift the real fill.
 
 ## Break-even is re-anchored on the real fill
 

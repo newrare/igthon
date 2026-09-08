@@ -19,6 +19,7 @@ from src.backtest.simulator import (
     run_open_visual,
     run_simulation,
 )
+from src.exit.close_zoneprofit import _opened_at
 from src.feed.price_buffer import Candle, PriceBuffer
 from src.web.app import create_app
 
@@ -99,6 +100,33 @@ class TestSimulationRun:
         loose = _run(target=200, seed=11, max_days=5)
         loose_keys = [(t.epic, t.day) for t in loose.trades]
         assert len(loose_keys) > len(set(loose_keys))
+
+    def test_every_trade_carries_its_open_instant(self):
+        """The two columns the close profile slices the buffer on.
+
+        A simulated trade used to carry only an ``HH:MM`` label, so
+        ``CloseZoneProfit._opened_at`` returned ``None`` and every *since the open*
+        measure (``minutes_open``, the MFE, the average speed since the open) read
+        the whole day's buffer instead of the position's own life — a replay of a
+        reading-driven exit measured something the live bot never sees.
+        """
+        result = _run(target=10)
+        assert result.trades
+        for t in result.trades:
+            assert t.date is not None and t.time_open is not None
+            assert t.time_open.strftime("%H:%M") == t.open_time
+            # What the close profile rebuilds: an aware instant matching the
+            # candles the simulator stamps.
+            opened_at = datetime.combine(t.date, t.time_open, tzinfo=UTC)
+            assert opened_at.tzinfo is not None
+
+    def test_the_open_instant_bounds_the_since_open_reading(self):
+        """The buffer the profile reads starts at the open, not at the session."""
+        result = _run(target=10)
+        trade = result.trades[0]
+        assert _opened_at(trade) == datetime.combine(
+            trade.date, trade.time_open, tzinfo=UTC
+        )
 
     def test_stops_at_max_days_when_no_signals(self):
         # A flat sideways market with a tiny day cap: the run must terminate.

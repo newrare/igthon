@@ -652,7 +652,14 @@ class _StubProfile:
         self.seen_group_tighten = "unset"
 
     def evaluate(
-        self, position, current_bid, buf, *, is_close_hour, group_tighten=None
+        self,
+        position,
+        current_bid,
+        buf,
+        *,
+        is_close_hour,
+        group_tighten=None,
+        day_book=None,
     ):
         from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
 
@@ -751,7 +758,14 @@ class _ZoneStubProfile:
         self._zone = zone
 
     def evaluate(
-        self, position, current_bid, buf, *, is_close_hour, group_tighten=None
+        self,
+        position,
+        current_bid,
+        buf,
+        *,
+        is_close_hour,
+        group_tighten=None,
+        day_book=None,
     ):
         from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
 

@@ -7,10 +7,16 @@ import pytest
 from src.core.indicators import (
     adverse_tick_noise,
     atr,
+    atr_from_series,
     band_noise,
     channel_position,
+    ema,
     linear_regression,
     rate_of_change,
+    retracement_depth,
+    rsi,
+    slope_angle,
+    sma,
     trend_pct,
 )
 from src.feed.price_buffer import Candle
@@ -94,6 +100,42 @@ class TestAdverseTickNoise:
     def test_insufficient_data(self):
         assert adverse_tick_noise([100.0]) == 0.0
         assert adverse_tick_noise([]) == 0.0
+
+
+class TestRetracementDepth:
+    """Tests for the deepest multi-step give-back from a running peak."""
+
+    def test_pure_uptrend_never_gives_anything_back(self):
+        assert retracement_depth([100.0, 101.0, 102.0, 103.0]) == 0.0
+
+    def test_measures_the_cumulative_pull_back_not_one_step(self):
+        # Five down-steps of 2 from the 110 peak = a 10-point give-back, while the
+        # single-step measure only ever sees 2. This is the whole reason the
+        # indicator exists: a trailing stop floored on the step measure sits inside
+        # a pull-back of this depth.
+        closes = [100.0, 110.0, 108.0, 106.0, 104.0, 102.0, 100.0]
+        assert retracement_depth(closes) == pytest.approx(10.0)
+        assert adverse_tick_noise(closes, std_k=0.0) < 10.0
+
+    def test_peak_is_the_running_maximum_not_the_final_one(self):
+        # The give-back is measured from the peak that preceded it: 110 → 104 = 6,
+        # even though the series later prints a higher high.
+        closes = [100.0, 110.0, 104.0, 120.0, 118.0]
+        assert retracement_depth(closes) == pytest.approx(6.0)
+
+    def test_deepest_of_several_pull_backs_wins(self):
+        closes = [100.0, 105.0, 102.0, 110.0, 103.0, 112.0, 109.0]
+        assert retracement_depth(closes) == pytest.approx(7.0)  # 110 → 103
+
+    def test_window_limits_the_lookback(self):
+        # An old deep pull-back outside the window rolls out on its own.
+        closes = [100.0, 60.0] + [100.0 + i for i in range(30)]
+        assert retracement_depth(closes, window=5) == 0.0
+
+    def test_insufficient_data(self):
+        assert retracement_depth([100.0]) == 0.0
+        assert retracement_depth([]) == 0.0
+        assert retracement_depth([100.0, 90.0], window=0) == 0.0
 
 
 class TestBandNoise:
@@ -275,3 +317,78 @@ class TestChannelPosition:
 
     def test_empty_input_is_the_midpoint(self):
         assert channel_position([], 5) == (0.5, 0.0, 0.0)
+
+
+class TestAtrFromSeries:
+    """The series form ``atr`` delegates to."""
+
+    def test_matches_the_candle_form(self):
+        candles = [
+            _candle(101, 99, 100),
+            _candle(103, 100, 102),
+            _candle(104, 101, 101),
+        ]
+        assert atr_from_series(
+            [c.bid_high for c in candles],
+            [c.bid_low for c in candles],
+            [c.bid_close for c in candles],
+            period=2,
+        ) == pytest.approx(atr(candles, period=2))
+
+    def test_ragged_series_are_bounded_by_the_shortest(self):
+        assert atr_from_series([1, 2, 3], [0, 1], [1, 2, 3], period=2) == 0.0
+
+
+class TestMovingAverages:
+    """SMA and EMA."""
+
+    def test_sma_is_the_mean_of_the_last_period(self):
+        assert sma([1, 2, 3, 4, 5], 3) == pytest.approx(4.0)
+
+    def test_sma_refuses_a_short_window(self):
+        # A shorter lookback would silently compare two different periods.
+        assert sma([1, 2], 3) == 0.0
+        assert sma([1, 2, 3], 0) == 0.0
+
+    def test_ema_leads_the_sma_on_a_rising_series(self):
+        values = [float(i) for i in range(1, 21)]
+        assert ema(values, 5) > sma(values, 20)
+
+    def test_ema_converges_to_a_constant_series(self):
+        assert ema([7.0] * 30, 5) == pytest.approx(7.0)
+
+    def test_ema_needs_its_seed(self):
+        assert ema([1.0, 2.0], 5) == 0.0
+
+
+class TestRsi:
+    """Wilder RSI."""
+
+    def test_only_gains_saturates_at_100(self):
+        assert rsi([float(i) for i in range(20)], 14) == pytest.approx(100.0)
+
+    def test_only_losses_bottoms_out(self):
+        assert rsi([float(20 - i) for i in range(20)], 14) == pytest.approx(0.0)
+
+    def test_alternating_series_is_balanced(self):
+        values = [100.0 + (1 if i % 2 else 0) for i in range(40)]
+        assert rsi(values, 14) == pytest.approx(50.0, abs=5)
+
+    def test_flat_and_short_series_are_neutral(self):
+        assert rsi([100.0] * 20, 14) == 50.0
+        assert rsi([1.0, 2.0], 14) == 50.0
+
+
+class TestSlopeAngle:
+    """Slope expressed as the angle read on the chart."""
+
+    def test_a_fit_spanning_its_own_range_is_45_degrees(self):
+        assert slope_angle(slope=1.0, steps=10, price_range=10.0) == pytest.approx(45.0)
+
+    def test_sign_follows_the_slope_and_stays_bounded(self):
+        assert slope_angle(-1.0, 10, 10.0) == pytest.approx(-45.0)
+        assert abs(slope_angle(1000.0, 10, 0.001)) < 90
+
+    def test_degenerate_inputs_are_flat(self):
+        assert slope_angle(1.0, 10, 0.0) == 0.0
+        assert slope_angle(1.0, 0, 10.0) == 0.0

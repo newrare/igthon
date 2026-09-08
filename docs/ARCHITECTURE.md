@@ -16,7 +16,9 @@ igthon/
 │   ├── core/               # INFRA — plumbing shared by every domain
 │   │   ├── config.py       # pydantic-settings — loads .env
 │   │   ├── scheduler.py    # APScheduler jobs (thin: orchestration, no decisions)
-│   │   ├── indicators.py   # Technical indicators (regression, SMA, ROC, ATR, ER)
+│   │   ├── indicators.py   # Technical indicators (regression, SMA/EMA, RSI, ATR, ER)
+│   │   ├── levels.py       # Readable levels: swing pivots, clusters, round numbers
+│   │   ├── reading.py      # CurveReading / PositionReading — the read-only facade
 │   │   ├── similarity.py   # Curve-shape signature + "same bet?" redundancy
 │   │   ├── recorder.py     # Structured logging + alerts
 │   │   ├── api_queue.py    # Single-worker queue — serialises all IG calls
@@ -29,7 +31,8 @@ igthon/
 │   │   ├── price_buffer.py # In-memory rolling candle buffer per epic
 │   │   └── candle_store.py # Persist + prune candles; per-week CSV archive
 │   ├── markets/            # MARCHÉS — build the tradeable epic list
-│   │   └── market_scanner.py
+│   │   ├── market_scanner.py  # Daily discovery (search terms + watchlists)
+│   │   └── catalog_crawler.py # Static full catalog — resumable /marketnavigation crawl
 │   ├── entry/              # OUVERTURE — entry strategies (open decision only)
 │   │   ├── base.py            # EntryStrategy → EntryIntent (direction, NO exit levels)
 │   │   ├── open_donchian.py   # Donchian breakout + Efficiency-Ratio regime gate
@@ -46,6 +49,7 @@ igthon/
 │   │   ├── trailing.py        # Pure close maths (decide_close_reason, trailing stop)
 │   │   ├── close_zoneprofit.py# Reference profile: per-zone stop management
 │   │   └── zones/             # Per-zone stop updaters (underwater / band / secure / profit)
+│   │                          #   adaptive.py spans zones 1-3: reads the market, holds or closes
 │   ├── execution/          # MAINS — turn decisions into broker/DB effects
 │   │   ├── gates.py        # Pure pre-open gates
 │   │   └── trading.py      # TradingService: order placement, close, reconcile

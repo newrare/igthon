@@ -177,6 +177,7 @@ Registered in [src/entry/\_\_init\_\_.py](../../src/entry/__init__.py):
 | `open_steady`       | `src/entry/open_steady.py`       | [open_steady.md](open_steady.md)             | **Two-sided** ranker: the most regular 10-minute curve           |
 | `open_five`         | `src/entry/open_five.py`         | [open_five.md](open_five.md)                 | **Two-sided** ranker: a series of 5 distinct curve shapes        |
 | `open_ultraranking` | `src/entry/open_ultraranking.py` | [open_ultraranking.md](open_ultraranking.md) | `open_saferanking` + a hard veto on a directionless market       |
+| `open_progressive`  | `src/entry/open_progressive.py`  | [open_progressive.md](open_progressive.md)   | One position at a time, euro risk funded by the day's gains      |
 
 ## Available stop-distance policies
 
@@ -199,25 +200,32 @@ Registered in [src/exit/\_\_init\_\_.py](../../src/exit/__init__.py):
 | ------------------ | ------------------------------ | ------------------------------------------ | ------------------------------------------------- |
 | `close_zoneprofit` | `src/exit/close_zoneprofit.py` | [close_zoneprofit.md](close_zoneprofit.md) | Composes a stop distance + four per-zone updaters |
 
+The `adaptive` updater below spans the first three zones at once and is documented
+on its own page: [close_adaptive.md](close_adaptive.md).
+
 ## Available zone updaters
 
 Registered per zone in [src/exit/zones/\_\_init\_\_.py](../../src/exit/zones/__init__.py);
 each zone selector takes a name from its own registry.
 
-| Selector           | Name                   | File                                 | Style                                                                                   |
-| ------------------ | ---------------------- | ------------------------------------ | --------------------------------------------------------------------------------------- |
-| `CLOSE_ZONESTART`  | `hold`                 | `src/exit/zones/underwater.py`       | Keep the stop posted at open, untouched                                                 |
-| `CLOSE_ZONESTART`  | `trendcut`             | `src/exit/zones/underwater.py`       | Cut a clean, confirmed adverse trend at a fraction of `-1R`                             |
-| `CLOSE_ZONESTART`  | `timedlift`            | `src/exit/zones/timedlift.py`        | Re-read the recent floor every 10 min and move the stop in behind it                    |
-| `CLOSE_ZONESTART`  | `smartgroup`           | `src/exit/zones/smartgroup.py`       | Book-wide: park **every** stop on `price − noise` once the group is green               |
-| `CLOSE_ZONEMARGE`  | `hold`                 | `src/exit/zones/breakeven_band.py`   | Keep the stop where it is across the break-even band                                    |
-| `CLOSE_ZONEMARGE`  | `breakeven_lock`       | `src/exit/zones/breakeven_band.py`   | Park the stop behind a confirmed swing low past break-even                              |
-| `CLOSE_ZONEMARGE`  | `breakeven_safe`       | `src/exit/zones/breakeven_band.py`   | Same lock, gated on a stricter safety confirmation                                      |
-| `CLOSE_ZONEMARGE`  | `limitloose`           | `src/exit/zones/breakeven_band.py`   | Move the stop at once to a double noise band under the market                           |
-| `CLOSE_ZONESECURE` | `hold`                 | `src/exit/zones/secure.py`           | Keep whatever stop the lower zones left                                                 |
-| `CLOSE_ZONESECURE` | `breakeven_half`       | `src/exit/zones/secure.py`           | Secure the midpoint of the break-even→margin band at once                               |
-| `CLOSE_ZONEPROFIT` | `trailing_ratchet`     | `src/exit/zones/trailing_ratchet.py` | Momentum-gated ATR chandelier trailing price in steps                                   |
-| `CLOSE_ZONEPROFIT` | `trailing_ratchetmore` | `src/exit/zones/trailing_ratchet.py` | Same, plus a give-back cap on the peak gain and a width that narrows as the run extends |
+| Selector           | Name                   | File                                 | Style                                                                                     |
+| ------------------ | ---------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `CLOSE_ZONESTART`  | `hold`                 | `src/exit/zones/underwater.py`       | Keep the stop posted at open, untouched                                                   |
+| `CLOSE_ZONESTART`  | `trendcut`             | `src/exit/zones/underwater.py`       | Cut a clean, confirmed adverse trend at a fraction of `-1R`                               |
+| `CLOSE_ZONESTART`  | `timedlift`            | `src/exit/zones/timedlift.py`        | Re-read the recent floor every 10 min and move the stop in behind it                      |
+| `CLOSE_ZONESTART`  | `smartgroup`           | `src/exit/zones/smartgroup.py`       | Book-wide: park **every** stop on `price − noise` once the group is green                 |
+| `CLOSE_ZONESTART`  | `adaptive`             | `src/exit/zones/adaptive.py`         | Read the market since the open: close a visible reversal, close a flat the day can afford |
+| `CLOSE_ZONEMARGE`  | `hold`                 | `src/exit/zones/breakeven_band.py`   | Keep the stop where it is across the break-even band                                      |
+| `CLOSE_ZONEMARGE`  | `breakeven_lock`       | `src/exit/zones/breakeven_band.py`   | Park the stop behind a confirmed swing low past break-even                                |
+| `CLOSE_ZONEMARGE`  | `breakeven_safe`       | `src/exit/zones/breakeven_band.py`   | Same lock, gated on a stricter safety confirmation                                        |
+| `CLOSE_ZONEMARGE`  | `limitloose`           | `src/exit/zones/breakeven_band.py`   | Move the stop at once to a double noise band under the market                             |
+| `CLOSE_ZONEMARGE`  | `adaptive`             | `src/exit/zones/adaptive.py`         | Same reading: take the no-loss exit once the move stops being a trend                     |
+| `CLOSE_ZONESECURE` | `hold`                 | `src/exit/zones/secure.py`           | Keep whatever stop the lower zones left                                                   |
+| `CLOSE_ZONESECURE` | `breakeven_half`       | `src/exit/zones/secure.py`           | Secure the midpoint of the break-even→margin band at once                                 |
+| `CLOSE_ZONESECURE` | `adaptive`             | `src/exit/zones/adaptive.py`         | Same reading: bank the gain once the move stops being a trend                             |
+| `CLOSE_ZONEPROFIT` | `trailing_ratchet`     | `src/exit/zones/trailing_ratchet.py` | Momentum-gated ATR chandelier trailing price in steps                                     |
+| `CLOSE_ZONEPROFIT` | `trailing_ratchetmore` | `src/exit/zones/trailing_ratchet.py` | Same, plus a give-back cap on the peak gain and a width that narrows as the run extends   |
+| `CLOSE_ZONEPROFIT` | `trailing_noise`       | `src/exit/zones/trailing_noise.py`   | Same, but no stop is ever left closer to price than the deepest recent retracement        |
 
 ## Contract
 

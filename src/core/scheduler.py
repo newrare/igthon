@@ -51,9 +51,11 @@ from src.exit import (
     CloseProfile,
     get_close_profile,
 )
+from src.exit.zones.base import DayBook
 from src.feed.candle_store import CandleStore
 from src.feed.market_data import MarketDataService
 from src.feed.price_buffer import DEFAULT_MAX_CANDLES, EpicBuffer, PriceBuffer
+from src.markets.catalog_crawler import CatalogCrawler, CatalogProgress
 from src.markets.market_scanner import MarketInfo, MarketScanner
 from src.models.day import Day, DayState
 from src.models.epic import Epic
@@ -180,6 +182,19 @@ JOB_DEFINITIONS: list[dict[str, str | bool]] = [
         "schedule": "Daily 07:30 · Mon–Fri",
         "danger": "safe",
         "catch_up": True,
+    },
+    {
+        "action": "crawl_market_catalog",
+        "job_id": "crawl_market_catalog",
+        "name": "Crawl Market Catalog",
+        "description": (
+            "Walk IG's market-navigation tree and build the static catalog of "
+            "every epic the broker offers. Resumable: a run stopped by the API "
+            "quota picks up where it left off on the next Run."
+        ),
+        "schedule": "Manual only",
+        "danger": "safe",
+        "toggleable": False,
     },
     {
         "action": "refresh_tradable_epics",
@@ -387,6 +402,13 @@ class BotScheduler:
         self._scanner = MarketScanner(
             client=client,
             settings=settings,
+        )
+        # Static market catalog builder (manual action only). It owns its own
+        # resume state in the database, so the scheduler just hands it the client
+        # and the session factory and never tracks the crawl itself.
+        self._catalog_crawler = CatalogCrawler(
+            client=client,
+            session_factory=session_factory,
         )
 
     def start(self) -> None:
@@ -1084,6 +1106,10 @@ class BotScheduler:
         """Manually run the daily epic list refresh."""
         await self._refresh_epic_list()
 
+    async def trigger_crawl_market_catalog(self) -> None:
+        """Manually run (or resume) the IG market-catalog crawl."""
+        await self._crawl_market_catalog()
+
     async def trigger_refresh_tradable_epics(self) -> None:
         """Manually run the hourly tradable epic filter."""
         await self._refresh_tradable_epics()
@@ -1478,6 +1504,38 @@ class BotScheduler:
         logger.info("Epic list refreshed: %d epics discovered", len(epics))
         self._recorder.info(f"Daily epic refresh: {len(epics)} epics")
         await self._record_job_run("refresh_epic_list")
+
+    async def _crawl_market_catalog(self) -> None:
+        """Build/refresh the static market catalog from IG's navigation tree.
+
+        Manual action only (dashboard "Crawl Market Catalog", or
+        ``python -m src.scripts.crawl_catalog``): the whole tree is far bigger
+        than one API allowance, so this is meant to be launched off-hours and
+        re-launched until it reports complete. The crawler persists its frontier,
+        so each run resumes at the node the previous one stopped on and nothing
+        is re-fetched.
+
+        The job run is only stamped when the frontier is fully drained, so a
+        partially-crawled catalog is never mistaken for a finished one.
+        """
+        if self._catalog_crawler.is_running:
+            logger.warning("Market catalog crawl already running — request ignored")
+            return
+
+        logger.info("Starting market catalog crawl")
+        try:
+            progress = await self._catalog_crawler.crawl()
+        except Exception as exc:
+            logger.error("Market catalog crawl failed: %s", exc)
+            return
+
+        self._recorder.info(f"Market catalog crawl: {progress.summary()}")
+        if progress.complete:
+            await self._record_job_run("crawl_market_catalog")
+
+    async def catalog_progress(self) -> CatalogProgress:
+        """Current market-catalog / crawl-frontier snapshot (dashboard)."""
+        return await self._catalog_crawler.progress()
 
     async def _open_position_epics(self) -> set[str]:
         """Return the epics that currently hold an OPEN position.
@@ -2441,6 +2499,29 @@ class BotScheduler:
                     )
                     return
 
+                # Risk ladder (``uses_risk_ladder``, e.g. ``open_progressive``):
+                # price every surviving candidate in euros — what a stop-out would
+                # actually cost — and let the strategy keep only those inside the
+                # band the day's *realised* P&L has paid for. This is the one place
+                # a strategy sees money: ``evaluate`` reads a price curve and cannot
+                # know what an epic costs to be wrong on. Done after the cross-epic
+                # filter so the euro estimate (one ``initial_plan`` per candidate)
+                # is only computed for candidates still in the running.
+                if getattr(strategy, "uses_risk_ladder", False):
+                    realised = await self._realized_pnl_today(session)
+                    risks = self._risk_estimates(ranked, config)
+                    ranked = strategy.filter_by_risk(
+                        ranked, risks=risks, realised_today=realised
+                    )
+                    if not ranked:
+                        logger.info(
+                            "Rolling select [%s]: no candidate the risk filter "
+                            "accepts at %.2f€ realised today — staying flat",
+                            strategy.name,
+                            realised,
+                        )
+                        return
+
                 available = await self._account_available_funds()
                 reserve = max(0.0, min(1.0, strategy.wallet_reserve))
                 spendable = (
@@ -2542,6 +2623,109 @@ class BotScheduler:
                         remaining,
                     )
 
+    @staticmethod
+    async def _realized_pnl_today(session: AsyncSession) -> float:
+        """Euros **banked** today: the net result of today's closed positions.
+
+        Feeds the entry risk ladder (``uses_risk_ladder``), whose whole premise is
+        that a bigger bet must be funded by money already in the account — so open
+        positions are deliberately excluded, however far in profit they are: an
+        unrealised gain is not a gain.
+
+        Mirrors the dashboard's daily P&L tile so the ladder and the screen can
+        never disagree: the stored ``euro`` when it holds a real figure, a
+        level-based recomputation as the fallback for rows that never got one, and
+        ``never_opened`` phantoms (provisional rows whose order never confirmed at
+        IG) dropped — they are not trades.
+        """
+        rows = (
+            await session.scalars(
+                select(Position).where(
+                    Position.date == date.today(),
+                    Position.state == PositionState.CLOSE,
+                )
+            )
+        ).all()
+        total = 0.0
+        for position in rows:
+            if position.reason_close == "never_opened":
+                continue
+            stored = float(position.euro) if position.euro is not None else None
+            if stored is not None and abs(stored) >= 0.001:
+                total += stored
+                continue
+            if position.level_open and position.level_close:
+                move = float(position.level_close) - float(position.level_open)
+                if position.direction == "SELL":
+                    move = -move
+                epp = (
+                    float(position.euro_per_point)
+                    if position.euro_per_point is not None
+                    else 0.0
+                )
+                total += move * epp if epp else move * (position.quantity or 1)
+            elif stored is not None:
+                total += stored
+        return total
+
+    def _risk_estimates(
+        self,
+        ranked: list[tuple[EntryIntent, EpicBuffer]],
+        config: TradeConfig,
+    ) -> dict[str, float | None]:
+        """Estimated worst-case euro loss per candidate epic.
+
+        The same arithmetic the open path runs, one step ahead of it: the composed
+        close profile chooses the candidate's initial stop from the live buffer
+        (``initial_plan`` — the very call ``TradingService.open_position`` will
+        make), the distance from the entry is floored by IG's padded minimum stop
+        distance, and the result is converted with the epic's euro-per-point for
+        one minimum deal size.
+
+        An epic maps to ``None`` — never to 0 — whenever anything needed is
+        missing (no market info, no euro-per-point, an empty buffer, a stop policy
+        that raised). The caller must treat that as "unknown", not "free".
+
+        This is an ESTIMATE, and knowingly so: ``euro_per_point`` is exact only for
+        a euro-quoted instrument, the quantity assumed is the minimum deal size,
+        and the stop is recomputed from the buffer as it stands now rather than as
+        it will stand when the order lands.
+        """
+        markets = {m.epic: m for m in self._tradable_markets}
+        margin = 1.0 + max(0.0, float(config.stop_min_distance_margin))
+        estimates: dict[str, float | None] = {}
+        for intent, buf in ranked:
+            info = markets.get(intent.epic)
+            last = buf.last
+            if info is None or last is None or not info.euro_per_point:
+                estimates[intent.epic] = None
+                continue
+            # The open path measures the stop distance from the bid, whatever the
+            # direction (see ``TradingService.open_position``), so do the same.
+            entry = last.bid_close
+            try:
+                plan = self.close_profile.initial_plan(
+                    entry_level=entry,
+                    direction=intent.direction,
+                    buf=buf,
+                )
+            except Exception as exc:  # a stop policy must not break the selection
+                logger.debug("Risk estimate failed for %s: %s", intent.epic, exc)
+                estimates[intent.epic] = None
+                continue
+            risk = abs(entry - plan.stop_level) * float(info.euro_per_point)
+            # Floor: IG refuses a stop inside its minimum distance, so a tighter
+            # strategy stop is clamped out at open and really costs that minimum.
+            # ``stop_loss_eur`` already prices that distance; pad it with the same
+            # safety margin the open path applies.
+            floor = (
+                float(info.stop_loss_eur) * margin
+                if info.stop_loss_eur is not None
+                else 0.0
+            )
+            estimates[intent.epic] = max(risk, floor) or None
+        return estimates
+
     async def _account_available_funds(self) -> float | None:
         """Live available balance (EUR) on the trading account, or None.
 
@@ -2587,6 +2771,35 @@ class BotScheduler:
         async with self._monitor_lock:
             await self._monitor_positions_pass()
 
+    async def _open_day_book(self, session: AsyncSession) -> DayBook:
+        """The day's banked result and flat-cut bill, from today's closed rows.
+
+        The one input the exit domain cannot derive from a curve: it is what makes
+        "can today afford to close this stagnating position at a loss?" an
+        arithmetic question rather than a guess (see
+        :mod:`src.exit.zones.adaptive`). Opened once per monitor pass and then
+        advanced position by position, so two positions closing in the same pass
+        do not both spend the same budget.
+
+        The split between the two figures — and why the flat cuts are kept out of
+        the base rather than merely netted into it — is documented on
+        :class:`~src.exit.zones.base.DayBook`. Phantom rows (``never_opened``) are
+        dropped by the book itself, exactly as the dashboard drops them. Never
+        raises: a read that fails degrades to an empty book (the conservative side
+        — nothing is closed on affordability grounds) rather than breaking the pass.
+        """
+        try:
+            result = await session.execute(
+                select(Position.reason_close, Position.euro).where(
+                    Position.date == date.today(),
+                    Position.state == PositionState.CLOSE,
+                )
+            )
+            return DayBook.from_closes(result.all())
+        except Exception as exc:
+            logger.warning("Could not read today's realized P&L: %s", exc)
+            return DayBook()
+
     async def _monitor_positions_pass(self) -> None:
         """Check every open position and apply its close profile's decision."""
         config = self._build_trade_config()
@@ -2606,6 +2819,13 @@ class BotScheduler:
             trading = TradingService(
                 self._client, session, config, close_profile=self.close_profile
             )
+
+            # What the day has already secured, and what the flat cut has already
+            # spent of it. Opened once here and advanced below as positions close,
+            # so a budget spent earlier in this very pass is gone for the positions
+            # managed after it (two stagnating positions used to close in the same
+            # pass, each authorised against the same opening figure).
+            day_book = await self._open_day_book(session)
 
             # Phase 1 — resolve the live bid + buffer for every open position.
             # Done up front so a group-aware profile can see the whole book before
@@ -2686,8 +2906,15 @@ class BotScheduler:
                             current_bid,
                             buf=buf,
                             group_tighten=group_plan.get(position.id),
+                            day_book=day_book,
                         )
                         if closed:
+                            # Charge this close to the day's book straight away:
+                            # the next position in the pass must see the budget
+                            # this one consumed, not the opening snapshot.
+                            day_book = day_book.after_close(
+                                position.reason_close, position.euro
+                            )
                             self._recorder.info(
                                 f"Position closed: {position.epic} "
                                 f"reason={position.reason_close} "

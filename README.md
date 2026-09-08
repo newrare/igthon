@@ -50,6 +50,7 @@ ______________________________________________________________________
 | [docs/USE.md](docs/USE.md)                     | Usage guide — commands, web endpoints, daily workflow |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)   | Project structure, layers, and data strategy          |
 | [docs/DATAFLOW.md](docs/DATAFLOW.md)           | Time and data contract — feed, buffer, decision clock |
+| [docs/READING.md](docs/READING.md)             | Reading a market — every measure a strategy can read  |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | All `.env` settings with descriptions                 |
 | [docs/strategies/](docs/strategies/README.md)  | Pluggable entry strategies and close profiles         |
 | [docs/API.md](docs/API.md)                     | IG REST API reference (auth, endpoints, streaming)    |

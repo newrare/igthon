@@ -24,8 +24,10 @@ from src.entry.open_five import OpenFive
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_steady import OpenSteady
+from src.execution.trading import TradeConfig
 from src.exit.zones import GroupPlanReport
-from src.feed.price_buffer import Candle, PriceBuffer
+from src.feed.price_buffer import Candle, EpicBuffer, PriceBuffer
+from src.markets.market_scanner import MarketInfo
 from src.models.database import Base
 from src.models.job_preference import JobPreference
 from src.models.position import Position, PositionState
@@ -2317,7 +2319,9 @@ class TestGroupStopPrePass:
 
         seen: list[tuple[str, float | None]] = []
 
-        async def _manage(position, current_bid, buf=None, *, group_tighten=None):
+        async def _manage(
+            position, current_bid, buf=None, *, group_tighten=None, **kwargs
+        ):
             seen.append((position.epic, group_tighten))
             return False
 
@@ -2370,6 +2374,153 @@ class TestGroupStopPrePass:
 
         profile.explain_group.assert_not_called()
         assert sorted(seen) == [("A", None), ("B", None)]
+
+
+class TestDayBook:
+    """What the book has banked today — the figures the ``adaptive`` exit prices on.
+
+    Opened once per monitor pass and handed to every position's close profile, so
+    it must count today's real closes and nothing else, and it must keep the flat
+    cuts out of the base they are budgeted against.
+    """
+
+    @staticmethod
+    async def _add(session_factory, rows) -> None:
+        async with session_factory() as session:
+            for i, (state, day, euro, reason) in enumerate(rows, start=1):
+                session.add(
+                    Position(
+                        id=i,
+                        epic=f"E{i}",
+                        epic_name=f"E{i}",
+                        date=day,
+                        direction="BUY",
+                        state=state,
+                        level_open=Decimal("1.10000"),
+                        euro=None if euro is None else Decimal(str(euro)),
+                        reason_close=reason,
+                    )
+                )
+            await session.commit()
+
+    async def test_sums_todays_closed_positions_only(self, session_factory):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        today = date.today()
+        await self._add(
+            session_factory,
+            [
+                (PositionState.CLOSE, today, "12.50", "follower"),
+                (PositionState.CLOSE, today, "-4.00", "stop"),
+                # Yesterday's result belongs to yesterday's budget.
+                (PositionState.CLOSE, today - timedelta(days=1), "99.00", "follower"),
+                # Still running: its P&L is not banked.
+                (PositionState.OPEN, today, "50.00", None),
+                # A phantom row whose order never confirmed at IG is not a trade.
+                (PositionState.CLOSE, today, "7.00", "never_opened"),
+            ],
+        )
+
+        async with session_factory() as session:
+            book = await scheduler._open_day_book(session)
+        assert book.realized_euro == pytest.approx(8.5)
+        assert book.flat_cut_euro == 0.0
+
+    async def test_flat_cuts_are_billed_apart_from_the_base(self, session_factory):
+        """A cut must not lower the base it is budgeted against — else the budget
+        shrinks with every cut and the series eats the whole banked gain."""
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        today = date.today()
+        await self._add(
+            session_factory,
+            [
+                (PositionState.CLOSE, today, "100.00", "follower"),
+                (PositionState.CLOSE, today, "-7.40", "flat_cut"),
+                (PositionState.CLOSE, today, "-12.15", "flat_cut"),
+            ],
+        )
+
+        async with session_factory() as session:
+            book = await scheduler._open_day_book(session)
+        assert book.realized_euro == pytest.approx(100.0)
+        assert book.flat_cut_euro == pytest.approx(19.55)
+        # 20 % of 100 € minus the 19.55 € already spent.
+        assert book.flat_cut_budget(0.20) == pytest.approx(0.45)
+
+    async def test_no_closed_position_today_banks_nothing(self, session_factory):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        async with session_factory() as session:
+            book = await scheduler._open_day_book(session)
+        assert (book.realized_euro, book.flat_cut_euro) == (0.0, 0.0)
+
+
+class TestDayBookConsumedInPass:
+    """The flat-cut budget is spent as the pass runs, not re-offered to everyone.
+
+    Two stagnating positions closing in the same monitor pass used to be
+    authorised against the same opening figure, so together they cost twice what
+    the budget allowed (observed live on 2026-08-28: two cuts at 10:07:02 for
+    −27.88 € against a 16.82 € allowance).
+    """
+
+    async def test_a_close_is_charged_before_the_next_position_is_managed(
+        self, session_factory, monkeypatch
+    ):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        profile = MagicMock()
+        profile.is_group_aware = False
+        scheduler._close_profile_obj = profile
+        for epic in ("A", "B"):
+            scheduler._buffer.add_candle(epic, _candle(datetime.now(UTC)))
+
+        async with session_factory() as session:
+            for i, epic in enumerate(("A", "B"), start=1):
+                session.add(
+                    Position(
+                        id=i,
+                        epic=epic,
+                        epic_name=epic,
+                        date=date.today(),
+                        direction="BUY",
+                        state=PositionState.OPEN,
+                        level_open=Decimal("1.10000"),
+                    )
+                )
+            # Already banked today, with nothing spent on flat cuts yet.
+            session.add(
+                Position(
+                    id=3,
+                    epic="C",
+                    epic_name="C",
+                    date=date.today(),
+                    direction="BUY",
+                    state=PositionState.CLOSE,
+                    level_open=Decimal("1.10000"),
+                    euro=Decimal("100.00"),
+                    reason_close="follower",
+                )
+            )
+            await session.commit()
+
+        seen: list[tuple[str, float, float]] = []
+
+        async def _manage(position, current_bid, buf=None, *, day_book=None, **kw):
+            seen.append((position.epic, day_book.realized_euro, day_book.flat_cut_euro))
+            if position.epic == "A":
+                position.state = PositionState.CLOSE
+                position.reason_close = "flat_cut"
+                position.euro = Decimal("-15.00")
+                return True
+            return False
+
+        trading_stub = MagicMock()
+        trading_stub.manage_position = AsyncMock(side_effect=_manage)
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+
+        await scheduler._monitor_positions()
+
+        assert seen == [("A", 100.0, 0.0), ("B", 100.0, 15.0)]
 
 
 class TestCandleDrivenMonitoring:
@@ -2503,3 +2654,266 @@ class TestWarmupCapacityWarning:
         with caplog.at_level(logging.WARNING):
             sched._warn_if_warmup_exceeds_buffer()
         assert caplog.text == ""
+
+
+class TestRealizedPnlToday:
+    """Euros banked today — the fuel of the entry risk ladder.
+
+    Deliberately mirrors the dashboard's daily P&L tile: the two must never
+    disagree about what the day has earned, since one drives the ladder and the
+    other is what the user reads.
+    """
+
+    async def test_zero_on_a_day_with_no_close(self, session_factory):
+        async with session_factory() as session:
+            assert await BotScheduler._realized_pnl_today(session) == 0.0
+
+    async def test_sums_todays_closed_positions_only(self, session_factory):
+        async with session_factory() as session:
+            session.add_all(
+                [
+                    Position(
+                        epic="WIN",
+                        epic_name="WIN",
+                        date=date.today(),
+                        state=PositionState.CLOSE,
+                        euro=Decimal("120.500"),
+                    ),
+                    Position(
+                        epic="LOSS",
+                        epic_name="LOSS",
+                        date=date.today(),
+                        state=PositionState.CLOSE,
+                        euro=Decimal("-40.500"),
+                    ),
+                    # Still open: a paper gain is not banked and must not unlock
+                    # a bigger rung.
+                    Position(
+                        epic="OPEN",
+                        epic_name="OPEN",
+                        date=date.today(),
+                        state=PositionState.OPEN,
+                        euro=Decimal("500.000"),
+                    ),
+                    # Yesterday's result belongs to yesterday's ladder.
+                    Position(
+                        epic="OLD",
+                        epic_name="OLD",
+                        date=date.today() - timedelta(days=1),
+                        state=PositionState.CLOSE,
+                        euro=Decimal("900.000"),
+                    ),
+                ]
+            )
+            await session.commit()
+        async with session_factory() as session:
+            assert await BotScheduler._realized_pnl_today(session) == pytest.approx(
+                80.0
+            )
+
+    async def test_ignores_never_opened_phantoms(self, session_factory):
+        # Provisional rows whose order never confirmed at IG are not trades, so
+        # their (always 0 €) result must not count as a closed position either.
+        async with session_factory() as session:
+            session.add_all(
+                [
+                    Position(
+                        epic="REAL",
+                        epic_name="REAL",
+                        date=date.today(),
+                        state=PositionState.CLOSE,
+                        euro=Decimal("30.000"),
+                    ),
+                    Position(
+                        epic="PHANTOM",
+                        epic_name="PHANTOM",
+                        date=date.today(),
+                        state=PositionState.CLOSE,
+                        euro=Decimal("-99.000"),
+                        reason_close="never_opened",
+                    ),
+                ]
+            )
+            await session.commit()
+        async with session_factory() as session:
+            assert await BotScheduler._realized_pnl_today(session) == pytest.approx(
+                30.0
+            )
+
+    async def test_falls_back_to_the_levels_when_euro_is_missing(self, session_factory):
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="LEGACY",
+                    epic_name="LEGACY",
+                    date=date.today(),
+                    state=PositionState.CLOSE,
+                    level_open=Decimal("100.00000"),
+                    level_close=Decimal("102.00000"),
+                    euro_per_point=Decimal("5.000000"),
+                )
+            )
+            await session.commit()
+        async with session_factory() as session:
+            assert await BotScheduler._realized_pnl_today(session) == pytest.approx(
+                10.0
+            )
+
+
+class TestRiskEstimates:
+    """Pricing a candidate in euros before it is opened — the ladder's input.
+
+    The estimate must reproduce the open path: the composed close profile's stop,
+    floored by IG's padded minimum stop distance, converted with the epic's
+    euro-per-point. Anything missing yields ``None`` — never a cheap-looking 0.
+    """
+
+    def _scheduler(self, *, stop_level: float, markets: list[MarketInfo]):
+        sched = _make_scheduler(MagicMock())
+        sched._tradable_markets = markets
+        sched._close_profile_obj = SimpleNamespace(
+            initial_plan=lambda **kwargs: SimpleNamespace(stop_level=stop_level)
+        )
+        return sched
+
+    def _ranked(self, epic: str, bid: float = 100.0):
+        buf = EpicBuffer(epic=epic, max_candles=10)
+        buf.add(
+            Candle(
+                timestamp=datetime.now(UTC),
+                bid_open=bid,
+                bid_close=bid,
+                bid_high=bid,
+                bid_low=bid,
+                offer_open=bid + 0.5,
+                offer_close=bid + 0.5,
+                offer_high=bid + 0.5,
+                offer_low=bid + 0.5,
+            )
+        )
+        return [(EntryIntent(epic=epic, direction="BUY", score=1.0), buf)]
+
+    def _market(self, epic: str, **overrides) -> MarketInfo:
+        defaults = dict(
+            epic=epic,
+            name=epic,
+            bid=100.0,
+            offer=100.5,
+            spread_ratio=0.005,
+            dealing_enabled=True,
+            status="TRADEABLE",
+            euro_per_point=4.0,
+            stop_loss_eur=1.0,
+        )
+        return MarketInfo(**{**defaults, **overrides})
+
+    def test_prices_the_strategy_stop(self):
+        # Stop 3 points below a bid of 100, at 4 €/point -> a 12 € stop-out.
+        sched = self._scheduler(stop_level=97.0, markets=[self._market("A")])
+        risks = sched._risk_estimates(
+            self._ranked("A"), TradeConfig(stop_min_distance_margin=0.15)
+        )
+        assert risks["A"] == pytest.approx(12.0)
+
+    def test_floored_by_igs_padded_minimum_stop(self):
+        # The strategy wants a 0.1-point stop (0.4 €), but IG's minimum costs 20 €
+        # and the open path pads it by 15 % — the real risk is 23 €, not 0.4 €.
+        sched = self._scheduler(
+            stop_level=99.9, markets=[self._market("A", stop_loss_eur=20.0)]
+        )
+        risks = sched._risk_estimates(
+            self._ranked("A"), TradeConfig(stop_min_distance_margin=0.15)
+        )
+        assert risks["A"] == pytest.approx(23.0)
+
+    def test_unknown_euro_per_point_yields_none(self):
+        sched = self._scheduler(
+            stop_level=97.0, markets=[self._market("A", euro_per_point=None)]
+        )
+        risks = sched._risk_estimates(self._ranked("A"), TradeConfig())
+        assert risks["A"] is None
+
+    def test_unknown_market_yields_none(self):
+        sched = self._scheduler(stop_level=97.0, markets=[])
+        risks = sched._risk_estimates(self._ranked("A"), TradeConfig())
+        assert risks["A"] is None
+
+    def test_a_raising_stop_policy_does_not_break_the_selection(self):
+        sched = self._scheduler(stop_level=97.0, markets=[self._market("A")])
+
+        def boom(**kwargs):
+            raise ValueError("no stop for this curve")
+
+        sched._close_profile_obj = SimpleNamespace(initial_plan=boom)
+        risks = sched._risk_estimates(self._ranked("A"), TradeConfig())
+        assert risks["A"] is None
+
+
+class TestMarketCatalogCrawl:
+    """The manual catalog crawl: delegation, run stamping and re-entrancy."""
+
+    @staticmethod
+    def _progress(*, complete: bool):
+        """A crawl snapshot with (or without) a fully drained frontier."""
+        from src.markets.catalog_crawler import CatalogProgress
+
+        return CatalogProgress(
+            running=False,
+            nodes_total=42,
+            nodes_pending=0 if complete else 7,
+            nodes_done=42 if complete else 35,
+            nodes_error=0,
+            markets=3000,
+            nodes_visited=42 if complete else 35,
+            markets_added=3000,
+            started_at=datetime(2026, 9, 8, 21, 0, tzinfo=UTC),
+            finished_at=datetime(2026, 9, 8, 23, 30, tzinfo=UTC),
+            last_error="" if complete else "quota",
+        )
+
+    async def _job_run(self, session_factory) -> JobPreference | None:
+        async with session_factory() as session:
+            return await session.get(JobPreference, "crawl_market_catalog")
+
+    async def test_complete_crawl_stamps_the_job_run(self, session_factory):
+        sched = _make_scheduler(session_factory)
+        sched._catalog_crawler = SimpleNamespace(
+            is_running=False,
+            crawl=AsyncMock(return_value=self._progress(complete=True)),
+        )
+
+        await sched.trigger_crawl_market_catalog()
+
+        assert (await self._job_run(session_factory)) is not None
+
+    async def test_interrupted_crawl_is_not_stamped(self, session_factory):
+        """A partial catalog must never look like a finished one."""
+        sched = _make_scheduler(session_factory)
+        sched._catalog_crawler = SimpleNamespace(
+            is_running=False,
+            crawl=AsyncMock(return_value=self._progress(complete=False)),
+        )
+
+        await sched.trigger_crawl_market_catalog()
+
+        assert (await self._job_run(session_factory)) is None
+
+    async def test_second_trigger_while_running_is_ignored(self, session_factory):
+        sched = _make_scheduler(session_factory)
+        crawl = AsyncMock(return_value=self._progress(complete=True))
+        sched._catalog_crawler = SimpleNamespace(is_running=True, crawl=crawl)
+
+        await sched.trigger_crawl_market_catalog()
+
+        crawl.assert_not_awaited()
+
+    async def test_crawl_failure_is_contained(self, session_factory):
+        """The action must never bubble an exception into the background task."""
+        sched = _make_scheduler(session_factory)
+        sched._catalog_crawler = SimpleNamespace(
+            is_running=False, crawl=AsyncMock(side_effect=RuntimeError("ig down"))
+        )
+
+        await sched.trigger_crawl_market_catalog()
+
+        assert (await self._job_run(session_factory)) is None

@@ -83,7 +83,7 @@ async def charts_index(request: Request) -> HTMLResponse:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Charts</title>
-    <link rel="stylesheet" href="/static/style.css?v=13">
+    <link rel="stylesheet" href="/static/style.css?v=18">
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
     <script src="/static/tables.js?v=1"></script>
 </head>
@@ -127,7 +127,7 @@ async def chart_epic(
     candles = await store.fetch(epic)
     if not candles:
         return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-            <link rel="stylesheet" href="/static/style.css?v=13"></head><body>
+            <link rel="stylesheet" href="/static/style.css?v=18"></head><body>
             <div class="container">{_nav("charts")}
             <div class="header-bar"><h1><i data-lucide="trending-up" class="lc-icon"></i> {html.escape(epic)}</h1></div>
             <div class="section"><p style="padding:2rem;text-align:center;color:#475569;">
@@ -168,15 +168,21 @@ async def chart_epic(
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — {html.escape(epic)}</title>
-    <link rel="stylesheet" href="/static/style.css?v=13">
+    <link rel="stylesheet" href="/static/style.css?v=18">
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
     <script src="/static/tables.js?v=1"></script>
+    <script src="/static/reading.js?v=1"></script>
 </head>
 <body>
 <div class="container">
     {_nav("charts")}
     <div class="header-bar">
         <h1><i data-lucide="trending-up" class="lc-icon"></i> {html.escape(epic)}</h1>
+        <button class="reading-btn" style="padding:0.3rem 0.7rem;gap:0.35rem;"
+                onclick="openReadingModal('{html.escape(epic)}', event)"
+                title="Read this market: regime, trends, noise, levels">
+            <i data-lucide="gauge" class="lc-icon"></i> Reading
+        </button>
         <div class="stat-badge">
             <span class="stat-label">Candles</span>
             <span class="stat-value" style="color:#4ade80;">{len(day_candles)}</span>

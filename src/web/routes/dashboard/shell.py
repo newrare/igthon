@@ -54,6 +54,31 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                             'onmouseleave="hideFundsTooltip()"'
                         ),
                     )
+                    + " "
+                    # Manual exit for the position shown on the chart. Hidden by
+                    # JS unless the epic has an OPEN trade whose running P&L is
+                    # strictly positive — closing here is meant to bank a gain,
+                    # never to crystallise a loss (the stop/close profile owns
+                    # that side).
+                    + render_button(
+                        "Close",
+                        cls="close-pos-btn",
+                        style="display:none;",
+                        onclick="closeChartPosition(this)",
+                        title="Close this position now (running P&amp;L is positive)",
+                        attrs='id="chart-close-btn"',
+                    )
+                    + " "
+                    # Opens the market-reading panel (regime, trends, noise,
+                    # levels, and the since-open measures when a trade is on) for
+                    # the epic currently displayed. Rendered by static/reading.js
+                    # on top of this modal.
+                    + render_button(
+                        '<i data-lucide="gauge" class="lc-icon"></i> Reading',
+                        cls="reading-btn",
+                        onclick="openReadingModal(_chartModalEpic, event)",
+                        title="Read this market: regime, trends, noise, levels",
+                    )
                 ),
                 # The chart sits in a relative wrapper so the carousel arrows
                 # (previous/next epic in the source table) and the "paused"
@@ -66,13 +91,19 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     'style="display:none;">‹</button>'
                     '<div id="chart-paused-badge" style="display:none;">'
                     "⏸ Paused (zoomed) — double-click to resume</div>"
-                    # Running/realised P&L for the epic's trade(s), overlaid
-                    # top-left of the chart. Filled by _loadChart from the
-                    # trade's stored euro P&L + position state.
-                    '<div id="chart-modal-pnl" style="position:absolute;'
-                    "top:6px;left:10px;z-index:5;font-size:0.82rem;"
+                    # Info badges overlaid top-left of the chart: the running /
+                    # realised P&L for the epic's trade(s) (filled by _loadChart
+                    # from the trade's stored euro P&L + position state) and the
+                    # live dealing spread of the market.
+                    '<div style="position:absolute;top:6px;left:10px;z-index:5;'
+                    'display:flex;gap:6px;align-items:center;flex-wrap:wrap;">'
+                    '<div id="chart-modal-pnl" style="font-size:0.82rem;'
                     "background:rgba(28,23,20,0.78);padding:3px 9px;"
                     'border-radius:4px;display:none;"></div>'
+                    '<div id="chart-modal-spread" style="font-size:0.82rem;'
+                    "background:rgba(28,23,20,0.78);padding:3px 9px;"
+                    'border-radius:4px;display:none;"></div>'
+                    "</div>"
                     '<div id="chart-container" style="height:100%;'
                     'min-height:420px;"></div>'
                     '<button id="chart-nav-next" class="chart-nav-btn chart-nav-next" '
@@ -228,7 +259,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=16">
+    <link rel="stylesheet" href="/static/style.css?v=18">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -337,7 +368,8 @@ def _render_dashboard(settings, state: dict) -> str:
     <footer id="footer-refresh">Live — updating every 1 s</footer>
 </div>
 
-<script src="/static/tables.js?v=1"></script>
-<script src="/static/dashboard.js?v=41"></script>
+<script src="/static/tables.js?v=2"></script>
+<script src="/static/dashboard.js?v=42"></script>
+<script src="/static/reading.js?v=1"></script>
 </body>
 </html>"""
