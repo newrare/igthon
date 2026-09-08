@@ -281,6 +281,20 @@ class Settings(BaseSettings):
     # markets we could never afford to open. Set to 0 to disable the filter.
     max_funds_per_position: float = 5000.0
 
+    # Risk-tier epic selection (see src/markets/risk_tiers.py). When enabled, the
+    # ~40 epics kept from the full discovered list are chosen by the euro cost of
+    # being wrong on them (``MarketInfo.stop_loss_eur``) rather than by spread
+    # diversification alone: the day starts on the smallest markets and only moves
+    # up a tier once its REALISED P&L has paid for it. False restores the previous
+    # behaviour (diversified pick across the whole tradable set).
+    epic_risk_tiers_enabled: bool = True
+    # Ascending euro boundaries of the ladder: bounds[i] is tier i's floor and
+    # bounds[i + 1] its ceiling, so N bounds describe N - 1 tiers. Tier i unlocks
+    # once the day's realised P&L is strictly above bounds[i] — the default reads
+    # 0-30 / 30-100 / 100-200 / 200-600 €.
+    # Override via EPIC_RISK_TIER_BOUNDS='[0,30,100,200,600]' in .env
+    epic_risk_tier_bounds: list[float] = [0.0, 30.0, 100.0, 200.0, 600.0]
+
     @property
     def ig_base_url(self) -> str:
         """Return the IG API base URL based on environment."""

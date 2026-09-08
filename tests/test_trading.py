@@ -669,6 +669,124 @@ class _StubProfile:
         return CloseDecision(action=ACTION_UPDATE_STOP, new_stop_level=stop)
 
 
+class TestArmedEuroTarget:
+    """The chart's queued close: "exit as soon as the P&L clears X €"."""
+
+    def _armed_service(self):
+        svc, _client, db = _trailing_service()
+        svc._is_epic_close_hour = AsyncMock(return_value=False)
+        # The close itself is covered by the close-path tests; here only the
+        # decision to fire matters.
+        svc._close_position = AsyncMock(return_value=True)
+        return svc, db
+
+    def _long(self, target: str | None) -> Position:
+        # 10 €/point long opened at 100: the P&L in euros is (bid - 100) * 10.
+        return Position(
+            epic="X",
+            deal_id="D",
+            direction="BUY",
+            state=PositionState.OPEN,
+            level_open=Decimal("100"),
+            euro_per_point=Decimal("10"),
+            close_when_euro_above=None if target is None else Decimal(target),
+        )
+
+    async def test_arming_persists_the_threshold(self):
+        svc, db = self._armed_service()
+        pos = self._long(None)
+        ok, message = await svc.set_euro_target(pos, 0.0)
+        assert (ok, message) == (True, "armed")
+        assert float(pos.close_when_euro_above) == 0.0
+        db.commit.assert_awaited()
+
+    async def test_disarming_clears_the_threshold(self):
+        svc, db = self._armed_service()
+        pos = self._long("-20")
+        ok, message = await svc.set_euro_target(pos, None)
+        assert (ok, message) == (True, "disarmed")
+        assert pos.close_when_euro_above is None
+        db.commit.assert_awaited()
+
+    async def test_arming_a_closed_position_is_refused(self):
+        svc, db = self._armed_service()
+        pos = self._long(None)
+        pos.state = PositionState.CLOSE
+        ok, _message = await svc.set_euro_target(pos, 0.0)
+        assert ok is False
+        assert pos.close_when_euro_above is None
+        db.commit.assert_not_awaited()
+
+    async def test_closes_once_the_pnl_clears_the_threshold(self):
+        # Armed at 0 €, bid at 100.5 -> +5 € -> the order fires.
+        svc, _db = self._armed_service()
+        pos = self._long("0")
+        closed = await svc.manage_position(
+            pos, current_bid=100.5, buf=_buffer_with_atr2()
+        )
+        assert closed is True
+        _position, level, reason = svc._close_position.await_args.args
+        assert reason == "euro_target"
+        assert level == pytest.approx(100.5)
+
+    async def test_holds_while_the_threshold_is_not_cleared(self):
+        # Armed at 0 €, still in the red: nothing is closed on this order.
+        svc, _db = self._armed_service()
+        pos = self._long("0")
+        await svc.manage_position(pos, current_bid=99.5, buf=_buffer_with_atr2())
+        svc._close_position.assert_not_awaited()
+
+    async def test_break_even_is_not_a_gain(self):
+        # Strictly above: arming 0 € must not close a flat position, whose exit
+        # would only pay the spread away.
+        svc, _db = self._armed_service()
+        pos = self._long("0")
+        await svc.manage_position(pos, current_bid=100.0, buf=_buffer_with_atr2())
+        svc._close_position.assert_not_awaited()
+
+    async def test_a_negative_threshold_caps_a_loss(self):
+        # "Close as soon as it is better than -20 €": at -15 € the order fires,
+        # so the position leaves before the loss can deepen again.
+        svc, _db = self._armed_service()
+        pos = self._long("-20")
+        closed = await svc.manage_position(
+            pos, current_bid=98.5, buf=_buffer_with_atr2()
+        )
+        assert closed is True
+
+    async def test_short_is_valued_on_the_offer(self):
+        # A short closes on the buy-back offer, so the P&L must be marked there
+        # (bid + spread) — exactly the figure the dashboard shows. Opened at 100
+        # with a 0.4 spread: bid 99.7 -> offer 100.1 -> -1 €, still under the
+        # armed 0 €, even though the bid alone would read +3 €.
+        svc, _db = self._armed_service()
+        pos = self._long("0")
+        pos.direction = "SELL"
+        await svc.manage_position(
+            pos, current_bid=99.7, buf=_buffer_with_atr2(close=99.7, spread=0.4)
+        )
+        svc._close_position.assert_not_awaited()
+
+    async def test_fires_without_a_buffer(self):
+        # The order must hold even on a tick the close profile cannot run (no
+        # buffer yet after a restart) — including for a short, which the
+        # profile-less path deliberately never closes.
+        svc, _db = self._armed_service()
+        pos = self._long("0")
+        pos.direction = "SELL"
+        pos.level_open = Decimal("100")
+        closed = await svc.manage_position(pos, current_bid=99.0, buf=None)
+        assert closed is True
+        _position, _level, reason = svc._close_position.await_args.args
+        assert reason == "euro_target"
+
+    async def test_unarmed_position_is_left_to_the_close_profile(self):
+        svc, _db = self._armed_service()
+        pos = self._long(None)
+        await svc.manage_position(pos, current_bid=100.5, buf=_buffer_with_atr2())
+        svc._close_position.assert_not_awaited()
+
+
 class TestManagePositionRatchet:
     """``manage_position`` enforces the ratchet invariant when applying a stop."""
 

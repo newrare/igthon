@@ -6,8 +6,10 @@ which the client swaps in place every two seconds instead of reloading the page.
 """
 
 import asyncio
+import re
 import sys
 from datetime import UTC, date, datetime, time
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -17,6 +19,8 @@ from httpx import ASGITransport, AsyncClient
 
 import src.web.routes.dashboard.router  # noqa: F401  (ensure submodule imported)
 from src.feed.price_buffer import PriceBuffer
+from src.models.epic import Epic
+from src.models.position import Position, PositionState
 from src.web.app import create_app
 from src.web.routes.dashboard import _build_fragments, _render_dashboard
 
@@ -486,6 +490,24 @@ class TestTradeOverlay:
         assert ov["close"] is None
         assert ov["closeTime"] is None
         assert ov["pnl"] == 5.0
+        # Nothing queued on this trade.
+        assert ov["euroTarget"] is None
+
+    def test_armed_euro_target_reaches_the_chart(self):
+        # The chart states the standing "close above X €" order, so it has to
+        # travel with the trade overlay.
+        from src.web.routes.dashboard.router import _trade_overlay
+
+        pos = SimpleNamespace(
+            id=9,
+            date=date(2026, 6, 8),
+            time_open=time(10, 0, 0),
+            time_close=None,
+            level_open=18000.0,
+            euro=-12.0,
+            close_when_euro_above=-20.0,
+        )
+        assert _trade_overlay(pos)["euroTarget"] == -20.0
 
     def test_closed_trade_has_close_marker(self):
         from src.web.routes.dashboard.router import _trade_overlay
@@ -868,7 +890,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=42" in html
+        assert "/static/dashboard.js?v=44" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -1008,6 +1030,16 @@ def _static(name: str) -> str:
     return (Path(__file__).resolve().parents[1] / "src/web/static" / name).read_text()
 
 
+def _js_function(name: str, script: str = "dashboard.js") -> str:
+    """The source of one top-level JS function, so a test can assert on *its*
+    body instead of on the whole file (where a string can drift in from an
+    unrelated helper)."""
+    js = _static(script)
+    start = js.index(f"function {name}(")
+    end = js.index("\n}", start)
+    return js[start:end]
+
+
 class TestSortPersistence:
     """A live poll must not throw away the column the user sorted on.
 
@@ -1040,7 +1072,7 @@ class TestSortPersistence:
 
 
 class TestChartModalChrome:
-    """The chart modal states the spread and offers a gain-only manual close."""
+    """The chart modal names the market, states its shape, and can always close."""
 
     def test_spread_badge_is_rendered(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -1050,16 +1082,82 @@ class TestChartModalChrome:
         js = _static("dashboard.js")
         assert "_renderChartSpread(data.spread)" in js
 
+    def test_spread_badge_states_only_the_euro_cost(self):
+        # The raw offer − bid point distance says nothing across instruments on
+        # its own; the badge states the euro cost of a round trip and nothing
+        # else (the point distance is only used by the noise dial below).
+        body = _js_function("_renderChartSpread")
+        assert "euro" in body
+        assert "points" not in body
+
+    def test_title_is_the_market_name_not_the_epic(self):
+        # The heading names the instrument the user recognises; the epic
+        # identifier is only the placeholder until the payload lands.
+        js = _static("dashboard.js")
+        assert "_setChartTitle(data.name || epic)" in js
+
+    def test_epic_identifier_is_a_discreet_footnote(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-modal-epic"' in html
+        js = _static("dashboard.js")
+        assert "_setChartEpicLabel(epic)" in js
+
+    def test_shape_badge_is_filled_from_the_chart_payload(self):
+        # Regime + one trend arrow per horizon, at the top of the chart.
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-modal-shape"' in html
+        js = _static("dashboard.js")
+        assert "_renderChartShape(data.shape)" in js
+
     def test_close_button_starts_hidden(self):
         html = _render_dashboard(_settings(), _base_state())
         assert 'id="chart-close-btn"' in html
         assert "closeChartPosition(this)" in html
 
-    def test_close_button_requires_a_strictly_positive_pnl(self):
-        # The button banks a gain; at break-even or in the red the close profile
-        # decides, so it must stay hidden.
+    def test_close_button_shows_on_a_losing_trade_too(self):
+        # Cutting a loss by hand is as legitimate as banking a gain: the button
+        # now depends on the trade being OPEN, not on the sign of its P&L.
+        body = _js_function("_updateChartCloseControls")
+        assert "pnl <= 0" not in body
+        assert "t.state === 'open'" in body
+
+    def test_trend_arrows_shrink_from_the_newest_horizon(self):
+        # Most recent first (5 → 60 min) and biggest first: what the market is
+        # doing now weighs more than what it did over the last hour.
         js = _static("dashboard.js")
-        assert "pnl === null || pnl <= 0" in js
+        sizes = re.search(r"_TREND_SIZES = \[([^\]]+)\]", js).group(1)
+        values = [float(v) for v in sizes.split(",")]
+        assert len(values) == 4
+        assert values == sorted(values, reverse=True)
+        body = _js_function("_renderChartShape")
+        assert "(a.minutes || 0) - (b.minutes || 0)" in body
+
+    def test_noise_dial_compares_the_noise_band_with_the_spread(self):
+        # Two concentric discs on one scale: is the tick noise a stop has to
+        # survive bigger than what a round trip costs?
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-modal-noise"' in html
+        js = _static("dashboard.js")
+        assert "_renderChartNoise(candles[candles.length - 1], data.spread)" in js
+        body = _js_function("_renderChartNoise")
+        assert "candle.noise" in body
+        assert "spread.points" in body
+
+    def test_queued_close_buttons_are_rendered(self):
+        # "As soon as it is positive" and "as soon as it is above x €" are the
+        # same order with a different threshold.
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-arm-zero-btn"' in html
+        assert "armChartEuroTarget(this, 0)" in html
+        assert 'id="chart-arm-custom-btn"' in html
+        assert "armChartEuroTargetPrompt(this)" in html
+
+    def test_armed_order_is_shown_with_a_cancel(self):
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="chart-modal-armed"' in html
+        body = _js_function("_renderChartArmed")
+        assert "trade.euroTarget" in body
+        assert "disarmChartEuroTarget(this)" in body
 
     def test_close_from_the_chart_tolerates_having_no_table_row(self):
         # closePosition() is shared with the positions table, where it dims the
@@ -1094,6 +1192,144 @@ class TestChartEndpoint:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             data = (await client.get("/api/chart/CS.D.EURUSD.MINI.IP")).json()
         assert data["spread"] is None
+
+    async def test_chart_payload_names_the_instrument(self):
+        # The chart titles itself with the epic's description (the market table's
+        # "Name"), so the payload has to carry it.
+        epic = "IX.D.DAX.IFMM.IP"
+        buffer = PriceBuffer()
+        buffer.add_candle(epic, _candle(1000.0))
+        app = create_app(settings=_settings(), buffer=buffer)
+        app.state.session_factory = lambda: _ChartSession("Germany 40 Cash")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/chart/{epic}")).json()
+        assert data["name"] == "Germany 40 Cash"
+
+    async def test_chart_payload_carries_the_market_shape(self):
+        # Regime + the four standard trend horizons, in increasing order, read
+        # from the in-memory buffer (no IG call).
+        epic = "IX.D.DAX.IFMM.IP"
+        buffer = PriceBuffer()
+        buffer.add_candle(epic, _candle(1000.0))
+        app = create_app(settings=_settings(), buffer=buffer)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get(f"/api/chart/{epic}")).json()
+        shape = data["shape"]
+        assert shape["regime"]
+        assert [t["minutes"] for t in shape["trends"]] == [5, 15, 30, 60]
+        assert all(t["direction"] in {"UP", "DOWN", "FLAT"} for t in shape["trends"])
+
+    async def test_chart_payload_shape_is_none_without_history(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get("/api/chart/CS.D.EURUSD.MINI.IP")).json()
+        assert data["shape"] is None
+
+
+class TestEuroTargetEndpoint:
+    """POST /api/positions/euro-target/{id} arms and disarms the queued close."""
+
+    def _app(self, position: Position):
+        app = create_app(settings=_settings(), buffer=PriceBuffer())
+        app.state.api_queue = _FakeQueue({})
+        app.state.session_factory = lambda: _PositionSession(position)
+        return app
+
+    def _open_position(self) -> Position:
+        return Position(
+            id=3,
+            epic="IX.D.DAX.IFMM.IP",
+            epic_name="DAX",
+            date=date(2026, 6, 9),
+            state=PositionState.OPEN,
+            direction="BUY",
+        )
+
+    async def test_arming_stores_the_threshold(self):
+        position = self._open_position()
+        transport = ASGITransport(app=self._app(position))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post("/api/positions/euro-target/3", json={"euro": -20})
+        assert res.status_code == 200
+        assert res.json()["euro"] == -20.0
+        assert float(position.close_when_euro_above) == -20.0
+
+    async def test_zero_threshold_means_as_soon_as_positive(self):
+        position = self._open_position()
+        transport = ASGITransport(app=self._app(position))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post("/api/positions/euro-target/3", json={"euro": 0})
+        assert res.status_code == 200
+        assert float(position.close_when_euro_above) == 0.0
+
+    async def test_null_disarms(self):
+        position = self._open_position()
+        position.close_when_euro_above = Decimal("-20")
+        transport = ASGITransport(app=self._app(position))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post("/api/positions/euro-target/3", json={"euro": None})
+        assert res.status_code == 200
+        assert position.close_when_euro_above is None
+
+    async def test_a_missing_threshold_is_rejected(self):
+        position = self._open_position()
+        transport = ASGITransport(app=self._app(position))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post("/api/positions/euro-target/3", json={})
+        assert res.status_code == 400
+        assert position.close_when_euro_above is None
+
+    async def test_a_closed_position_cannot_be_armed(self):
+        position = self._open_position()
+        position.state = PositionState.CLOSE
+        transport = ASGITransport(app=self._app(position))
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post("/api/positions/euro-target/3", json={"euro": 0})
+        assert res.status_code == 400
+        assert position.close_when_euro_above is None
+
+
+class _PositionSession:
+    """Session stub returning one position row from ``session.get``."""
+
+    def __init__(self, position: Position) -> None:
+        self._position = position
+        self.committed = False
+
+    async def __aenter__(self) -> "_PositionSession":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def get(self, _model, _pk):
+        return self._position
+
+    async def commit(self) -> None:
+        self.committed = True
+
+
+class _ChartSession:
+    """Session stub for /api/chart: no trade rows, one enriched epic row."""
+
+    def __init__(self, description: str | None) -> None:
+        self._description = description
+
+    async def __aenter__(self) -> "_ChartSession":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def scalars(self, _statement):
+        return SimpleNamespace(all=lambda: [])
+
+    async def scalar(self, _statement):
+        return Epic(name="IX.D.DAX.IFMM.IP", description=self._description)
 
 
 class TestFragmentsEndpoint:

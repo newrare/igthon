@@ -1303,13 +1303,199 @@ def _market(epic: str, status: str = "TRADEABLE") -> SimpleNamespace:
     )
 
 
+def _tier_market(epic: str, risk: float | None, spread: float = 0.001) -> MarketInfo:
+    """A MarketInfo priced at ``risk`` euros per stop-out, for the tier selection."""
+    return MarketInfo(
+        epic=epic,
+        name=epic,
+        bid=1.0,
+        offer=1.0,
+        spread_ratio=spread,
+        dealing_enabled=True,
+        status="TRADEABLE",
+        instrument_type="CURRENCIES",
+        stop_loss_eur=risk,
+    )
+
+
+def _tier_scheduler(session_factory, streaming, cap: int = 2) -> BotScheduler:
+    """A scheduler with the risk-tier epic selection enabled and a small cap."""
+    settings = MagicMock()
+    settings.strategy_hour_close = 17
+    settings.streaming_max_epics = cap
+    settings.epic_risk_tiers_enabled = True
+    settings.epic_risk_tier_bounds = [0.0, 30.0, 100.0, 200.0, 600.0]
+    return BotScheduler(
+        settings=settings,
+        client=MagicMock(),
+        buffer=MagicMock(),
+        market_data=MagicMock(),
+        recorder=MagicMock(),
+        epics=["SMALL1", "SMALL2", "BIG1", "BIG2"],
+        session_factory=session_factory,
+        candle_store=MagicMock(),
+        streaming=streaming,
+    )
+
+
+async def _add_closed(session_factory, epic: str, euro: float) -> None:
+    """Bank ``euro`` on today's realised P&L via one closed position."""
+    async with session_factory() as session:
+        session.add(
+            Position(
+                epic=epic,
+                epic_name=epic,
+                date=date.today(),
+                state=PositionState.CLOSE,
+                euro=Decimal(str(euro)),
+            )
+        )
+        await session.commit()
+
+
+class TestRiskTierEpicSelection:
+    """The watched universe climbs the euro ladder with the day's banked P&L."""
+
+    def _wire(self, scheduler, markets):
+        scheduler._scanner.get_all_market_infos = AsyncMock(return_value=markets)
+        scheduler._scanner.select_tradable = MagicMock(return_value=markets)
+        scheduler._scanner.get_non_tradable_reasons = MagicMock(return_value={})
+        scheduler._persist_epic_enrichment = AsyncMock()
+        scheduler._persist_tradable_flags = AsyncMock()
+
+    async def test_flat_day_watches_the_small_markets(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming)
+        self._wire(
+            scheduler,
+            [
+                _tier_market("SMALL1", 10.0),
+                _tier_market("SMALL2", 20.0),
+                _tier_market("BIG1", 150.0),
+                _tier_market("BIG2", 400.0),
+            ],
+        )
+
+        await scheduler._refresh_tradable_epics()
+
+        assert sorted(scheduler._tradable_epics) == ["SMALL1", "SMALL2"]
+        assert scheduler._risk_tier.index == 0
+        # The dropped epics are labelled with the tier that dropped them, not
+        # with the generic streaming cap.
+        reasons = scheduler._persist_tradable_flags.await_args.args[1]
+        assert reasons["BIG1"] == "risk_tier_0-30€"
+
+    async def test_banked_gains_unlock_the_next_tier(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming)
+        self._wire(
+            scheduler,
+            [
+                _tier_market("SMALL1", 10.0),
+                _tier_market("SMALL2", 20.0),
+                _tier_market("BIG1", 150.0),
+                _tier_market("BIG2", 400.0),
+            ],
+        )
+        await _add_closed(session_factory, "SMALL1", 120.0)
+
+        await scheduler._refresh_tradable_epics()
+
+        assert scheduler._risk_tier.index == 2  # 100-200 € band
+        assert scheduler._tradable_epics[0] == "BIG1"
+
+    async def test_open_position_is_kept_outside_its_tier(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming)
+        self._wire(
+            scheduler,
+            [
+                _tier_market("SMALL1", 10.0),
+                _tier_market("SMALL2", 20.0),
+                _tier_market("BIG1", 150.0),
+            ],
+        )
+        await _add_open(session_factory, "BIG1")
+
+        await scheduler._refresh_tradable_epics()
+
+        # Flat day = tier 0, yet the 150 € market holding a position stays in.
+        assert scheduler._tradable_epics[0] == "BIG1"
+        assert len(scheduler._tradable_epics) == 2
+
+    async def test_reselect_is_a_noop_while_the_tier_holds(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming)
+        self._wire(scheduler, [_tier_market("SMALL1", 10.0)])
+        await scheduler._refresh_tradable_epics()
+        streaming.set_epics.reset_mock()
+
+        await _add_closed(session_factory, "SMALL1", 5.0)  # still under 30 €
+        await scheduler._maybe_reselect_risk_tier()
+
+        streaming.set_epics.assert_not_awaited()
+
+    async def test_reselect_switches_the_list_intraday(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming)
+        self._wire(
+            scheduler,
+            [
+                _tier_market("SMALL1", 10.0),
+                _tier_market("SMALL2", 20.0),
+                _tier_market("MID1", 50.0),
+                _tier_market("MID2", 60.0),
+            ],
+        )
+        await scheduler._refresh_tradable_epics()
+        assert sorted(scheduler._tradable_epics) == ["SMALL1", "SMALL2"]
+
+        await _add_closed(session_factory, "SMALL1", 45.0)
+        await scheduler._maybe_reselect_risk_tier()
+
+        # Re-picked from the cached snapshot — no second /markets fetch.
+        assert scheduler._scanner.get_all_market_infos.await_count == 1
+        assert sorted(scheduler._tradable_epics) == ["MID1", "MID2"]
+        assert scheduler._risk_tier.index == 1
+
+    async def test_a_giveback_walks_the_list_back_down(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming)
+        self._wire(
+            scheduler,
+            [
+                _tier_market("SMALL1", 10.0),
+                _tier_market("SMALL2", 20.0),
+                _tier_market("MID1", 50.0),
+                _tier_market("MID2", 60.0),
+            ],
+        )
+        await _add_closed(session_factory, "MID1", 45.0)
+        await scheduler._refresh_tradable_epics()
+        assert sorted(scheduler._tradable_epics) == ["MID1", "MID2"]
+
+        await _add_closed(session_factory, "MID2", -40.0)  # day back to +5 €
+        await scheduler._maybe_reselect_risk_tier()
+
+        assert sorted(scheduler._tradable_epics) == ["SMALL1", "SMALL2"]
+        assert scheduler._risk_tier.index == 0
+
+
 class TestStreamingKeepsOpenPositions:
     async def test_open_position_epic_stays_subscribed_when_capped(
         self, session_factory
     ):
+        """Legacy (risk tiers off) path: the class-diversified cap keeps the pins."""
         settings = MagicMock()
         settings.strategy_hour_close = 17
         settings.streaming_max_epics = 2  # force the cap with 3 candidates
+        settings.epic_risk_tiers_enabled = False
         streaming = MagicMock()
         streaming.set_epics = AsyncMock()
         scheduler = BotScheduler(

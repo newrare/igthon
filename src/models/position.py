@@ -98,6 +98,13 @@ class Position(Base):
     # the bid crosses into a different zone (auto management then resumes). NULL =
     # no manual override active. See migration c2d3e4f5a6b7.
     manual_stop_zone: Mapped[str | None] = mapped_column(String(20))
+    # Armed manual exit (dashboard chart): close this position as soon as its
+    # running euro P&L is strictly ABOVE this threshold. A human order, so it is
+    # honoured before the close profile is consulted, on every monitor tick, and
+    # it survives a restart. "Close as soon as it is positive" is the same order
+    # with a 0 threshold; a negative value caps a loss ("close as soon as it is
+    # better than -20 €"). NULL = nothing armed. See migration a2b3c4d5e6f7.
+    close_when_euro_above: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro_stop: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     # Euros of realized/unrealized P&L per 1.0 of price movement for the whole

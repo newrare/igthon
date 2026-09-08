@@ -56,17 +56,57 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     )
                     + " "
                     # Manual exit for the position shown on the chart. Hidden by
-                    # JS unless the epic has an OPEN trade whose running P&L is
-                    # strictly positive — closing here is meant to bank a gain,
-                    # never to crystallise a loss (the stop/close profile owns
-                    # that side).
+                    # JS unless the epic has an OPEN trade, whatever the sign of
+                    # its running P&L: banking a gain and cutting a loss are both
+                    # legitimate manual calls. The label carries the P&L that
+                    # clicking would realise.
                     + render_button(
                         "Close",
                         cls="close-pos-btn",
                         style="display:none;",
                         onclick="closeChartPosition(this)",
-                        title="Close this position now (running P&amp;L is positive)",
+                        title="Close this position now at market price",
                         attrs='id="chart-close-btn"',
+                    )
+                    + " "
+                    # Queued exits: instead of closing now, arm a standing order
+                    # the monitor honours on the tick the running P&L clears a
+                    # euro threshold — 0 € ("as soon as it is positive") or a
+                    # figure the user types (e.g. -20 € to cap a loss). Both are
+                    # the same order with a different threshold, persisted on the
+                    # position so a restart cannot drop it.
+                    + render_button(
+                        "⏳ ≥ 0 €",
+                        cls="close-pos-btn",
+                        # Same geometry as Close, blue instead of red: a queued
+                        # order must not read as "close now".
+                        style=(
+                            "display:none;background:#172554;"
+                            "border-color:#1e3a8a;color:#60a5fa;"
+                        ),
+                        onclick="armChartEuroTarget(this, 0)",
+                        title=(
+                            "Queue a close: exit as soon as the running P&amp;L "
+                            "turns positive (checked on every monitor tick)"
+                        ),
+                        attrs='id="chart-arm-zero-btn"',
+                    )
+                    + " "
+                    + render_button(
+                        "⏳ ≥ x €",
+                        cls="close-pos-btn",
+                        # Same geometry as Close, blue instead of red: a queued
+                        # order must not read as "close now".
+                        style=(
+                            "display:none;background:#172554;"
+                            "border-color:#1e3a8a;color:#60a5fa;"
+                        ),
+                        onclick="armChartEuroTargetPrompt(this)",
+                        title=(
+                            "Queue a close: exit as soon as the running P&amp;L is "
+                            "above a euro threshold you choose (e.g. -20 €)"
+                        ),
+                        attrs='id="chart-arm-custom-btn"',
                     )
                     + " "
                     # Opens the market-reading panel (regime, trends, noise,
@@ -93,8 +133,9 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     "⏸ Paused (zoomed) — double-click to resume</div>"
                     # Info badges overlaid top-left of the chart: the running /
                     # realised P&L for the epic's trade(s) (filled by _loadChart
-                    # from the trade's stored euro P&L + position state) and the
-                    # live dealing spread of the market.
+                    # from the trade's stored euro P&L + position state), the live
+                    # dealing spread of the market, and its shape — the regime
+                    # plus one trend arrow per horizon (5/15/30/60 min).
                     '<div style="position:absolute;top:6px;left:10px;z-index:5;'
                     'display:flex;gap:6px;align-items:center;flex-wrap:wrap;">'
                     '<div id="chart-modal-pnl" style="font-size:0.82rem;'
@@ -103,9 +144,33 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                     '<div id="chart-modal-spread" style="font-size:0.82rem;'
                     "background:rgba(28,23,20,0.78);padding:3px 9px;"
                     'border-radius:4px;display:none;"></div>'
+                    '<div id="chart-modal-shape" style="font-size:0.82rem;'
+                    "background:rgba(28,23,20,0.78);padding:3px 9px;"
+                    'border-radius:4px;display:none;"></div>'
+                    # Noise vs spread: two concentric discs sized by the market's
+                    # own tick-noise band and by the dealing spread, so it is
+                    # visible at a glance whether the noise a stop has to survive
+                    # is bigger than what a round trip costs.
+                    '<div id="chart-modal-noise" style="font-size:0.82rem;'
+                    "background:rgba(28,23,20,0.78);padding:3px 9px;"
+                    "border-radius:4px;display:none;align-items:center;"
+                    'gap:6px;"></div>'
+                    # The armed queued close, when one is set: what it waits for,
+                    # and a click to cancel it.
+                    '<div id="chart-modal-armed" style="font-size:0.82rem;'
+                    "background:rgba(28,23,20,0.78);padding:3px 9px;"
+                    'border-radius:4px;display:none;"></div>'
                     "</div>"
                     '<div id="chart-container" style="height:100%;'
                     'min-height:420px;"></div>'
+                    # The modal title now names the instrument, so the epic
+                    # identifier lives here: a discreet footnote under the curve
+                    # (left-aligned on the plot area, past Plotly's y-axis
+                    # margin) for whoever needs the exact IG code.
+                    '<div id="chart-modal-epic" style="position:absolute;'
+                    "bottom:2px;left:58px;z-index:5;font-size:0.66rem;"
+                    "color:#64748b;letter-spacing:0.05em;"
+                    'pointer-events:none;"></div>'
                     '<button id="chart-nav-next" class="chart-nav-btn chart-nav-next" '
                     'onclick="chartNavNext()" title="Next epic (→)" '
                     'style="display:none;">›</button>'
@@ -369,7 +434,7 @@ def _render_dashboard(settings, state: dict) -> str:
 </div>
 
 <script src="/static/tables.js?v=2"></script>
-<script src="/static/dashboard.js?v=42"></script>
+<script src="/static/dashboard.js?v=44"></script>
 <script src="/static/reading.js?v=1"></script>
 </body>
 </html>"""

@@ -111,6 +111,39 @@ separately, from IG's navigation tree, into the `market_catalog` table — see
 [USE.md § Market catalog](USE.md#market-catalog-full-instrument-list). No env
 variable drives it: it is a manual action.
 
+### Watched-epic selection (risk tiers)
+
+The scanner discovers ~140 epics; IG's Lightstreamer connection only accepts
+`STREAMING_MAX_EPICS` (40) subscriptions, and an epic that is not watched can
+never be opened. Which 40 are kept is a **profit-funded ladder** on the euro cost
+of being wrong (`MarketInfo.stop_loss_eur`, the risk column of the Epic List) —
+see `src/markets/risk_tiers.py`.
+
+| Variable                  | Default              | Description                                            |
+| ------------------------- | -------------------- | ------------------------------------------------------ |
+| `EPIC_RISK_TIERS_ENABLED` | `true`               | `false` restores the plain class-diversified pick      |
+| `EPIC_RISK_TIER_BOUNDS`   | `[0,30,100,200,600]` | Ascending euro boundaries; N bounds describe N−1 tiers |
+
+The default bounds read as four tiers — `0-30`, `30-100`, `100-200`,
+`200-600 €`. Tier *i* unlocks once the day's **realised** P&L (closed positions
+only) is strictly above its floor, so the day starts on the smallest markets and
+only moves up with money already in the bank. The tier is recomputed on every
+analysis tick, never latched: giving the gains back walks the watched list
+straight back down to the small markets, within 30 seconds and without any extra
+API call (the pick is replayed from the last `/markets` snapshot).
+
+Two rules keep the list usable:
+
+- an epic **holding an open position is always kept**, whatever tier it belongs
+  to, so a live trade never loses its feed;
+- the list is **always filled to the cap** — when the unlocked band holds fewer
+  markets than there are slots, the rest is taken from below the floor first
+  (cheaper is always safe), then from above the ceiling, then from the markets
+  whose risk could not be priced.
+
+Epics cut by the ladder are labelled `risk_tier_<band>` in the Epic List's
+exclusion-reason column.
+
 ### Position sizing
 
 | Variable                     | Default  | Description                        |

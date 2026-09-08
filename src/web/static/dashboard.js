@@ -950,15 +950,47 @@ function _showChartEpic(epic) {
     _chartOpenTrade = null;
     _clearStopButtons();  // drop the previous epic's buttons until the new load
     _setChartZoomed(false);
-    titleEl.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> ' + epic;
-    lucide.createIcons();
+    // The epic identifier is only a placeholder title until the load brings the
+    // instrument name back; it always shows as the footnote under the curve.
+    _setChartTitle(epic);
+    _setChartEpicLabel(epic);
     container.innerHTML = '<div style="color:#64748b;padding:3rem;text-align:center;">Loading…</div>';
     const pnlEl = document.getElementById('chart-modal-pnl');
     if (pnlEl) pnlEl.style.display = 'none';
     const spreadEl = document.getElementById('chart-modal-spread');
     if (spreadEl) spreadEl.style.display = 'none';
-    _updateChartCloseBtn();  // hides it until the new epic's trade is known
+    ['chart-modal-shape', 'chart-modal-noise', 'chart-modal-armed'].forEach(
+        function(id) {
+            const badge = document.getElementById(id);
+            if (badge) badge.style.display = 'none';
+        }
+    );
+    _updateChartCloseControls();  // hides it until the new epic's trade is known
     _updateChartNav();
+}
+
+// Paint the modal title: the human-readable market name, which is what the user
+// actually recognises. Set with textContent so an instrument description can
+// never inject markup. Skipped when the text is unchanged — the 3 s chart
+// refresh calls this on every repaint, and rebuilding the header would re-run
+// the whole-document lucide icon scan for nothing.
+let _chartTitleText = null;
+
+function _setChartTitle(text) {
+    const el = document.getElementById('chart-modal-title');
+    const label = text || '';
+    if (!el || label === _chartTitleText) return;
+    el.innerHTML = '<i data-lucide="trending-up" class="lc-icon"></i> <span></span>';
+    el.querySelector('span').textContent = label;
+    _chartTitleText = label;
+    lucide.createIcons();
+}
+
+// Paint the discreet epic-identifier footnote under the curve (the IG code the
+// title no longer carries).
+function _setChartEpicLabel(epic) {
+    const el = document.getElementById('chart-modal-epic');
+    if (el) el.textContent = epic || '';
 }
 
 // ── Chart carousel ────────────────────────────────────────────────────────────
@@ -1164,29 +1196,83 @@ function _renderChartPnl(trades) {
 }
 
 // Paint the dealing-spread badge: what one round trip on this market costs at
-// minimum deal size (same figure as the market table's "Spread (€)" column),
-// plus the raw offer − bid price distance it is derived from. Hidden when the
-// spread cache has nothing for the epic yet (it fills in on a later refresh).
+// minimum deal size (same figure as the market table's "Spread (€)" column).
+// Only the euro cost is shown — the raw offer − bid point distance means nothing
+// on its own across instruments. Hidden when the spread cache has nothing for
+// the epic yet (it fills in on a later refresh).
 function _renderChartSpread(spread) {
     const el = document.getElementById('chart-modal-spread');
     if (!el) return;
-    const euro   = spread && typeof spread.euro === 'number' ? spread.euro : null;
-    const points = spread && typeof spread.points === 'number' ? spread.points : null;
-    if (euro === null && points === null) {
+    const euro = spread && typeof spread.euro === 'number' ? spread.euro : null;
+    if (euro === null) {
         el.style.display = 'none';
         return;
     }
-    const parts = [];
-    if (euro !== null) {
-        parts.push('<span style="color:#f59e0b;font-weight:600;">'
-            + euro.toFixed(2) + ' €</span>');
-    }
-    if (points !== null) {
-        parts.push('<span style="color:#94a3b8;">' + _fmtPoints(points) + ' pts</span>');
-    }
-    el.innerHTML = '<span style="color:#94a3b8;">Spread</span> ' + parts.join(' · ');
+    el.innerHTML = '<span style="color:#94a3b8;">Spread</span> '
+        + '<span style="color:#f59e0b;font-weight:600;">' + euro.toFixed(2) + ' €</span>';
     el.style.display = 'block';
 }
+
+// ── Market shape badge (regime + trend arrows) ───────────────────────────────
+// Colours mirror the reading panel's tones, so the same regime reads the same
+// way in both views.
+const _REGIME_COLOR = {
+    TREND_UP: '#4ade80',
+    TREND_DOWN: '#ef4444',
+    RANGE: '#f59e0b',
+    VOLATILE: '#ef4444',
+    UNKNOWN: '#64748b',
+};
+const _TREND_GLYPH = { UP: '▲', DOWN: '▼', FLAT: '▬' };
+const _TREND_COLOR = { UP: '#4ade80', DOWN: '#ef4444', FLAT: '#64748b' };
+// Arrow size per horizon, newest (5 min) to oldest (60 min).
+const _TREND_SIZES = [1.05, 0.88, 0.74, 0.62];
+
+// Paint the shape badge at the top of the chart: the regime (range, trend up, …)
+// and, next to it, one arrow per trend horizon in increasing order (5, 15, 30,
+// 60 min) — so the curve is read together with the context the entry gates see.
+// Hidden when the epic has no buffered history to read yet.
+function _renderChartShape(shape) {
+    const el = document.getElementById('chart-modal-shape');
+    if (!el) return;
+    const regime = shape && shape.regime ? String(shape.regime).toUpperCase() : '';
+    if (!regime) {
+        el.style.display = 'none';
+        return;
+    }
+    // Most recent horizon first (5 → 60 min) and drawn biggest: what the market
+    // is doing right now weighs more than what it did over the last hour, so the
+    // arrows shrink as they go back in time.
+    const trends = (shape.trends || []).slice().sort(function(a, b) {
+        return (a.minutes || 0) - (b.minutes || 0);
+    });
+    const arrows = trends.map(function(t, i) {
+        const dir = String(t.direction || 'FLAT').toUpperCase();
+        const size = _TREND_SIZES[Math.min(i, _TREND_SIZES.length - 1)];
+        return '<span title="' + t.minutes + ' min · ' + dir.toLowerCase() + '"'
+            + ' style="color:' + (_TREND_COLOR[dir] || '#64748b')
+            + ';font-size:' + size + 'rem;line-height:1;vertical-align:middle;">'
+            + (_TREND_GLYPH[dir] || '▬') + '</span>';
+    });
+    let html = '<span style="color:' + (_REGIME_COLOR[regime] || '#64748b')
+        + ';font-weight:700;letter-spacing:0.04em;">'
+        + regime.replace(/_/g, ' ') + '</span>';
+    if (arrows.length) {
+        html += '<span style="color:#475569;"> · </span>'
+            + '<span title="Trend 5 / 15 / 30 / 60 min" style="letter-spacing:0.14em;">'
+            + arrows.join('') + '</span>';
+    }
+    el.innerHTML = html;
+    el.style.display = 'block';
+}
+
+// ── Noise vs spread dial ─────────────────────────────────────────────────────
+// Two concentric discs on the same scale: the market's adverse tick-noise band
+// (the same one drawn under the bid — what a stop has to survive) and the
+// dealing spread (what a round trip costs). One glance answers the only question
+// that matters before placing a stop: is the noise bigger than the spread?
+const _NOISE_COLOR  = '#60a5fa';
+const _SPREAD_COLOR = '#f59e0b';
 
 // Price distances span forex (0.00012) to indices (12.5), so keep enough
 // decimals to stay readable without printing float noise.
@@ -1196,29 +1282,172 @@ function _fmtPoints(value) {
     return value.toFixed(dp);
 }
 
-// Show the header "Close" button only while the epic on screen has an OPEN trade
-// whose running P&L is strictly positive — the button exists to bank a gain, so
-// it stays hidden at break-even or in the red (the close profile owns those).
-// The label carries the P&L that would be realised by clicking it.
-function _updateChartCloseBtn() {
+// ``candle`` is the last plotted candle (its ``noise`` is the band in price
+// points, server-computed) and ``spread`` the cached dealing spread. Hidden
+// unless both figures are known — a single disc compares nothing.
+function _renderChartNoise(candle, spread) {
+    const el = document.getElementById('chart-modal-noise');
+    if (!el) return;
+    const noise  = candle && typeof candle.noise === 'number' && isFinite(candle.noise)
+        ? candle.noise : null;
+    const points = spread && typeof spread.points === 'number' && isFinite(spread.points)
+        ? spread.points : null;
+    if (noise === null || points === null || (noise <= 0 && points <= 0)) {
+        el.style.display = 'none';
+        return;
+    }
+    // Radius by value on a shared scale, so the two discs are directly
+    // comparable; a floor keeps the smaller one visible when the ratio is wild.
+    const max = Math.max(noise, points);
+    const R = function(v) { return 3 + 9 * (max > 0 ? Math.max(0, v) / max : 0); };
+    const discs = [
+        { r: R(points), color: _SPREAD_COLOR },
+        { r: R(noise),  color: _NOISE_COLOR },
+    ].sort(function(a, b) { return b.r - a.r; });  // biggest behind
+    const svg = '<svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">'
+        + discs.map(function(d) {
+            return '<circle cx="13" cy="13" r="' + d.r.toFixed(2) + '" fill="'
+                + d.color + '" fill-opacity="0.28" stroke="' + d.color
+                + '" stroke-width="1"></circle>';
+        }).join('')
+        + '</svg>';
+    // The ratio is the actionable number: above 1 the tick noise alone can trip
+    // a stop placed one spread away.
+    const ratio = points > 0 ? noise / points : null;
+    const ratioColor = ratio === null ? '#94a3b8' : (ratio > 1 ? '#ef4444' : '#4ade80');
+    el.innerHTML = svg
+        + '<span style="color:#94a3b8;">Noise</span>'
+        + (ratio === null ? '' : ' <span style="color:' + ratioColor
+            + ';font-weight:600;">×' + ratio.toFixed(2) + '</span>');
+    el.title = 'Noise band ' + _fmtPoints(noise) + ' vs spread '
+        + _fmtPoints(points) + ' (price points) — '
+        + (ratio !== null && ratio > 1
+            ? 'tick noise alone is wider than the spread'
+            : 'the spread is wider than the tick noise');
+    el.style.display = 'flex';
+}
+
+// Show the header exit controls — close now, and the two queued closes — only
+// while the epic on screen has an OPEN trade. The immediate Close appears
+// whatever the sign of the running P&L: banking a gain and cutting a loss are
+// both legitimate manual calls. Its label carries the (signed) P&L that would be
+// realised by clicking it, red in the red so the loss is never clicked blind.
+function _updateChartCloseControls() {
+    const t = _chartOpenTrade;
+    const open = !!t && t.state === 'open';
+    ['chart-arm-zero-btn', 'chart-arm-custom-btn'].forEach(function(id) {
+        const b = document.getElementById(id);
+        if (b) b.style.display = open ? '' : 'none';
+    });
+    _renderChartArmed(open ? t : null);
+
     const btn = document.getElementById('chart-close-btn');
     if (!btn) return;
     // A close is being confirmed / sent: leave the button exactly as the close
     // flow left it, so the 3 s chart refresh can't wipe its in-flight state.
     if (btn.dataset.busy === '1') return;
-    const t = _chartOpenTrade;
-    const pnl = t && typeof t.pnl === 'number' && isFinite(t.pnl) ? t.pnl : null;
-    if (!t || t.state !== 'open' || pnl === null || pnl <= 0) {
+    if (!open) {
         btn.style.display = 'none';
         return;
     }
+    const pnl = typeof t.pnl === 'number' && isFinite(t.pnl) ? t.pnl : null;
     btn.style.display = '';
     btn.disabled = false;
     // Clear any ✓/✗ feedback colours left by a previous close attempt.
     btn.style.background = '';
     btn.style.color = '';
-    btn.textContent = 'Close +' + pnl.toFixed(2) + ' €';
+    if (pnl === null) {
+        btn.textContent = 'Close';
+        return;
+    }
+    btn.style.color = pnl >= 0 ? '#4ade80' : '#ef4444';
+    btn.textContent = 'Close ' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' €';
 }
+
+// ── Queued close (armed euro target) ─────────────────────────────────────────
+// Paint the badge stating the standing order: what the monitor is waiting for,
+// and a click to cancel it. Hidden when nothing is armed.
+function _renderChartArmed(trade) {
+    const el = document.getElementById('chart-modal-armed');
+    if (!el) return;
+    const target = trade && typeof trade.euroTarget === 'number'
+        && isFinite(trade.euroTarget) ? trade.euroTarget : null;
+    if (target === null) {
+        el.style.display = 'none';
+        return;
+    }
+    el.innerHTML = '<span style="color:#94a3b8;">⏳ Closes above</span> '
+        + '<span style="color:#60a5fa;font-weight:600;">'
+        + (target >= 0 ? '+' : '') + target.toFixed(2) + ' €</span> '
+        + '<button onclick="disarmChartEuroTarget(this)" '
+        + 'title="Cancel this queued close" '
+        + 'style="background:none;border:none;color:#ef4444;cursor:pointer;'
+        + 'font-size:0.82rem;padding:0 2px;">✕</button>';
+    el.style.display = 'block';
+}
+
+// Arm (``euro`` a number) or disarm (``euro`` null) the queued close on the
+// trade currently shown. Nothing reaches IG: the order is a standing instruction
+// the monitor honours on the tick the running P&L clears the threshold.
+async function armChartEuroTarget(btn, euro) {
+    const t = _chartOpenTrade;
+    if (!t) return;
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '…'; }
+    try {
+        const res = await fetch('/api/positions/euro-target/' + t.id, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ euro: euro }),
+        });
+        const data = await res.json().catch(function() { return {}; });
+        if (res.ok) {
+            if (euro === null) {
+                showToast('Queued close cancelled', _chartModalEpic || '', 'info');
+            } else {
+                showToast(
+                    'Queued close armed',
+                    'Closes as soon as the P&L is above ' + euro.toFixed(2) + ' €',
+                    'success'
+                );
+            }
+            t.euroTarget = euro;
+            _renderChartArmed(t);
+            if (_chartModalEpic) _loadChart(_chartModalEpic, false);
+        } else {
+            showToast('Not armed', data.error || 'Rejected', 'error');
+        }
+    } catch (e) {
+        showToast('Not armed', e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = orig; }
+    }
+}
+
+// Ask for the threshold, then arm. Pre-filled with the armed value if any, else
+// the running P&L rounded down to the euro — the figure the user is looking at.
+function armChartEuroTargetPrompt(btn) {
+    const t = _chartOpenTrade;
+    if (!t) return;
+    const armed = typeof t.euroTarget === 'number' && isFinite(t.euroTarget)
+        ? t.euroTarget : null;
+    const pnl = typeof t.pnl === 'number' && isFinite(t.pnl) ? t.pnl : 0;
+    const preset = armed !== null ? armed : Math.floor(pnl);
+    const raw = window.prompt(
+        'Close ' + (_chartModalEpic || 'this position')
+            + ' as soon as its P&L is above… (€, e.g. -20)',
+        String(preset)
+    );
+    if (raw === null) return;
+    const euro = parseFloat(String(raw).replace(',', '.').trim());
+    if (!isFinite(euro)) {
+        showToast('Not armed', 'Enter a euro figure, e.g. -20', 'error');
+        return;
+    }
+    armChartEuroTarget(btn, euro);
+}
+
+function disarmChartEuroTarget(btn) { armChartEuroTarget(btn, null); }
 
 // Manual exit of the position currently shown on the chart, reusing the same
 // confirm + toast flow as the positions table.
@@ -1255,8 +1484,12 @@ async function _loadChart(epic, initial) {
         // Pre-open projection (break-even / margin / profit as if a BUY opened
         // now). Present only on trade-less "global" charts; drawn very discreetly.
         const projection = (!trades.length && data.projection) ? data.projection : null;
+        _setChartTitle(data.name || epic);
+        _setChartEpicLabel(epic);
         _renderChartPnl(trades);
         _renderChartSpread(data.spread);
+        _renderChartShape(data.shape);
+        _renderChartNoise(candles[candles.length - 1], data.spread);
         const rawBids = candles.map(function(c) { return c.bid; });
         // Offer (ask) curve. A long is filled on the offer, so level_open/zero sit
         // on this curve, not the bid one; without it the entry marker floats a
@@ -1318,7 +1551,7 @@ async function _loadChart(epic, initial) {
         _chartLo = lo;
         _chartRange = range;
         _chartOpenTrade = trades.find(function(t) { return t.state === 'open'; }) || null;
-        _updateChartCloseBtn();
+        _updateChartCloseControls();
 
         // Candle timestamps as epoch ms (parsed in the browser's local tz; all
         // values use the same convention so differences and round-trips are
@@ -1737,7 +1970,7 @@ function closeChartModal() {
     _chartEpicIndex = -1;
     _chartOpenTrade = null;
     _clearStopButtons();
-    _updateChartCloseBtn();
+    _updateChartCloseControls();
     _setChartZoomed(false);
     document.getElementById('chart-modal').style.display = 'none';
     Plotly.purge(document.getElementById('chart-container'));

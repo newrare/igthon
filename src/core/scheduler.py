@@ -57,6 +57,7 @@ from src.feed.market_data import MarketDataService
 from src.feed.price_buffer import DEFAULT_MAX_CANDLES, EpicBuffer, PriceBuffer
 from src.markets.catalog_crawler import CatalogCrawler, CatalogProgress
 from src.markets.market_scanner import MarketInfo, MarketScanner
+from src.markets.risk_tiers import RiskTier, select_by_risk_tier, tier_for_pnl
 from src.models.day import Day, DayState
 from src.models.epic import Epic
 from src.models.job_preference import JobPreference
@@ -375,6 +376,15 @@ class BotScheduler:
         self._tradable_epics: list[str] = list(epics)
         self._tradable_markets: list[MarketInfo] = []
         self._tradable_last_refresh: datetime | None = None
+        # Last market snapshot fetched by ``_refresh_tradable_epics``. Kept so the
+        # risk tier can re-pick the watched subset intra-day (``_rebuild_tradable_set``)
+        # without spending a fresh batch of /markets calls.
+        self._market_infos: list[MarketInfo] = []
+        # Risk tier the current watched subset was picked for, and the open-position
+        # epics pinned into it. Both are the change detector of
+        # ``_maybe_reselect_risk_tier``; None means nothing has been picked yet.
+        self._risk_tier: RiskTier | None = None
+        self._risk_tier_pins: frozenset[str] = frozenset()
         self._epic_last_refresh: datetime | None = None
         # UTC timestamp of the last successful open-position sync (the moment the
         # stored ``euro`` figures were last refreshed from IG). Surfaced on the
@@ -1651,9 +1661,11 @@ class BotScheduler:
         of 25) and applies the open/TRADEABLE filter. No spread filter is applied
         here — the spread is checked later at analysis time.
 
-        When streaming is active, subscriptions are updated immediately after the
-        filter so the Lightstreamer feed delivers prices for the new set. No
-        historical priming is done — prices arrive via the live stream.
+        This is the only path that *fetches*: it refreshes the market snapshot,
+        force-closes any open position whose market is no longer tradable, then
+        hands the snapshot to :meth:`_rebuild_tradable_set`, which owns the actual
+        subscription-set choice and is also re-run intra-day (without any API
+        call) when the risk tier moves.
         """
         logger.info(
             "Refreshing tradable epics from %d candidates", len(self._all_epics)
@@ -1672,62 +1684,14 @@ class BotScheduler:
         # batch fetch — the Epic List modal reads these columns from the DB.
         await self._persist_epic_enrichment(infos)
 
-        # Full set passing the open/affordable/dedupe filters, before any
-        # streaming-subscription cap. Reasons are computed against THIS set so
-        # the only exclusions it explains are genuine ones (closed, no price,
-        # too expensive, product-variant duplicate) — never the cap below.
-        selected = self._scanner.select_tradable(infos)
-        tradeable = selected
-
-        # IG caps Lightstreamer at 40 subscriptions per connection. When streaming
-        # is active and more markets are tradable than fit, pick a subset balanced
-        # across asset classes (indices / forex / commodities) rather than the
-        # globally tightest spreads — which would otherwise fill every slot with
-        # FX pairs and starve the other classes.
-        capped_out: list[str] = []
-        if (
-            self._streaming is not None
-            and len(selected) > self._settings.streaming_max_epics
-        ):
-            tradeable = self._scanner.select_diversified_subset(
-                selected, self._settings.streaming_max_epics
-            )
-            kept = {m.epic for m in tradeable}
-            capped_out = [m.epic for m in selected if m.epic not in kept]
-            mix: dict[str, int] = {}
-            for m in tradeable:
-                cls = m.instrument_type.upper() or "OTHER"
-                mix[cls] = mix.get(cls, 0) + 1
-            breakdown = ", ".join(f"{k}={v}" for k, v in sorted(mix.items()))
-            logger.info(
-                "Tradable epics capped to %d (diversified across classes: %s) — "
-                "dropped %d over the IG streaming limit",
-                self._settings.streaming_max_epics,
-                breakdown,
-                len(capped_out),
-            )
-
-        self._tradable_markets = tradeable
-        self._tradable_epics = [m.epic for m in tradeable]
-        self._tradable_last_refresh = datetime.now(UTC)
-        self._pricing_blacklist.clear()
-        logger.info(
-            "Tradable epics: %d / %d are open/TRADEABLE (pricing blacklist cleared)",
-            len(self._tradable_epics),
-            len(self._all_epics),
-        )
-
-        # Epics holding an open position must keep their live feed until the trade
-        # closes, so the position's candle history (and the bid the monitor reads)
-        # never stops mid-trade — even if the spread/diversity cap would otherwise
-        # drop them. They are streamed regardless of the cap below.
-        open_epics = await self._open_position_epics()
-
         # Safety net for the per-epic close rule: if an open position's market is
         # no longer TRADEABLE (it closed, or went to auction/edits-only), force it
         # shut so a trade can't be stranded past its market's close. Only act on a
         # status we actually observed this refresh (unknown epics are left alone).
+        # Done BEFORE the selection so a market being force-closed here no longer
+        # claims one of the pinned slots below.
         status_by_epic = {m.epic: m.status for m in infos}
+        open_epics = await self._open_position_epics()
         not_tradeable_open = {
             e for e in open_epics if status_by_epic.get(e, "TRADEABLE") != "TRADEABLE"
         }
@@ -1741,27 +1705,160 @@ class BotScheduler:
                     self._client, session, self._build_trade_config()
                 )
                 await trading.close_epics(not_tradeable_open, "market_closed")
-            open_epics = await self._open_position_epics()
 
-        # Reasons against the pre-cap set, then overlay the streaming-cap reason
-        # for markets that were tradable but cut to fit the 40-subscription limit
-        # — so the Epic List doesn't mislabel them as "duplicate".
+        # Keep the snapshot so the risk tier can re-pick the watched set intra-day
+        # from the same data instead of spending a fresh batch of API calls.
+        self._market_infos = infos
+        self._pricing_blacklist.clear()
+        await self._rebuild_tradable_set(infos)
+        logger.debug("Pricing blacklist cleared by the tradable refresh")
+
+    async def _rebuild_tradable_set(self, infos: list[MarketInfo]) -> None:
+        """Choose the watched subset from a market snapshot and publish it.
+
+        Split out of :meth:`_refresh_tradable_epics` because it must also run
+        *without* fetching: the risk tier (see :mod:`src.markets.risk_tiers`) can
+        move at any moment of the day — the instant a close changes the realised
+        P&L — and the watched list has to follow it immediately, not at the next
+        hourly refresh. Everything here is pure computation plus the two writes
+        that publish the result (the Epic List flags and the feed subscriptions).
+
+        Three stages:
+
+        1. ``select_tradable`` — the open/affordable/dedupe filters, applied to
+           the whole snapshot. Exclusion reasons are computed against THIS set so
+           the only ones it explains are genuine (closed, no price, too expensive,
+           product-variant duplicate) — never the cap below.
+        2. the cap — IG allows a fixed number of Lightstreamer subscriptions, so
+           when more markets are tradable than fit, either the risk-tier ladder
+           picks them (``epic_risk_tiers_enabled``: the day's realised P&L chooses
+           the euro band, open positions are pinned in) or, when it is disabled,
+           the previous class-diversified pick does.
+        3. publication — persist the flags, then push the subscription set with
+           the open-position epics first so they survive ``set_epics``' own
+           truncation.
+        """
+        selected = self._scanner.select_tradable(infos)
+        open_epics = await self._open_position_epics()
+        cap = self._settings.streaming_max_epics if self._streaming is not None else 0
+
+        capped_out: list[str] = []
+        reason_capped = "streaming_cap"
+        if self._settings.epic_risk_tiers_enabled and cap > 0:
+            realised = await self._realized_pnl_today_safe()
+            tier = tier_for_pnl(realised, tuple(self._settings.epic_risk_tier_bounds))
+            selection = select_by_risk_tier(
+                selected, cap=cap, tier=tier, pinned=open_epics
+            )
+            tradeable = selection.markets
+            self._risk_tier = tier
+            self._risk_tier_pins = frozenset(open_epics)
+            reason_capped = f"risk_tier_{tier.label}"
+            logger.info(
+                "Risk-tier epic selection: %.2f€ realised today -> %s (from %d "
+                "tradable candidates)",
+                realised,
+                selection.summary(),
+                len(selected),
+            )
+        elif cap > 0 and len(selected) > cap:
+            tradeable = self._scanner.select_diversified_subset(selected, cap)
+            mix: dict[str, int] = {}
+            for m in tradeable:
+                cls = m.instrument_type.upper() or "OTHER"
+                mix[cls] = mix.get(cls, 0) + 1
+            breakdown = ", ".join(f"{k}={v}" for k, v in sorted(mix.items()))
+            logger.info(
+                "Tradable epics capped to %d (diversified across classes: %s) — "
+                "dropped %d over the IG streaming limit",
+                cap,
+                breakdown,
+                len(selected) - len(tradeable),
+            )
+        else:
+            tradeable = selected
+
+        kept = {m.epic for m in tradeable}
+        capped_out = [m.epic for m in selected if m.epic not in kept]
+
+        self._tradable_markets = tradeable
+        self._tradable_epics = [m.epic for m in tradeable]
+        self._tradable_last_refresh = datetime.now(UTC)
+        logger.info(
+            "Tradable epics: %d / %d are open/TRADEABLE",
+            len(self._tradable_epics),
+            len(self._all_epics),
+        )
+
+        # Reasons against the pre-cap set, then overlay the cap reason for markets
+        # that were tradable but cut to fit the subscription limit / the unlocked
+        # risk tier — so the Epic List doesn't mislabel them as "duplicate".
         reasons = self._scanner.get_non_tradable_reasons(infos, selected)
         for epic in capped_out:
-            # A capped epic that still holds an open position stays on the feed
-            # below, so don't mislabel it as dropped by the cap.
-            if epic not in open_epics:
-                reasons[epic] = "streaming_cap"
+            reasons[epic] = reason_capped
         await self._persist_tradable_flags(self._tradable_epics, reasons)
 
         if self._streaming is not None:
-            # Open-position epics first so they survive ``set_epics``' truncation
-            # to the IG subscription cap; the tradable set fills the rest.
+            # Epics holding an open position must keep their live feed until the
+            # trade closes, so the position's candle history (and the bid the
+            # monitor reads) never stops mid-trade — even if the selection above
+            # dropped them. They come first so they survive ``set_epics``'
+            # truncation to the IG subscription cap; the tradable set fills the
+            # rest.
             stream_epics = [
                 *sorted(open_epics),
                 *(e for e in self._tradable_epics if e not in open_epics),
             ]
             await self._streaming.set_epics(stream_epics)
+
+    async def _realized_pnl_today_safe(self) -> float:
+        """Today's banked P&L, or 0 € when it cannot be read.
+
+        The risk tier degrades to its first rung (the small markets) on a DB
+        error, which is the conservative side: an unreadable P&L must never be
+        read as permission to escalate.
+        """
+        try:
+            async with self._session_factory() as session:
+                return await self._realized_pnl_today(session)
+        except Exception as exc:
+            logger.warning("Could not read today's realized P&L for the tier: %s", exc)
+            return 0.0
+
+    async def _maybe_reselect_risk_tier(self) -> None:
+        """Re-pick the watched epics when the day's P&L unlocked another tier.
+
+        Called on every analysis tick and cheap by design: it reads the realised
+        P&L and the open-position epics, and returns immediately unless one of
+        them actually moved the selection. Without it a tier change would only
+        take effect at the next hourly refresh, so a morning that banks its first
+        30 € would keep trading the small markets for the rest of the hour.
+
+        The pinned set is part of the trigger, not just the tier: a close frees
+        the slot its epic held, and the freed slot should go back to the tier at
+        once rather than stay parked on a market nothing is riding any more.
+        """
+        if not self._settings.epic_risk_tiers_enabled:
+            return
+        if not self._market_infos or self._streaming is None:
+            return  # nothing to re-pick from, or no subscription cap to respect
+
+        realised = await self._realized_pnl_today_safe()
+        tier = tier_for_pnl(realised, tuple(self._settings.epic_risk_tier_bounds))
+        pins = frozenset(await self._open_position_epics())
+        if tier == self._risk_tier and pins == self._risk_tier_pins:
+            return
+
+        if tier != self._risk_tier:
+            previous = self._risk_tier.label if self._risk_tier else "none"
+            logger.info(
+                "Risk tier moved %s -> %s on %.2f€ realised today — re-picking the "
+                "watched epics",
+                previous,
+                tier.label,
+                realised,
+            )
+        await self._rebuild_tradable_set(self._market_infos)
 
     # ------------------------------------------------------------------
     # Scheduled tasks
@@ -1852,6 +1949,12 @@ class BotScheduler:
         # a stalled subscription must be recovered even if the tradable set is
         # empty this tick.
         await self._ensure_open_epics_streamed()
+
+        # Then make sure the watched universe still matches the risk tier the day
+        # has paid for: a close that banks the next 30 € must move the list now,
+        # not at the next hourly refresh. A no-op unless the tier or the pinned
+        # open positions actually changed.
+        await self._maybe_reselect_risk_tier()
 
         config = self._build_trade_config()
         epics = [e for e in self._tradable_epics if e not in self._pricing_blacklist]

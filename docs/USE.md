@@ -161,6 +161,45 @@ Beware: the CLI opens its own IG session (IG allows a limited number of
 concurrent ones), so prefer it while the bot is stopped — otherwise use the
 dashboard button, which reuses the bot's session and its queue.
 
+### Chart modal
+
+Clicking any row (Market Data, Open / Closed Positions) opens the whole-day curve
+for that epic. The header names the **market** (the instrument description, not
+the epic code — that one sits discreetly under the curve) and carries the actions:
+`Buy` / `Sell`, the exits below, and `Reading`.
+
+Overlaid on the top-left of the chart:
+
+- the running (`en cours`) or realised (`validé`) **P&L** per trade, prefixed by
+  its BUY / SELL chip;
+- the euro **spread** — what one round trip at minimum size pays away;
+- the **regime** (range, trend up, …) followed by one **trend arrow per horizon**,
+  most recent first and biggest first: 5, 15, 30 then 60 minutes;
+- a **noise / spread dial** — two concentric discs on one scale, the market's
+  adverse tick-noise band against the dealing spread, with their ratio. Above ×1
+  the tick noise alone is wider than the spread, so a stop placed one spread away
+  can be tripped by noise only;
+- the **queued close**, when one is armed, with a `✕` to cancel it.
+
+Three exits, all only while the epic holds an open position:
+
+| Button       | Effect                                                                                                                                                    |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Close ±x €` | Closes now at market price. Shown in the red too — cutting a loss by hand is as valid as banking a gain; the label carries the P&L that will be realised. |
+| `⏳ ≥ 0 €`   | Queues the close: exit **as soon as the running P&L turns positive**.                                                                                     |
+| `⏳ ≥ x €`   | Same order with a threshold you type — e.g. `-20` for "exit as soon as it is better than -20 €".                                                          |
+
+A queued close is a standing order stored on the position
+(`close_when_euro_above`), so it survives a restart. It is evaluated on every
+monitoring pass, before the close profile decides anything, on the same close-out
+price the badge shows (the bid for a long, the offer for a short) and strictly
+above the threshold — arming `0` never closes a flat position at break-even.
+Closes it fires are stamped `reason_close = euro_target` ("Euro target" in the
+tables). Nothing is sent to IG when arming: only the close itself is an order.
+
+The chart refreshes every 3 seconds, freezes while you zoom (double-click to
+resume) and the `‹` `›` arrows browse the rows of the table it was opened from.
+
 ### Market reading panel
 
 The **gauge icon** opens the read-only reading of a market: regime, trend per

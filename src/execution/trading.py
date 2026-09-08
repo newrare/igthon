@@ -2035,9 +2035,22 @@ class TradingService:
         :meth:`~src.exit.base.CloseProfile.evaluate`); ``None`` for a caller that
         does not track it.
 
+        An armed euro target (:meth:`set_euro_target`) is honoured first, before
+        the profile is consulted: it is a standing order from the user, not a
+        strategy decision.
+
         Returns:
             True if the position was closed, False otherwise.
         """
+        # Armed manual exit first: the user asked, from the chart, for this
+        # position to be closed as soon as its running P&L cleared a euro
+        # threshold. A standing human order outranks every strategy decision, and
+        # it must hold even for a position the close profile cannot manage this
+        # tick (no buffer yet after a restart), so it is checked before anything
+        # else. A no-op unless ``close_when_euro_above`` is set.
+        if await self._maybe_close_on_euro_target(position, current_bid, buf):
+            return True
+
         # One direction-aware close profile manages both sides (see
         # :mod:`src.exit.close_zoneprofit`): the zones, their ``CLOSE_ZONE*``
         # selectors and the ratchet all mirror themselves for a SELL.
@@ -2568,6 +2581,78 @@ class TradingService:
         )
         message = "ok" if pushed else "queued (broker update not confirmed by IG)"
         return True, message
+
+    async def set_euro_target(
+        self, position: Position, threshold: float | None
+    ) -> tuple[bool, str]:
+        """Arm (or disarm) the "close as soon as the P&L clears X €" order.
+
+        The dashboard chart's queued-close buttons land here. ``threshold`` is a
+        euro figure the running P&L must be strictly above for the position to be
+        closed on the next monitor tick — ``0.0`` for "as soon as it is positive",
+        a negative value to cap a loss ("as soon as it is better than -20 €").
+        ``None`` disarms.
+
+        Persisted on the row (``close_when_euro_above``) rather than held in
+        memory, so a restart cannot silently drop a human order. Nothing is sent
+        to IG here: the order is a standing instruction, not a broker-side one.
+
+        Returns:
+            ``(ok, message)`` — ``ok`` False with the reason when the position is
+            not open (nothing is written).
+        """
+        if position.state != PositionState.OPEN:
+            return False, "Position is not open"
+        position.close_when_euro_above = (
+            None if threshold is None else Decimal(str(round(threshold, 3)))
+        )
+        await self._db.commit()
+        if threshold is None:
+            logger.info("Euro-target close disarmed for %s", position.epic)
+            return True, "disarmed"
+        logger.info(
+            "Euro-target close armed for %s: close as soon as P&L > %.2f€",
+            position.epic,
+            threshold,
+        )
+        return True, "armed"
+
+    async def _maybe_close_on_euro_target(
+        self,
+        position: Position,
+        current_bid: float,
+        buf: EpicBuffer | None,
+    ) -> bool:
+        """Honour an armed euro target: close now if the P&L cleared it.
+
+        Evaluated before the close profile is consulted — an explicit human order
+        outranks the strategy — and valued on the **close-out** price the dashboard
+        shows in its running P&L (the bid for a long, the offer for a short), so
+        the trade exits exactly when the figure the user watched crossed the
+        threshold they typed. Strictly above, so arming ``0`` never closes a flat
+        position at break-even.
+
+        Needs neither a buffer nor a close profile: the euro P&L comes from the
+        position's own ``euro_per_point``. Returns True when the position was
+        closed.
+        """
+        target = position.close_when_euro_above
+        if target is None:
+            return False
+        spread = float(buf.last.spread or 0) if (buf and buf.last) else 0.0
+        close_out = (
+            current_bid + spread if position.direction == "SELL" else current_bid
+        )
+        euro = self._euro_pnl(position, close_out)
+        if euro <= float(target):
+            return False
+        logger.info(
+            "Euro target reached for %s: P&L %.2f€ > %.2f€ — closing (armed order)",
+            position.epic,
+            euro,
+            float(target),
+        )
+        return await self._close_position(position, close_out, "euro_target")
 
     async def close_manually(self, position: Position, close_level: float) -> bool:
         """Force-close ``position`` now at ``close_level`` (dashboard manual close).

@@ -259,6 +259,8 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
         "now": ("Forced close", "#f59e0b"),
         "end_of_day": ("End of day", "#60a5fa"),
         "manual": ("Manual", "#60a5fa"),
+        # Queued from the chart: "close as soon as the P&L clears X €".
+        "euro_target": ("Euro target", "#60a5fa"),
         "closed_externally": ("IG / external", "#a78bfa"),
         "not_found_in_ig": ("Not found (IG)", "#94a3b8"),
         "never_opened": ("Never opened", "#64748b"),
@@ -283,6 +285,7 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
 _FORCED_CLOSE_REASONS = {
     "end_of_day",
     "manual",
+    "euro_target",
     "now",
     "closed_externally",
     "not_found_in_ig",

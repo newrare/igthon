@@ -10,8 +10,10 @@ from sqlalchemy import select
 
 from src.core.api_queue import Priority
 from src.core.indicators import adverse_tick_noise
+from src.core.reading import CurveReading
 from src.entry.base import EntryIntent
 from src.execution.trading import TradeConfig, TradingService
+from src.models.epic import Epic
 from src.models.position import Position, PositionState
 from src.utils.tools import _to_float, euro_per_point, margin_factor_pct
 from src.web.routes.dashboard.fragments import _build_fragments
@@ -525,6 +527,30 @@ def _trade_overlay(p: Position) -> dict:
         # ("en cours") for an open trade or realised ("validé") once closed.
         "state": getattr(getattr(p, "state", None), "value", None),
         "pnl": _num("euro"),
+        # Armed manual exit, when the user queued one from the chart: the euro
+        # threshold the running P&L must clear for the position to be closed on
+        # the next monitor tick. None = nothing armed.
+        "euroTarget": _num("close_when_euro_above"),
+    }
+
+
+def _chart_shape(buf) -> dict | None:
+    """Regime + the four standard trend horizons, for the chart header.
+
+    Read straight from the in-memory buffer (no IG call, never the API queue),
+    so the live chart can state the market's shape — the same regime and
+    per-horizon directions the reading panel spells out, condensed to the two
+    facts the header draws. ``None`` when the epic has no buffered history yet.
+    """
+    if buf is None or not len(buf):
+        return None
+    reading = CurveReading.of(buf)
+    return {
+        "regime": reading.regime.value,
+        "trends": [
+            {"minutes": minutes, "direction": trend.direction.value}
+            for minutes, trend in sorted(reading.trends.items())
+        ],
     }
 
 
@@ -573,15 +599,27 @@ async def api_chart(request: Request, epic: str) -> JSONResponse:
 
     # Every trade on this epic today (all open/close cycles, oldest first).
     trades: list[dict] = []
+    # Human-readable market name: the chart titles itself with the instrument,
+    # and the epic identifier is only a discreet footnote. Same source as the
+    # market table's "Name" column (the enriched epic row), falling back to the
+    # name captured on the trade rows for an epic not (yet) discovered.
+    name = ""
     session_factory = getattr(request.app.state, "session_factory", None)
     if session_factory is not None:
         async with session_factory() as session:
-            rows = await session.scalars(
-                select(Position)
-                .where(Position.epic == epic, Position.date == today)
-                .order_by(Position.id)
+            rows = list(
+                (
+                    await session.scalars(
+                        select(Position)
+                        .where(Position.epic == epic, Position.date == today)
+                        .order_by(Position.id)
+                    )
+                ).all()
             )
             trades = [_trade_overlay(p) for p in rows]
+            epic_row = await session.scalar(select(Epic).where(Epic.name == epic))
+            description = epic_row.description if epic_row is not None else None
+            name = description or (rows[-1].epic_name if rows else "") or ""
 
     # Pre-open ("global") chart: no trade was taken on this epic today, so there
     # are no real position indicators to draw. Instead project — very discreetly,
@@ -622,10 +660,14 @@ async def api_chart(request: Request, epic: str) -> JSONResponse:
     return JSONResponse(
         {
             "epic": epic,
+            "name": name,
             "candles": candles,
             "trades": trades,
             "projection": projection,
             "spread": spread,
+            # Market shape (regime + per-horizon trend directions) drawn at the
+            # top of the chart, so the curve is read with its context.
+            "shape": _chart_shape(request.app.state.buffer.get(epic)),
         }
     )
 
@@ -1138,6 +1180,60 @@ async def set_stop_manual(request: Request, position_id: int) -> JSONResponse:
                 # "ok" when IG confirmed the broker push, otherwise a note that
                 # the software stop is set but the broker update was not confirmed.
                 "detail": message,
+            }
+        )
+
+
+@router.post("/api/positions/euro-target/{position_id}")
+async def set_euro_target_manual(request: Request, position_id: int) -> JSONResponse:
+    """Arm (or disarm) a queued close on an open position, from the chart.
+
+    Body: ``{"euro": <threshold>}`` — close this position as soon as its running
+    P&L is strictly above ``threshold`` euros (``0`` for "as soon as it is
+    positive", ``-20`` for "as soon as it is better than -20 €"). ``{"euro":
+    null}`` disarms. The order is a standing instruction evaluated on every
+    monitor tick by :meth:`TradingService.manage_position`; nothing is sent to IG
+    here, so this never touches the API queue.
+    """
+    session_factory = getattr(request.app.state, "session_factory", None)
+    api_queue = getattr(request.app.state, "api_queue", None)
+    settings = request.app.state.settings
+
+    if not session_factory:
+        return JSONResponse({"error": "Trading not available"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw = body.get("euro", "missing")
+    if raw == "missing":
+        return JSONResponse({"error": "Missing 'euro'"}, status_code=400)
+    threshold = None if raw is None else _to_float_or_none(raw)
+    if raw is not None and threshold is None:
+        return JSONResponse({"error": "Invalid 'euro'"}, status_code=400)
+
+    async with session_factory() as session:
+        position = await session.get(Position, position_id)
+        if not position:
+            return JSONResponse({"error": "Position not found"}, status_code=404)
+
+        trading = TradingService(
+            api_queue, session, TradeConfig.from_settings(settings)
+        )
+        try:
+            ok, message = await trading.set_euro_target(position, threshold)
+        except Exception as exc:
+            logger.error("Arming euro target failed for %s: %s", position.epic, exc)
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        if not ok:
+            return JSONResponse({"error": message}, status_code=400)
+
+        return JSONResponse(
+            {
+                "status": message,
+                "epic": position.epic,
+                "euro": _to_float_or_none(position.close_when_euro_above),
             }
         )
 

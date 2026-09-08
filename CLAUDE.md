@@ -59,6 +59,7 @@ src/
 │   └── api/                # IG HTTP client (client.py, session.py, endpoints/)
 ├── feed/                   # FLUX — streaming, market_data, price_buffer, candle_store
 ├── markets/                # MARCHÉS — market_scanner (build the epic list)
+│                           # + risk_tiers (pick the ~40 watched epics by euro risk tier)
 │                           # + catalog_crawler (static full catalog, resumable crawl)
 ├── entry/                  # OUVERTURE — EntryStrategy → EntryIntent (direction only)
 │   ├── base.py · open_donchian.py · open_projection.py · open_ranking.py
@@ -156,6 +157,28 @@ ______________________________________________________________________
 - All DB models inherit from SQLAlchemy `DeclarativeBase`.
 - All schema changes go through **Alembic** migrations — never `create_all()` in production.
 - Use `TIMESTAMPTZ` (timezone-aware) for all datetime columns.
+
+#### Never leave a migration unapplied
+
+Adding or altering a model column means **writing the revision AND running it**,
+before reporting the work as done. Do not hand the command to the user to run:
+the running app queries every mapped column, so an unapplied revision means the
+next request dies with `sqlite3.OperationalError: no such column: …` and a 500 on
+the dashboard.
+
+Same rule for any command needed to make a change effective (migration, asset
+version bump, reformat): **run it, verify the output, then answer** — the reply
+must state what was actually done, never what remains to be done.
+
+```bash
+alembic upgrade head   # apply — instant on the local SQLite DB
+alembic current        # verify: must print the new revision, tagged (head)
+```
+
+`alembic/env.py` reads `DATABASE_URL` from `.env` (local dev is
+`sqlite:///./ig_trading.db`), so it always targets the DB the bot actually uses —
+ignore the placeholder `sqlalchemy.url` in `alembic.ini`. Adding a nullable
+column is safe and the revision carries its `downgrade()`.
 
 ### Testing
 

@@ -32,6 +32,7 @@ igthon/
 │   │   └── candle_store.py # Persist + prune candles; per-week CSV archive
 │   ├── markets/            # MARCHÉS — build the tradeable epic list
 │   │   ├── market_scanner.py  # Daily discovery (search terms + watchlists)
+│   │   ├── risk_tiers.py      # Which ~40 of them to watch: euro ladder funded by the day's P&L
 │   │   └── catalog_crawler.py # Static full catalog — resumable /marketnavigation crawl
 │   ├── entry/              # OUVERTURE — entry strategies (open decision only)
 │   │   ├── base.py            # EntryStrategy → EntryIntent (direction, NO exit levels)
@@ -106,6 +107,15 @@ the reversal. Both rules are pure
 `core/scheduler.BotScheduler._revert_after_stop_loss`, so it belongs to neither
 the entry nor the exit domain — it only reacts to a close and asks the shared open
 path for the reverse side.
+
+Two **manual overrides** sit outside the close profile as well, both set from the
+dashboard chart and both owned by `execution/trading.py` because they are human
+orders rather than strategy: the stop the user places by hand
+(`Position.manual_stop_zone` — automatic ratcheting is suspended while the bid
+stays in that zone) and the queued close
+(`Position.close_when_euro_above` — exit as soon as the running euro P&L clears a
+threshold, checked on every monitor tick *before* the profile is consulted). Both
+are persisted on the position, so a restart cannot silently drop them.
 
 ______________________________________________________________________
 
