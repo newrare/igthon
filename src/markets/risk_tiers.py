@@ -29,11 +29,17 @@ position it sizes. Here the ladder is applied one level *up*, on the universe
 itself, so it constrains every entry strategy — not only the ones that opt into a
 risk ladder.
 
-Two rules keep the list usable rather than merely pure:
+Three rules keep the list usable rather than merely pure:
 
 * **An epic holding an open position is always kept**, whatever tier it belongs
   to. Dropping it would cut the live feed the position monitor and its chart
   read, so the pins come first and the tier fills what is left.
+* **An epic already traded today is kept for the rest of the day**, even once its
+  position is closed (won or lost). The point is to keep recording the market the
+  bot picked at time T so the curve after the exit stays readable — did the trade
+  leave money on the table, or did it dodge a reversal? These *follow-ups* rank
+  just behind the pins but, unlike them, are bounded (``follow_cap``) and dropped
+  when there is no room: a day of trades must never eat the whole universe.
 * **The list is always filled to the cap.** A tier is a preference, not a quota:
   when the band holds fewer markets than there are slots, the remainder is taken
   first from *below* the floor (cheaper markets can never break the invariant),
@@ -95,6 +101,7 @@ class TierSelection:
     markets: list[MarketInfo] = field(default_factory=list)
     tier: RiskTier = RiskTier(0, 0.0, 0.0)
     pinned: int = 0
+    followed: int = 0
     from_band: int = 0
     from_cheaper: int = 0
     from_dearer: int = 0
@@ -109,9 +116,9 @@ class TierSelection:
         """One-line breakdown of where the slots went, for the refresh log."""
         return (
             f"tier {self.tier.index} ({self.tier.label}): {len(self.markets)} epic(s) "
-            f"— {self.pinned} open, {self.from_band} in band, "
-            f"{self.from_cheaper} cheaper, {self.from_dearer} dearer, "
-            f"{self.from_unknown} unpriced"
+            f"— {self.pinned} open, {self.followed} followed, "
+            f"{self.from_band} in band, {self.from_cheaper} cheaper, "
+            f"{self.from_dearer} dearer, {self.from_unknown} unpriced"
         )
 
 
@@ -185,6 +192,8 @@ def select_by_risk_tier(
     cap: int,
     tier: RiskTier,
     pinned: Iterable[str] = (),
+    followed: Sequence[str] = (),
+    follow_cap: int | None = None,
 ) -> TierSelection:
     """Pick the ``cap`` markets to watch for ``tier``, pinning the open positions.
 
@@ -193,26 +202,38 @@ def select_by_risk_tier(
 
     1. **pins** — every epic in ``pinned`` that is still in ``markets``. A live
        position must keep its feed whatever tier its market belongs to.
-    2. **the band** — ``floor < risk <= ceiling``, the markets the day has earned
+    2. **follow-ups** — the epics of ``followed``, in the order given (the caller
+       ranks them, most recently closed first), capped by ``follow_cap``. These
+       are the markets already traded today whose position is now closed: keeping
+       them subscribed is what lets the day show how a market the bot picked at
+       time T behaved *after* the exit. Unlike pins they are droppable — whatever
+       does not fit rejoins the pools below and competes on risk like any other
+       candidate.
+    3. **the band** — ``floor < risk <= ceiling``, the markets the day has earned
        the right to, tightest spread first within each class.
-    3. **cheaper** — ``risk <= floor``, closest to the floor first. Always safe:
+    4. **cheaper** — ``risk <= floor``, closest to the floor first. Always safe:
        a smaller stop-out cannot break the ladder's invariant.
-    4. **dearer** — ``risk > ceiling``, cheapest first. Only reached when
+    5. **dearer** — ``risk > ceiling``, cheapest first. Only reached when
        everything at or below the tier is exhausted.
-    5. **unpriced** — markets whose ``stop_loss_eur`` is unknown, last, because
+    6. **unpriced** — markets whose ``stop_loss_eur`` is unknown, last, because
        an unknown cost is precisely what the ladder cannot bound.
 
     ``cap <= 0`` disables the cap and returns every market, pins first.
     """
     pinned_set = set(pinned)
+    follow_order = [e for e in dict.fromkeys(followed) if e not in pinned_set]
+    follow_set = set(follow_order)
+    by_epic = {m.epic: m for m in markets}
     ordered_pins = [m for m in markets if m.epic in pinned_set]
-    rest = [m for m in markets if m.epic not in pinned_set]
+    ordered_follows = [by_epic[e] for e in follow_order if e in by_epic]
+    rest = [m for m in markets if m.epic not in pinned_set and m.epic not in follow_set]
 
     if cap <= 0:
         return TierSelection(
-            markets=[*ordered_pins, *rest],
+            markets=[*ordered_pins, *ordered_follows, *rest],
             tier=tier,
             pinned=len(ordered_pins),
+            followed=len(ordered_follows),
             from_band=len(rest),
         )
 
@@ -222,11 +243,19 @@ def select_by_risk_tier(
     # candidate every time).
     chosen = list(ordered_pins)
 
+    # Follow-ups come next, but only as far as ``follow_cap`` and the room the
+    # pins left: a day that trades twenty markets must still leave the tier
+    # enough slots to find the twenty-first.
+    room = cap - len(chosen)
+    follow_room = room if follow_cap is None else min(room, max(follow_cap, 0))
+    kept_follows = ordered_follows[: max(follow_room, 0)]
+    chosen.extend(kept_follows)
+
     band: list[MarketInfo] = []
     cheaper: list[MarketInfo] = []
     dearer: list[MarketInfo] = []
     unpriced: list[MarketInfo] = []
-    for market in rest:
+    for market in [*rest, *ordered_follows[len(kept_follows) :]]:
         risk = market.stop_loss_eur
         if risk is None:
             unpriced.append(market)
@@ -265,6 +294,7 @@ def select_by_risk_tier(
         markets=chosen,
         tier=tier,
         pinned=len(ordered_pins),
+        followed=len(kept_follows),
         from_band=counts[0],
         from_cheaper=counts[1],
         from_dearer=counts[2],

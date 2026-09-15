@@ -181,6 +181,18 @@ class Settings(BaseSettings):
     close_zonesecure: str = ""  # zone margin→profit        (e.g. breakeven_half)
     close_zoneprofit: str = ""  # zone above profit trigger (e.g. trailing_ratchet)
 
+    # Automatic-open mode (OPEN_MODE) — GLOBAL to every open strategy.
+    #   auto   : an entry intent that passes the pre-open gates is opened for real.
+    #   notify : the very same intent, having passed the very same gates, opens
+    #            NOTHING. It is recorded as a signal (src/core/signals.py), the
+    #            dashboard raises a browser notification, and the user goes and
+    #            reads the market before deciding. The manual Buy/Sell buttons are
+    #            unaffected: they are human opens and never pass through the mode.
+    # REQUIRED like the selection names: a rule that decides whether the bot may
+    # place an order on its own must be stated explicitly, never silently
+    # defaulted (see ``validate_strategy_selection`` in src/core/scheduler.py).
+    open_mode: str = ""
+
     # Same-day re-open policy — GLOBAL to every open strategy (ALLOW_SAME_DAY_REOPEN).
     # False: an epic may be opened at most ONCE per day. Whatever the direction
     # (BUY or SELL), once a position has been opened on an epic today that epic is
@@ -294,6 +306,13 @@ class Settings(BaseSettings):
     # 0-30 / 30-100 / 100-200 / 200-600 €.
     # Override via EPIC_RISK_TIER_BOUNDS='[0,30,100,200,600]' in .env
     epic_risk_tier_bounds: list[float] = [0.0, 30.0, 100.0, 200.0, 600.0]
+    # Follow-up slots: how many epics already traded TODAY stay in the watched /
+    # streamed set after their position closed (won or lost), so the day keeps
+    # recording what the market the bot picked at time T did after the exit.
+    # Ranked most recently closed first; they rank behind the open positions and
+    # ahead of the risk tier, and never take more than this many of the ~40
+    # slots. Set to 0 to drop a market as soon as its trade is over.
+    epic_follow_closed_max: int = 10
 
     @property
     def ig_base_url(self) -> str:

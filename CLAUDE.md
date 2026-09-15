@@ -16,6 +16,31 @@ All architecture, modules, and files belong inside `src/`.
 
 ______________________________________________________________________
 
+## Common commands (`Makefile`)
+
+Every routine command has a `make` target — `make help` lists them all. Prefer
+them over the raw command: they carry the project's rules (Markdown reformatted
+before the tests, `alembic current` printed after a migration, a single bot
+process at a time).
+
+| Task                | Command                                                            |
+| ------------------- | ------------------------------------------------------------------ |
+| First-time setup    | `make setup`                                                       |
+| Run bot + dashboard | `make run` (`status`/`stop`/`restart`)                             |
+| Follow the logs     | `make logs`                                                        |
+| Tests               | `make test` · `make test-cov`                                      |
+| Lint / format       | `make lint` · `make format` · `make fix`                           |
+| Pre-commit gate     | `make check`                                                       |
+| Align the Markdown  | `make docs`                                                        |
+| Migrations          | `make migrate` · `make revision M="…"`                             |
+| IG tools            | `make trace` · `make adopt` · `make crawl` · `make inspect EPIC=…` |
+
+Extra flags go through `ARGS`: `make test ARGS="-k signals"`.
+
+Full reference: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#make-targets).
+
+______________________________________________________________________
+
 ## Git Conventions
 
 This project follows **Conventional Commits** standard for commit messages:
@@ -54,6 +79,7 @@ src/
 │   ├── levels.py           # Readable levels (swing pivots, clusters, round numbers)
 │   ├── reading.py          # CurveReading / PositionReading — read-only market facade
 │   ├── similarity.py       # Curve-shape signature + cross-epic "same bet?" test
+│   ├── signals.py          # Entry signals — proposed opens (OPEN_MODE=notify)
 │   ├── recorder.py         # Logging + alerts
 │   ├── api_queue.py / api_guard.py / api_error_log.py
 │   └── api/                # IG HTTP client (client.py, session.py, endpoints/)
@@ -99,6 +125,10 @@ tests/                      # one test file per module + isolated entry/exit/ris
   persistence, no runtime switching): `OPEN_STRATEGY` / `STOP_STRATEGY` and the
   four per-zone close selectors `CLOSE_ZONESTART` / `CLOSE_ZONEMARGE` /
   `CLOSE_ZONESECURE` / `CLOSE_ZONEPROFIT`.
+- **`OPEN_MODE`** (required too) decides *who places the order*: `auto` opens for
+  real, `notify` records the validated intent as a signal (`core/signals.py`),
+  the dashboard notifies the browser and the user opens it manually or dismisses
+  it. Same gates, same sizing, same close profile either way.
 
 ______________________________________________________________________
 

@@ -87,6 +87,19 @@ STANDARD_HORIZONS = (5, 15, 30, 60)
 #: Below this many candles nothing can honestly be said about a regime.
 MIN_REGIME_MINUTES = 10
 
+#: Share of its own travelled range a move must still hold — measured from the end
+#: it started at — to not read as finishing (see :attr:`CurveReading.move_phase`).
+#: At or below half, the move has handed back more than it kept: that is coming
+#: apart, not pausing.
+LATE_MOVE_HOLD = 0.5
+
+#: How far apart the 9/21 momentum averages must sit, in ATR units, for the market
+#: to count as being in a move at all (:attr:`CurveReading.move_phase`). Below it
+#: the two averages are inside the market's own candle noise and their crossings
+#: are chop, not legs — measured at 0.02 ATR on a tight two-tick chop against 0.38
+#: two candles into a real leg.
+MIN_MOVE_GAP_ATR = 0.25
+
 
 class Trend(StrEnum):
     """Sign of a fitted trend."""
@@ -114,6 +127,43 @@ class Regime(StrEnum):
     RANGE = "RANGE"
     VOLATILE = "VOLATILE"
     UNKNOWN = "UNKNOWN"
+
+
+class MovePhase(StrEnum):
+    """How far along its current move the market is — the move's *age*.
+
+    Answers "am I early or late?", which :class:`Regime` cannot: ``TREND_UP`` says
+    the same thing on the first candle of a move and on its last. The move here is
+    the **9/21 momentum leg**, not the regime — deliberately, so the two read
+    independently: a young leg inside a market the regime still calls ``RANGE`` is
+    exactly the case worth seeing, and by the time a give-back is deep enough to
+    matter the regime has already stopped calling the market trending. Built from
+    :meth:`CurveReading.cross` and :meth:`CurveReading.channel` only, so it
+    introduces no new maths:
+
+    - ``START``: the crossing is recent (not yet established, see
+      :attr:`CrossReading.is_established`) — the leg has just begun.
+    - ``MIDDLE``: the crossing has held and the price still holds most of the
+      range the leg travelled — the meat of it.
+    - ``END``: the price no longer holds even :data:`LATE_MOVE_HOLD` of that range
+      — the leg has given back more than it kept and is finishing.
+    - ``NONE``: no move to be inside of — the averages sit within
+      :data:`MIN_MOVE_GAP_ATR` of each other (their crossings are chop, not legs),
+      or there is too little history.
+
+    Youth is tested before damage on purpose: a violent start is young, not late,
+    and a fresh crossing's own window still contains the leg it reversed. The RSI
+    is deliberately *not* an exhaustion sign here — it sits stretched for the whole
+    length of a healthy trend, so it would call every strong move finished.
+
+    It is an age, not a forecast: ``END`` says the leg is old and damaged, never
+    that the price is about to turn.
+    """
+
+    NONE = "NONE"
+    START = "START"
+    MIDDLE = "MIDDLE"
+    END = "END"
 
 
 @dataclass(frozen=True, slots=True)
@@ -980,6 +1030,54 @@ class CurveReading:
     def is_trending(self) -> bool:
         """True when the regime is a trend, either way."""
         return self.regime in (Regime.TREND_UP, Regime.TREND_DOWN)
+
+    @cached_property
+    def move_phase(self) -> MovePhase:
+        """Where the market sits inside its current move.
+
+        See :class:`MovePhase` for the rule and for what it deliberately leaves
+        out. The give-back is judged over :attr:`regime_window`, the same horizon
+        the regime uses, so the two columns speak about the same stretch of curve.
+        """
+        if self.minutes < MIN_REGIME_MINUTES:
+            return MovePhase.NONE
+
+        # Is there a move at all? Averages closer together than a quarter of a
+        # candle are inside the market's own noise: their crossings are chop.
+        cross = self.cross()
+        if cross.state is Trend.FLAT:
+            return MovePhase.NONE
+        if self.atr <= 0 or abs(cross.gap) < MIN_MOVE_GAP_ATR * self.atr:
+            return MovePhase.NONE
+
+        # Young: the crossing that carries the leg is recent. Tested before any
+        # damage measure — the window of a fresh crossing still holds the leg it
+        # reversed, which would read as a give-back.
+        if cross.crossed_in_history and not cross.is_established:
+            return MovePhase.START
+
+        # Finishing: how much of its own travelled range the price still holds,
+        # measured from the end the leg started at (so a fall reads exactly like
+        # the mirrored rise). ``channel.position`` is 0 at the window low, 1 at
+        # its high.
+        held = self.channel(self.regime_window).position
+        if cross.state is Trend.DOWN:
+            held = 1.0 - held
+        if held <= LATE_MOVE_HOLD:
+            return MovePhase.END
+        return MovePhase.MIDDLE
+
+    @property
+    def move_direction(self) -> Trend:
+        """Which way the current move points, or ``FLAT`` when there is none.
+
+        The companion of :attr:`move_phase` — "start of *what*?" — and ``FLAT``
+        exactly when the phase is :attr:`MovePhase.NONE`, so the pair is never
+        contradictory.
+        """
+        if self.move_phase is MovePhase.NONE:
+            return Trend.FLAT
+        return self.cross().state
 
     # ---- readable levels -------------------------------------------------------
 

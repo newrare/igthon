@@ -177,6 +177,84 @@ class TestSelectByRiskTier:
         # One market of every class, not the three tightest FX spreads.
         assert classes == {"CURRENCIES", "INDICES", "COMMODITIES"}
 
+    def test_follow_ups_rank_behind_the_pins_and_ahead_of_the_band(self):
+        markets = [_market("OPEN", 500.0), _market("DONE", 500.0)]
+        markets += [_market(f"IN{i}", 10.0) for i in range(5)]
+
+        selection = select_by_risk_tier(
+            markets,
+            cap=3,
+            tier=RiskTier(0, 0.0, 30.0),
+            pinned={"OPEN"},
+            followed=["DONE"],
+        )
+
+        assert selection.epics[:2] == ["OPEN", "DONE"]
+        assert (selection.pinned, selection.followed) == (1, 1)
+        assert selection.from_band == 1
+
+    def test_follow_ups_keep_the_caller_order(self):
+        markets = [_market("OLD", 500.0), _market("RECENT", 500.0)]
+
+        selection = select_by_risk_tier(
+            markets,
+            cap=2,
+            tier=RiskTier(0, 0.0, 30.0),
+            followed=["RECENT", "OLD"],
+        )
+
+        assert selection.epics == ["RECENT", "OLD"]
+
+    def test_follow_cap_bounds_the_slots(self):
+        markets = [_market("DONE1", 500.0), _market("DONE2", 500.0)]
+        markets += [_market("IN", 10.0)]
+
+        selection = select_by_risk_tier(
+            markets,
+            cap=3,
+            tier=RiskTier(0, 0.0, 30.0),
+            followed=["DONE1", "DONE2"],
+            follow_cap=1,
+        )
+
+        # One follow-up slot: the rest is the tier's, and the dropped follow-up
+        # falls back into the pools instead of vanishing from the universe.
+        assert selection.epics[0] == "DONE1"
+        assert selection.followed == 1
+        assert set(selection.epics) == {"DONE1", "DONE2", "IN"}
+        assert selection.from_band == 1
+        assert selection.from_dearer == 1
+
+    def test_follow_ups_are_dropped_when_the_pins_fill_the_cap(self):
+        markets = [_market("OPEN1", 500.0), _market("OPEN2", 500.0)]
+        markets += [_market("DONE", 500.0)]
+
+        selection = select_by_risk_tier(
+            markets,
+            cap=2,
+            tier=RiskTier(0, 0.0, 30.0),
+            pinned={"OPEN1", "OPEN2"},
+            followed=["DONE"],
+        )
+
+        # Unlike a pin, a finished trade yields its slot to a live position.
+        assert selection.epics == ["OPEN1", "OPEN2"]
+        assert selection.followed == 0
+
+    def test_an_open_epic_is_never_counted_twice(self):
+        markets = [_market("OPEN", 500.0), _market("IN", 10.0)]
+
+        selection = select_by_risk_tier(
+            markets,
+            cap=2,
+            tier=RiskTier(0, 0.0, 30.0),
+            pinned={"OPEN"},
+            followed=["OPEN"],
+        )
+
+        assert selection.epics == ["OPEN", "IN"]
+        assert (selection.pinned, selection.followed) == (1, 0)
+
     def test_cap_zero_disables_the_selection(self):
         markets = [_market("A", 10.0), _market("B", 900.0)]
 

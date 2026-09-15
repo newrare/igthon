@@ -20,6 +20,7 @@ igthon/
 │   │   ├── levels.py       # Readable levels: swing pivots, clusters, round numbers
 │   │   ├── reading.py      # CurveReading / PositionReading — the read-only facade
 │   │   ├── similarity.py   # Curve-shape signature + "same bet?" redundancy
+│   │   ├── signals.py      # Entry signals — proposed opens (OPEN_MODE=notify)
 │   │   ├── recorder.py     # Structured logging + alerts
 │   │   ├── api_queue.py    # Single-worker queue — serialises all IG calls
 │   │   ├── api_guard.py    # Rate-limit tracker (per-second + per-minute)

@@ -7,6 +7,7 @@ import pytest
 
 from src.core.reading import (
     CurveReading,
+    MovePhase,
     PositionReading,
     Regime,
     Trend,
@@ -262,6 +263,83 @@ class TestRegime:
 
     def test_short_history_is_unknown(self):
         assert CurveReading.of(_buffer([100.0] * 5)).regime is Regime.UNKNOWN
+
+
+class TestMovePhase:
+    """The age of the current momentum leg: start / middle / end."""
+
+    #: 30 minutes of two-tick chop — a market with no leg at all.
+    CHOP = [100.0 + (0.1 if i % 2 else -0.1) for i in range(30)]
+
+    def _phase(self, bids: list[float], wick: float = 0.0) -> MovePhase:
+        return CurveReading.of(_buffer(bids, wick=wick)).move_phase
+
+    def test_chop_is_no_move(self):
+        # The 9/21 averages cross constantly in a chop, but they stay inside the
+        # candle noise: those crossings are not legs.
+        reading = CurveReading.of(_buffer(self.CHOP, wick=0.1))
+        assert reading.move_phase is MovePhase.NONE
+        assert reading.move_direction is Trend.FLAT
+
+    def test_flat_line_is_no_move(self):
+        assert self._phase([100.0] * 40) is MovePhase.NONE
+
+    def test_short_history_is_no_move(self):
+        assert self._phase([100.0] * 5) is MovePhase.NONE
+
+    def test_a_fresh_leg_out_of_a_chop_is_a_start(self):
+        # Three clean candles up after half an hour of chop: the crossing is
+        # recent, so the leg is young — and this is the case a regime cannot
+        # report, since it still reads RANGE here.
+        bids = self.CHOP + [100.0 + i * 0.4 for i in range(1, 4)]
+        reading = CurveReading.of(_buffer(bids, wick=0.1))
+        assert reading.move_phase is MovePhase.START
+        assert reading.move_direction is Trend.UP
+        assert reading.regime is Regime.RANGE
+
+    def test_a_fresh_fall_is_a_start_pointing_down(self):
+        bids = self.CHOP + [100.0 - i * 0.4 for i in range(1, 4)]
+        reading = CurveReading.of(_buffer(bids, wick=0.1))
+        assert reading.move_phase is MovePhase.START
+        assert reading.move_direction is Trend.DOWN
+
+    def test_an_established_leg_is_the_middle(self):
+        # Twelve candles in: the crossing has held and the price is still at the
+        # top of the range it travelled.
+        bids = self.CHOP + [100.0 + i * 0.4 for i in range(1, 13)]
+        assert self._phase(bids, wick=0.1) is MovePhase.MIDDLE
+
+    def test_a_clean_ramp_is_the_middle_not_the_end(self):
+        # A relentless ramp leaves the RSI pinned overbought for its whole
+        # length; reading that as exhaustion would call every strong move
+        # finished, so it must not.
+        assert self._phase([100.0 + i * 0.3 for i in range(40)]) is MovePhase.MIDDLE
+
+    def test_a_clean_fall_is_the_middle(self):
+        reading = CurveReading.of(_buffer([100.0 - i * 0.3 for i in range(40)]))
+        assert reading.move_phase is MovePhase.MIDDLE
+        assert reading.move_direction is Trend.DOWN
+
+    def test_a_leg_that_gave_back_half_its_range_is_the_end(self):
+        # Forty candles up, then a pull-back through the middle of the window's
+        # range: the leg has handed back more than it kept.
+        bids = [100.0 + i * 0.5 for i in range(40)] + [
+            119.5 - i * 1.2 for i in range(7)
+        ]
+        assert self._phase(bids) is MovePhase.END
+
+    def test_a_fall_that_bounced_back_is_the_end(self):
+        # Mirror: a down leg is judged from the low it came from, so a bounce
+        # through the middle finishes it exactly like the rise above.
+        bids = [100.0 - i * 0.5 for i in range(40)] + [80.5 + i * 1.5 for i in range(6)]
+        assert self._phase(bids) is MovePhase.END
+
+    def test_direction_is_flat_exactly_when_there_is_no_phase(self):
+        for bids, wick in (([100.0] * 40, 0.0), (self.CHOP, 0.1)):
+            reading = CurveReading.of(_buffer(bids, wick=wick))
+            assert (reading.move_phase is MovePhase.NONE) == (
+                reading.move_direction is Trend.FLAT
+            )
 
 
 class TestChannelAndMomentum:

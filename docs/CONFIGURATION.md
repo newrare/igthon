@@ -119,10 +119,11 @@ never be opened. Which 40 are kept is a **profit-funded ladder** on the euro cos
 of being wrong (`MarketInfo.stop_loss_eur`, the risk column of the Epic List) —
 see `src/markets/risk_tiers.py`.
 
-| Variable                  | Default              | Description                                            |
-| ------------------------- | -------------------- | ------------------------------------------------------ |
-| `EPIC_RISK_TIERS_ENABLED` | `true`               | `false` restores the plain class-diversified pick      |
-| `EPIC_RISK_TIER_BOUNDS`   | `[0,30,100,200,600]` | Ascending euro boundaries; N bounds describe N−1 tiers |
+| Variable                  | Default              | Description                                             |
+| ------------------------- | -------------------- | ------------------------------------------------------- |
+| `EPIC_RISK_TIERS_ENABLED` | `true`               | `false` restores the plain class-diversified pick       |
+| `EPIC_RISK_TIER_BOUNDS`   | `[0,30,100,200,600]` | Ascending euro boundaries; N bounds describe N−1 tiers  |
+| `EPIC_FOLLOW_CLOSED_MAX`  | `10`                 | Slots kept for markets already traded today (`0` = off) |
 
 The default bounds read as four tiers — `0-30`, `30-100`, `100-200`,
 `200-600 €`. Tier *i* unlocks once the day's **realised** P&L (closed positions
@@ -132,10 +133,17 @@ analysis tick, never latched: giving the gains back walks the watched list
 straight back down to the small markets, within 30 seconds and without any extra
 API call (the pick is replayed from the last `/markets` snapshot).
 
-Two rules keep the list usable:
+Three rules keep the list usable:
 
 - an epic **holding an open position is always kept**, whatever tier it belongs
   to, so a live trade never loses its feed;
+- an epic **already traded today stays watched after its exit**, won or lost, so
+  the day keeps recording what the market the bot picked at time T did next —
+  the table flags it `TRADED` with the euros it banked. `EPIC_FOLLOW_CLOSED_MAX`
+  bounds how many such markets keep a slot (most recent exits first); they rank
+  behind the open positions and ahead of the tier, and the ones that do not fit
+  simply compete on risk like any other candidate. They are **not** re-opened:
+  `ALLOW_SAME_DAY_REOPEN=false` still refuses a second trade on the same epic;
 - the list is **always filled to the cap** — when the unlocked band holds fewer
   markets than there are slots, the rest is taken from below the floor first
   (cheaper is always safe), then from above the ceiling, then from the markets
@@ -154,10 +162,11 @@ exclusion-reason column.
 
 ### Opening and closing
 
-| Variable                | Default    | Description                                                                                       |
-| ----------------------- | ---------- | ------------------------------------------------------------------------------------------------- |
-| `ALLOW_SAME_DAY_REOPEN` | *required* | `false` = one opening per epic per day (BUY or SELL); `true` = re-open once the epic is flat      |
-| `ALLOW_RECOVERY_REVERT` | *required* | `true` = open the opposite side at once when a trade is stopped out at a loss on its opening stop |
+| Variable                | Default    | Description                                                                                                             |
+| ----------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `ALLOW_SAME_DAY_REOPEN` | *required* | `false` = one opening per epic per day (BUY or SELL); `true` = re-open once the epic is flat                            |
+| `ALLOW_RECOVERY_REVERT` | *required* | `true` = open the opposite side at once when a trade is stopped out at a loss on its opening stop                       |
+| `OPEN_MODE`             | *required* | `auto` = the bot places the order itself; `notify` = it raises a dashboard signal + browser notification and you decide |
 
 `ALLOW_SAME_DAY_REOPEN` is **global to every entry strategy** and required (no
 code default — a missing value stops startup). With `false`, an epic that already
@@ -186,6 +195,27 @@ the stop is a prime revert (thresholds are constants in
 duplicate-epic gate and the "market closes soon" gate all apply, and the reverse
 trade is sized/stopped by the configured `STOP_STRATEGY` and close zones. See
 [strategies/README.md](strategies/README.md).
+
+`OPEN_MODE` is global and required too. It changes **who places the order**, and
+nothing else:
+
+- `auto` — an entry intent that passes the pre-open gates becomes a real order.
+- `notify` — the *same* intent, having passed the *same* gates, opens nothing.
+  It is recorded as a **signal** ([src/core/signals.py](../src/core/signals.py)),
+  listed in the dashboard's "Entry Signals — Your Call" section, and pushed to
+  the browser as a desktop notification. You go and read the market (the card's
+  **Chart** and **Read** buttons), then either open it yourself with **Buy** /
+  **Sell** — a manual open, driving the very same sizing, `STOP_STRATEGY` and
+  close zones — or **dismiss** it.
+
+Everything else is unchanged in `notify`: prices stream, candles record, and every
+position already open is still managed by its close profile. A signal is only
+raised **after** the gates, so you are never notified about a market the bot could
+not have opened (already held, closing soon, margin unaffordable). Signals live in
+memory only (nothing is persisted), expire after 15 minutes, and the same epic
+never signals twice within 10 minutes. Blocking auto-open, or ending the day, stops
+the signals too — the decision has already been made. See
+[USE.md](USE.md#entry-signals-notify-mode).
 
 There is no wall-clock trading-hours gate: an epic can be opened whenever its
 live market status is TRADEABLE (from the Lightstreamer subscription). Each open

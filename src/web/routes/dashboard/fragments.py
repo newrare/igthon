@@ -11,12 +11,15 @@ from src.web.routes.dashboard.components import (
 )
 from src.web.routes.dashboard.state import (
     _PARIS,
+    _PHASE_RANK,
     _bid_pct,
     _close_reason_label,
     _display_pnl,
     _loss_explanation,
     _open_reason_label,
+    _phase_label,
     _pnl_color,
+    _regime_label,
     _unrealized_pnl_color,
 )
 
@@ -126,14 +129,39 @@ def _render_selection_chips(selection: dict) -> str:
     )
 
 
-def _render_title_bar(enabled: bool, selection: dict) -> str:
+# ``OPEN_MODE`` decides *who places the order* — ``auto`` lets the bot fire, while
+# ``notify`` only proposes the validated intent and waits for the user. It is the
+# single most consequential switch in ``.env``, so the bar spells it out instead
+# of leaving it to be inferred from an empty signals list.
+def _render_open_mode_chip(open_mode: str) -> str:
+    """Render the active OPEN_MODE as a read-only badge for the title bar."""
+    mode = (open_mode or "").strip().lower() or "auto"
+    if mode == "notify":
+        cls, icon = "notify", "bell"
+        detail = (
+            "the bot proposes every validated open as a signal and waits for you "
+            "to place it"
+        )
+    else:
+        cls, icon = "auto", "zap"
+        detail = "the bot places its own orders"
+    title = f"OPEN_MODE={mode} — {detail} (set OPEN_MODE in .env)"
+    return (
+        f'<span class="dashboard-title-mode mode-{cls}" title="{html.escape(title)}">'
+        f'<i data-lucide="{icon}" class="lc-icon"></i>'
+        f'<span class="mode-name">OPEN_MODE={html.escape(mode)}</span>'
+        "</span>"
+    )
+
+
+def _render_title_bar(enabled: bool, selection: dict, open_mode: str) -> str:
     """Render the merged title bar: bot identity + the auto-open switch.
 
-    One single-line bar carries the bot name, the active entry/stop/close
-    selection and the two day controls (block openings / end the day). Its colour
-    *is* the auto-open state — green while the bot may still take a trade, red
-    (pulsing) the moment openings are blocked — so the state needs no wording of
-    its own: the lock icon (whose tooltip spells it out) plus the bar colour say
+    One single-line bar carries the bot name, the active OPEN_MODE, the active
+    entry/stop/close selection and the two day controls (block openings / end the
+    day). Its colour *is* the auto-open state — green while the bot may still
+    take a trade, red (pulsing) the moment openings are blocked — so the state
+    needs no wording of its own: the lock icon (whose tooltip spells it out) plus the bar colour say
     it, and the row stays one line high. Rebuilt from the server state on every
     poll, so what is displayed can never drift from the scheduler's.
     """
@@ -147,6 +175,7 @@ def _render_title_bar(enabled: bool, selection: dict) -> str:
         <div class="dashboard-title autoopen-{state_cls}" id="autoopen-banner">
             <i data-lucide="bot" class="lc-icon dashboard-title-bot"></i>
             <h1>IG Trading Bot</h1>
+            {_render_open_mode_chip(open_mode)}
             <span class="dashboard-title-sep">·</span>
             {_render_selection_chips(selection)}
             <div class="dashboard-title-actions">
@@ -163,6 +192,80 @@ def _render_title_bar(enabled: bool, selection: dict) -> str:
                 </button>
             </div>
         </div>"""
+
+
+def _render_signals_section(signals: list[dict], open_mode: str) -> str:
+    """Render the pending entry signals — the opens the bot proposed to the user.
+
+    Only ``OPEN_MODE=notify`` ever fills this list: each card is an intent that
+    cleared every pre-open gate and was handed over instead of being ordered. The
+    card carries what is needed to decide without leaving the dashboard — the
+    direction, the strategy and its score, the close-out price, how old the
+    proposal is — plus the two ways to look at the market (chart, market reading)
+    and the two ways to answer it (Buy/Sell, Dismiss).
+
+    In ``auto`` mode the section states that the bot is opening by itself, so an
+    empty list never reads as "the strategy found nothing".
+    """
+    if open_mode != "notify":
+        return (
+            '<div class="signal-empty">'
+            "OPEN_MODE=auto — the bot opens its own positions. "
+            "Set <code>OPEN_MODE=notify</code> in <code>.env</code> to be "
+            "notified instead and decide yourself."
+            "</div>"
+        )
+    if not signals:
+        return (
+            '<div class="signal-empty">'
+            "No pending signal — nothing worth opening right now."
+            "</div>"
+        )
+
+    cards = ""
+    for sig in signals:
+        epic = html.escape(str(sig["epic"]))
+        name = html.escape(str(sig.get("name") or sig["epic"]))
+        direction = "SELL" if str(sig["direction"]).upper() == "SELL" else "BUY"
+        dir_cls = "sell" if direction == "SELL" else "buy"
+        strategy = html.escape(str(sig.get("strategy") or "—"))
+        score = float(sig.get("score") or 0.0)
+        price = float(sig.get("price") or 0.0)
+        price_txt = f"{price:.2f}" if price else "—"
+        age = int(sig.get("age_seconds") or 0)
+        age_txt = f"{age}s" if age < 60 else f"{age // 60}min"
+        sid = int(sig["id"])
+        open_btn = render_button(
+            direction.title(),
+            cls=f"{dir_cls}-btn",
+            onclick=f"openPosition('{epic}', this, '{direction}')",
+            title=f"Open {direction} on {epic} at minimum size",
+            attrs=(
+                f"onmouseenter=\"showFundsTooltip(event, '{epic}')\" "
+                'onmouseleave="hideFundsTooltip()"'
+            ),
+        )
+        cards += f"""
+        <div class="signal-card signal-{dir_cls}" data-signal-id="{sid}">
+            <div class="signal-head">
+                <span class="signal-dir signal-dir-{dir_cls}">{direction}</span>
+                <span class="signal-epic">{epic}</span>
+                <span class="signal-age">{age_txt} ago</span>
+            </div>
+            <div class="signal-name">{name}</div>
+            <div class="signal-meta">
+                <span title="Entry strategy that proposed this open">{strategy}</span>
+                <span title="Strategy score (diagnostic only)">score {score:.2f}</span>
+                <span title="Close-out price when the signal was raised">@ {price_txt}</span>
+            </div>
+            <div class="signal-actions">
+                {render_button('<i data-lucide="line-chart" class="lc-icon"></i> Chart', cls="signal-btn", onclick=f"openChartModal('{epic}', event)", title="Look at the curve before deciding")}
+                {render_button('<i data-lucide="gauge" class="lc-icon"></i> Read', cls="signal-btn", onclick=f"openReadingModal('{epic}', event)", title="Read this market: regime, trends, noise, levels")}
+                {open_btn}
+                {render_button('<i data-lucide="x" class="lc-icon"></i>', cls="signal-btn signal-dismiss", onclick=f"dismissSignal({sid}, this)", title="Pass — drop this proposal")}
+            </div>
+        </div>"""
+    return f'<div class="signals-grid">{cards}</div>'
 
 
 def _render_action_cards(jobs: list[dict]) -> str:
@@ -506,8 +609,30 @@ def _build_fragments(state: dict) -> dict[str, str]:
         pct = _bid_pct(s["bid"], s["low"], s["high"])
         pct_color = "#4ade80" if pct >= 50 else "#f59e0b" if pct >= 25 else "#ef4444"
         epic_esc = html.escape(str(s["epic"]))
+        # Where the price sits inside its current move (a three-segment gauge:
+        # start / middle / end) and the regime it sits in — the two reads that
+        # replaced the raw high/low pair.
+        phase_gauge, phase_label, phase_color, phase_why = _phase_label(
+            s.get("phase"), s.get("phase_direction")
+        )
+        phase_title = html.escape(f"Momentum — {phase_why}")
+        regime_label, regime_color, regime_why = _regime_label(s.get("regime"))
+        regime_title = html.escape(f"Regime — {regime_why}")
         spread_cost = s.get("spread_cost")
         spread_str = f"{spread_cost:.2f}€" if spread_cost else "—"
+        # A market traded and already closed today stays in the watched list so
+        # its curve after the exit keeps being recorded — the badge says so, and
+        # carries what the epic banked.
+        followed_badge = ""
+        if s.get("followed"):
+            banked = s.get("followed_pnl")
+            banked_str = f" {banked:+.2f}€" if banked is not None else ""
+            followed_badge = (
+                ' <span style="color:#38bdf8;font-size:0.68rem;font-weight:700;'
+                'letter-spacing:0.5px;" title="Already traded today — kept live to '
+                'follow the market after the exit">TRADED'
+                f"{html.escape(banked_str)}</span>"
+            )
         buy_btn = render_button(
             "Buy",
             cls="buy-btn",
@@ -539,10 +664,11 @@ def _build_fragments(state: dict) -> dict[str, str]:
         )
         market_rows += f"""
         <tr class="clickable-row" onclick="openChartModal('{epic_esc}', event)">
-            <td class="epic-col">{epic_esc}</td>
+            <td class="epic-col">{epic_esc}{followed_badge}</td>
             <td class="desc-col">{html.escape(str(s.get('name', '—')))}</td>
             <td class="number">{spread_str}</td>
-            <td class="number">{s['high']:.1f} / {s['low']:.1f}</td>
+            <td class="number" data-sort="{_PHASE_RANK.get(s.get('phase'), 0)}" title="{phase_title}"><span style="color:{phase_color};letter-spacing:0.06em;">{phase_gauge}</span> <span style="color:{phase_color};">{phase_label}</span></td>
+            <td title="{regime_title}" style="color:{regime_color};white-space:nowrap;">{regime_label}</td>
             <td>
                 <div class="range-bar-wrap">
                     <div class="range-bar-bg">
@@ -1022,6 +1148,7 @@ def _build_fragments(state: dict) -> dict[str, str]:
         "title_bar": _render_title_bar(
             bool(state.get("auto_open_enabled", True)),
             state.get("selection") or {},
+            str(state.get("open_mode") or "auto"),
         ),
         "kpi_bar": kpi_bar,
         "market_rows": market_rows,
@@ -1039,5 +1166,9 @@ def _build_fragments(state: dict) -> dict[str, str]:
         "closed_positions_modal": closed_positions_modal,
         "epic_result_modal": _render_epic_result_modal(closed_positions, kpis),
         "actions": _render_action_cards(state.get("jobs", [])),
+        "signals_section": _render_signals_section(
+            state.get("signals") or [],
+            str(state.get("open_mode") or "auto"),
+        ),
         "logs_section": _render_logs_section(state.get("log_entries") or []),
     }

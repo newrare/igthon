@@ -6,6 +6,8 @@ which the client swaps in place every two seconds instead of reloading the page.
 """
 
 import asyncio
+import json
+import pathlib
 import re
 import sys
 from datetime import UTC, date, datetime, time
@@ -18,6 +20,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 import src.web.routes.dashboard.router  # noqa: F401  (ensure submodule imported)
+from src.core.signals import SignalBook
 from src.feed.price_buffer import PriceBuffer
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
@@ -42,6 +45,7 @@ _FRAGMENT_KEYS = {
     "closed_positions_modal",
     "epic_result_modal",
     "actions",
+    "signals_section",
     "logs_section",
 }
 
@@ -125,6 +129,7 @@ def _settings() -> SimpleNamespace:
         close_zonemarge="hold",
         close_zonesecure="hold",
         close_zoneprofit="trailing_ratchet",
+        open_mode="notify",
         web_port=8000,
         # Extra knobs read by TradeConfig.from_settings (manual-open path).
         strategy_close_margin_minutes=5,
@@ -161,8 +166,51 @@ class TestBuildFragments:
         )
         rows = _build_fragments(state)["market_rows"]
         assert "IX.D.DAX.IFMM.IP" in rows
-        assert "18100.0" in rows
         assert "30" in rows
+        # The high/low pair is no longer printed: it only feeds the "Bid % range"
+        # bar, which says the same thing in a readable way.
+        assert "18100.0" not in rows
+        assert "50%" in rows
+
+    def test_market_rows_state_the_momentum_phase_and_regime(self):
+        # The two reads that replaced the high/low column. A market with no
+        # directional move shows the empty gauge and no regime label.
+        state = _base_state(
+            market_summary=[
+                {
+                    "epic": "IX.D.DAX.IFMM.IP",
+                    "bid": 18000.0,
+                    "dots": 30,
+                    "high": 18100.0,
+                    "low": 17900.0,
+                    "regime": "TREND_UP",
+                    "phase": "START",
+                }
+            ]
+        )
+        rows = _build_fragments(state)["market_rows"]
+        assert "▪▫▫" in rows  # start of the move: first segment only
+        assert "Start" in rows
+        assert "Trend ↑" in rows
+        # Sortable by how far along the move is, not alphabetically.
+        assert 'data-sort="1"' in rows
+
+    def test_market_rows_tolerate_an_unread_epic(self):
+        # A half-warmed epic (no regime/phase in the state yet) must render.
+        state = _base_state(
+            market_summary=[
+                {
+                    "epic": "IX.D.DAX.IFMM.IP",
+                    "bid": 18000.0,
+                    "dots": 3,
+                    "high": 18100.0,
+                    "low": 17900.0,
+                }
+            ]
+        )
+        rows = _build_fragments(state)["market_rows"]
+        assert "▫▫▫" in rows
+        assert 'data-sort="0"' in rows
 
     def test_market_rows_render_spread_cost(self):
         state = _base_state(
@@ -822,6 +870,19 @@ class TestRenderDashboard:
         for key in _FRAGMENT_KEYS:
             assert f'id="frag-{key}"' in html
 
+    def test_signals_section_exposes_the_alert_controls(self):
+        # A signal the user neither hears nor is notified about is a missed
+        # trade: both controls must reach the page, and the chime must be
+        # wired in the script (an OS notification is silent by default).
+        html = _render_dashboard(_settings(), _base_state())
+        assert 'id="notify-permission-btn"' in html
+        assert 'id="signal-sound-btn"' in html
+        js = (
+            pathlib.Path(__file__).resolve().parents[1] / "src/web/static/dashboard.js"
+        ).read_text()
+        assert "function playSignalChime" in js
+        assert "playSignalChime(dir)" in js  # fired on every new signal
+
     def test_page_polls_instead_of_reloading(self):
         html = _render_dashboard(_settings(), _base_state())
         # The polling engine now lives in the external static script.
@@ -890,7 +951,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=44" in html
+        assert "/static/dashboard.js?v=47" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -1576,7 +1637,10 @@ def _manual_app() -> object:
     # The active close profile is opaque here — the route only forwards it.
     # ``open_epic_guarded`` mirrors the real scheduler so the route can delegate.
     app.state.scheduler = SimpleNamespace(
-        close_profile=object(), open_epic_guarded=_guarded_open
+        close_profile=object(),
+        open_epic_guarded=_guarded_open,
+        # The route drops any pending proposal on the epic the user just opened.
+        signals=SignalBook(),
     )
     return app, epic
 
@@ -1633,6 +1697,7 @@ class TestAutoOpenEndpoint:
             tradable_last_refresh=None,
             positions_synced_at=None,
             jobs_status=lambda: [],
+            signals=SignalBook(),
         )
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1641,6 +1706,125 @@ class TestAutoOpenEndpoint:
         assert frags["auto_open"] is False
         assert "autoopen-off" in frags["fragments"]["title_bar"]
         assert status["auto_open"] is False
+
+
+class TestSignalsEndpoints:
+    """``/api/signals`` — the opens the bot proposed and left to the user."""
+
+    def _app_with_signals(self) -> tuple[object, SignalBook]:
+        app = create_app(settings=_settings(), buffer=PriceBuffer())
+        book = SignalBook()
+        app.state.scheduler = SimpleNamespace(
+            signals=book,
+            auto_open_enabled=True,
+            is_paused=False,
+            all_epics=[],
+            epic_last_refresh=None,
+            tradable_epics=[],
+            tradable_last_refresh=None,
+            positions_synced_at=None,
+            jobs_status=lambda: [],
+        )
+        return app, book
+
+    async def test_list_returns_the_pending_signals(self):
+        app, book = self._app_with_signals()
+        book.record("E", "BUY", strategy="open_momentum", score=1.0, price=10.0)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/signals")
+        body = resp.json()
+        assert resp.status_code == 200
+        assert body["open_mode"] == "notify"
+        assert [s["epic"] for s in body["signals"]] == ["E"]
+
+    async def test_dismiss_drops_the_signal(self):
+        app, book = self._app_with_signals()
+        signal = book.record("E", "BUY")
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/signals/{signal.id}/dismiss")
+        assert resp.status_code == 200
+        assert book.pending() == []
+
+    async def test_dismissing_an_unknown_signal_returns_404(self):
+        app, _ = self._app_with_signals()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/signals/4242/dismiss")
+        assert resp.status_code == 404
+
+    async def test_no_scheduler_returns_503(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/api/signals")).status_code == 503
+            assert (await client.post("/api/signals/1/dismiss")).status_code == 503
+
+    async def test_the_stream_pushes_the_book_when_it_changes(self, monkeypatch):
+        # The alert channel for a hidden tab: a browser throttles a background
+        # tab's timers to about one tick a minute, so the poll cannot be what
+        # delivers a signal — the stream must push it.
+        monkeypatch.setattr(_ROUTER_MOD, "_SSE_TICK", 0.01)
+        book = SignalBook()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(scheduler=SimpleNamespace(signals=book))
+            ),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+
+        response = await _ROUTER_MOD.api_signals_stream(request)
+        assert response.media_type == "text/event-stream"
+        assert response.headers["cache-control"] == "no-cache"
+
+        frames = []
+        stream = response.body_iterator.__aiter__()
+        # First frame on connect: the current (empty) truth, so a reconnecting
+        # client needs no catch-up protocol.
+        frames.append(await stream.__anext__())
+        book.record("E", "BUY", name="Epic E")
+        for _ in range(50):  # the next data frame lands within a few ticks
+            chunk = await stream.__anext__()
+            if chunk.startswith("data:"):
+                frames.append(chunk)
+                break
+        await stream.aclose()
+
+        assert json.loads(frames[0][6:])["signals"] == []
+        pushed = json.loads(frames[1][6:])["signals"]
+        assert [s["epic"] for s in pushed] == ["E"]
+
+    async def test_the_stream_stops_when_the_client_disconnects(self, monkeypatch):
+        monkeypatch.setattr(_ROUTER_MOD, "_SSE_TICK", 0.01)
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(scheduler=SimpleNamespace(signals=SignalBook()))
+            ),
+            is_disconnected=AsyncMock(return_value=True),
+        )
+        response = await _ROUTER_MOD.api_signals_stream(request)
+        assert [chunk async for chunk in response.body_iterator] == []
+
+    async def test_the_stream_reports_a_missing_scheduler(self):
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(scheduler=None)),
+            is_disconnected=AsyncMock(return_value=False),
+        )
+        response = await _ROUTER_MOD.api_signals_stream(request)
+        chunks = [chunk async for chunk in response.body_iterator]
+        assert chunks and chunks[0].startswith("event: error")
+
+    async def test_the_poll_carries_the_signals_for_the_browser(self):
+        # The browser raises one desktop notification per unseen id, so the
+        # 1 s poll must carry the list itself — no second request.
+        app, book = self._app_with_signals()
+        book.record("E", "BUY", name="Germany 40")
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = (await client.get("/api/dashboard-fragments")).json()
+        assert payload["open_mode"] == "notify"
+        assert [s["epic"] for s in payload["signals"]] == ["E"]
+        assert "Germany 40" in payload["fragments"]["signals_section"]
 
 
 class TestEndDayEndpoint:
@@ -1762,6 +1946,34 @@ class TestManualOpenEndpoint:
         assert seen["close_profile"] is app.state.scheduler.close_profile
         # The manual origin is tagged on the persisted position.
         assert position.reason_open == "manual"
+
+    async def test_opening_drops_the_pending_signal_on_that_epic(self, monkeypatch):
+        # The user acted on the proposal: it must stop notifying.
+        app, epic = _manual_app()
+        app.state.scheduler.signals.record(epic, "BUY")
+        position = SimpleNamespace(
+            level_open=1000.0, quantity=1, deal_id="DEAL1", reason_open="auto"
+        )
+
+        class _OkTrading:
+            def __init__(self, *a, **k) -> None:
+                pass
+
+            async def can_open_intent(
+                self, intent, *, allow_short=False, allow_reopen=False
+            ):
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return position
+
+        monkeypatch.setattr(_ROUTER_MOD, "TradingService", _OkTrading)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(f"/api/positions/open/{epic}")
+
+        assert resp.status_code == 200
+        assert app.state.scheduler.signals.pending() == []
 
     async def test_open_rejected_returns_400(self, monkeypatch):
         app, epic = _manual_app()

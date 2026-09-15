@@ -8,81 +8,154 @@
 
 ______________________________________________________________________
 
+## Make targets
+
+The `Makefile` at the repository root wraps every command in this guide. It is a
+convenience only — the raw commands still work — but it removes the recurring
+foot-guns: `make test` reformats the Markdown first, `make run` refuses to start
+a second bot, `make migrate` prints `alembic current` so an unapplied revision
+cannot be missed.
+
+```bash
+make help        # list every target, grouped, with the active WEB_PORT
+```
+
+| Group        | Target           | Runs                                                 |
+| ------------ | ---------------- | ---------------------------------------------------- |
+| Setup        | `setup`          | `venv` + `install` + `env` + `migrate`               |
+|              | `venv`           | `python3 -m venv .venv`                              |
+|              | `install`        | `pip install -e ".[dev]"`                            |
+|              | `env`            | `cp .env.example .env` (never overwrites)            |
+| Run          | `run`            | `python -m src.main --web` (+ `caffeinate` on macOS) |
+|              | `run-debug`      | same, with `--log-level DEBUG`                       |
+|              | `bot`            | `python -m src.main` (scheduler only)                |
+|              | `status`         | the running bot's PID, start time and command        |
+|              | `stop`           | `kill` the running bot                               |
+|              | `restart`        | `stop`, then `run`                                   |
+|              | `open`           | open the dashboard in the browser                    |
+| Logs         | `logs`           | `tail -f /tmp/ig_bot/ig_bot.log`                     |
+|              | `logs-api`       | `tail -f /tmp/ig_bot/ig_api_calls.log`               |
+|              | `logs-errors`    | `tail -f /tmp/ig_bot/ig_api_errors.log`              |
+| Quality      | `check`          | `lint` + `test` — run before committing              |
+|              | `test`           | `mdformat`, then `pytest tests/ -q`                  |
+|              | `test-cov`       | `pytest --cov=src --cov-report=term-missing`         |
+|              | `lint`           | `ruff check src/ tests/`                             |
+|              | `format`         | `black src/ tests/` + `mdformat`                     |
+|              | `fix`            | `ruff check --fix`, then `format`                    |
+|              | `docs`           | `mdformat docs/ README.md CLAUDE.md`                 |
+| Database     | `migrate`        | `alembic upgrade head` + `alembic current`           |
+|              | `revision M="…"` | `alembic revision --autogenerate -m "…"`             |
+|              | `downgrade`      | `alembic downgrade -1` + `alembic current`           |
+|              | `db-current`     | `alembic current`                                    |
+|              | `db-history`     | `alembic history --verbose`                          |
+|              | `db-shell`       | `sqlite3 ig_trading.db`                              |
+| Tools        | `crawl`          | `python -m src.scripts.crawl_catalog`                |
+|              | `crawl-status`   | the crawl progress (no IG session, no API call)      |
+|              | `trace`          | `python -m src.scripts.trace_activity`               |
+|              | `adopt`          | `python -m src.scripts.adopt_orphans`                |
+|              | `inspect EPIC=…` | `python -m src.scripts.inspect_market <epic>`        |
+|              | `dump-euro`      | `python -m src.scripts.dump_euro_per_point`          |
+| Housekeeping | `clean`          | drop `__pycache__`, `.pytest_cache`, `.ruff_cache`   |
+
+Conventions:
+
+- **`ARGS`** forwards extra flags to the underlying command:
+  `make test ARGS="-k signals -v"`, `make trace ARGS="--days 3"`,
+  `make crawl ARGS="--max-nodes 200"`.
+- **Named variables** are required where the command needs one:
+  `make revision M="add my_column to position"`, `make inspect EPIC=CC.D.LCC.UNC.IP`.
+- Targets use `.venv/bin/python` when the virtual environment exists, so they
+  work without activating it.
+- `run` / `run-debug` / `bot` refuse to start when another bot process is alive:
+  a single scheduler is a hard invariant (two of them race on the per-epic open
+  lock and can double-open a position).
+
+______________________________________________________________________
+
 ## Setup
 
 ```bash
 # Clone / enter the project
 cd igthon/
 
-# Create and activate the virtual environment
+# Everything at once: venv, dependencies, .env, database
+make setup
+```
+
+Equivalent to:
+
+```bash
 python -m venv .venv
 source .venv/bin/activate        # macOS / Linux
 # .venv\Scripts\activate         # Windows
-
-# Install all dependencies (including dev extras)
 pip install -e ".[dev]"
-
-# Configure credentials
 cp .env.example .env
-# Edit .env — fill in IG_API_KEY, IG_USERNAME, IG_PASSWORD, IG_ACCOUNT_ID
-
-# Create the database
 alembic upgrade head
-
 ```
+
+Then edit `.env` — fill in `IG_API_KEY`, `IG_USERNAME`, `IG_PASSWORD`,
+`IG_ACCOUNT_ID` (see [CONFIGURATION.md](CONFIGURATION.md) for every setting).
 
 ______________________________________________________________________
 
 ## Standalone scripts
 
-Utility scripts live in `src/scripts/` — they are not part of the importable package and
-are meant to be run directly for debugging or one-off tasks.
+Utility scripts live in `src/scripts/` — they are run as modules for debugging or
+one-off tasks. Each has a `make` shortcut.
 
 ```bash
-# Trace the activity/audit trail for a deal or epic
-python src/scripts/trace_activity.py
-
-# Adopt orphan IG positions the bot lost track of
-python src/scripts/adopt_orphans.py
+make trace ARGS="--days 3"          # python -m src.scripts.trace_activity
+make adopt                          # python -m src.scripts.adopt_orphans
+make inspect EPIC=CC.D.LCC.UNC.IP   # python -m src.scripts.inspect_market
+make crawl                          # python -m src.scripts.crawl_catalog
+make crawl-status                   # crawl progress, no IG session
+make dump-euro                      # python -m src.scripts.dump_euro_per_point
 ```
+
+`crawl` and `dump-euro` open their own IG session: run them with the bot stopped
+(`make stop`), or expect the bot's session to be re-authenticated.
 
 ______________________________________________________________________
 
 ## Running the bot
 
 ```bash
-# Analysis only (safe — no orders placed)
-python -m src.main --analyze-only
+# Bot + web dashboard (the usual command) — port is WEB_PORT in .env
+make run
 
-# Full bot with scheduler
-python -m src.main
+# Scheduler only, no web UI
+make bot
 
-# Bot + web dashboard at http://localhost:8000
-python -m src.main --web
+# Verbose console output
+make run-debug
 
-# Custom epics
-python -m src.main --analyze-only --epics IX.D.DAX.IFMM.IP CS.D.EURUSD.TODAY.IP
-
-# Verbose output
-python -m src.main --analyze-only --log-level DEBUG
+# Is one already running? Stop it, restart it
+make status
+make stop
+make restart
 ```
+
+`make run` wraps `python -m src.main --web` and, on macOS, prefixes it with
+`caffeinate -i -s` so the machine does not sleep mid-session.
+
+Whether a validated intent is actually sent to the broker is `OPEN_MODE` in
+`.env`: `auto` places the order, `notify` records it as a signal for the
+dashboard. Same gates, same sizing either way — there is no "analyse only" flag.
 
 ______________________________________________________________________
 
 ## Tests
 
 ```bash
-# All tests
-python -m pytest tests/ -v
+# The whole suite (reformats the Markdown first)
+make test
 
-# Quick run (minimal output)
-python -m pytest tests/ -q
+# A single module, or any pytest flag, through ARGS
+make test ARGS="tests/test_signals.py -v"
+make test ARGS="-k trailing"
 
-# Single module
-python -m pytest tests/test_compute.py -v
-
-# With coverage report
-python -m pytest tests/ --cov=src --cov-report=term-missing
+# With a coverage report
+make test-cov
 ```
 
 Tests must never hit the real IG API. Use `respx` to mock httpx calls.
@@ -93,14 +166,10 @@ ______________________________________________________________________
 ## Linting and formatting
 
 ```bash
-# Format code
-black src/ tests/
-
-# Lint (includes import sorting)
-ruff check src/ tests/
-
-# Auto-fix lint issues
-ruff check --fix src/ tests/
+make lint      # ruff check src/ tests/ (includes import sorting)
+make format    # black src/ tests/ + mdformat docs/ README.md CLAUDE.md
+make fix       # ruff --fix, then format
+make check     # lint + tests — the pre-commit gate
 ```
 
 Configuration is in `pyproject.toml`:
@@ -113,23 +182,29 @@ ______________________________________________________________________
 ## Database migrations
 
 ```bash
-# Apply all pending migrations
-alembic upgrade head
+# Apply all pending migrations (then prints `alembic current`)
+make migrate
 
-# Generate a new migration from model changes
-alembic revision --autogenerate -m "Add my_column to position"
+# Generate a migration from model changes
+make revision M="add my_column to position"
 
 # Roll back one migration
-alembic downgrade -1
+make downgrade
 
-# Check current revision
-alembic current
+# Where does the DB stand?
+make db-current
+make db-history
 
-# Show migration history
-alembic history --verbose
+# Query the local SQLite database
+make db-shell
 ```
 
 Migration files are in [alembic/versions/](../alembic/versions/).
+
+**A new column means writing the revision *and* running `make migrate`.** The
+running app queries every mapped column, so an unapplied revision turns the next
+request into `no such column: …` and a 500 on the dashboard. `make migrate`
+prints the current revision afterwards so the check is not forgotten.
 
 **Never use `Base.metadata.create_all()` in production.**
 All schema changes go through Alembic.

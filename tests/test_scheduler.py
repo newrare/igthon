@@ -8,7 +8,7 @@ recording until it closes.
 
 import asyncio
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -17,10 +17,16 @@ import pytest
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.core.scheduler import BotScheduler, validate_strategy_selection
+from src.core.scheduler import (
+    AUTO_OPEN_REFUSAL,
+    NOTIFY_REFUSAL,
+    BotScheduler,
+    validate_strategy_selection,
+)
 from src.entry.base import EntryIntent
 from src.entry.open_allincrease import OpenAllIncrease
 from src.entry.open_five import OpenFive
+from src.entry.open_momentum import OpenMomentum
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_steady import OpenSteady
@@ -179,6 +185,115 @@ class TestOpenEpicGuarded:
         assert order.index(("open-end", "A")) < order.index(("gate", "B"))
 
 
+class TestNotifyMode:
+    """``OPEN_MODE=notify`` — the bot proposes the open instead of taking it.
+
+    The intent must still be fully validated (the pre-open gates run exactly as
+    in ``auto``), so the user is only ever notified about a market the bot could
+    really have opened. What changes is the last step: no order, a signal.
+    """
+
+    @staticmethod
+    def _notify_scheduler():
+        sched = _make_scheduler(MagicMock())
+        sched._settings.open_mode = "notify"
+        sched._strategy = SimpleNamespace(name="open_momentum")
+        return sched
+
+    class _Trading:
+        """Gate-passing trading stub that records any order it is asked for."""
+
+        def __init__(self, allowed: bool = True) -> None:
+            self.allowed = allowed
+            self.ordered = False
+
+        async def can_open_intent(
+            self, intent, *, allow_short=False, allow_reopen=False
+        ):
+            return self.allowed, "ok" if self.allowed else "Epic already open"
+
+        async def open_from_intent(self, intent, buf):
+            self.ordered = True
+            return object()
+
+    async def test_validated_intent_signals_instead_of_ordering(self):
+        sched = self._notify_scheduler()
+        trading = self._Trading()
+        intent = SimpleNamespace(epic="E", direction="BUY", score=1.25)
+
+        position, reason = await sched.open_epic_guarded(trading, intent, None)
+
+        assert position is None
+        assert reason == NOTIFY_REFUSAL
+        assert trading.ordered is False  # no order was ever placed
+        (signal,) = sched.signals.pending()
+        assert (signal.epic, signal.direction) == ("E", "BUY")
+        assert signal.strategy == "open_momentum"
+        assert signal.score == 1.25
+
+    async def test_a_refused_gate_raises_no_signal(self):
+        # Never notify about a market the bot could not have opened anyway.
+        sched = self._notify_scheduler()
+        intent = SimpleNamespace(epic="E", direction="BUY", score=0.0)
+
+        position, reason = await sched.open_epic_guarded(
+            self._Trading(allowed=False), intent, None
+        )
+
+        assert position is None
+        assert reason == "Epic already open"
+        assert sched.signals.pending() == []
+
+    async def test_manual_open_ignores_the_mode(self):
+        # The dashboard buttons are the human decision itself — notify mode must
+        # never turn a click into a notification.
+        sched = self._notify_scheduler()
+        trading = self._Trading()
+        intent = SimpleNamespace(epic="E", direction="BUY", score=0.0)
+
+        position, reason = await sched.open_epic_guarded(
+            trading, intent, None, manual=True
+        )
+
+        assert position is not None and reason is None
+        assert trading.ordered is True
+        assert sched.signals.pending() == []
+
+    async def test_auto_mode_opens_as_before(self):
+        sched = _make_scheduler(MagicMock())
+        sched._settings.open_mode = "auto"
+        trading = self._Trading()
+        intent = SimpleNamespace(epic="E", direction="BUY", score=0.0)
+
+        position, reason = await sched.open_epic_guarded(trading, intent, None)
+
+        assert position is not None and reason is None
+        assert trading.ordered is True
+        assert sched.signals.pending() == []
+
+    async def test_blocked_auto_open_wins_over_notify(self):
+        # A closed day proposes nothing either: the user has already decided.
+        sched = self._notify_scheduler()
+        sched._auto_open_enabled = False
+        sched._auto_open_day = date.today()
+        trading = self._Trading()
+        intent = SimpleNamespace(epic="E", direction="BUY", score=0.0)
+
+        position, reason = await sched.open_epic_guarded(trading, intent, None)
+
+        assert position is None and reason == AUTO_OPEN_REFUSAL
+        assert sched.signals.pending() == []
+
+    def test_signal_price_is_the_close_out_side(self):
+        last = SimpleNamespace(bid_close=100.0, spread=0.5)
+        buf = SimpleNamespace(last=last)
+        assert BotScheduler._signal_price("BUY", buf) == 100.0  # sell back at bid
+        assert BotScheduler._signal_price("SELL", buf) == 100.5  # buy back at offer
+
+    def test_signal_price_is_zero_without_a_candle(self):
+        assert BotScheduler._signal_price("BUY", SimpleNamespace(last=None)) == 0.0
+
+
 class TestValidateStrategySelection:
     """The ``.env`` selection is validated up front (single source of truth).
 
@@ -197,6 +312,7 @@ class TestValidateStrategySelection:
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
             allow_recovery_revert=False,
+            open_mode="auto",
         )
         validate_strategy_selection(settings)  # does not raise
 
@@ -212,6 +328,7 @@ class TestValidateStrategySelection:
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=None,
             allow_recovery_revert=False,
+            open_mode="auto",
         )
         with pytest.raises(ValueError, match="ALLOW_SAME_DAY_REOPEN"):
             validate_strategy_selection(settings)
@@ -226,6 +343,7 @@ class TestValidateStrategySelection:
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=True,
             allow_recovery_revert=True,
+            open_mode="auto",
         )
         validate_strategy_selection(settings)  # does not raise
 
@@ -240,9 +358,56 @@ class TestValidateStrategySelection:
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
             allow_recovery_revert=None,
+            open_mode="auto",
         )
         with pytest.raises(ValueError, match="ALLOW_RECOVERY_REVERT"):
             validate_strategy_selection(settings)
+
+    def test_missing_open_mode_is_rejected(self):
+        # Whether the bot may place an order on its own (auto) or only propose it
+        # (notify) is as explicit as the policies above — no silent default.
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zonesecure="hold",
+            close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=False,
+            allow_recovery_revert=False,
+            open_mode="",
+        )
+        with pytest.raises(ValueError, match="OPEN_MODE"):
+            validate_strategy_selection(settings)
+
+    def test_unknown_open_mode_is_rejected(self):
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zonesecure="hold",
+            close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=False,
+            allow_recovery_revert=False,
+            open_mode="notifyy",
+        )
+        with pytest.raises(ValueError, match="OPEN_MODE"):
+            validate_strategy_selection(settings)
+
+    def test_notify_mode_passes(self):
+        settings = SimpleNamespace(
+            open_strategy="open_projection",
+            stop_strategy="stop_support",
+            close_zonestart="hold",
+            close_zonemarge="hold",
+            close_zonesecure="hold",
+            close_zoneprofit="trailing_ratchet",
+            allow_same_day_reopen=False,
+            allow_recovery_revert=False,
+            open_mode="notify",
+        )
+        validate_strategy_selection(settings)  # does not raise
 
     def test_empty_selection_is_rejected(self):
         settings = SimpleNamespace(
@@ -254,6 +419,7 @@ class TestValidateStrategySelection:
             close_zoneprofit="",
             allow_same_day_reopen=False,
             allow_recovery_revert=False,
+            open_mode="auto",
         )
         with pytest.raises(ValueError) as exc:
             validate_strategy_selection(settings)
@@ -275,6 +441,7 @@ class TestValidateStrategySelection:
             close_zoneprofit="trailing_ratchet",
             allow_same_day_reopen=False,
             allow_recovery_revert=False,
+            open_mode="auto",
         )
         with pytest.raises(ValueError, match="OPEN_STRATEGY"):
             validate_strategy_selection(settings)
@@ -1318,13 +1485,20 @@ def _tier_market(epic: str, risk: float | None, spread: float = 0.001) -> Market
     )
 
 
-def _tier_scheduler(session_factory, streaming, cap: int = 2) -> BotScheduler:
-    """A scheduler with the risk-tier epic selection enabled and a small cap."""
+def _tier_scheduler(
+    session_factory, streaming, cap: int = 2, follow: int = 0
+) -> BotScheduler:
+    """A scheduler with the risk-tier epic selection enabled and a small cap.
+
+    ``follow`` is ``epic_follow_closed_max`` — kept at 0 by default so the tier
+    tests below read the ladder alone; the follow-up slots have their own class.
+    """
     settings = MagicMock()
     settings.strategy_hour_close = 17
     settings.streaming_max_epics = cap
     settings.epic_risk_tiers_enabled = True
     settings.epic_risk_tier_bounds = [0.0, 30.0, 100.0, 200.0, 600.0]
+    settings.epic_follow_closed_max = follow
     return BotScheduler(
         settings=settings,
         client=MagicMock(),
@@ -1338,7 +1512,9 @@ def _tier_scheduler(session_factory, streaming, cap: int = 2) -> BotScheduler:
     )
 
 
-async def _add_closed(session_factory, epic: str, euro: float) -> None:
+async def _add_closed(
+    session_factory, epic: str, euro: float, closed_at: time | None = None
+) -> None:
     """Bank ``euro`` on today's realised P&L via one closed position."""
     async with session_factory() as session:
         session.add(
@@ -1348,6 +1524,7 @@ async def _add_closed(session_factory, epic: str, euro: float) -> None:
                 date=date.today(),
                 state=PositionState.CLOSE,
                 euro=Decimal(str(euro)),
+                time_close=closed_at,
             )
         )
         await session.commit()
@@ -1487,6 +1664,101 @@ class TestRiskTierEpicSelection:
         assert scheduler._risk_tier.index == 0
 
 
+class TestFollowTradedEpics:
+    """A market traded today keeps its slot once the trade is over.
+
+    The point is not to re-trade it (the same-day re-open gate still refuses):
+    it is to keep recording the curve of a market the bot picked at time T, so
+    the rest of the day shows what the exit left behind.
+    """
+
+    def _wire(self, scheduler, markets):
+        scheduler._scanner.get_all_market_infos = AsyncMock(return_value=markets)
+        scheduler._scanner.select_tradable = MagicMock(return_value=markets)
+        scheduler._scanner.get_non_tradable_reasons = MagicMock(return_value={})
+        scheduler._persist_epic_enrichment = AsyncMock()
+        scheduler._persist_tradable_flags = AsyncMock()
+
+    def _markets(self):
+        return [
+            _tier_market("SMALL1", 10.0, spread=0.001),
+            _tier_market("SMALL2", 20.0, spread=0.002),
+            _tier_market("BIG1", 400.0, spread=0.003),
+        ]
+
+    async def test_closed_epic_keeps_its_slot_out_of_tier(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming, follow=1)
+        self._wire(scheduler, self._markets())
+        await _add_closed(session_factory, "BIG1", 0.0)  # flat: still tier 0
+
+        await scheduler._refresh_tradable_epics()
+
+        # Tier 0 would drop the 400 € market; the follow-up slot keeps it, and
+        # ahead of the band so the cap can never cut it.
+        assert scheduler._tradable_epics == ["BIG1", "SMALL1"]
+        # And it stays on the live feed.
+        streamed = streaming.set_epics.await_args.args[0]
+        assert "BIG1" in streamed
+
+    async def test_follow_cap_keeps_the_latest_exits(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming, cap=3, follow=1)
+        self._wire(scheduler, self._markets())
+        await _add_closed(session_factory, "SMALL2", 0.0, time(9, 0))
+        await _add_closed(session_factory, "BIG1", 0.0, time(11, 30))
+
+        await scheduler._refresh_tradable_epics()
+
+        # One follow-up slot for two exits: the most recent one takes it. SMALL2
+        # is not lost — it simply competes on risk again, and tier 0 keeps it.
+        assert scheduler._tradable_epics[0] == "BIG1"
+        assert set(scheduler._tradable_epics) == {"BIG1", "SMALL1", "SMALL2"}
+
+    async def test_zero_drops_the_market_once_the_trade_is_over(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming, follow=0)
+        self._wire(scheduler, self._markets())
+        await _add_closed(session_factory, "BIG1", 0.0)
+
+        await scheduler._refresh_tradable_epics()
+
+        assert scheduler._tradable_epics == ["SMALL1", "SMALL2"]
+
+    async def test_an_open_position_outranks_a_follow_up(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming, cap=1, follow=1)
+        self._wire(scheduler, self._markets())
+        await _add_closed(session_factory, "BIG1", 0.0)
+        await _add_open(session_factory, "SMALL2")
+
+        await scheduler._refresh_tradable_epics()
+
+        # The single slot goes to the live position, never to the finished trade.
+        assert scheduler._tradable_epics == ["SMALL2"]
+
+    async def test_a_fresh_exit_re_picks_the_list_intraday(self, session_factory):
+        streaming = MagicMock()
+        streaming.set_epics = AsyncMock()
+        scheduler = _tier_scheduler(session_factory, streaming, follow=1)
+        self._wire(scheduler, self._markets())
+        await scheduler._refresh_tradable_epics()
+        assert scheduler._tradable_epics == ["SMALL1", "SMALL2"]
+        streaming.set_epics.reset_mock()
+
+        # A close the scheduler never saw as a pin (tier unchanged, P&L flat):
+        # the follow-up set alone must trigger the re-pick.
+        await _add_closed(session_factory, "BIG1", 0.0)
+        await scheduler._maybe_reselect_risk_tier()
+
+        assert scheduler._tradable_epics == ["BIG1", "SMALL1"]
+        streaming.set_epics.assert_awaited_once()
+
+
 class TestStreamingKeepsOpenPositions:
     async def test_open_position_epic_stays_subscribed_when_capped(
         self, session_factory
@@ -1496,6 +1768,7 @@ class TestStreamingKeepsOpenPositions:
         settings.strategy_hour_close = 17
         settings.streaming_max_epics = 2  # force the cap with 3 candidates
         settings.epic_risk_tiers_enabled = False
+        settings.epic_follow_closed_max = 0
         streaming = MagicMock()
         streaming.set_epics = AsyncMock()
         scheduler = BotScheduler(
@@ -1551,6 +1824,7 @@ class TestStreamingKeepsOpenPositions:
         settings = MagicMock()
         settings.strategy_hour_close = 17
         settings.streaming_max_epics = 40
+        settings.epic_follow_closed_max = 0
         scheduler = BotScheduler(
             settings=settings,
             client=MagicMock(),
@@ -2358,6 +2632,114 @@ class TestRequireFlatBook:
         scheduler = self._scheduler(session_factory, strategy)
         assert strategy.require_flat_book is False
         await self._add_position(session_factory, direction="BUY")
+
+        await scheduler._select_and_open()
+
+        assert strategy.evaluate.call_count == 3
+
+
+class TestRequireRangeBook:
+    """``require_range_book`` — add a bet only into a book that has stopped moving.
+
+    ``open_momentum`` opens one position at a time: while any open position's epic
+    is still in a move (its regime reads anything but ``RANGE``) nothing new is
+    opened, and only a book entirely in a range re-opens the door. An epic whose
+    curve cannot be judged blocks too — the brake opens into a *demonstrably* quiet
+    book, never into an unknown one, which is the opposite choice from
+    ``block_open_while_alive``.
+    """
+
+    @staticmethod
+    def _feed(scheduler: BotScheduler, epic: str, closes: list[float]) -> None:
+        base = datetime.now(UTC) - timedelta(minutes=len(closes))
+        for i, close in enumerate(closes):
+            scheduler._buffer.add_candle(
+                epic, _candle(base + timedelta(minutes=i), bid=close)
+            )
+
+    def _scheduler(self, session_factory, strategy=None):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        strategy = strategy or OpenMomentum()
+        scheduler._strategy = strategy
+        strategy.min_participation_ratio = 0.0
+        strategy.min_participation_count = 0
+        strategy.evaluate = MagicMock(return_value=None)
+        scheduler._tradable_epics = [f"E{i}" for i in range(3)]
+        for i in range(3):
+            self._feed(scheduler, f"E{i}", [1.0] * strategy.warmup)
+        return scheduler
+
+    @staticmethod
+    async def _add_open(session_factory, epic: str) -> None:
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic=epic,
+                    epic_name=epic,
+                    date=date.today(),
+                    state=PositionState.OPEN,
+                )
+            )
+            await session.commit()
+
+    async def test_an_empty_book_runs_the_tournament(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_a_trending_open_position_blocks(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        await self._add_open(session_factory, "HELD")
+        # A straight ramp: the position is still riding the move it was opened for.
+        self._feed(scheduler, "HELD", [100.0 + i for i in range(60)])
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_a_book_entirely_in_range_opens(self, session_factory):
+        scheduler = self._scheduler(session_factory)
+        await self._add_open(session_factory, "HELD")
+        # A flat, contained curve: RANGE, so the money committed is no longer
+        # working and a new momentum trade may go on beside it.
+        self._feed(scheduler, "HELD", [100.0] * 60)
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_one_trending_epic_among_ranges_blocks(self, session_factory):
+        """ "At least one in a trend" is the rule — not "the majority"."""
+        scheduler = self._scheduler(session_factory)
+        for epic in ("FLAT1", "FLAT2", "MOVING"):
+            await self._add_open(session_factory, epic)
+        self._feed(scheduler, "FLAT1", [100.0] * 60)
+        self._feed(scheduler, "FLAT2", [200.0] * 60)
+        self._feed(scheduler, "MOVING", [100.0 + i for i in range(60)])
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_an_unreadable_epic_blocks(self, session_factory):
+        """No buffer at all: the book cannot be shown to be quiet, so it blocks."""
+        scheduler = self._scheduler(session_factory)
+        await self._add_open(session_factory, "HELD")
+        assert scheduler._buffer.get("HELD") is None
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_other_strategies_are_unaffected(self, session_factory):
+        """The brake is opt-in: a ranker that does not declare it keeps opening."""
+        strategy = OpenSafeRanking()
+        scheduler = self._scheduler(session_factory, strategy)
+        assert strategy.require_range_book is False
+        await self._add_open(session_factory, "HELD")
+        self._feed(scheduler, "HELD", [100.0 + i for i in range(60)])
 
         await scheduler._select_and_open()
 

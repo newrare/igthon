@@ -1,11 +1,12 @@
 """Dashboard HTTP routes (FastAPI endpoint handlers)."""
 
 import asyncio
+import json
 import logging
 from datetime import UTC, date, datetime, time, timedelta
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy import select
 
 from src.core.api_queue import Priority
@@ -69,6 +70,11 @@ async def api_dashboard_fragments(request: Request) -> JSONResponse:
             "bot_paused": state["bot_paused"],
             "auto_open": state["auto_open_enabled"],
             "scheduler_available": state["scheduler_available"],
+            # Proposed opens waiting for the user (OPEN_MODE=notify). Carried by
+            # the existing 1 s poll rather than a second request: the browser
+            # raises one notification per signal id it has not seen yet.
+            "signals": state["signals"],
+            "open_mode": state["open_mode"],
             "server_time": datetime.now(_PARIS).strftime("%H:%M:%S"),
         }
     )
@@ -160,6 +166,96 @@ async def end_day(request: Request) -> JSONResponse:
         logger.error("End day failed: %s", exc)
         return JSONResponse({"error": f"End day failed: {exc}"}, status_code=500)
     return JSONResponse({"closed": closed, "auto_open": False})
+
+
+@router.get("/api/signals")
+async def api_signals(request: Request) -> JSONResponse:
+    """JSON API: the opens the bot proposed and did not take.
+
+    Only ever populated in ``OPEN_MODE=notify``: each entry is an intent that
+    passed every pre-open gate and was handed to the user instead of being
+    ordered. The dashboard poll already carries the same list; this endpoint
+    exists for a standalone client (or a quick curl) that only wants the signals.
+    """
+    scheduler = request.app.state.scheduler
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    return JSONResponse(
+        {
+            "open_mode": getattr(request.app.state.settings, "open_mode", ""),
+            "signals": scheduler.signals.as_dicts(),
+        }
+    )
+
+
+# Server-sent-events cadence. The generator compares an integer every
+# ``_SSE_TICK`` seconds (no DB, no IG call) and pushes only when the book
+# actually changed; ``_SSE_HEARTBEAT`` bounds how long the connection can stay
+# silent, which keeps proxies and browsers from dropping it as dead.
+_SSE_TICK = 1.0
+_SSE_HEARTBEAT = 15.0
+
+
+@router.get("/api/signals/stream")
+async def api_signals_stream(request: Request) -> StreamingResponse:
+    """Push the pending signals to the browser as server-sent events.
+
+    The dashboard's ordinary 1 s poll cannot be what raises an alert: a browser
+    throttles the timers of a hidden tab to roughly one tick a minute, which is
+    exactly the situation this feature exists for — the user is in another window
+    or another tab. An open SSE connection is not throttled, so a signal reaches
+    the page (chime, notification, tab badge) the second it is raised.
+
+    Each event carries the full pending list, so a reconnecting client needs no
+    catch-up protocol: the first message after ``EventSource`` reconnects is the
+    current truth, and the client already ignores ids it has alerted on.
+    """
+    scheduler = request.app.state.scheduler
+
+    async def _events():
+        if scheduler is None:
+            yield 'event: error\ndata: {"error": "Scheduler not available"}\n\n'
+            return
+        book = scheduler.signals
+        last_version = -1  # forces an immediate first message on connect
+        silent_for = 0.0
+        while True:
+            if await request.is_disconnected():
+                return
+            if book.version != last_version:
+                last_version = book.version
+                silent_for = 0.0
+                payload = json.dumps({"signals": book.as_dicts()})
+                yield f"data: {payload}\n\n"
+            elif silent_for >= _SSE_HEARTBEAT:
+                silent_for = 0.0
+                yield ": keep-alive\n\n"  # comment frame, ignored by the client
+            await asyncio.sleep(_SSE_TICK)
+            silent_for += _SSE_TICK
+
+    return StreamingResponse(
+        _events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Tell any reverse proxy in front of the app not to buffer the stream
+            # (nginx buffers by default, which would defeat the whole point).
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/signals/{signal_id}/dismiss")
+async def dismiss_signal(request: Request, signal_id: int) -> JSONResponse:
+    """Drop one proposed open — the user looked at it and passed."""
+    scheduler = request.app.state.scheduler
+    if scheduler is None:
+        return JSONResponse({"error": "Scheduler not available"}, status_code=503)
+    dismissed = scheduler.signals.dismiss(signal_id)
+    if not dismissed:
+        return JSONResponse({"error": "Unknown signal"}, status_code=404)
+    return JSONResponse({"dismissed": signal_id})
 
 
 _ACTIONS = {
@@ -1018,6 +1114,10 @@ async def open_position_manual(request: Request, epic: str) -> JSONResponse:
             # Tag the manual origin (open_from_intent records reason_open="auto").
             position.reason_open = "manual"
             await session.commit()
+
+            # The user acted on this market: any signal still proposing it has
+            # served its purpose and must not keep notifying.
+            scheduler.signals.dismiss_epic(epic)
 
             level = float(position.level_open)
             quantity = int(position.quantity)

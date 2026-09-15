@@ -166,6 +166,36 @@ independent measures — the efficiency ratio (is the path directional?) and
 
 `is_trending` covers both trend values.
 
+### Move phase
+
+`move_phase` → `MovePhase`, with `move_direction` → `Trend` saying which way that
+move points (`FLAT` exactly when the phase is `NONE`). It answers the question the
+regime cannot — **am I early or late?** — since `TREND_UP` reads the same on the
+first candle of a move and on its last.
+
+The move measured is the **9/21 momentum leg**, deliberately not the regime: a
+young leg inside a market the regime still calls `RANGE` is exactly the case worth
+seeing, and by the time a give-back is deep enough to matter the regime has
+already stopped calling the market trending.
+
+| Value    | Meaning                                                                         |
+| -------- | ------------------------------------------------------------------------------- |
+| `START`  | The crossing carrying the leg is recent (not yet `is_established`)              |
+| `MIDDLE` | The crossing has held and the price still holds most of the range it travelled  |
+| `END`    | More than `LATE_MOVE_HOLD` (half) of that range has been given back             |
+| `NONE`   | No leg: the averages sit within `MIN_MOVE_GAP_ATR` of each other, or no history |
+
+Two decisions worth knowing about:
+
+- **youth is tested before damage** — a violent start is young, not late, and the
+  window of a fresh crossing still contains the leg it reversed, which would read
+  as a give-back;
+- **the RSI is not used** as an exhaustion sign: it sits stretched for the whole
+  length of a healthy trend, so it would call every strong move finished.
+
+`END` is an age, not a forecast: it says the leg is old and damaged, never that
+the price is about to turn.
+
 ### Readable levels
 
 | Field                                      | Reads                                                |

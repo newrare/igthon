@@ -18,7 +18,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -29,7 +29,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.core.api.client import IGAPIError, IGClient
 from src.core.api_queue import APIQueue, Priority
 from src.core.config import Settings
+from src.core.reading import MIN_REGIME_MINUTES, CurveReading, Regime
 from src.core.recorder import Recorder
+from src.core.signals import SignalBook
 from src.entry import ENTRY_STRATEGIES, EntryIntent, EntryStrategy, get_entry_strategy
 from src.execution.gates import (
     RECOVERY_REVERT_REASON_OPEN,
@@ -110,6 +112,14 @@ def validate_strategy_selection(settings: Settings) -> None:
     # own must be stated explicitly, never silently defaulted.
     if getattr(settings, "allow_recovery_revert", None) is None:
         problems.append("ALLOW_RECOVERY_REVERT is not set (expected true or false)")
+    # Automatic-open mode: whether a signal becomes an order or a notification.
+    # Explicit like the policies above — the difference between the two is
+    # whether the bot may spend money on its own.
+    if getattr(settings, "open_mode", "") not in OPEN_MODES:
+        problems.append(
+            f"OPEN_MODE={getattr(settings, 'open_mode', '') or ''!r} is invalid "
+            f"(expected one of {sorted(OPEN_MODES)})"
+        )
     if problems:
         raise ValueError(
             "Invalid strategy selection — please configure your .env file:\n  - "
@@ -152,6 +162,17 @@ AUTO_OPEN_PREF_KEY = "auto_open"
 # ordinary gate refusal — the user set this one themselves and wants to see what
 # it cost them.
 AUTO_OPEN_REFUSAL = "Auto-open disabled for today"
+
+# Accepted ``OPEN_MODE`` values. ``auto`` places the order the entry strategy
+# asked for; ``notify`` records it as a signal for the user to act on (or not).
+OPEN_MODE_AUTO = "auto"
+OPEN_MODE_NOTIFY = "notify"
+OPEN_MODES = frozenset({OPEN_MODE_AUTO, OPEN_MODE_NOTIFY})
+
+# Refusal reason returned by ``open_epic_guarded`` in notify mode. The open was
+# fully validated (gates passed) and deliberately not taken: the decision is the
+# user's, and the dashboard notifies them.
+NOTIFY_REFUSAL = "Notify mode — signal raised, waiting for your decision"
 
 
 # Registry of schedulable jobs surfaced in the dashboard "Actions" section.
@@ -380,11 +401,13 @@ class BotScheduler:
         # risk tier can re-pick the watched subset intra-day (``_rebuild_tradable_set``)
         # without spending a fresh batch of /markets calls.
         self._market_infos: list[MarketInfo] = []
-        # Risk tier the current watched subset was picked for, and the open-position
-        # epics pinned into it. Both are the change detector of
-        # ``_maybe_reselect_risk_tier``; None means nothing has been picked yet.
+        # Risk tier the current watched subset was picked for, the open-position
+        # epics pinned into it and the already-traded epics followed behind them.
+        # All three are the change detector of ``_maybe_reselect_risk_tier``; None
+        # means nothing has been picked yet.
         self._risk_tier: RiskTier | None = None
         self._risk_tier_pins: frozenset[str] = frozenset()
+        self._risk_tier_follows: tuple[str, ...] = ()
         self._epic_last_refresh: datetime | None = None
         # UTC timestamp of the last successful open-position sync (the moment the
         # stored ``euro`` figures were last refreshed from IG). Surfaced on the
@@ -408,6 +431,13 @@ class BotScheduler:
         # Manual dashboard opens are never affected.
         self._auto_open_enabled: bool = True
         self._auto_open_day: date | None = None
+
+        # Proposed opens, in ``OPEN_MODE=notify`` only: an intent that cleared
+        # every pre-open gate and was deliberately NOT taken. The dashboard turns
+        # each one into a browser notification so the user can go and read the
+        # market before opening it themselves. In-memory on purpose — a signal is
+        # worth nothing once its market has moved on (see src/core/signals.py).
+        self._signals = SignalBook()
 
         self._scanner = MarketScanner(
             client=client,
@@ -788,6 +818,22 @@ class BotScheduler:
             and job.next_run_time is not None
             for entry in JOB_DEFINITIONS
         )
+
+    @property
+    def signals(self) -> SignalBook:
+        """Return the book of proposed opens (``OPEN_MODE=notify``)."""
+        return self._signals
+
+    @property
+    def notify_only(self) -> bool:
+        """Return True when an automatic open must notify instead of ordering.
+
+        Read straight from the settings (``OPEN_MODE``, validated at startup by
+        :func:`validate_strategy_selection`) — like the strategy selection, the
+        ``.env`` file is the single source of truth and there is no runtime
+        switch.
+        """
+        return getattr(self._settings, "open_mode", "") == OPEN_MODE_NOTIFY
 
     @property
     def auto_open_enabled(self) -> bool:
@@ -1566,6 +1612,49 @@ class BotScheduler:
             logger.warning("Could not load open-position epics for streaming: %s", exc)
             return set()
 
+    async def _followed_today_epics(self) -> list[str]:
+        """Epics traded today whose position is already closed, latest close first.
+
+        The day's watched list is not only about what can still be opened: a market
+        the bot selected at time T and has since left (won or lost) stays worth
+        recording, so the curve after the exit can be read against the trade. These
+        epics are handed to :func:`~src.markets.risk_tiers.select_by_risk_tier` as
+        *follow-ups* — kept behind the open positions, capped by
+        ``epic_follow_closed_max``, and dropped from the ranking downwards when the
+        cap leaves no room.
+
+        Ordered by close time descending (rows with no ``time_close`` — a closed
+        position whose time was never recorded — come last) so the cap keeps the
+        most recent exits, which are the ones still worth watching. Returns an
+        empty list on any DB error: a follow-up is a nicety, never a reason to fail
+        the refresh.
+        """
+        limit = self._settings.epic_follow_closed_max
+        if limit <= 0:
+            return []
+        try:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.execute(
+                        select(Position.epic, func.max(Position.time_close))
+                        .where(
+                            Position.date == date.today(),
+                            Position.state != PositionState.OPEN,
+                        )
+                        .group_by(Position.epic)
+                    )
+                ).all()
+        except Exception as exc:
+            logger.warning("Could not load today's closed epics for the feed: %s", exc)
+            return []
+
+        ordered = sorted(
+            rows,
+            key=lambda row: (row[1] is not None, row[1] or time.min),
+            reverse=True,
+        )
+        return [epic for epic, _ in ordered]
+
     @staticmethod
     async def _traded_today_epics(session: AsyncSession) -> set[str]:
         """Epics that already had an opening today (any state, open or closed).
@@ -1654,6 +1743,42 @@ class BotScheduler:
             alive.append(position.epic)
         return alive
 
+    async def _still_moving_positions(
+        self, session: AsyncSession, window: int
+    ) -> list[str]:
+        """Open epics whose market is **not** a plain range, with their regime.
+
+        Drives the ``require_range_book`` brake in :meth:`_select_and_open`: the
+        strategy may only add a position when everything already open has stopped
+        moving. An epic qualifies as quiet only when its live curve reads
+        :attr:`~src.core.reading.Regime.RANGE` over ``window`` candles — choppy
+        *and* contained. Everything else is reported, so the brake blocks on it:
+
+        * ``TREND_UP`` / ``TREND_DOWN`` — the position is still riding its move;
+        * ``VOLATILE`` — swings going nowhere, the worst market to add risk into;
+        * ``UNKNOWN`` — no buffer or too little history to judge. Deliberately
+          blocking: this brake opens only into a book that is *demonstrably*
+          quiet, never into one it cannot read (the opposite choice from
+          :meth:`_alive_positions`, which must not freeze opening on an unknown).
+
+        Returns ``"EPIC=REGIME"`` strings so the caller can name what is blocking.
+        """
+        epics = (
+            await session.scalars(
+                select(Position.epic).where(Position.state == PositionState.OPEN)
+            )
+        ).all()
+        moving: list[str] = []
+        for epic in dict.fromkeys(epics):  # de-duplicated, order kept
+            buf = self._buffer.get(epic)
+            if buf is None or len(buf) < MIN_REGIME_MINUTES:
+                moving.append(f"{epic}={Regime.UNKNOWN}")
+                continue
+            regime = CurveReading.of(buf, regime_window=window).regime
+            if regime is not Regime.RANGE:
+                moving.append(f"{epic}={regime}")
+        return moving
+
     async def _refresh_tradable_epics(self) -> None:
         """Filter ``_all_epics`` to those currently open and TRADEABLE.
 
@@ -1732,14 +1857,20 @@ class BotScheduler:
         2. the cap — IG allows a fixed number of Lightstreamer subscriptions, so
            when more markets are tradable than fit, either the risk-tier ladder
            picks them (``epic_risk_tiers_enabled``: the day's realised P&L chooses
-           the euro band, open positions are pinned in) or, when it is disabled,
+           the euro band, open positions are pinned in and the epics already
+           traded today are followed right behind them) or, when it is disabled,
            the previous class-diversified pick does.
         3. publication — persist the flags, then push the subscription set with
-           the open-position epics first so they survive ``set_epics``' own
-           truncation.
+           the open-position epics first, then the day's follow-ups, so both
+           survive ``set_epics``' own truncation.
         """
         selected = self._scanner.select_tradable(infos)
         open_epics = await self._open_position_epics()
+        # Markets already traded today, still watched so the day can show what they
+        # did after the exit (see :meth:`_followed_today_epics`).
+        followed = [
+            e for e in await self._followed_today_epics() if e not in open_epics
+        ]
         cap = self._settings.streaming_max_epics if self._streaming is not None else 0
 
         capped_out: list[str] = []
@@ -1748,11 +1879,17 @@ class BotScheduler:
             realised = await self._realized_pnl_today_safe()
             tier = tier_for_pnl(realised, tuple(self._settings.epic_risk_tier_bounds))
             selection = select_by_risk_tier(
-                selected, cap=cap, tier=tier, pinned=open_epics
+                selected,
+                cap=cap,
+                tier=tier,
+                pinned=open_epics,
+                followed=followed,
+                follow_cap=self._settings.epic_follow_closed_max,
             )
             tradeable = selection.markets
             self._risk_tier = tier
             self._risk_tier_pins = frozenset(open_epics)
+            self._risk_tier_follows = tuple(followed)
             reason_capped = f"risk_tier_{tier.label}"
             logger.info(
                 "Risk-tier epic selection: %.2f€ realised today -> %s (from %d "
@@ -1803,11 +1940,14 @@ class BotScheduler:
             # trade closes, so the position's candle history (and the bid the
             # monitor reads) never stops mid-trade — even if the selection above
             # dropped them. They come first so they survive ``set_epics``'
-            # truncation to the IG subscription cap; the tradable set fills the
-            # rest.
+            # truncation to the IG subscription cap, then the day's follow-ups
+            # (traded and already closed — their curve is still being recorded),
+            # and the tradable set fills the rest.
+            follow_stream = followed[: max(self._settings.epic_follow_closed_max, 0)]
+            head = [*sorted(open_epics), *follow_stream]
             stream_epics = [
-                *sorted(open_epics),
-                *(e for e in self._tradable_epics if e not in open_epics),
+                *head,
+                *(e for e in self._tradable_epics if e not in set(head)),
             ]
             await self._streaming.set_epics(stream_epics)
 
@@ -1834,9 +1974,9 @@ class BotScheduler:
         take effect at the next hourly refresh, so a morning that banks its first
         30 € would keep trading the small markets for the rest of the hour.
 
-        The pinned set is part of the trigger, not just the tier: a close frees
-        the slot its epic held, and the freed slot should go back to the tier at
-        once rather than stay parked on a market nothing is riding any more.
+        The pinned set is part of the trigger, not just the tier: a close turns its
+        epic from a pin into a follow-up (still watched, but now droppable), which
+        hands the slot back to the tier as soon as the cap needs it.
         """
         if not self._settings.epic_risk_tiers_enabled:
             return
@@ -1846,7 +1986,12 @@ class BotScheduler:
         realised = await self._realized_pnl_today_safe()
         tier = tier_for_pnl(realised, tuple(self._settings.epic_risk_tier_bounds))
         pins = frozenset(await self._open_position_epics())
-        if tier == self._risk_tier and pins == self._risk_tier_pins:
+        follows = tuple(e for e in await self._followed_today_epics() if e not in pins)
+        if (
+            tier == self._risk_tier
+            and pins == self._risk_tier_pins
+            and follows == self._risk_tier_follows
+        ):
             return
 
         if tier != self._risk_tier:
@@ -2113,8 +2258,49 @@ class BotScheduler:
             )
             if not allowed:
                 return None, reason
+            # Notify mode — the open is fully validated and deliberately not
+            # taken. Recorded *after* the gates so the user is only ever
+            # notified about a market the bot could really have opened (no
+            # notification for an epic already held, a market about to close or
+            # an unaffordable margin), and inside the per-epic lock so two
+            # concurrent ticks raise one signal, not two.
+            if not manual and self.notify_only:
+                self._signals.record(
+                    intent.epic,
+                    intent.direction,
+                    strategy=self.strategy.name,
+                    score=intent.score,
+                    price=self._signal_price(intent.direction, buf),
+                    name=self._market_name(intent.epic),
+                )
+                return None, NOTIFY_REFUSAL
             position = await trading.open_from_intent(intent, buf)
             return position, None
+
+    def _market_name(self, epic: str) -> str:
+        """Return the instrument description for ``epic``, or "" when unknown.
+
+        Best effort from the last market snapshot: a signal is readable without
+        it (the epic is displayed either way), it just reads better with it.
+        """
+        for info in self._market_infos:
+            if info.epic == epic:
+                return info.name
+        return ""
+
+    @staticmethod
+    def _signal_price(direction: str, buf: EpicBuffer) -> float:
+        """Return the close-out price shown in a signal, 0.0 when unavailable.
+
+        Close-out, not mid: it is the price the user would actually get out at,
+        which is the only one worth quoting next to a proposal to enter.
+        """
+        last = getattr(buf, "last", None)
+        if last is None:
+            return 0.0
+        bid = float(getattr(last, "bid_close", 0.0) or 0.0)
+        spread = float(getattr(last, "spread", 0.0) or 0.0)
+        return bid + spread if direction.upper() == "SELL" else bid
 
     def _curve_supports_revert(
         self, position: Position, buf: EpicBuffer
@@ -2363,7 +2549,11 @@ class BotScheduler:
         A count-bounded strategy may also declare ``require_flat_book``
         (``open_five``), which turns the top-up into an all-or-nothing **series**:
         nothing is opened while any position is still open, and when the book is
-        empty the whole basket goes on in a single pass.
+        empty the whole basket goes on in a single pass. A strategy that declares
+        ``require_range_book`` (``open_momentum``) instead makes the book's *state*
+        the condition: it opens only while every open position's epic has stopped
+        moving (regime ``RANGE``), so a second bet is never taken beside one that
+        is still riding its move.
 
         Each invocation:
 
@@ -2458,6 +2648,31 @@ class BotScheduler:
                             ", ".join(alive),
                         )
                         return
+
+                # Range-book brake: a strategy that declares
+                # ``require_range_book`` adds a position only when everything
+                # already open has stopped moving — every open epic reads RANGE.
+                # One position still riding a trend (or a market too thin to be
+                # read) holds the whole pass: the money already committed is
+                # working, and a second bet beside it only dilutes it.
+                if getattr(strategy, "require_range_book", False) and open_count:
+                    window = int(getattr(strategy, "book_regime_window", 30) or 30)
+                    moving = await self._still_moving_positions(session, window)
+                    if moving:
+                        logger.info(
+                            "Rolling select [%s]: %d open position(s) still in a "
+                            "move (%s) — opening nothing new",
+                            strategy.name,
+                            len(moving),
+                            ", ".join(moving),
+                        )
+                        return
+                    logger.debug(
+                        "Rolling select [%s]: the whole book (%d position(s)) is "
+                        "in a range — a new open is allowed",
+                        strategy.name,
+                        open_count,
+                    )
 
                 # Open cooldown: a strategy that spaces its opens out
                 # (``open_cooldown_minutes`` > 0) opens at most one position per
@@ -2658,10 +2873,16 @@ class BotScheduler:
                     self._client, session, config, close_profile=self.close_profile
                 )
                 opened = 0
+                # Notify mode only: candidates proposed to the user instead of
+                # opened. Counted against ``slots`` exactly like a real open
+                # would be, so the bot signals the best candidate(s) it would
+                # have taken — not every ranked epic that happens to pass the
+                # gates once nothing ever fills the book.
+                signalled = 0
                 gate_blocked = 0  # candidates rejected by the base open gates
                 wallet_blocked = 0  # candidates the wallet could not cover
                 for intent, buf in ranked:
-                    if opened >= slots:
+                    if opened + signalled >= slots:
                         break
                     allowed, reason = await trading.can_open_intent(
                         intent, allow_short=allow_short
@@ -2691,7 +2912,7 @@ class BotScheduler:
                     # Single-flight per epic: re-checks the duplicate gate under
                     # the per-epic lock so a manual dashboard open on the same
                     # epic cannot slip a second order through the race window.
-                    position, _ = await self.open_epic_guarded(
+                    position, reason = await self.open_epic_guarded(
                         trading, intent, buf, allow_short=allow_short
                     )
                     if position:
@@ -2702,9 +2923,20 @@ class BotScheduler:
                             f"Rolling open: {intent.epic} @ {position.level_open} "
                             f"(score={intent.score:.3f})"
                         )
+                    elif reason == NOTIFY_REFUSAL:
+                        signalled += 1
+                        self._recorder.info(
+                            f"Rolling signal: {intent.epic} "
+                            f"(score={intent.score:.3f}) — your call"
+                        )
 
                 if opened:
                     logger.info("Rolling select: opened %d position(s)", opened)
+                elif signalled:
+                    logger.info(
+                        "Rolling select: %d signal(s) raised (OPEN_MODE=notify)",
+                        signalled,
+                    )
                 elif ranked:
                     # The tournament produced ranked candidates and had a free slot
                     # — it *wanted* to open — yet nothing was taken: every candidate
@@ -3170,6 +3402,9 @@ class BotScheduler:
         """
         logger.info("End day requested: blocking openings and closing everything")
         await self.set_auto_open(False)
+        # Proposals die with the day: a signal raised minutes ago must not keep
+        # inviting an open on a book the user has just decided to empty.
+        self._signals.clear()
         closed = await self._force_close_all()
         self._recorder.info(
             f"Day ended by the user — {closed} position(s) closed, no further opening"

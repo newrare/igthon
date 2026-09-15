@@ -249,7 +249,7 @@ async function endDay(btn) {
 // there is no full-page reload, no scroll jump and no lost UI state.
 const PAUSE_KEY     = 'ig_refresh_paused';
 const POLL_INTERVAL = 1000; // ms
-const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-epic-result', 'refresh-actions', 'refresh-logs'];
+const LIVE_STAMPS   = ['refresh-kpi', 'refresh-market', 'refresh-day', 'refresh-queue', 'refresh-epics', 'refresh-positions', 'refresh-closed', 'refresh-epic-result', 'refresh-actions', 'refresh-signals', 'refresh-logs'];
 const btnPause  = document.getElementById('btn-pause');
 const footer    = document.getElementById('footer-refresh');
 
@@ -370,6 +370,7 @@ async function _poll() {
         if (res.ok) {
             const data = await res.json();
             _applyFragments(data.fragments || {});
+            _handleSignals(data.signals || []);
             const st = data.server_time || '';
             LIVE_STAMPS.forEach(function(id) { _stamp(id, st); });
         }
@@ -392,6 +393,391 @@ _applyLogsPauseUI();
 if (!_paused) {
     _scheduleNextPoll();
 }
+
+// ── Entry signals — desktop notifications for the opens the bot proposes ─────
+// OPEN_MODE=notify hands every validated entry intent to the user instead of
+// ordering it. The dashboard poll carries the pending list; each id notifies
+// exactly once, whatever the tab's state, so a signal cannot be missed by
+// looking away — and clicking the notification brings the chart up on that epic.
+const _SEEN_SIGNALS_KEY = 'ig_seen_signals_v1';
+let _seenSignals = new Set();
+
+(function _loadSeenSignals() {
+    // Persisted per browser: a page reload must not re-notify signals the user
+    // has already been shown (the server list is still pending until its TTL).
+    try {
+        const raw = JSON.parse(sessionStorage.getItem(_SEEN_SIGNALS_KEY) || '[]');
+        if (Array.isArray(raw)) _seenSignals = new Set(raw);
+    } catch (_) {}
+})();
+
+function _rememberSignal(id) {
+    _seenSignals.add(id);
+    try {
+        sessionStorage.setItem(_SEEN_SIGNALS_KEY, JSON.stringify([..._seenSignals]));
+    } catch (_) {}
+}
+
+// ── Signal chime ────────────────────────────────────────────────────────────
+// The page plays its own sound rather than relying on the desktop notification
+// to make one: a web notification is silent unless the OS is configured to sound
+// for this browser, which is off by default on macOS — so "notified" would mean
+// "a banner I did not see". Synthesised with WebAudio (no asset to load, no
+// network, works with the tab in the background) and pitched by direction:
+// rising for a BUY, falling for a SELL, so the side is audible without looking.
+const SOUND_KEY = 'ig_signal_sound';
+let _soundEnabled = localStorage.getItem(SOUND_KEY) !== 'off';
+let _audioCtx = null;
+
+function _ensureAudio() {
+    if (_audioCtx) return _audioCtx;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try { _audioCtx = new Ctx(); } catch (_) { return null; }
+    return _audioCtx;
+}
+
+// Browsers start every AudioContext suspended until a user gesture authorises
+// audio. A signal can land hours after the page was opened, so the context is
+// unlocked (and re-resumed, the browser may suspend it again) on any click.
+['click', 'keydown', 'pointerdown', 'touchstart'].forEach(function(evt) {
+    document.addEventListener(evt, function() {
+        const ctx = _ensureAudio();
+        if (ctx && ctx.state === 'suspended') ctx.resume().catch(function() {});
+        _refreshAlertStatus();
+    }, true);
+});
+
+// How loud and how insistent the chime is. A single quiet sine was easy to miss
+// from another room, so each note now carries its own octave above (a harmonic
+// reads much louder than a pure tone at the same gain) and the whole two-note
+// motif repeats CHIME_REPEATS times. A compressor sits between the notes and the
+// output so stacking partials raises loudness without ever clipping.
+const CHIME_REPEATS     = 3;      // motif plays three times in a row
+const CHIME_MOTIF_GAP   = 0.62;   // seconds between the start of two repeats
+const CHIME_NOTE_GAP    = 0.16;   // seconds between the two notes of a motif
+const CHIME_PEAK_GAIN   = 0.85;   // fundamental peak (compressor keeps it clean)
+const CHIME_HARM_GAIN   = 0.34;   // octave above, adds presence not volume alone
+
+function _chimeOutput(ctx) {
+    if (ctx._igChimeOut) return ctx._igChimeOut;
+    let out;
+    try {
+        const comp = ctx.createDynamicsCompressor();
+        comp.threshold.setValueAtTime(-12, ctx.currentTime);
+        comp.ratio.setValueAtTime(12, ctx.currentTime);
+        comp.attack.setValueAtTime(0.003, ctx.currentTime);
+        comp.release.setValueAtTime(0.25, ctx.currentTime);
+        comp.connect(ctx.destination);
+        out = comp;
+    } catch (_) {
+        out = ctx.destination;
+    }
+    ctx._igChimeOut = out;
+    return out;
+}
+
+function _chimeNote(ctx, dest, freq, at, peak, type) {
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, at);
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.exponentialRampToValueAtTime(peak, at + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.38);
+    osc.connect(gain).connect(dest);
+    osc.start(at);
+    osc.stop(at + 0.4);
+}
+
+function playSignalChime(direction) {
+    if (!_soundEnabled) return;
+    const ctx = _ensureAudio();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(function() {});
+    // Two notes, 160 ms apart: a chime, not a beep. Each is a fast attack and an
+    // exponential decay so it reads as a bell and never clicks, and is pitched by
+    // direction: rising for a BUY, falling for a SELL.
+    const notes = (direction === 'SELL') ? [880, 587] : [587, 880];
+    const dest  = _chimeOutput(ctx);
+    const t0    = ctx.currentTime + 0.01;
+    for (let r = 0; r < CHIME_REPEATS; r++) {
+        const base = t0 + r * CHIME_MOTIF_GAP;
+        notes.forEach(function(freq, i) {
+            const at = base + i * CHIME_NOTE_GAP;
+            _chimeNote(ctx, dest, freq,       at, CHIME_PEAK_GAIN, 'sine');
+            _chimeNote(ctx, dest, freq * 2,   at, CHIME_HARM_GAIN, 'triangle');
+        });
+    }
+}
+
+function _soundToggleLabel(btn) {
+    if (!btn) return;
+    btn.innerHTML = '<i data-lucide="' + (_soundEnabled ? 'volume-2' : 'volume-x')
+                  + '" class="lc-icon"></i> ' + (_soundEnabled ? 'Sound on' : 'Sound off');
+    btn.title = _soundEnabled
+        ? 'A chime plays on every new entry signal (click to mute)'
+        : 'Signals are silent (click to unmute)';
+    if (window.lucide) lucide.createIcons();
+}
+
+function toggleSignalSound(btn) {
+    _soundEnabled = !_soundEnabled;
+    try { localStorage.setItem(SOUND_KEY, _soundEnabled ? 'on' : 'off'); } catch (_) {}
+    _soundToggleLabel(btn);
+    // Play it back immediately: the click is also the gesture that unlocks the
+    // audio context, so turning the sound on proves it actually works.
+    if (_soundEnabled) playSignalChime('BUY');
+    _refreshAlertStatus();
+}
+
+// ── Alert status — say out loud what is actually armed ──────────────────────
+// Every part of this chain can be off for a reason the page can see (permission
+// never granted, audio not yet unlocked by a click, stream disconnected). Left
+// implicit, a silent dashboard is indistinguishable from a quiet market, so the
+// section states its own readiness instead of letting the user guess.
+let _streamState = 'connecting';
+
+function _refreshAlertStatus() {
+    const el = document.getElementById('signal-alert-status');
+    if (!el) return;
+    const bits = [];
+    const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
+    if (perm === 'granted')      bits.push(['ok',   'desktop notifications on']);
+    else if (perm === 'denied')  bits.push(['bad',  'notifications blocked by the browser']);
+    else if (perm === 'default') bits.push(['warn', 'notifications not allowed yet — click Notifications']);
+    else                         bits.push(['bad',  'this browser has no desktop notifications']);
+
+    if (!_soundEnabled)                      bits.push(['warn', 'sound muted']);
+    else if (!_audioCtx)                     bits.push(['warn', 'sound armed on your first click']);
+    else if (_audioCtx.state === 'running')  bits.push(['ok',   'sound on']);
+    else                                     bits.push(['warn', 'sound waiting for a click on the page']);
+
+    if (_streamState === 'open')      bits.push(['ok',   'live stream connected']);
+    else if (_streamState === 'down') bits.push(['bad',  'live stream down — falling back to the 1 s poll']);
+    else                              bits.push(['warn', 'live stream connecting…']);
+
+    el.innerHTML = bits.map(function(b) {
+        return '<span class="alert-state alert-' + b[0] + '">' + b[1] + '</span>';
+    }).join('');
+}
+
+// Fires the whole alert chain on a fake signal so the user can verify chime +
+// notification + tab badge in one click instead of waiting for a real setup.
+function testSignalAlert() {
+    _showSignalNotification({
+        id: 'test',
+        epic: 'TEST.SIGNAL',
+        name: 'Alert test — not a real signal',
+        direction: 'BUY',
+        strategy: 'test',
+        score: 0,
+        price: 0,
+    });
+    _updateTabBadge(_pendingCount + 1);
+    // Drop the fake badge shortly after: it stands for no pending signal.
+    setTimeout(function() { _updateTabBadge(Math.max(_pendingCount - 1, 0)); }, 8000);
+}
+
+// ── Live signal stream (server-sent events) ─────────────────────────────────
+// The poll below keeps the dashboard's HTML fresh, but a browser throttles a
+// hidden tab's timers to roughly one tick a minute — and a hidden tab is exactly
+// when an alert matters. This connection is not throttled, so a signal raised
+// while the user is in another window reaches the page at once. EventSource
+// reconnects on its own; the poll stays as the belt-and-braces fallback and the
+// id bookkeeping makes both paths idempotent.
+(function _openSignalStream() {
+    if (!('EventSource' in window)) { _streamState = 'down'; return; }
+    let src;
+    try { src = new EventSource('/api/signals/stream'); }
+    catch (_) { _streamState = 'down'; _refreshAlertStatus(); return; }
+
+    src.onopen = function() {
+        _streamState = 'open';
+        _refreshAlertStatus();
+    };
+    src.onmessage = function(evt) {
+        try {
+            const data = JSON.parse(evt.data);
+            if (Array.isArray(data.signals)) _handleSignals(data.signals);
+        } catch (_) {}
+    };
+    src.onerror = function() {
+        // EventSource retries by itself; only report the outage.
+        _streamState = 'down';
+        _refreshAlertStatus();
+    };
+})();
+
+// Hide the badge the moment the user comes back to the dashboard, and bring it
+// straight back if they leave again with signals still pending.
+document.addEventListener('visibilitychange', _repaintTabBadge);
+
+function _notifyPermissionLabel(btn) {
+    if (!btn) return;
+    const supported = ('Notification' in window);
+    const state = supported ? Notification.permission : 'unsupported';
+    const map = {
+        granted:     ['bell-ring', 'Notifications on',      'Desktop notifications are enabled for new entry signals'],
+        denied:      ['bell-off',  'Notifications blocked', 'Your browser blocked notifications for this site — re-allow them in the site settings'],
+        default:     ['bell',      'Notifications',         'Allow desktop notifications for new entry signals'],
+        unsupported: ['bell-off',  'No notifications',      'This browser does not support desktop notifications'],
+    };
+    const [icon, label, title] = map[state] || map.default;
+    btn.innerHTML = '<i data-lucide="' + icon + '" class="lc-icon"></i> ' + label;
+    btn.title = title;
+    btn.disabled = (state === 'denied' || state === 'unsupported');
+    if (window.lucide) lucide.createIcons();
+}
+
+async function requestSignalNotifications(btn) {
+    if (!('Notification' in window)) {
+        showToast('Not supported', 'This browser has no desktop notifications', 'warning');
+        _notifyPermissionLabel(btn);
+        return;
+    }
+    try {
+        // Must be called from a user gesture — hence the button.
+        const perm = await Notification.requestPermission();
+        if (perm === 'granted') {
+            showToast('Notifications enabled', 'You will be alerted on every new entry signal', 'success');
+        } else if (perm === 'denied') {
+            showToast('Notifications blocked', 'Re-allow them in your browser site settings', 'warning');
+        }
+    } catch (e) {
+        showToast('Notifications', e.message, 'error');
+    }
+    _notifyPermissionLabel(btn);
+    _refreshAlertStatus();
+}
+
+function _showSignalNotification(sig) {
+    const dir   = (sig.direction || 'BUY').toUpperCase();
+    const title = dir + ' signal — ' + (sig.name || sig.epic);
+    const price = sig.price ? ' @ ' + Number(sig.price).toFixed(2) : '';
+    const body  = sig.epic + price
+                + '\n' + (sig.strategy || 'strategy') + ' · score ' + (sig.score ?? 0)
+                + '\nOpen it yourself if the market agrees.';
+    // Always toast and always ring: both are independent of the notification
+    // permission, so a refused (or OS-silenced) notification still reaches you.
+    showToast(title, sig.epic + price + ' — your call', dir === 'SELL' ? 'warning' : 'info');
+    playSignalChime(dir);
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    try {
+        const notif = new Notification(title, {
+            body: body,
+            tag: 'ig-signal-' + sig.id,   // one notification per signal, never stacked
+            requireInteraction: true,     // stays until the user acts on it
+            silent: true,                 // the chime above is the sound — never double it
+        });
+        notif.onclick = function() {
+            window.focus();
+            notif.close();
+            if (typeof openChartModal === 'function') openChartModal(sig.epic);
+        };
+    } catch (_) {}
+}
+
+function _handleSignals(signals) {
+    const live = new Set();
+    signals.forEach(function(sig) {
+        live.add(sig.id);
+        if (_seenSignals.has(sig.id)) return;
+        _rememberSignal(sig.id);
+        _showSignalNotification(sig);
+    });
+    _updateTabBadge(signals.length);
+    // Forget ids the server has dropped (dismissed or expired) so the set cannot
+    // grow without bound over a long session.
+    if (_seenSignals.size > 200) {
+        _seenSignals = new Set([..._seenSignals].filter(function(id) { return live.has(id); }));
+    }
+}
+
+// ── Tab badge — the alert channel that needs no permission ──────────────────
+// A desktop notification can be refused, silenced by the OS or missed; the tab
+// title and favicon cannot. While signals are pending the tab reads "(2) IG
+// Trading Bot" with a dotted favicon, exactly like an unread count, so glancing
+// at the browser is enough to know something is waiting.
+const _BASE_TITLE = document.title;
+let _pendingCount = 0;   // signals the server still lists as waiting
+let _paintedCount = -1;  // what the tab currently shows
+
+function _updateTabBadge(count) {
+    _pendingCount = Math.max(count, 0);
+    _repaintTabBadge();
+}
+
+function _repaintTabBadge() {
+    // The badge answers "is something waiting while I am elsewhere?", so it is
+    // shown only while the tab is hidden: with the dashboard in front of the
+    // user the cards themselves are the notification, and a permanent "(2)" in
+    // the title would just be noise.
+    const shown = document.hidden ? _pendingCount : 0;
+    if (shown === _paintedCount) return;   // never repaint for nothing
+    _paintedCount = shown;
+    document.title = shown > 0 ? '(' + shown + ') ' + _BASE_TITLE : _BASE_TITLE;
+    _paintFavicon(shown);
+}
+
+function _paintFavicon(count) {
+    let link = document.getElementById('favicon-badge');
+    if (!link) {
+        link = document.createElement('link');
+        link.id  = 'favicon-badge';
+        link.rel = 'icon';
+        document.head.appendChild(link);
+    }
+    const c = document.createElement('canvas');
+    c.width = c.height = 32;
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+    // Base mark: the bot's amber square, so the tab is recognisable when idle.
+    ctx.fillStyle = '#E07B39';
+    ctx.beginPath();
+    ctx.roundRect ? ctx.roundRect(2, 2, 28, 28, 7) : ctx.rect(2, 2, 28, 28);
+    ctx.fill();
+    ctx.fillStyle = '#120e0c';
+    ctx.font = 'bold 19px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('IG', 16, 17);
+    if (count > 0) {
+        // Unread dot, top-right, with the count when it fits.
+        ctx.fillStyle = '#ef4444';
+        ctx.beginPath();
+        ctx.arc(24, 8, 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 11px -apple-system, sans-serif';
+        ctx.fillText(count > 9 ? '9+' : String(count), 24, 9);
+    }
+    link.href = c.toDataURL('image/png');
+}
+
+async function dismissSignal(signalId, btn) {
+    if (btn) btn.disabled = true;
+    try {
+        const res = await fetch('/api/signals/' + signalId + '/dismiss', { method: 'POST' });
+        if (!res.ok) {
+            const data = await res.json().catch(function() { return {}; });
+            showToast('Dismiss failed', data.error || 'Signal already gone', 'error');
+            if (btn) btn.disabled = false;
+            return;
+        }
+        const card = document.querySelector('.signal-card[data-signal-id="' + signalId + '"]');
+        if (card) card.remove();   // the next poll re-renders the section anyway
+    } catch (e) {
+        showToast('Dismiss failed', e.message, 'error');
+        if (btn) btn.disabled = false;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    _notifyPermissionLabel(document.getElementById('notify-permission-btn'));
+    _soundToggleLabel(document.getElementById('signal-sound-btn'));
+    _refreshAlertStatus();
+});
 
 async function clearErrors() {
     try {

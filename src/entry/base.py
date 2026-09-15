@@ -119,6 +119,23 @@ class EntryStrategy(ABC):
     # always judged on a whole series rather than on a drip of overlapping trades.
     # See :class:`~src.entry.open_five.OpenFive`.
     require_flat_book: bool = False
+    # When True the rolling selector opens nothing unless **every** currently open
+    # position sits in a market the regime calls ``RANGE`` — the move it was opened
+    # for is over and the price is chopping inside a contained band. A single open
+    # position whose epic still reads ``TREND_UP`` / ``TREND_DOWN`` / ``VOLATILE``,
+    # or whose curve is too short to be judged at all, blocks the whole pass: the
+    # brake opens only into a book that is *demonstrably* quiet, never into an
+    # unknown one. Different from ``require_flat_book`` (which waits for an empty
+    # book) and from ``block_open_while_alive`` (which only steps aside for a
+    # secured winner): here what matters is whether the money already committed is
+    # still riding a move. The regime is read on the epic's live buffer by the
+    # scheduler — the strategy itself never sees the open positions. See
+    # :class:`~src.entry.open_momentum.OpenMomentum`.
+    require_range_book: bool = False
+    # Window (in candles/minutes) the ``require_range_book`` regime is judged on.
+    # Keep it equal to the window the strategy's own regime gate uses, so the entry
+    # and the brake speak about the same stretch of curve.
+    book_regime_window: int = 30
     # NOTE: the same-day re-open policy is NOT a strategy knob. It is global to
     # every open strategy and read from ``ALLOW_SAME_DAY_REOPEN`` in .env: False
     # = one opening per epic per day (BUY or SELL), True = an epic is a candidate

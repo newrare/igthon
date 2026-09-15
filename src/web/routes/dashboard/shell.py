@@ -324,7 +324,7 @@ def _render_dashboard(settings, state: dict) -> str:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>IG Trading Bot — Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css?v=18">
+    <link rel="stylesheet" href="/static/style.css?v=21">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
 </head>
@@ -343,6 +343,27 @@ def _render_dashboard(settings, state: dict) -> str:
     <div class="kpi-updated">Live data · updated <span id="refresh-kpi">—</span></div>
     <div class="kpi-bar" id="frag-kpi_bar">{frags['kpi_bar']}</div>
 
+    <!-- Entry signals — opens the bot proposes instead of taking (OPEN_MODE=notify).
+         Each card is a validated intent waiting for the user's decision; the bell
+         button asks the browser for permission to notify when a new one lands. -->
+    <div class="section">
+        <div class="section-header" data-sid="signals">
+            <span class="section-title"><i data-lucide="bell-ring" class="lc-icon"></i> Entry Signals — Your Call</span>
+            <button class="section-action" id="notify-permission-btn" title="Allow desktop notifications for new entry signals" onclick="event.stopPropagation(); requestSignalNotifications(this)"><i data-lucide="bell" class="lc-icon"></i> Notifications</button>
+            <button class="section-action" id="signal-sound-btn" title="A chime plays on every new entry signal (click to mute)" onclick="event.stopPropagation(); toggleSignalSound(this)"><i data-lucide="volume-2" class="lc-icon"></i> Sound on</button>
+            <button class="section-action" id="signal-test-btn" title="Fire a fake signal to check the chime, the desktop notification and the tab badge" onclick="event.stopPropagation(); testSignalAlert()"><i data-lucide="flask-conical" class="lc-icon"></i> Test</button>
+            <span class="section-refresh">updated <span id="refresh-signals">—</span></span>
+            <button class="section-toggle">&#8722;</button>
+        </div>
+        <div class="section-body">
+            <!-- What is actually armed right now (permission, sound, live
+                 stream): a silent dashboard must never be mistaken for a quiet
+                 market. Filled in by dashboard.js. -->
+            <div id="signal-alert-status" class="alert-status"></div>
+            <div id="frag-signals_section">{frags['signals_section']}</div>
+        </div>
+    </div>
+
     <!-- Market Data -->
     <div class="section">
         <div class="section-header" data-sid="market">
@@ -358,7 +379,8 @@ def _render_dashboard(settings, state: dict) -> str:
                             <th>Epic</th>
                             <th>Name</th>
                             <th title="Euro cost of crossing the spread once at minimum deal size: (offer − bid) × € per point">Spread (€)</th>
-                            <th>High / Low</th>
+                            <th title="How far along its current directional move the market is: start (young), mid (established) or end (stretched / already giving back). Blank when there is no move to be inside of.">Momentum</th>
+                            <th title="Market state over the last 30 min: trend up/down, range (contained, mean-reverting) or volatile (big swings going nowhere)">Regime</th>
                             <th>Bid % range</th>
                             <th title="Number of price points (readings) currently buffered for this epic">Dots</th>
                             <th>Action</th>
@@ -434,7 +456,7 @@ def _render_dashboard(settings, state: dict) -> str:
 </div>
 
 <script src="/static/tables.js?v=2"></script>
-<script src="/static/dashboard.js?v=44"></script>
+<script src="/static/dashboard.js?v=48"></script>
 <script src="/static/reading.js?v=1"></script>
 </body>
 </html>"""

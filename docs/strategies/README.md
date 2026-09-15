@@ -178,6 +178,7 @@ Registered in [src/entry/\_\_init\_\_.py](../../src/entry/__init__.py):
 | `open_five`         | `src/entry/open_five.py`         | [open_five.md](open_five.md)                 | **Two-sided** ranker: a series of 5 distinct curve shapes        |
 | `open_ultraranking` | `src/entry/open_ultraranking.py` | [open_ultraranking.md](open_ultraranking.md) | `open_saferanking` + a hard veto on a directionless market       |
 | `open_progressive`  | `src/entry/open_progressive.py`  | [open_progressive.md](open_progressive.md)   | One position at a time, euro risk funded by the day's gains      |
+| `open_momentum`     | `src/entry/open_momentum.py`     | [open_momentum.md](open_momentum.md)         | Start of an up leg, only while every open epic is in a range     |
 
 ## Available stop-distance policies
 

@@ -9,6 +9,7 @@ from fastapi import Request
 from sqlalchemy import select
 
 from src.core.api_queue import Priority
+from src.core.reading import CurveReading
 from src.models.day import Day
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
@@ -249,6 +250,79 @@ def _open_reason_label(reason: str | None) -> tuple[str, str]:
     return "—", "#64748b"
 
 
+#: How each regime reads in the market table: label, colour, and the one-line
+#: explanation behind the tooltip. Mirrors the reading panel's tones so the same
+#: market says the same thing in both views.
+_REGIME_DISPLAY = {
+    "TREND_UP": ("Trend ↑", "#4ade80", "directional path, pointing up"),
+    "TREND_DOWN": ("Trend ↓", "#ef4444", "directional path, pointing down"),
+    "RANGE": ("Range", "#f59e0b", "choppy and contained — mean-reverting"),
+    "VOLATILE": ("Volatile", "#ef4444", "choppy and agitated — swings going nowhere"),
+    "UNKNOWN": ("—", "#64748b", "not enough history to judge"),
+}
+
+#: How each move phase reads: a three-segment gauge (filled left to right), a
+#: label, a colour, and what earned it. See
+#: :class:`~src.core.reading.MovePhase` — it is the age of the momentum leg, not a
+#: forecast.
+_PHASE_DISPLAY = {
+    "START": (
+        "▪▫▫",
+        "Start",
+        "#4ade80",
+        "young leg — the 9/21 momentum crossing carrying it is recent",
+    ),
+    "MIDDLE": (
+        "▪▪▫",
+        "Mid",
+        "#f59e0b",
+        "established leg — the crossing has held and the price still holds "
+        "most of the range it travelled",
+    ),
+    "END": (
+        "▪▪▪",
+        "End",
+        "#ef4444",
+        "finishing leg — more than half the range it travelled has been given back",
+    ),
+    "NONE": (
+        "▫▫▫",
+        "—",
+        "#64748b",
+        "no move to be inside of — the momentum averages sit inside the "
+        "market's own candle noise",
+    ),
+}
+
+#: Arrow stating which way the momentum leg points, appended to its phase.
+_MOVE_ARROW = {"UP": " ↑", "DOWN": " ↓", "FLAT": ""}
+
+
+def _regime_label(regime: str | None) -> tuple[str, str, str]:
+    """Map a stored regime value to ``(label, colour, tooltip)`` for the table."""
+    return _REGIME_DISPLAY.get(regime or "UNKNOWN", _REGIME_DISPLAY["UNKNOWN"])
+
+
+def _phase_label(
+    phase: str | None, direction: str | None = None
+) -> tuple[str, str, str, str]:
+    """Map a move phase to ``(gauge, label, colour, tooltip)`` for the table.
+
+    ``direction`` is the leg's own direction (:attr:`CurveReading.move_direction`):
+    "Start" alone does not say start of *what*, so its arrow rides with the label.
+    """
+    gauge, label, color, why = _PHASE_DISPLAY.get(
+        phase or "NONE", _PHASE_DISPLAY["NONE"]
+    )
+    arrow = _MOVE_ARROW.get(direction or "FLAT", "")
+    return gauge, f"{label}{arrow}", color, why
+
+
+#: Sort rank of the move phases, so clicking the Momentum column orders the
+#: table by how far along each move is rather than alphabetically.
+_PHASE_RANK = {"NONE": 0, "START": 1, "MIDDLE": 2, "END": 3}
+
+
 def _close_reason_label(reason: str | None) -> tuple[str, str]:
     """Map a stored ``reason_close`` value to a (label, color) for display."""
     mapping = {
@@ -469,6 +543,13 @@ async def _gather_dashboard_state(request: Request) -> dict:
     for epic in epics:
         buf = buffer.get(epic)
         if buf and buf.last:
+            # Shape of the market, read from the buffer alone (no IG call, never
+            # the API queue): the regime and how far along its current
+            # directional move the price is. The raw high/low pair this replaced
+            # in the table said nothing the "Bid % range" column does not
+            # already show; both are still kept here because that column is
+            # computed from them.
+            reading = CurveReading.of(buf)
             market_summary.append(
                 {
                     "epic": epic,
@@ -476,6 +557,9 @@ async def _gather_dashboard_state(request: Request) -> dict:
                     "dots": len(buf),
                     "high": max(buf.bid_closes) if buf.bid_closes else 0,
                     "low": min(buf.bid_closes) if buf.bid_closes else 0,
+                    "regime": reading.regime.value,
+                    "phase": reading.move_phase.value,
+                    "phase_direction": reading.move_direction.value,
                 }
             )
 
@@ -681,9 +765,22 @@ async def _gather_dashboard_state(request: Request) -> dict:
     # Human-readable instrument name (IG description), mirrored from the Epic
     # List. Sourced from the DB epic rows keyed by epic identifier; a dash when
     # the epic has not been enriched (discovered) yet.
+    # Markets already traded today and since closed: the watched list keeps them
+    # subscribed for the rest of the day (see src/markets/risk_tiers.py) so the
+    # curve AFTER the exit stays recorded. Flag the row with what the epic banked
+    # so the table says why a market nothing is riding is still live.
+    banked_by_epic: dict[str, float] = {}
+    for p in closed_positions:
+        banked_by_epic[p.epic] = banked_by_epic.get(p.epic, 0.0) + float(p.euro or 0)
+    open_epics_now = {p.epic for p in open_positions}
+
     for entry in market_summary:
         epic_row = epic_db_map.get(entry["epic"])
         entry["name"] = (epic_row.description or "—") if epic_row else "—"
+        entry["followed"] = (
+            entry["epic"] in banked_by_epic and entry["epic"] not in open_epics_now
+        )
+        entry["followed_pnl"] = banked_by_epic.get(entry["epic"])
 
     return {
         "market_summary": market_summary,
@@ -709,6 +806,11 @@ async def _gather_dashboard_state(request: Request) -> dict:
         # shell — because the title bar carrying these chips is now the
         # auto-open switch itself, re-rendered on every poll.
         "selection": _selection_names(request.app.state.settings),
+        # Automatic-open mode read from .env: "auto" places the orders,
+        # "notify" hands every validated intent to the user as a signal.
+        "open_mode": getattr(request.app.state.settings, "open_mode", "auto"),
+        # Proposed opens still waiting for a decision (empty in "auto" mode).
+        "signals": scheduler.signals.as_dicts() if scheduler else [],
         "scheduler_available": scheduler is not None,
         "jobs": scheduler.jobs_status() if scheduler else [],
         "log_entries": log_entries,

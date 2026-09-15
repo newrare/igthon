@@ -22,6 +22,7 @@ from src.entry.open_fade import OpenFade
 from src.entry.open_five import OpenFive
 from src.entry.open_linear import OpenLinear
 from src.entry.open_manual import OpenManual
+from src.entry.open_momentum import OpenMomentum
 from src.entry.open_progressive import OpenProgressive
 from src.entry.open_projection import OpenProjection
 from src.entry.open_pullback import OpenPullback
@@ -41,6 +42,7 @@ ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenFive.name: OpenFive,
     OpenLinear.name: OpenLinear,
     OpenManual.name: OpenManual,
+    OpenMomentum.name: OpenMomentum,
     OpenProgressive.name: OpenProgressive,
     OpenProjection.name: OpenProjection,
     OpenPullback.name: OpenPullback,
@@ -77,6 +79,7 @@ __all__ = [
     "OpenFive",
     "OpenLinear",
     "OpenManual",
+    "OpenMomentum",
     "OpenProgressive",
     "OpenProjection",
     "OpenPullback",

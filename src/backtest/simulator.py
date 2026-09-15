@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from itertools import groupby
 
+from src.core.reading import MIN_REGIME_MINUTES, CurveReading, Regime
 from src.entry.base import EntryStrategy
 from src.execution.gates import evaluate_open_gates
 from src.execution.trading import TradeConfig
@@ -546,10 +547,15 @@ class StrategySimulator:
         #    several times in one day.
         #  - require_flat_book: opens in *series* — nothing while any position is
         #    still open, then the whole basket at once (``open_five``).
+        #  - require_range_book: opens only while every open position's curve has
+        #    stopped moving (regime RANGE), so a second bet is never taken beside
+        #    one still riding its move (``open_momentum``).
         wallet_bounded = getattr(self._entry, "wallet_bounded", False)
         cooldown_min = int(getattr(self._entry, "open_cooldown_minutes", 0) or 0)
         allow_reopen = bool(getattr(self._config, "allow_same_day_reopen", True))
         require_flat_book = bool(getattr(self._entry, "require_flat_book", False))
+        require_range_book = bool(getattr(self._entry, "require_range_book", False))
+        book_window = int(getattr(self._entry, "book_regime_window", 30) or 30)
         target = (
             len(curves)
             if wallet_bounded
@@ -601,6 +607,8 @@ class StrategySimulator:
                 allow_reopen=allow_reopen,
                 last_open_ts=last_open_ts,
                 require_flat_book=require_flat_book,
+                require_range_book=require_range_book,
+                book_window=book_window,
             )
 
         # Force-close anything still open at the end of the day.
@@ -632,6 +640,8 @@ class StrategySimulator:
         allow_reopen: bool = False,
         last_open_ts: datetime | None = None,
         require_flat_book: bool = False,
+        require_range_book: bool = False,
+        book_window: int = 30,
     ) -> datetime | None:
         """Score every eligible epic, rank by score, open the best into free slots.
 
@@ -652,9 +662,25 @@ class StrategySimulator:
         ``require_flat_book`` mirrors the live series model: while anything is
         still open the pass is a no-op, so a new basket is only opened from a
         completely empty book.
+
+        ``require_range_book`` mirrors the live range brake: a position is only
+        added while **every** open one sits in a market whose regime reads
+        ``RANGE`` over ``book_window`` candles. Anything else — a curve still
+        trending, a volatile one, or one too short to be judged — holds the pass,
+        exactly as the scheduler's ``_still_moving_positions`` does.
         """
         if require_flat_book and open_positions:
             return last_open_ts  # a new series waits for a flat book
+        if require_range_book and open_positions:
+            for e in open_positions:
+                buf = buffers[e]
+                if len(buf) < MIN_REGIME_MINUTES:
+                    return last_open_ts  # unreadable curve blocks, like live
+                if (
+                    CurveReading.of(buf, regime_window=book_window).regime
+                    is not Regime.RANGE
+                ):
+                    return last_open_ts  # still riding a move
         slots = target - len(open_positions)
         if slots <= 0:
             return last_open_ts  # target met — cheap path

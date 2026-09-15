@@ -9,37 +9,56 @@ ______________________________________________________________________
 
 ## Quick start
 
+Every command below is also a `make` target — run `make help` for the full list.
+
 ```bash
-# 1. Install dependencies
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+# 1. Install, configure, create the database (venv + deps + .env + alembic)
+make setup
 
-# 2. Configure credentials
-cp .env.example .env
-# Edit .env — set IG_API_KEY, IG_USERNAME, IG_PASSWORD, IG_ACCOUNT_ID
+# 2. Fill in the credentials
+#    Edit .env — set IG_API_KEY, IG_USERNAME, IG_PASSWORD, IG_ACCOUNT_ID
 
-# 3. Create the database
-alembic upgrade head
-
-# 4. Test the connection (no trading)
-python -m src.main --analyze-only
-
-# 5. Start bot + web dashboard
-python -m src.main --web
-# → http://localhost:8000
+# 3. Start bot + web dashboard
+make run
+# → http://localhost:9000  (WEB_PORT in .env)
 ```
 
 ______________________________________________________________________
 
 ## Running modes
 
-| Command                                       | Effect                                                        |
-| --------------------------------------------- | ------------------------------------------------------------- |
-| `python -m src.main --analyze-only`           | Fetch prices, compute signals, print table — no orders placed |
-| `python -m src.main`                          | Full bot with scheduler (no web UI)                           |
-| `python -m src.main --web`                    | Full bot + FastAPI dashboard at `http://localhost:8000`       |
-| `python -m src.main --epics IX.D.DAX.IFMM.IP` | Override the tracked epics list                               |
-| `python -m src.main --log-level DEBUG`        | Verbose output for all API calls and decisions                |
+| Command          | Raw equivalent                               | Effect                                         |
+| ---------------- | -------------------------------------------- | ---------------------------------------------- |
+| `make run`       | `python -m src.main --web`                   | Full bot + FastAPI dashboard on `WEB_PORT`     |
+| `make bot`       | `python -m src.main`                         | Full bot with scheduler, no web UI             |
+| `make run-debug` | `python -m src.main --web --log-level DEBUG` | Same as `run`, verbose API calls and decisions |
+| `make status`    | —                                            | Is a bot already running? (PID and start time) |
+| `make stop`      | —                                            | Stop the running bot and free the port         |
+| `make logs`      | `tail -f /tmp/ig_bot/ig_bot.log`             | Follow the rotating log                        |
+
+`make run` refuses to start when a bot is already running: two schedulers race
+on the per-epic open lock and can double-open a position. Use `make restart` to
+stop the old one and start a fresh one.
+
+Whether the bot places orders itself or only proposes them is `OPEN_MODE` in
+`.env` (`auto` / `notify`) — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+______________________________________________________________________
+
+## Make targets
+
+| Group    | Targets                                                                               |
+| -------- | ------------------------------------------------------------------------------------- |
+| Setup    | `setup` · `venv` · `install` · `env`                                                  |
+| Run      | `run` · `run-debug` · `bot` · `status` · `stop` · `restart` · `open`                  |
+| Logs     | `logs` · `logs-api` · `logs-errors`                                                   |
+| Quality  | `check` · `test` · `test-cov` · `lint` · `format` · `fix` · `docs`                    |
+| Database | `migrate` · `revision M="…"` · `downgrade` · `db-current` · `db-history` · `db-shell` |
+| Tools    | `crawl` · `crawl-status` · `trace` · `adopt` · `inspect EPIC=…` · `dump-euro`         |
+
+Targets forward extra flags through `ARGS`, e.g. `make test ARGS="-k signals"` or
+`make trace ARGS="--days 3"`. Full reference:
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#make-targets).
 
 ______________________________________________________________________
 

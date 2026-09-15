@@ -2,12 +2,18 @@
 
 ## Prerequisites
 
+Every command in this guide has a `make` shortcut — `make help` lists them all,
+grouped, with the dashboard port currently configured in `.env`. The raw commands
+are kept alongside so nothing is hidden. The `make` targets use `.venv/bin/python`
+when the virtual environment exists, so activating it is optional.
+
 ```bash
 cd igthon/
-source .venv/bin/activate
+make help
 ```
 
-Make sure `.env` is configured:
+Make sure `.env` is configured (`make env` creates it from the example, never
+overwriting an existing one):
 
 ```bash
 cp .env.example .env
@@ -18,10 +24,16 @@ ______________________________________________________________________
 
 ## 1. First-time setup
 
+Everything at once — virtual environment, dependencies, `.env`, database:
+
+```bash
+make setup
+```
+
 ### Create the database
 
 ```bash
-alembic upgrade head
+make migrate          # alembic upgrade head, then alembic current
 ```
 
 Creates `ig_trading.db` (SQLite) with tables: `position`, `epic`, `day`, `resume`, `candle`.
@@ -29,74 +41,77 @@ Creates `ig_trading.db` (SQLite) with tables: `position`, `epic`, `day`, `resume
 ### Verify the API connection
 
 ```bash
-python -m src.main --analyze-only --log-level DEBUG
+make run-debug        # python -m src.main --web --log-level DEBUG
 ```
 
-If the connection works you'll see prices and indicator scores for each tracked epic.
+The login, the epic selection and every IG call are printed on the console. If
+the credentials are wrong the bot keeps the dashboard up and retries the
+connection every 30 s, so the error is visible in the log rather than fatal.
 
 ______________________________________________________________________
 
 ## 2. Running modes
 
-### Analysis only (no trading)
-
-Fetches live prices, computes all indicators, prints a summary table, then exits.
-No orders are placed — safe to run at any time.
-
-```bash
-python -m src.main --analyze-only
-```
-
-Example output:
-
-```
-Epic                                Score    Dir     R²    ROC  Spread
----------------------------------------------------------------------------
-  IX.D.DAX.IFMM.IP                  0.81    BUY   0.88   0.04   12.00
-  IX.D.FTSE.DAILY.IP                0.43  NEUTRAL  0.55  -0.01    5.00
-  CS.D.EURUSD.TODAY.IP              0.22  NEUTRAL  0.31   0.00    0.00
-```
-
-Analyse a specific set of epics:
-
-```bash
-python -m src.main --analyze-only --epics IX.D.DAX.IFMM.IP CS.D.EURUSD.TODAY.IP
-```
-
-### Bot only (no web UI)
-
-Starts the full scheduler. The bot will:
-
-- fetch prices every 30 seconds (via Lightstreamer or REST fallback)
-- open positions when a BUY signal is triggered
-- monitor open positions and apply trailing stop
-- force-close all positions at 17:30
-- write daily summary at 18:00
-
-```bash
-python -m src.main
-```
+| Command          | Raw equivalent                               | Effect                                        |
+| ---------------- | -------------------------------------------- | --------------------------------------------- |
+| `make run`       | `python -m src.main --web`                   | Bot + dashboard on `WEB_PORT` (the usual one) |
+| `make bot`       | `python -m src.main`                         | Scheduler only, no web UI                     |
+| `make run-debug` | `python -m src.main --web --log-level DEBUG` | Same as `run`, every API call printed         |
+| `make status`    | —                                            | Is a bot running? PID and start time          |
+| `make stop`      | —                                            | Stop it and free the port                     |
+| `make restart`   | —                                            | `stop`, then `run`                            |
+| `make open`      | —                                            | Open the dashboard in the browser             |
 
 ### Bot + web dashboard
 
-Same as above, plus a web interface at [http://localhost:8000](http://localhost:8000).
+Starts the full scheduler and the web interface. The bot will:
+
+- receive live prices from the Lightstreamer feed (REST fallback when it drops)
+- open positions when the entry strategy validates a signal — or record it as a
+  dashboard notification when `OPEN_MODE=notify`
+- monitor open positions and ratchet the stop through the four exit zones
+- write the daily summary at the end of the session
 
 ```bash
-python -m src.main --web
+make run
+# → http://localhost:9000  (WEB_PORT in .env)
 ```
+
+On macOS `make run` prefixes the command with `caffeinate -i -s`, so the machine
+does not fall asleep while positions are open.
+
+### Bot only (no web UI)
+
+```bash
+make bot
+```
+
+### Only one bot at a time
+
+`run`, `run-debug` and `bot` refuse to start when another bot process is alive:
+two schedulers race on the per-epic open lock and can double-open a position.
+
+```bash
+make status    # who is running
+make stop      # stop it
+make restart   # stop then start again (e.g. to load new code)
+```
+
+Without the guard the second start fails deeper, on
+`[Errno 48] address already in use`.
 
 ### Debug mode
 
 ```bash
-python -m src.main --analyze-only --log-level DEBUG
-python -m src.main --web --log-level DEBUG
+make run-debug
+make bot ARGS="--log-level DEBUG"
 ```
 
 ______________________________________________________________________
 
 ## 3. Web dashboard
 
-Start: `python -m src.main --web`
+Start: `make run` (`python -m src.main --web`)
 
 ### Available endpoints
 
@@ -124,17 +139,17 @@ schedule), or from the terminal:
 
 ```bash
 # Crawl / resume (goes through the API queue at background priority)
-python -m src.scripts.crawl_catalog
+make crawl                                    # python -m src.scripts.crawl_catalog
 
 # Where does it stand? (no IG session, no API call)
-python -m src.scripts.crawl_catalog --status
+make crawl-status                             # …crawl_catalog --status
 
 # Bounded run, or re-walk the whole tree from the root
-python -m src.scripts.crawl_catalog --max-nodes 200
-python -m src.scripts.crawl_catalog --reset
+make crawl ARGS="--max-nodes 200"
+make crawl ARGS="--reset"
 
 # Prune whole subtrees by node name (repeatable)
-python -m src.scripts.crawl_catalog --exclude Options --exclude Bonds
+make crawl ARGS="--exclude Options --exclude Bonds"
 ```
 
 **The crawl is resumable, so hitting the API quota is harmless.** Every node is
@@ -160,6 +175,32 @@ catalog running: 4211 markets · 118/126 nodes done, 8 pending, 0 error
 Beware: the CLI opens its own IG session (IG allows a limited number of
 concurrent ones), so prefer it while the bot is stopped — otherwise use the
 dashboard button, which reuses the bot's session and its queue.
+
+### Market Data table
+
+One row per tracked epic, refreshed by the live poll. Every column is read from
+the in-memory buffer or a background-refreshed cache, so browsing the table
+never costs IG quota.
+
+| Column        | Reads                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `Spread (€)`  | Euro cost of crossing the spread once at minimum deal size                                                 |
+| `Momentum`    | How far along its current momentum leg the market is — `Start` / `Mid` / `End` with the leg's direction    |
+| `Regime`      | Market state over the last 30 min: trend up/down, range (contained) or volatile (big swings going nowhere) |
+| `Bid % range` | Where the bid sits in the buffer's own high/low range                                                      |
+| `Dots`        | Candles buffered for the epic                                                                              |
+
+`Momentum` is a three-segment gauge — `▪▫▫` start, `▪▪▫` middle, `▪▪▪` end,
+`▫▫▫` when there is no leg at all — and it is the **age** of the move, never a
+forecast: `End` says the leg has already given back more than half of what it
+travelled, not that the price is about to turn. It is deliberately independent of
+`Regime`: a young leg inside a market still labelled `Range` is exactly the case
+the regime alone cannot report. Both columns are sortable (`Momentum` by how far
+along the move is, not alphabetically), and hovering either states what earned
+the value. The full derivation is in [READING.md](READING.md#move-phase).
+
+The raw `High / Low` pair these two replaced is gone: it only ever fed the
+`Bid % range` bar, which says the same thing in a readable way.
 
 ### Chart modal
 
@@ -256,6 +297,61 @@ carries into the next session. **Allow openings** lifts it immediately.
 `/api/status` and the fragments poll both report the current state as
 `auto_open`.
 
+### Entry signals (notify mode)
+
+With `OPEN_MODE=notify` in `.env`, the bot **never opens by itself**: every entry
+intent that passes the pre-open gates is handed to you instead of being ordered.
+
+- the **Entry Signals — Your Call** section lists each pending proposal —
+  direction, epic, instrument name, the strategy and its score, the close-out
+  price when the signal was raised and how old it is;
+- the browser raises a **desktop notification** per new signal (click
+  **Notifications** in the section header once to grant permission — the browser
+  only asks on a click). Clicking the notification focuses the dashboard and
+  opens the chart on that epic. A toast is always shown as well, so a refused
+  permission never means a missed signal;
+- the page plays its own **chime** — two notes, rising for a BUY, falling for a
+  SELL — so the side is audible without looking. It is the page's sound, not the
+  operating system's: a web notification is silent unless macOS is configured to
+  play a sound for the browser, so the desktop notification is deliberately
+  created `silent` and the chime is the single, guaranteed sound. It rings even
+  with the permission refused and with the tab in the background. **Sound
+  on/off** in the section header mutes it (remembered per browser); turning it
+  back on plays it once as a check. Browsers only allow audio after a click, so
+  the chime is armed by the first click anywhere on the dashboard;
+- the **tab itself** carries the count: while the dashboard sits in another tab
+  or another window, its title reads `(2) IG Trading Bot` and the favicon shows a
+  red badge. This is the one channel no permission can switch off — it works with
+  notifications refused and the sound muted. It clears when you come back to the
+  tab and returns if you leave again with signals still pending;
+- delivery does **not** depend on the 1 s poll. A browser throttles a hidden
+  tab's timers to roughly one tick a minute — exactly the case this feature
+  exists for — so the page also holds an open **server-sent-events** connection
+  (`/api/signals/stream`), which browsers do not throttle: a signal reaches the
+  page the second it is raised, whatever window you are in. The poll stays as the
+  fallback, and both paths ignore a signal already alerted on;
+- the section header states what is actually armed (notification permission,
+  sound, stream) and a **Test** button fires the whole chain on a fake signal, so
+  a silent dashboard is never mistaken for a quiet market;
+- each card offers **Chart** (the curve), **Read** (regime, trends, noise,
+  levels), **Buy** / **Sell** (a manual open at minimum size — same sizing, same
+  `STOP_STRATEGY`, same close zones as an automatic open) and **✕** to pass.
+
+A signal is only raised **after** the gates, so nothing notifies you about a
+market that could not be opened anyway. Signals are in-memory: they expire after
+15 minutes, the same epic never signals twice within 10 minutes, opening the epic
+yourself clears its signal, and blocking auto-open or ending the day clears them
+all.
+
+| URL                                           | Method | Effect                                                       |
+| --------------------------------------------- | ------ | ------------------------------------------------------------ |
+| `http://localhost:8000/api/signals`           | GET    | List the pending signals                                     |
+| `http://localhost:8000/api/signals/stream`    | GET    | Server-sent events: the pending list, pushed on every change |
+| `http://localhost:8000/api/signals/7/dismiss` | POST   | Dismiss signal `7`                                           |
+
+The stream is what drives the alerts; the fragments poll carries the same list
+under `signals` as a fallback.
+
 ### Position endpoint filters
 
 ```bash
@@ -290,16 +386,27 @@ ______________________________________________________________________
 2026-06-01 18:00:00 [INFO]  ig_bot — Daily summary: 8 trades, P&L=87.20€
 ```
 
-### Save logs to a file
+### Follow the log files
+
+The bot always writes rotating logs under `/tmp/ig_bot/`, whatever the console
+shows:
 
 ```bash
-python -m src.main --web 2>&1 | tee bot_$(date +%Y%m%d).log
+make logs          # tail -f /tmp/ig_bot/ig_bot.log        (everything, DEBUG)
+make logs-api      # tail -f /tmp/ig_bot/ig_api_calls.log  (every IG call)
+make logs-errors   # tail -f /tmp/ig_bot/ig_api_errors.log (rejected calls)
+```
+
+Keeping a copy of one session's console output:
+
+```bash
+make run 2>&1 | tee bot_$(date +%Y%m%d).log
 ```
 
 ### Direct database queries
 
 ```bash
-# Open SQLite shell
+# Open SQLite shell — make db-shell
 sqlite3 ig_trading.db
 
 # Open positions
@@ -326,17 +433,19 @@ ______________________________________________________________________
 ## 5. Running tests
 
 ```bash
-# All tests
-python -m pytest tests/ -v
+# All tests (reformats the Markdown first, as the commit rules require)
+make test
 
-# Quick run
-python -m pytest tests/ -q
-
-# Single file
-python -m pytest tests/test_compute.py -v
+# Any pytest flag, through ARGS
+make test ARGS="-v"
+make test ARGS="tests/test_signals.py -v"
+make test ARGS="-k trailing"
 
 # With coverage
-python -m pytest tests/ --cov=src --cov-report=term-missing
+make test-cov
+
+# Lint + tests, the pre-commit gate
+make check
 ```
 
 ______________________________________________________________________
@@ -344,19 +453,24 @@ ______________________________________________________________________
 ## 6. Database migrations
 
 ```bash
-# Apply pending migrations
-alembic upgrade head
+# Apply pending migrations (prints the resulting revision)
+make migrate
 
 # Generate a migration from model changes
-alembic revision --autogenerate -m "Add column to position"
+make revision M="add my_column to position"
 
 # Roll back one step
-alembic downgrade -1
+make downgrade
 
 # Check current state
-alembic current
-alembic history --verbose
+make db-current
+make db-history
 ```
+
+A new or altered model column means writing the revision **and** running
+`make migrate` straight away: the running app queries every mapped column, so an
+unapplied revision turns the next request into `no such column: …` and a 500 on
+the dashboard.
 
 ______________________________________________________________________
 
@@ -417,18 +531,17 @@ DEFAULT_EPICS = [
 ]
 ```
 
-Override without editing code:
-
-```bash
-python -m src.main --epics IX.D.DAX.IFMM.IP IX.D.CAC.IDF.IP
-```
+This list is only the seed handed to the scheduler at start-up: the watched set
+is then rebuilt by the daily discovery (`markets/market_scanner.py` +
+`markets/risk_tiers.py`), driven by the `.env` settings — see
+[CONFIGURATION.md](CONFIGURATION.md). There is no CLI flag to override it.
 
 ______________________________________________________________________
 
 ## 9. Typical daily workflow
 
 ```
-08:50   python -m src.main --web
+08:50   make run
         → subscribe to the tradeable epics via Lightstreamer
 
 During market hours
