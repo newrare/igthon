@@ -456,7 +456,7 @@ def _render_dashboard(settings, state: dict) -> str:
 </div>
 
 <script src="/static/tables.js?v=2"></script>
-<script src="/static/dashboard.js?v=48"></script>
+<script src="/static/dashboard.js?v=49"></script>
 <script src="/static/reading.js?v=1"></script>
 </body>
 </html>"""

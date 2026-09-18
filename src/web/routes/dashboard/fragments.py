@@ -259,7 +259,7 @@ def _render_signals_section(signals: list[dict], open_mode: str) -> str:
                 <span title="Close-out price when the signal was raised">@ {price_txt}</span>
             </div>
             <div class="signal-actions">
-                {render_button('<i data-lucide="line-chart" class="lc-icon"></i> Chart', cls="signal-btn", onclick=f"openChartModal('{epic}', event)", title="Look at the curve before deciding")}
+                {render_button('<i data-lucide="line-chart" class="lc-icon"></i> Chart', cls="signal-btn", onclick=f"openSignalChart('{epic}', {sid}, event)", title="Look at the curve — this drops the proposal from the list")}
                 {render_button('<i data-lucide="gauge" class="lc-icon"></i> Read', cls="signal-btn", onclick=f"openReadingModal('{epic}', event)", title="Read this market: regime, trends, noise, levels")}
                 {open_btn}
                 {render_button('<i data-lucide="x" class="lc-icon"></i>', cls="signal-btn signal-dismiss", onclick=f"dismissSignal({sid}, this)", title="Pass — drop this proposal")}

@@ -673,7 +673,7 @@ function _showSignalNotification(sig) {
         notif.onclick = function() {
             window.focus();
             notif.close();
-            if (typeof openChartModal === 'function') openChartModal(sig.epic);
+            openSignalChart(sig.epic, sig.id, null);
         };
     } catch (_) {}
 }
@@ -753,6 +753,16 @@ function _paintFavicon(count) {
         ctx.fillText(count > 9 ? '9+' : String(count), 24, 9);
     }
     link.href = c.toDataURL('image/png');
+}
+
+// Looking at the chart IS the answer to a proposal: the user asked for it, saw
+// the curve, and whatever they decide next (open by hand, or nothing) the card
+// has served its purpose. So the signal is dismissed server-side the moment the
+// chart opens and never comes back on the next poll. The chart is opened first
+// so ``_buildChartEpicList`` still sees the card that was clicked.
+function openSignalChart(epic, signalId, evt) {
+    openChartModal(epic, evt);
+    dismissSignal(signalId, null);
 }
 
 async function dismissSignal(signalId, btn) {
