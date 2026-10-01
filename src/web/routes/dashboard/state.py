@@ -538,9 +538,17 @@ async def _gather_dashboard_state(request: Request) -> dict:
     )
     tradable_kpi_color, tradable_refresh_label = _kpi_freshness(tradable_last_refresh)
 
-    # Build market data summary
+    # Build market data summary — only the day's live list (the ~40 epics fed
+    # right now, today's traded ones included). The buffer keeps the history of
+    # markets that dropped out of it; those are no longer followed, so they are
+    # not shown here. Without a scheduler, every buffered epic is shown.
+    if scheduler:
+        buffered = set(epics)
+        market_epics = [e for e in scheduler.live_epics if e in buffered]
+    else:
+        market_epics = epics
     market_summary = []
-    for epic in epics:
+    for epic in market_epics:
         buf = buffer.get(epic)
         if buf and buf.last:
             # Shape of the market, read from the buffer alone (no IG call, never
@@ -567,7 +575,7 @@ async def _gather_dashboard_state(request: Request) -> dict:
     # epic. Built from the live dealing spread and contract details, neither of
     # which is in the price buffer — read from cache (refreshed in the background,
     # never awaited here so the poll can't stall on the IG queue).
-    spread_cost = _spread_cost_map(request, epics)
+    spread_cost = _spread_cost_map(request, market_epics)
     for entry in market_summary:
         entry["spread_cost"] = spread_cost.get(entry["epic"])
 

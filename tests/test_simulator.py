@@ -6,7 +6,8 @@ curves; these tests check that runs are deterministic, internally consistent
 the ``/simulator`` API.
 """
 
-from datetime import UTC, datetime
+import random
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -15,12 +16,17 @@ from httpx import ASGITransport, AsyncClient
 from src.backtest.simulator import (
     SessionExtremes,
     SimulationConfig,
+    StrategySimulator,
     run_close_visual,
     run_open_visual,
     run_simulation,
 )
+from src.entry.open_testing import OpenTesting
+from src.execution.trading import TradeConfig
+from src.exit import CloseZoneProfit
 from src.exit.close_zoneprofit import _opened_at
 from src.feed.price_buffer import Candle, PriceBuffer
+from src.stops import StopAtr
 from src.web.app import create_app
 
 
@@ -132,6 +138,80 @@ class TestSimulationRun:
         # A flat sideways market with a tiny day cap: the run must terminate.
         result = _run(target=1000, profile="sideways", max_days=3)
         assert result.days_simulated == 3
+
+
+class TestSpreadBudgetInSimulation:
+    def test_every_open_is_refused_when_no_spread_is_affordable(self, monkeypatch):
+        # A zero budget refuses every candidate: the shared gate runs on the
+        # replay path too, and its refusals are counted like the other gates'.
+        from src.execution import gates
+
+        monkeypatch.setattr(gates, "MAX_SPREAD_STOP_RATIO", 0.0)
+        result = _run(target=5, max_days=3)
+        assert result.trades == []
+        assert result.rejections["Spread budget exceeded"] > 0
+
+
+class TestSameBetInSimulation:
+    """Two listings of one market are never held together in a replay."""
+
+    def _day(self) -> list[tuple[str, list[Candle]]]:
+        rng = random.Random(3)
+        t0 = datetime(2026, 7, 7, 8, 0, tzinfo=UTC)
+        price, path = 1000.0, []
+        for i in range(300):
+            price *= 1 + rng.gauss(0, 0.001)
+            path.append((t0 + timedelta(minutes=i), price))
+
+        def listing(scale: float) -> list[Candle]:
+            return [
+                Candle(
+                    timestamp=ts,
+                    bid_open=p * scale,
+                    bid_close=p * scale,
+                    bid_high=p * scale * 1.0005,
+                    bid_low=p * scale * 0.9995,
+                    offer_open=p * scale + 0.01,
+                    offer_close=p * scale + 0.01,
+                    offer_high=p * scale * 1.0005 + 0.01,
+                    offer_low=p * scale * 0.9995 + 0.01,
+                )
+                for ts, p in path
+            ]
+
+        return [("CC", listing(1.0)), ("LCC", listing(1.7))]
+
+    def _replay(self):
+        simulator = StrategySimulator(
+            trade_config=TradeConfig(),
+            entry=OpenTesting(),
+            close_profile=CloseZoneProfit(stop_distance=StopAtr()),
+            sim_config=SimulationConfig(target_trades=1000),
+        )
+        return simulator.run_days([self._day()])
+
+    @staticmethod
+    def _overlap(trades) -> bool:
+        spans = [(t.open_time, t.close_time) for t in trades]
+        return any(
+            a[0] < b[1] and b[0] < a[1]
+            for i, a in enumerate(spans)
+            for b in spans[i + 1 :]
+        )
+
+    def test_twin_is_refused_while_the_first_is_open(self):
+        result = self._replay()
+        assert result.trades
+        assert result.rejections["Same bet as an open position"] > 0
+        assert not self._overlap(result.trades)
+
+    def test_relaxed_gate_holds_both_twins(self, monkeypatch):
+        from src.execution import gates
+
+        monkeypatch.setattr(gates, "MAX_SAME_BET_REDUNDANCY", float("inf"))
+        result = self._replay()
+        assert result.rejections["Same bet as an open position"] == 0
+        assert self._overlap(result.trades)
 
 
 class TestCloseVisual:

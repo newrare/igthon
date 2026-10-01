@@ -105,8 +105,9 @@ single timestamp-ordered stream, so misaligned real series (different start time
 
 The replay applies the **same** rules as production: the pluggable entry
 strategy (`evaluate`), the pre-open gates
-([trading.py](../src/execution/trading.py)), the win/stop levels, and the per-zone
-stop updates. A market order fills on the side that pays the spread, the
+([gates.py](../src/execution/gates.py) — including the spread budget and the
+same-bet gate, which refuses a candidate whose curve is the same bet as a
+position already open), the win/stop levels, and the per-zone stop updates. A market order fills on the side that pays the spread, the
 protective stop fills intra-candle when the close-out price reaches it, and
 anything still open at end of day is force-closed.
 

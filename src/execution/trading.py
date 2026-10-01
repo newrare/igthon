@@ -9,6 +9,7 @@ Implements the full trading workflow:
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -24,7 +25,12 @@ from src.core.api_queue import (
 )
 from src.core.indicators import RegressionResult, TradingLevels, TradingSignal, atr
 from src.entry.base import EntryIntent
-from src.execution.gates import evaluate_open_gates
+from src.execution.gates import (
+    evaluate_open_gates,
+    same_bet_free,
+    spread_fits_stop,
+    worst_case_stop_distance,
+)
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
 from src.exit.trailing import (
     clamp_trailing_distance,
@@ -32,7 +38,7 @@ from src.exit.trailing import (
     decide_close_reason,
 )
 from src.exit.zones.base import DayBook
-from src.feed.price_buffer import EpicBuffer
+from src.feed.price_buffer import EpicBuffer, PriceBuffer
 from src.models.candle import CandleRecord
 from src.models.epic import Epic
 from src.models.position import Position, PositionState, PositionStrategy
@@ -301,6 +307,9 @@ class TradingService:
         *,
         allow_short: bool = False,
         allow_reopen: bool = False,
+        buf: EpicBuffer | None = None,
+        price_buffer: PriceBuffer | None = None,
+        pending: Sequence[tuple[str, str]] = (),
     ) -> tuple[bool, str]:
         """Pre-open gates for a decoupled :class:`EntryIntent`.
 
@@ -323,13 +332,26 @@ class TradingService:
         ``allow_reopen`` lifts the same-day re-open gate the same way (an
         explicit human open is never blocked by the diversity policy). Automatic
         callers leave both ``False``.
+
+        ``buf`` enables the spread-budget gate (:meth:`_spread_budget`), which
+        needs the live candle and the close profile's stop. Automatic callers pass
+        it — so a notify-mode signal is only raised for an open the bot would have
+        taken — and a manual dashboard open leaves it ``None``: the user sees the
+        spread and decides.
+
+        ``price_buffer`` (with ``buf``) arms the same-bet gate
+        (:meth:`_same_bet`): the candidate is refused when its curve is the same
+        bet as an open position or as one of the ``pending`` ``(epic,
+        direction)`` pairs — the notify-mode signals still awaiting the user, so
+        one exposure is not proposed twice either. Automatic callers pass both;
+        a manual dashboard open passes neither.
         """
         traded_today = (
             not allow_reopen
             and not self._config.allow_same_day_reopen
             and await self._is_epic_traded_today(intent.epic)
         )
-        return evaluate_open_gates(
+        allowed, reason = evaluate_open_gates(
             epic=intent.epic,
             direction=intent.direction,
             in_trading_hours=True,
@@ -338,6 +360,82 @@ class TradingService:
             allow_short=allow_short,
             epic_traded_today=traded_today,
         )
+        if not allowed or buf is None:
+            return allowed, reason
+        allowed, reason = await self._spread_budget(intent, buf)
+        if not allowed or price_buffer is None:
+            return allowed, reason
+        return await self._same_bet(intent, buf, price_buffer, pending)
+
+    async def _same_bet(
+        self,
+        intent: EntryIntent,
+        buf: EpicBuffer,
+        price_buffer: PriceBuffer,
+        pending: Sequence[tuple[str, str]],
+    ) -> tuple[bool, str]:
+        """Same-bet gate against the open book (plus the pending signals).
+
+        Reads the open positions' epic and direction from the local database (no
+        IG call) and their curves from the live ``price_buffer``; an epic with no
+        buffered curve cannot be judged and is skipped
+        (see :func:`~src.execution.gates.same_bet_free`).
+        """
+        result = await self._db.execute(
+            select(Position.epic, Position.direction).where(
+                Position.state == PositionState.OPEN
+            )
+        )
+        held = [(epic, direction or "BUY") for epic, direction in result.all()]
+        book = []
+        for epic, direction in [*held, *pending]:
+            held_buf = price_buffer.get(epic)
+            if held_buf is not None:
+                book.append((epic, direction, held_buf.candles))
+        return same_bet_free(
+            epic=intent.epic,
+            direction=intent.direction,
+            candles=buf.candles,
+            book=book,
+        )
+
+    async def _spread_budget(
+        self, intent: EntryIntent, buf: EpicBuffer
+    ) -> tuple[bool, str]:
+        """Spread-budget gate on the stop the close profile would place now.
+
+        Rebuilds the open geometry :meth:`open_from_intent` +
+        :meth:`open_position` will use — the profile's ``initial_plan`` stop, the
+        broker stop one spread plus the ATR cushion beyond it, the fill on the
+        paying side — and applies :func:`~src.execution.gates.spread_fits_stop`
+        to the fill → broker-stop distance. IG's minimum-distance clamp is not
+        applied here (it needs the ``/markets`` dealing rules, an external call):
+        the clamp only ever widens the stop, so the ratio measured here is an
+        upper bound and the gate errs on the refusing side for those few epics.
+        Without a close profile or a candle there is nothing to measure; the open
+        path refuses those cases itself.
+        """
+        profile = self._close_profile
+        last = buf.last
+        if profile is None or last is None:
+            return True, "OK"
+        plan = profile.initial_plan(
+            entry_level=last.bid_close,
+            direction=intent.direction,
+            buf=buf,
+            day_extreme=await self._session_extreme(intent.epic, intent.direction),
+        )
+        spread = max(float(last.spread or 0.0), 0.0)
+        broker_stop = self._broker_stop_level(
+            intent.direction, plan.stop_level, spread, self._broker_stop_buffer(buf)
+        )
+        distance = worst_case_stop_distance(
+            intent.direction,
+            bid=last.bid_close,
+            offer=last.offer_close,
+            broker_stop=broker_stop,
+        )
+        return spread_fits_stop(spread, distance)
 
     async def _session_extreme(self, epic: str, direction: str) -> float | None:
         """Today's lowest bid low (BUY) / highest offer high (SELL) for ``epic``.
@@ -797,21 +895,9 @@ class TradingService:
         # 3. Quantity — minimum deal size scaled by the (martingale) multiplier.
         quantity = max(int(min_deal_size), 1) * max(int(quantity_multiplier), 1)
 
-        # 4. Compute the worst-case euro risk for logging. ``euro_per_point`` is
-        # the currency-converted euro value of one full point of price movement
-        # for the whole position, so the worst-case loss is simply
-        # distance × euro_per_point. Fall back to a rough estimate only when the
-        # contract size is unknown. Both paths are ESTIMATES (IG's exchangeRate is
-        # a reference rate on a foreign quote) — the open log below prints the
-        # resolved euro-per-point alongside the risk so a suspect figure is
-        # traceable, and ``reconcile_realized_pnl`` fixes the realized P&L later.
         currency = instrument.get("currencies", [{}])[0].get("code", "EUR")
         expiry = instrument.get("expiry", "-")
         epp = euro_per_point(market_data, quantity, currency)
-        if epp:
-            euro_risk = stop_price_distance * epp
-        else:
-            euro_risk = quantity * stop_price_distance
 
         # The broker stop sits one spread PLUS an ATR-scaled noise cushion
         # (``broker_noise_buffer``) further from price than the software follower
@@ -824,18 +910,44 @@ class TradingService:
         # this stop untouched until break-even, so the cushion set here persists
         # for the whole pre-break-even life (the phase most exposed to bid noise).
         # Pushing the broker stop FURTHER from price never violates IG's
-        # minimum-distance rule, and the euro risk is unchanged because the bot
-        # still closes at the (nearer) software ``stop_level``.
+        # minimum-distance rule.
         spread = max(float(levels.spread or 0.0), 0.0)
         broker_stop = self._broker_stop_level(
             direction, stop_level, spread, broker_noise_buffer
         )
 
-        # 5. Send order with an absolute stop level (avoids any point/price unit
-        # conversion on the IG side). A BUY fills at the ask (price through
-        # ``levels.offer``), a SELL at the bid (``levels.bid``), so the
-        # marketable-LIMIT fallback prices through the matching touch.
+        # A BUY fills at the ask (``levels.offer``), a SELL at the bid
+        # (``levels.bid``): the touch the order prices through, and the expected
+        # fill the euro risk is measured from.
         reference_price = levels.bid if direction == "SELL" else levels.offer
+
+        # 4. Worst-case euro risk: the loss paid when the BROKER stop fills, i.e.
+        # from the fill (spread included) to the broker stop (cushion included) —
+        # see :func:`~src.execution.gates.worst_case_stop_distance`. Measured on
+        # the live book, a bid-to-software-stop figure under-stated the realized
+        # loss at the stop by 30-50 %: most stop-outs are the broker order
+        # (``closed_externally``), not the nearer software stop. ``euro_per_point``
+        # is the currency-converted euro value of one full point for the whole
+        # position; it is an ESTIMATE on a foreign quote (IG's reference rate) and
+        # ``reconcile_realized_pnl`` fixes the realized P&L later. Without a
+        # contract size, keep the legacy bid-to-stop estimate: the P&L fallback of
+        # :meth:`_euro_pnl` divides ``euro_stop`` by that very distance.
+        if epp:
+            euro_risk = (
+                worst_case_stop_distance(
+                    direction,
+                    bid=levels.bid,
+                    offer=levels.offer,
+                    broker_stop=broker_stop,
+                )
+                * epp
+            )
+        else:
+            euro_risk = quantity * stop_price_distance
+
+        # 5. Send order with an absolute stop level (avoids any point/price unit
+        # conversion on the IG side); the marketable-LIMIT fallback prices
+        # through ``reference_price``.
         order_payload = {
             "epic": epic,
             "expiry": expiry,
@@ -985,6 +1097,12 @@ class TradingService:
         )
         position.deal_id = deal_id or None
         position.level_open = Decimal(str(round(open_level, 5)))
+        # The stops are not re-anchored (see ``_reanchor_exit_references``), so a
+        # slipped fill changes the real risk: re-measure it from the actual fill.
+        if epp and confirmed_level is not None:
+            position.euro_stop = Decimal(
+                str(round(abs(open_level - broker_stop) * epp, 3))
+            )
         # The exit references were frozen from the pre-order candle; the fill can
         # land several points away. Translate them onto the real entry so the
         # break-even the exit logic (and the chart) uses is the price actually
@@ -1118,7 +1236,8 @@ class TradingService:
         are deliberately left untouched: they are market-structure levels
         (support / regression / ATR) already resting at the broker, not
         entry-relative offsets, so a slipped fill widens the real risk rather than
-        moving the stop (``euro_stop`` keeps the pre-fill figure).
+        moving the stop (:meth:`open_position` re-measures ``euro_stop`` from the
+        confirmed fill).
 
         Returns the applied delta, ``0.0`` when nothing moved.
         """

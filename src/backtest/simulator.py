@@ -5,7 +5,10 @@ exact same decoupled decision pipeline used live:
 
 - open: an :class:`src.entry.base.EntryStrategy` produces a direction-only
   :class:`~src.entry.base.EntryIntent`;
-- pre-open gates: :func:`src.execution.gates.evaluate_open_gates`;
+- pre-open gates: :func:`src.execution.gates.evaluate_open_gates`, then the
+  spread budget (:func:`src.execution.gates.spread_fits_stop`) on the stop the
+  close profile places and the same-bet gate
+  (:func:`src.execution.gates.same_bet_free`) against the open book;
 - exit: a :class:`src.exit.base.CloseProfile` chosen *independently* picks the
   initial stop (``initial_plan``) and drives every per-tick close decision
   (``evaluate``).
@@ -45,7 +48,12 @@ from itertools import groupby
 
 from src.core.reading import MIN_REGIME_MINUTES, CurveReading, Regime
 from src.entry.base import EntryStrategy
-from src.execution.gates import evaluate_open_gates
+from src.execution.gates import (
+    evaluate_open_gates,
+    same_bet_free,
+    spread_fits_stop,
+    worst_case_stop_distance,
+)
 from src.execution.trading import TradeConfig
 from src.exit.base import ACTION_CLOSE, ACTION_UPDATE_STOP, CloseProfile
 from src.exit.zones.base import DayBook
@@ -488,6 +496,7 @@ class StrategySimulator:
                     result,
                     used_today,
                     session,
+                    buffers,
                 )
 
         # Force-close anything still open at the end of the day.
@@ -747,6 +756,7 @@ class StrategySimulator:
                 result,
                 used_today,  # _try_open records the epic as used on success
                 session.get(e, intent.direction),
+                buffers,
             ):
                 slots -= 1
                 opened += 1
@@ -784,6 +794,7 @@ class StrategySimulator:
         result: SimulationResult,
         used_today: set[int] | None = None,
         session: SessionExtremes | None = None,
+        buffers: Sequence[EpicBuffer] | None = None,
     ) -> None:
         """Per-epic open path — mirror of the scheduler's ``_evaluate_epic``.
 
@@ -811,6 +822,7 @@ class StrategySimulator:
             result,
             used_today,
             session.get(epic_index, intent.direction) if session else None,
+            buffers,
         )
 
     def _try_open(
@@ -825,6 +837,7 @@ class StrategySimulator:
         result: SimulationResult,
         used_today: set[int] | None = None,
         day_extreme: float | None = None,
+        buffers: Sequence[EpicBuffer] | None = None,
     ) -> bool:
         """Run the pre-open gates and open on success.
 
@@ -841,6 +854,10 @@ class StrategySimulator:
         ``TradeConfig``): with the policy off, an epic in that set is refused by
         the shared gate exactly as the live path refuses it. Opened epics are
         recorded here so both day runners share one bookkeeping point.
+
+        ``buffers`` (the day's per-epic buffers, indexed like ``open_positions``)
+        arms the same-bet gate: the candidate is refused when its curve is the
+        same bet as a position already open. Both day runners pass it.
 
         Returns True when a position was opened.
         """
@@ -869,9 +886,37 @@ class StrategySimulator:
             day_extreme=day_extreme,
         )
         sign = direction_sign(intent.direction)
-        stop_distance = sign * (candle.bid_close - plan.stop_level)
+        # The emulated broker stop IS the profile's stop (no cushion here), so the
+        # worst case runs from the fill on the paying side to ``plan.stop_level`` —
+        # the distance the shared spread-budget gate and the euro risk use live.
+        risk_distance = worst_case_stop_distance(
+            intent.direction,
+            bid=candle.bid_close,
+            offer=candle.offer_close,
+            broker_stop=plan.stop_level,
+        )
+        allowed, reason = spread_fits_stop(candle.spread, risk_distance)
+        if not allowed:
+            result.rejections[reason.split("(")[0].strip()] += 1
+            return False
+        if buffers is not None:
+            # Same-bet gate, as live: never hold one exposure twice under two
+            # epics. The book is every position open at this tick, read from the
+            # day's own buffers (no look-ahead).
+            allowed, reason = same_bet_free(
+                epic=buf.epic,
+                direction=intent.direction,
+                candles=buf.candles,
+                book=[
+                    (buffers[e].epic, held.direction, buffers[e].candles)
+                    for e, held in open_positions.items()
+                ],
+            )
+            if not allowed:
+                result.rejections[reason.split("(")[0].strip()] += 1
+                return False
         euro_per_point = self._sim.euro_per_point * self._sim.quantity
-        euro_risk = stop_distance * euro_per_point
+        euro_risk = risk_distance * euro_per_point
 
         # A market order fills on the side that costs the spread: a BUY at the
         # offer, a SELL at the bid (same as IG's confirmation level). The position
@@ -1114,8 +1159,15 @@ def run_close_visual(
     plan = profile.initial_plan(
         entry_level=open_candle.bid_close, direction="BUY", buf=buf
     )
-    stop_distance = open_candle.bid_close - plan.stop_level
-    euro_risk = stop_distance * euro_per_point
+    euro_risk = (
+        worst_case_stop_distance(
+            "BUY",
+            bid=open_candle.bid_close,
+            offer=open_candle.offer_close,
+            broker_stop=plan.stop_level,
+        )
+        * euro_per_point
+    )
 
     # Reference levels for the chart, all expressed on the bid scale (the curve
     # plotted): break-even is the offer paid for a BUY (≈ one spread above the

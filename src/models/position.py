@@ -106,6 +106,10 @@ class Position(Base):
     # better than -20 €"). NULL = nothing armed. See migration a2b3c4d5e6f7.
     close_when_euro_above: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     euro: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
+    # Worst-case euro risk at open: fill → initial BROKER stop × euro_per_point,
+    # the loss actually paid when that stop fills (entry spread and broker cushion
+    # included). Rows opened before 2026-09-29 carry the old bid → software-stop
+    # figure, 30-50 % below the realized loss at the stop.
     euro_stop: Mapped[Decimal | None] = mapped_column(Numeric(10, 3))
     # Euros of realized/unrealized P&L per 1.0 of price movement for the whole
     # position: P&L = (close - open) * euro_per_point. Derived at open from IG

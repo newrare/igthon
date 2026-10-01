@@ -28,6 +28,23 @@ distance and exit are plugged in:
   **long-only by default**: a strategy that genuinely trades both ways declares
   `emits_shorts = True` and the scheduler then keeps its SELL intents and forwards
   `allow_short` to the gate
+- the spread budget (`spread_fits_stop`): an automatic open — or a notify-mode
+  signal — is refused when the entry spread reaches `MAX_SPREAD_STOP_RATIO` (20 %)
+  of the worst-case stop distance, fill → broker stop. Measured on the live book,
+  trades at 20–35 % lost −0.43 R with a third of winners. Manual dashboard opens
+  are not gated. The same distance sizes `Position.euro_stop`, the loss paid when
+  the broker stop fills
+- the same-bet gate (`same_bet_free`, [similarity](../../src/core/similarity.py)):
+  an automatic open — or a notify-mode signal — is refused when its last-hour
+  curve, signed by the two directions, correlates above `MAX_SAME_BET_REDUNDANCY`
+  (0.80) with a position already open or a signal still pending. It applies to
+  **every** entry strategy, live and in the backtest, so two listings of one
+  market (cocoa NY + London taken the same way) or a mirrored pair (EUR/USD long +
+  USD/CHF short) are never held twice; a hedge (opposite exposure) is allowed.
+  Measured on `open_fade`, cocoa NY and London were opened together on the same
+  side on 19 of 26 shared days. Manual dashboard opens are not gated. `open_five`
+  keeps its own `filter_ranked` on top, which dedupes the candidates of one
+  ranking pass so a dropped twin's slot goes to the next survivor
 - order placement and the broker-side protective stop (`TradingService`)
 - the simulator, the dashboard, the charts
 

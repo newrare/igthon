@@ -70,7 +70,9 @@ def _up_then_recent_drop(
     return rise + drop
 
 
-def _trending_down(n: int = 90, start: float = 8100.0, step: float = 1.0) -> list[float]:
+def _trending_down(
+    n: int = 90, start: float = 8100.0, step: float = 1.0
+) -> list[float]:
     return [start - i * step for i in range(n)]
 
 
@@ -166,7 +168,9 @@ class TestPullbackSafety:
 
 class TestRecentBearishFactor:
     def test_rising_window_has_no_malus(self):
-        assert _recent_bearish_factor([100.0 + i for i in range(10)], 0.003, 0.05) == 1.0
+        assert (
+            _recent_bearish_factor([100.0 + i for i in range(10)], 0.003, 0.05) == 1.0
+        )
 
     def test_flat_window_has_no_malus(self):
         assert _recent_bearish_factor([100.0] * 10, 0.003, 0.05) == 1.0
@@ -203,8 +207,7 @@ class TestEvaluate:
     def test_insufficient_warmup_returns_none(self):
         # warmup = max(60, 30, 60, 10, 30, 60, 14) + 1 = 61; 40 candles is too few.
         assert (
-            OpenSafeRanking().evaluate("TEST.EPIC", _buffer(_trending_up(40)))
-            is None
+            OpenSafeRanking().evaluate("TEST.EPIC", _buffer(_trending_up(40))) is None
         )
 
     def test_zero_volatility_returns_none(self):

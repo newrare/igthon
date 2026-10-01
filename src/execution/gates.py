@@ -8,17 +8,23 @@ there actually look like a reversal?" (:func:`curve_supports_revert`). They carr
 no I/O and are shared by the live trading service and the simulator, which is why
 they live in the execution domain rather than the trading service.
 
-The gates here are correctness checks only (market hours, signal direction,
-duplicate-epic suppression, same-day re-open policy) — the daily P&L / win-rate
-/ max-position circuit-breakers were removed.
+The gates here are correctness checks (market hours, signal direction,
+duplicate-epic suppression, same-day re-open policy), one cost check, the
+spread budget (:func:`spread_fits_stop`: the entry spread must not eat too large
+a share of the stop distance), and one concentration check, the same-bet gate
+(:func:`same_bet_free`: never hold the same exposure twice under two epics) —
+the daily P&L / win-rate / max-position circuit-breakers were removed.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from src.core.indicators import efficiency_ratio
+from src.core.similarity import bet_redundancy, shape_signature
+from src.feed.price_buffer import Candle
 
 #: ``reason_close`` values that mean "the protective stop took the position
 #: out", i.e. the price came to the stop rather than the bot choosing to leave:
@@ -87,6 +93,30 @@ REVERT_MAX_EFFICIENCY_BAR = 0.8
 REVERT_MAX_FAVOURABLE_RATIO = 1.0
 REVERT_MIN_BREAK_RATIO = 0.1
 REVERT_MIN_CURVE_CANDLES = 2
+
+#: Largest share of the stop distance the entry spread may take
+#: (:func:`spread_fits_stop`). The distance is the worst case — from the fill to
+#: the broker stop (:func:`worst_case_stop_distance`), i.e. the loss actually paid
+#: when the trade is stopped out. Measured on the live book (2026-06 → 2026-09,
+#: ~960 trades, spread over that same fill → initial broker stop distance): below
+#: 10 % the expectancy is flat (−0.01 R), 10–20 % costs −0.11 R, and **20–35 %
+#: loses −0.43 R with a third of winners** (−0.83 R since August), the confidence
+#: interval clear of zero. Such a trade starts a fifth of the way to its stop and
+#: its stop sits inside the bid/offer churn. Tuned **here**, not in ``.env``.
+MAX_SPREAD_STOP_RATIO = 0.20
+
+#: Same-bet gate (:func:`same_bet_free`): a candidate whose curve, signed by the
+#: two trade directions, correlates above :data:`MAX_SAME_BET_REDUNDANCY` with a
+#: position already held is the same exposure taken twice. Measured on open_fade
+#: (W24–W39): cocoa NY and cocoa London were opened the same day on the same side
+#: on 19 of 26 shared days — four of the five best trades were such pairs, i.e.
+#: the cocoa risk was doubled, not diversified. Same windows and threshold as the
+#: open_five ranking filter: ~1 h of candles, 20 shared timestamps to trust a
+#: correlation, and a 0.80 veto (below the ~0.95 of two listings of one market, so
+#: near-twins are caught too). Tuned **here**, not in ``.env``.
+SAME_BET_WINDOW = 60
+SAME_BET_MIN_OVERLAP = 20
+MAX_SAME_BET_REDUNDANCY = 0.80
 
 
 def reverse_direction(direction: str | None) -> str:
@@ -331,6 +361,99 @@ def curve_supports_revert(
             f"(max {max_favourable_ratio:.0%}) — oscillation, not a wrong side"
         )
 
+    return True, "OK"
+
+
+def worst_case_stop_distance(
+    direction: str | None, *, bid: float, offer: float, broker_stop: float
+) -> float:
+    """Price distance from the fill to the broker stop: the loss if stopped out.
+
+    A BUY fills at the offer and is stopped out on the bid; a SELL fills at the
+    bid and is stopped out on the offer. The broker stop level *is* the close-out
+    price in both cases, so the realized loss per unit is the gap between the fill
+    and that level — one spread more than a bid-to-stop distance for a long, and
+    including whatever cushion separates the broker stop from the software stop.
+    """
+    fill = bid if direction == "SELL" else offer
+    return abs(fill - broker_stop)
+
+
+def spread_fits_stop(
+    spread: float, stop_distance: float, max_ratio: float | None = None
+) -> tuple[bool, str]:
+    """Refuse an open whose entry spread eats too much of its stop distance.
+
+    ``stop_distance`` is the worst-case fill → broker-stop distance
+    (:func:`worst_case_stop_distance`). ``max_ratio`` defaults to
+    :data:`MAX_SPREAD_STOP_RATIO`, read at call time so a backtest can compare a
+    run with the gate relaxed. A non-positive distance means the stop sits on the
+    wrong side of the fill — refused, there is no risk budget to speak of.
+
+    Returns:
+        (allowed, reason) — reason carries the measured ratio on a refusal.
+    """
+    limit = MAX_SPREAD_STOP_RATIO if max_ratio is None else max_ratio
+    if stop_distance <= 0:
+        return False, "Spread budget exceeded (no stop distance)"
+    ratio = max(spread, 0.0) / stop_distance
+    if ratio >= limit:
+        return False, (
+            f"Spread budget exceeded (spread {ratio:.0%} of the stop distance, "
+            f"max {limit:.0%})"
+        )
+    return True, "OK"
+
+
+def same_bet_free(
+    *,
+    epic: str,
+    direction: str,
+    candles: Sequence[Candle],
+    book: Sequence[tuple[str, str, Sequence[Candle]]],
+    window: int = SAME_BET_WINDOW,
+    min_overlap: int = SAME_BET_MIN_OVERLAP,
+    max_redundancy: float | None = None,
+) -> tuple[bool, str]:
+    """Refuse an open that is the same bet as a position already held.
+
+    ``book`` lists the open positions as ``(epic, direction, candles)``. The
+    candidate and every held curve are reduced to a shape signature over the last
+    ``window`` candles (:func:`~src.core.similarity.shape_signature`) and compared
+    with :func:`~src.core.similarity.bet_redundancy` — the return correlation
+    signed by the two directions — so two listings of one market taken the same
+    way (cocoa NY + cocoa London long) and a mirrored pair (EUR/USD long +
+    USD/CHF short) are both refused, while a hedge (negative redundancy) is not.
+
+    Applies to every entry strategy, unlike ``filter_ranked`` (which only
+    deduplicates the candidates of one ranking pass, never against the book). A
+    position on the candidate's own epic is skipped: the duplicate-epic gate
+    already owns that case. A curve that cannot be judged (too short, flat, too
+    little timestamp overlap) never refuses — a data gap must not block opens.
+    ``max_redundancy`` defaults to :data:`MAX_SAME_BET_REDUNDANCY`, read at call
+    time so a backtest can compare a run with the gate relaxed.
+
+    Returns:
+        (allowed, reason) — reason names the held twin and the redundancy.
+    """
+    limit = MAX_SAME_BET_REDUNDANCY if max_redundancy is None else max_redundancy
+    candidate = shape_signature(epic, list(candles), window)
+    if candidate is None:
+        return True, "OK"
+    for held_epic, held_direction, held_candles in book:
+        if held_epic == epic:
+            continue
+        held = shape_signature(held_epic, list(held_candles), window)
+        if held is None:
+            continue
+        redundancy = bet_redundancy(
+            candidate, held, direction, held_direction, min_overlap=min_overlap
+        )
+        if redundancy is not None and redundancy > limit:
+            return False, (
+                f"Same bet as an open position ({held_direction} {held_epic}, "
+                f"redundancy {redundancy:.2f} > {limit:.2f})"
+            )
     return True, "OK"
 
 

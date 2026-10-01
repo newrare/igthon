@@ -1,23 +1,33 @@
 """Tests for the pure pre-open rules (src/execution/gates.py).
 
-Correctness gates only (trading hours, long-only unless ``allow_short``,
-duplicate-epic suppression, same-day re-open policy) plus the recovery-revert
-rule — the bookkeeping half (which stop fired) and the curve half (did the market
-really break through it). Exit- and entry-agnostic, no I/O.
+Correctness gates (trading hours, long-only unless ``allow_short``,
+duplicate-epic suppression, same-day re-open policy), the spread budget, the
+same-bet gate, plus the recovery-revert rule — the bookkeeping half (which stop
+fired) and the curve half (did the market really break through it). Exit- and
+entry-agnostic, no I/O.
 """
 
-from datetime import UTC, date, datetime, time
+import random
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 
+import pytest
+
+from src.execution import gates
 from src.execution.gates import (
+    MAX_SPREAD_STOP_RATIO,
     RECOVERY_REVERT_REASON_OPEN,
     curve_supports_revert,
     evaluate_open_gates,
     original_stop_level,
     position_opened_at,
     reverse_direction,
+    same_bet_free,
     should_revert_after_stop_loss,
+    spread_fits_stop,
+    worst_case_stop_distance,
 )
+from src.feed.price_buffer import Candle
 
 
 def _gate(**overrides):
@@ -109,6 +119,172 @@ def _revert(**overrides):
     }
     base.update(overrides)
     return should_revert_after_stop_loss(**base)
+
+
+class TestWorstCaseStopDistance:
+    def test_buy_runs_from_the_offer_to_the_broker_stop(self):
+        # A long fills at the offer (100.5) and is stopped out on the bid at 95.
+        assert worst_case_stop_distance(
+            "BUY", bid=100.0, offer=100.5, broker_stop=95.0
+        ) == pytest.approx(5.5)
+
+    def test_sell_runs_from_the_bid_to_the_broker_stop(self):
+        # A short fills at the bid (100) and is stopped out on the offer at 105.
+        assert worst_case_stop_distance(
+            "SELL", bid=100.0, offer=100.5, broker_stop=105.0
+        ) == pytest.approx(5.0)
+
+
+class TestSpreadBudgetGate:
+    def test_small_spread_passes(self):
+        assert spread_fits_stop(0.5, 10.0) == (True, "OK")
+
+    def test_spread_at_the_limit_is_refused(self):
+        allowed, reason = spread_fits_stop(MAX_SPREAD_STOP_RATIO * 10.0, 10.0)
+        assert allowed is False
+        assert reason.startswith("Spread budget exceeded")
+
+    def test_reason_reports_the_measured_ratio(self):
+        _, reason = spread_fits_stop(3.0, 10.0)
+        assert "30%" in reason and "max 20%" in reason
+
+    def test_no_stop_distance_is_refused(self):
+        allowed, reason = spread_fits_stop(0.1, 0.0)
+        assert allowed is False
+        assert "no stop distance" in reason
+
+    def test_explicit_ratio_overrides_the_constant(self):
+        assert spread_fits_stop(3.0, 10.0, max_ratio=0.5)[0] is True
+
+    def test_constant_is_read_at_call_time(self, monkeypatch):
+        # Lets a backtest relax the gate without threading a parameter through.
+        monkeypatch.setattr(gates, "MAX_SPREAD_STOP_RATIO", float("inf"))
+        assert spread_fits_stop(9.0, 10.0)[0] is True
+
+
+def _walk(seed: int, n: int = 80) -> list[float]:
+    """Deterministic random-walk bid path (relative steps of ~0.1 %)."""
+    rng = random.Random(seed)
+    prices = [100.0]
+    for _ in range(n - 1):
+        prices.append(prices[-1] * (1 + rng.gauss(0, 0.001)))
+    return prices
+
+
+def _candles(prices: list[float], start: datetime | None = None) -> list[Candle]:
+    """One-minute candles on ``prices`` (bid), stamped from ``start``."""
+    t0 = start or datetime(2026, 7, 7, 10, 0, tzinfo=UTC)
+    return [
+        Candle(
+            timestamp=t0 + timedelta(minutes=i),
+            bid_open=p,
+            bid_close=p,
+            bid_high=p,
+            bid_low=p,
+            offer_open=p + 0.01,
+            offer_close=p + 0.01,
+            offer_high=p + 0.01,
+            offer_low=p + 0.01,
+        )
+        for i, p in enumerate(prices)
+    ]
+
+
+class TestSameBetGate:
+    def test_twin_listing_same_side_is_refused(self):
+        # Cocoa NY + cocoa London: same curve shape at another price scale.
+        path = _walk(1)
+        twin = [p * 1.7 for p in path]
+        allowed, reason = same_bet_free(
+            epic="LCC",
+            direction="SELL",
+            candles=_candles(twin),
+            book=[("CC", "SELL", _candles(path))],
+        )
+        assert allowed is False
+        assert reason.startswith("Same bet as an open position")
+        assert "SELL CC" in reason
+
+    def test_twin_listing_opposite_side_is_a_hedge(self):
+        path = _walk(1)
+        allowed, _ = same_bet_free(
+            epic="LCC",
+            direction="BUY",
+            candles=_candles([p * 1.7 for p in path]),
+            book=[("CC", "SELL", _candles(path))],
+        )
+        assert allowed is True
+
+    def test_mirrored_pair_opposite_side_is_refused(self):
+        # EUR/USD long + USD/CHF short: anti-correlated curves, one dollar bet.
+        path = _walk(2)
+        mirror = [200.0 - p for p in path]
+        allowed, _ = same_bet_free(
+            epic="USDCHF",
+            direction="SELL",
+            candles=_candles(mirror),
+            book=[("EURUSD", "BUY", _candles(path))],
+        )
+        assert allowed is False
+
+    def test_independent_market_passes(self):
+        allowed, _ = same_bet_free(
+            epic="B",
+            direction="BUY",
+            candles=_candles(_walk(3)),
+            book=[("A", "BUY", _candles(_walk(4)))],
+        )
+        assert allowed is True
+
+    def test_own_epic_is_left_to_the_duplicate_epic_gate(self):
+        path = _candles(_walk(5))
+        assert same_bet_free(
+            epic="A", direction="BUY", candles=path, book=[("A", "BUY", path)]
+        ) == (True, "OK")
+
+    def test_curves_without_shared_timestamps_cannot_refuse(self):
+        # Another market recorded on another day: nothing to correlate.
+        allowed, _ = same_bet_free(
+            epic="B",
+            direction="BUY",
+            candles=_candles(_walk(6)),
+            book=[("A", "BUY", _candles(_walk(7), datetime(2026, 7, 8, tzinfo=UTC)))],
+        )
+        assert allowed is True
+
+    def test_identical_fingerprint_needs_no_shared_timestamps(self):
+        # The exact same quantised path is one curve by construction.
+        path = _walk(6)
+        allowed, _ = same_bet_free(
+            epic="B",
+            direction="BUY",
+            candles=_candles(path),
+            book=[
+                (
+                    "A",
+                    "BUY",
+                    _candles([p * 2 for p in path], datetime(2026, 7, 8, tzinfo=UTC)),
+                )
+            ],
+        )
+        assert allowed is False
+
+    def test_empty_book_passes(self):
+        assert same_bet_free(
+            epic="A", direction="BUY", candles=_candles(_walk(8)), book=[]
+        ) == (True, "OK")
+
+    def test_constant_is_read_at_call_time(self, monkeypatch):
+        monkeypatch.setattr(gates, "MAX_SAME_BET_REDUNDANCY", 1.0)
+        path = _walk(9)
+        noisy = [p * (1 + 0.0002 * ((i % 3) - 1)) for i, p in enumerate(path)]
+        allowed, _ = same_bet_free(
+            epic="B",
+            direction="BUY",
+            candles=_candles(noisy),
+            book=[("A", "BUY", _candles(path))],
+        )
+        assert allowed is True
 
 
 class TestReverseDirection:

@@ -126,5 +126,7 @@ class TestInitialStop:
         buf = _buffer([8000.0 - i for i in range(40)])
         entry = buf.last.bid_close
         ref = StopAtr().initial_stop(entry_level=entry, direction="SELL", buf=buf)
-        got = StopRegression().initial_stop(entry_level=entry, direction="SELL", buf=buf)
+        got = StopRegression().initial_stop(
+            entry_level=entry, direction="SELL", buf=buf
+        )
         assert got == pytest.approx(ref)

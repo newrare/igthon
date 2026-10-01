@@ -951,7 +951,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=47" in html
+        assert "/static/dashboard.js?v=49" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -1406,6 +1406,33 @@ class TestFragmentsEndpoint:
         assert data["scheduler_available"] is False
         assert data["bot_paused"] is None
 
+    async def test_market_table_shows_only_the_live_list(self):
+        # A market that dropped out of the live list keeps its buffered history,
+        # but it is no longer followed, so the table must not show it.
+        buffer = PriceBuffer()
+        buffer.add_candle("LIVE.EPIC", _candle(100.0))
+        buffer.add_candle("GONE.EPIC", _candle(200.0))
+        app = create_app(settings=_settings(), buffer=buffer)
+        app.state.scheduler = SimpleNamespace(
+            auto_open_enabled=True,
+            is_paused=False,
+            all_epics=[],
+            epic_last_refresh=None,
+            tradable_epics=[],
+            live_epics=["LIVE.EPIC", "NOT.BUFFERED"],
+            tradable_last_refresh=None,
+            positions_synced_at=None,
+            jobs_status=lambda: [],
+            signals=SignalBook(),
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            data = (await client.get("/api/dashboard-fragments")).json()
+        rows = data["fragments"]["market_rows"]
+        assert "LIVE.EPIC" in rows
+        assert "GONE.EPIC" not in rows
+        assert "NOT.BUFFERED" not in rows
+
     async def test_server_time_is_hh_mm_ss(self, app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -1694,6 +1721,7 @@ class TestAutoOpenEndpoint:
             all_epics=[],
             epic_last_refresh=None,
             tradable_epics=[],
+            live_epics=[],
             tradable_last_refresh=None,
             positions_synced_at=None,
             jobs_status=lambda: [],
@@ -1721,6 +1749,7 @@ class TestSignalsEndpoints:
             all_epics=[],
             epic_last_refresh=None,
             tradable_epics=[],
+            live_epics=[],
             tradable_last_refresh=None,
             positions_synced_at=None,
             jobs_status=lambda: [],
@@ -1891,7 +1920,7 @@ class TestManualOpenEndpoint:
                 pass
 
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self, intent, *, allow_short=False, allow_reopen=False, buf=None
             ):
                 return False, "Epic already open"
 
@@ -1917,7 +1946,7 @@ class TestManualOpenEndpoint:
                 seen["close_profile"] = close_profile
 
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self, intent, *, allow_short=False, allow_reopen=False, buf=None
             ):
                 seen["direction"] = intent.direction
                 seen["epic"] = intent.epic
@@ -1960,7 +1989,7 @@ class TestManualOpenEndpoint:
                 pass
 
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self, intent, *, allow_short=False, allow_reopen=False, buf=None
             ):
                 return True, "ok"
 
@@ -1983,7 +2012,7 @@ class TestManualOpenEndpoint:
                 pass
 
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self, intent, *, allow_short=False, allow_reopen=False, buf=None
             ):
                 return True, "ok"
 
@@ -2010,7 +2039,7 @@ class TestManualOpenEndpoint:
                 pass
 
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self, intent, *, allow_short=False, allow_reopen=False, buf=None
             ):
                 seen["direction"] = intent.direction
                 seen["allow_short"] = allow_short

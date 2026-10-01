@@ -9,7 +9,7 @@ independently chosen ``CloseProfile``:
   decision (close / ratchet stop / hold).
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,7 +18,7 @@ import pytest
 from src.entry.base import EntryIntent
 from src.execution.trading import TradeConfig, TradingService
 from src.exit import CloseZoneProfit
-from src.feed.price_buffer import Candle, EpicBuffer
+from src.feed.price_buffer import Candle, EpicBuffer, PriceBuffer
 from src.models.position import Position, PositionState
 from src.stops import StopAtr
 
@@ -47,6 +47,26 @@ def _buffer_atr2(n: int = 20, close: float = 100.0) -> EpicBuffer:
                 offer_close=close,
                 offer_high=close + 1,
                 offer_low=close - 1,
+            )
+        )
+    return buf
+
+
+def _buffer_with_spread(spread: float, n: int = 20, close: float = 100.0) -> EpicBuffer:
+    """ATR-2 buffer (as :func:`_buffer_atr2`) quoting an offer ``spread`` above."""
+    buf = EpicBuffer(epic="X", max_candles=200)
+    for _ in range(n):
+        buf.add(
+            Candle(
+                timestamp=datetime(2026, 1, 1, 10, 0, tzinfo=UTC),
+                bid_open=close,
+                bid_close=close,
+                bid_high=close + 1,
+                bid_low=close - 1,
+                offer_open=close + spread,
+                offer_close=close + spread,
+                offer_high=close + 1 + spread,
+                offer_low=close - 1 + spread,
             )
         )
     return buf
@@ -137,6 +157,37 @@ class TestOpenFromIntent:
         assert payload["stopLevel"] == pytest.approx(94.0)
         # The position remembers which profile manages its exit.
         assert pos.close_profile == "close_zoneprofit"
+
+    async def test_euro_stop_is_the_fill_to_broker_stop_risk(self):
+        # Broker stop at 94 (see above), confirmed fill at 100, 1 €/point: the
+        # loss if the broker stop fills is 6 €, not the 5 € bid → software stop.
+        svc, client, _ = _service(close_profile=_profile())
+        client.get.side_effect = [
+            _market(),
+            {"dealStatus": "ACCEPTED", "dealId": "D1", "level": 100.0},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF"})
+
+        pos = await svc.open_from_intent(
+            EntryIntent(epic="X", direction="BUY"), _buffer_atr2(close=100.0)
+        )
+
+        assert float(pos.euro_stop) == pytest.approx(6.0)
+
+    async def test_euro_stop_is_re_measured_from_a_slipped_fill(self):
+        # The stops stay where they are; a fill 1 point higher adds 1 € of risk.
+        svc, client, _ = _service(close_profile=_profile())
+        client.get.side_effect = [
+            _market(),
+            {"dealStatus": "ACCEPTED", "dealId": "D1", "level": 101.0},
+        ]
+        client.post = AsyncMock(return_value={"dealReference": "REF"})
+
+        pos = await svc.open_from_intent(
+            EntryIntent(epic="X", direction="BUY"), _buffer_atr2(close=100.0)
+        )
+
+        assert float(pos.euro_stop) == pytest.approx(7.0)
 
     async def test_requires_a_close_profile(self):
         svc, _, _ = _service(close_profile=None)
@@ -362,6 +413,149 @@ class TestSameDayReopenPolicy:
         assert "position.epic" in sql and "position.date" in sql
         assert "state" not in sql  # a closed opening still counts as "used today"
         assert query.compile().params["date_1"] == date.today()
+
+
+class TestSpreadBudgetGate:
+    """The spread-budget gate, armed by passing the live buffer."""
+
+    def _gate_ready(self, svc):
+        """Neutralise the base gates so only the spread budget is exercised."""
+        svc._is_epic_open = AsyncMock(return_value=False)
+        svc._is_epic_close_soon = AsyncMock(return_value=False)
+        svc._is_epic_traded_today = AsyncMock(return_value=False)
+
+    async def test_wide_spread_against_the_stop_is_refused(self):
+        svc, _, _ = _service(close_profile=_profile())
+        self._gate_ready(svc)
+        allowed, reason = await svc.can_open_intent(
+            EntryIntent(epic="X", direction="BUY"), buf=_buffer_with_spread(3.0)
+        )
+        assert allowed is False
+        assert reason.startswith("Spread budget exceeded")
+
+    async def test_small_spread_passes(self):
+        svc, _, _ = _service(close_profile=_profile())
+        self._gate_ready(svc)
+        allowed, _ = await svc.can_open_intent(
+            EntryIntent(epic="X", direction="BUY"), buf=_buffer_with_spread(0.2)
+        )
+        assert allowed is True
+
+    async def test_without_a_buffer_the_gate_is_skipped(self):
+        # A manual dashboard open passes no buffer: the user judges the spread.
+        svc, _, _ = _service(close_profile=_profile())
+        self._gate_ready(svc)
+        allowed, _ = await svc.can_open_intent(EntryIntent(epic="X", direction="BUY"))
+        assert allowed is True
+
+    async def test_a_base_gate_refusal_wins(self):
+        svc, _, _ = _service(close_profile=_profile())
+        self._gate_ready(svc)
+        svc._is_epic_open = AsyncMock(return_value=True)
+        allowed, reason = await svc.can_open_intent(
+            EntryIntent(epic="X", direction="BUY"), buf=_buffer_with_spread(3.0)
+        )
+        assert allowed is False and "already open" in reason
+
+
+def _buffer_walk(epic: str, scale: float = 1.0, n: int = 80) -> EpicBuffer:
+    """Zig-zag bid path (ATR > 0, tiny spread), rescaled by ``scale``.
+
+    Two buffers built with different ``scale`` trace the same shape at two price
+    levels — two listings of one market.
+    """
+    buf = EpicBuffer(epic=epic, max_candles=200)
+    t0 = datetime(2026, 7, 7, 10, 0, tzinfo=UTC)
+    price = 100.0
+    for i in range(n):
+        price += (1.0 if (i * 7) % 5 < 3 else -1.2) * 0.3
+        bid = price * scale
+        buf.add(
+            Candle(
+                timestamp=t0 + timedelta(minutes=i),
+                bid_open=bid,
+                bid_close=bid,
+                bid_high=bid + 0.5 * scale,
+                bid_low=bid - 0.5 * scale,
+                offer_open=bid + 0.01,
+                offer_close=bid + 0.01,
+                offer_high=bid + 0.5 * scale + 0.01,
+                offer_low=bid - 0.5 * scale + 0.01,
+            )
+        )
+    return buf
+
+
+class TestSameBetGate:
+    """The same-bet gate, armed by passing the live price buffer."""
+
+    def _service_holding(self, held: list[tuple[str, str]]):
+        svc, _, db = _service(close_profile=_profile())
+        svc._is_epic_open = AsyncMock(return_value=False)
+        svc._is_epic_close_soon = AsyncMock(return_value=False)
+        svc._is_epic_traded_today = AsyncMock(return_value=False)
+        svc._spread_budget = AsyncMock(return_value=(True, "OK"))
+        result = MagicMock()
+        result.all.return_value = held
+        db.execute = AsyncMock(return_value=result)
+        return svc
+
+    def _prices(self, *buffers: EpicBuffer) -> PriceBuffer:
+        prices = PriceBuffer(max_candles=200)
+        for buf in buffers:
+            prices.update(buf.epic, list(buf.candles))
+        return prices
+
+    async def test_twin_of_an_open_position_is_refused(self):
+        svc = self._service_holding([("CC", "SELL")])
+        allowed, reason = await svc.can_open_intent(
+            EntryIntent(epic="LCC", direction="SELL"),
+            allow_short=True,
+            buf=_buffer_walk("LCC", scale=1.7),
+            price_buffer=self._prices(_buffer_walk("CC")),
+        )
+        assert allowed is False
+        assert reason.startswith("Same bet as an open position")
+
+    async def test_twin_of_a_pending_signal_is_refused(self):
+        svc = self._service_holding([])
+        allowed, _ = await svc.can_open_intent(
+            EntryIntent(epic="LCC", direction="BUY"),
+            buf=_buffer_walk("LCC", scale=1.7),
+            price_buffer=self._prices(_buffer_walk("CC")),
+            pending=[("CC", "BUY")],
+        )
+        assert allowed is False
+
+    async def test_hedge_passes(self):
+        svc = self._service_holding([("CC", "SELL")])
+        allowed, _ = await svc.can_open_intent(
+            EntryIntent(epic="LCC", direction="BUY"),
+            buf=_buffer_walk("LCC", scale=1.7),
+            price_buffer=self._prices(_buffer_walk("CC")),
+        )
+        assert allowed is True
+
+    async def test_held_epic_without_a_curve_cannot_refuse(self):
+        svc = self._service_holding([("CC", "SELL")])
+        allowed, _ = await svc.can_open_intent(
+            EntryIntent(epic="LCC", direction="SELL"),
+            allow_short=True,
+            buf=_buffer_walk("LCC", scale=1.7),
+            price_buffer=PriceBuffer(max_candles=200),
+        )
+        assert allowed is True
+
+    async def test_without_a_price_buffer_the_gate_is_skipped(self):
+        # A manual dashboard open passes no price buffer: the user sees the book.
+        svc = self._service_holding([("CC", "SELL")])
+        allowed, _ = await svc.can_open_intent(
+            EntryIntent(epic="LCC", direction="SELL"),
+            allow_short=True,
+            buf=_buffer_walk("LCC", scale=1.7),
+        )
+        assert allowed is True
+        svc._db.execute.assert_not_awaited()
 
 
 class TestSessionExtreme:

@@ -113,7 +113,13 @@ class TestOpenEpicGuarded:
 
         class _Trading:
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self,
+                intent,
+                *,
+                allow_short=False,
+                allow_reopen=False,
+                buf=None,
+                **gates,
             ):
                 return False, "Epic IX.D.DAX.IFMM.IP already open"
 
@@ -134,7 +140,13 @@ class TestOpenEpicGuarded:
 
         class _Trading:
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self,
+                intent,
+                *,
+                allow_short=False,
+                allow_reopen=False,
+                buf=None,
+                **gates,
             ):
                 return True, "ok"
 
@@ -146,6 +158,56 @@ class TestOpenEpicGuarded:
         assert position is sentinel
         assert reason is None
 
+    async def test_buffer_arms_the_spread_gate_for_automatic_opens_only(self):
+        # The spread budget needs the live buffer: an automatic open hands it to
+        # the gate, a manual dashboard open does not (the user judges the spread).
+        sched = _make_scheduler(MagicMock())
+        seen: list[object] = []
+
+        class _Trading:
+            async def can_open_intent(
+                self,
+                intent,
+                *,
+                allow_short=False,
+                allow_reopen=False,
+                buf=None,
+                **gates,
+            ):
+                seen.append(buf)
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return object()
+
+        buf = object()
+        intent = SimpleNamespace(epic="E", direction="BUY")
+        sched._settings.open_mode = "auto"
+        await sched.open_epic_guarded(_Trading(), intent, buf)
+        await sched.open_epic_guarded(_Trading(), intent, buf, manual=True)
+        assert seen == [buf, None]
+
+    async def test_book_arms_the_same_bet_gate_for_automatic_opens_only(self):
+        # The same-bet gate needs the live curves and the pending signals: an
+        # automatic open hands both to the gate, a manual open hands neither.
+        sched = _make_scheduler(MagicMock())
+        sched._signals.record("CC", "SELL", strategy="open_fade")
+        seen: list[tuple[object, object]] = []
+
+        class _Trading:
+            async def can_open_intent(self, intent, *, price_buffer=None, **kwargs):
+                seen.append((price_buffer, list(kwargs.get("pending", ()))))
+                return True, "ok"
+
+            async def open_from_intent(self, intent, buf):
+                return object()
+
+        intent = SimpleNamespace(epic="LCC", direction="SELL")
+        sched._settings.open_mode = "auto"
+        await sched.open_epic_guarded(_Trading(), intent, object())
+        await sched.open_epic_guarded(_Trading(), intent, object(), manual=True)
+        assert seen == [(sched._buffer, [("CC", "SELL")]), (None, [])]
+
     async def test_concurrent_same_epic_calls_are_serialised(self):
         sched = _make_scheduler(MagicMock())
         order: list[tuple[str, str]] = []
@@ -156,7 +218,13 @@ class TestOpenEpicGuarded:
                 self.tag = tag
 
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self,
+                intent,
+                *,
+                allow_short=False,
+                allow_reopen=False,
+                buf=None,
+                **gates,
             ):
                 order.append(("gate", self.tag))
                 return True, "ok"
@@ -208,7 +276,7 @@ class TestNotifyMode:
             self.ordered = False
 
         async def can_open_intent(
-            self, intent, *, allow_short=False, allow_reopen=False
+            self, intent, *, allow_short=False, allow_reopen=False, buf=None, **gates
         ):
             return self.allowed, "ok" if self.allowed else "Epic already open"
 
@@ -490,7 +558,13 @@ class TestAutoOpenSwitch:
 
         class _Trading:
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self,
+                intent,
+                *,
+                allow_short=False,
+                allow_reopen=False,
+                buf=None,
+                **gates,
             ):
                 nonlocal gate_ran
                 gate_ran = True
@@ -532,7 +606,13 @@ class TestAutoOpenSwitch:
 
         class _Trading:
             async def can_open_intent(
-                self, intent, *, allow_short=False, allow_reopen=False
+                self,
+                intent,
+                *,
+                allow_short=False,
+                allow_reopen=False,
+                buf=None,
+                **gates,
             ):
                 return True, "ok"
 
@@ -1701,6 +1781,8 @@ class TestFollowTradedEpics:
         # And it stays on the live feed.
         streamed = streaming.set_epics.await_args.args[0]
         assert "BIG1" in streamed
+        # The day's live list (shown on the dashboard) keeps it too.
+        assert "BIG1" in scheduler.live_epics
 
     async def test_follow_cap_keeps_the_latest_exits(self, session_factory):
         streaming = MagicMock()
@@ -1802,6 +1884,8 @@ class TestStreamingKeepsOpenPositions:
         scheduler._scanner.get_non_tradable_reasons = MagicMock(return_value={})
         scheduler._persist_epic_enrichment = AsyncMock()
         scheduler._persist_tradable_flags = AsyncMock()
+        # Nothing published yet: the live list falls back to the tradable seed.
+        assert scheduler.live_epics == ["A", "B", "C"]
 
         await scheduler._refresh_tradable_epics()
 
@@ -1813,6 +1897,8 @@ class TestStreamingKeepsOpenPositions:
         streamed = streaming.set_epics.await_args.args[0]
         assert streamed[0] == "A"
         assert set(streamed) == {"A", "B", "C"}
+        # The live list is what the stream actually subscribes: capped like it.
+        assert scheduler.live_epics == ["A", "B"]
 
     async def test_open_epic_no_longer_tradeable_is_force_closed(
         self, session_factory, monkeypatch
@@ -1932,7 +2018,7 @@ class TestTwoSidedRankerSelection:
 
         scheduler.open_epic_guarded = AsyncMock(side_effect=_open)
 
-        async def _can_open(intent, *, allow_short=False):
+        async def _can_open(intent, *, allow_short=False, buf=None, **gates):
             gate_calls.append(allow_short)
             return True, None
 

@@ -397,6 +397,11 @@ class BotScheduler:
         self._tradable_epics: list[str] = list(epics)
         self._tradable_markets: list[MarketInfo] = []
         self._tradable_last_refresh: datetime | None = None
+        # The day's live list: the epics actually fed (open positions, today's
+        # follow-ups, then the risk-tier pick), as last published by
+        # ``_rebuild_tradable_set``. None until the first publication, in which
+        # case ``live_epics`` falls back to the tradable set.
+        self._live_epics: list[str] | None = None
         # Last market snapshot fetched by ``_refresh_tradable_epics``. Kept so the
         # risk tier can re-pick the watched subset intra-day (``_rebuild_tradable_set``)
         # without spending a fresh batch of /markets calls.
@@ -1212,6 +1217,20 @@ class BotScheduler:
         return list(self._tradable_epics)
 
     @property
+    def live_epics(self) -> list[str]:
+        """The day's live list: the epics currently fed, in feed order.
+
+        Open-position epics first, then the markets already traded today (their
+        curve is still recorded after the exit), then the risk-tier pick — capped
+        to the IG subscription limit exactly as pushed to the stream. Markets
+        that dropped out of it are no longer followed, even when the price buffer
+        still holds their history.
+        """
+        if self._live_epics is None:
+            return list(self._tradable_epics)
+        return list(self._live_epics)
+
+    @property
     def tradable_markets(self) -> list[MarketInfo]:
         """Market snapshots from the last tradable-epic refresh (for display)."""
         return list(self._tradable_markets)
@@ -1935,7 +1954,9 @@ class BotScheduler:
             reasons[epic] = reason_capped
         await self._persist_tradable_flags(self._tradable_epics, reasons)
 
-        if self._streaming is not None:
+        if self._streaming is None:
+            self._live_epics = list(self._tradable_epics)
+        else:
             # Epics holding an open position must keep their live feed until the
             # trade closes, so the position's candle history (and the bid the
             # monitor reads) never stops mid-trade — even if the selection above
@@ -1948,6 +1969,11 @@ class BotScheduler:
             stream_epics = [
                 *head,
                 *(e for e in self._tradable_epics if e not in set(head)),
+            ]
+            # Same dedupe + cap as ``set_epics``, so the live list is exactly
+            # what the stream subscribes.
+            self._live_epics = list(dict.fromkeys(stream_epics))[
+                : self._settings.streaming_max_epics
             ]
             await self._streaming.set_epics(stream_epics)
 
@@ -2253,8 +2279,16 @@ class BotScheduler:
             return None, AUTO_OPEN_REFUSAL
 
         async with self._open_lock(intent.epic):
+            # ``buf`` arms the spread-budget and same-bet gates for automatic
+            # opens only: a manual dashboard open is the user's call on a spread
+            # and a book they can see.
             allowed, reason = await trading.can_open_intent(
-                intent, allow_short=allow_short, allow_reopen=allow_reopen
+                intent,
+                allow_short=allow_short,
+                allow_reopen=allow_reopen,
+                buf=None if manual else buf,
+                price_buffer=None if manual else self._buffer,
+                pending=() if manual else self._pending_bets(),
             )
             if not allowed:
                 return None, reason
@@ -2276,6 +2310,15 @@ class BotScheduler:
                 return None, NOTIFY_REFUSAL
             position = await trading.open_from_intent(intent, buf)
             return position, None
+
+    def _pending_bets(self) -> list[tuple[str, str]]:
+        """``(epic, direction)`` of the notify-mode signals awaiting the user.
+
+        Fed to the same-bet gate next to the open positions, so a signal already
+        proposed on one listing of a market is not proposed again on its twin.
+        Empty in auto mode (nothing is ever recorded there).
+        """
+        return [(s.epic, s.direction) for s in self._signals.pending()]
 
     def _market_name(self, epic: str) -> str:
         """Return the instrument description for ``epic``, or "" when unknown.
@@ -2885,7 +2928,11 @@ class BotScheduler:
                     if opened + signalled >= slots:
                         break
                     allowed, reason = await trading.can_open_intent(
-                        intent, allow_short=allow_short
+                        intent,
+                        allow_short=allow_short,
+                        buf=buf,
+                        price_buffer=self._buffer,
+                        pending=self._pending_bets(),
                     )
                     if not allowed:
                         gate_blocked += 1
