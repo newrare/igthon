@@ -13,7 +13,7 @@ from src.core.reading import CurveReading
 from src.models.day import Day
 from src.models.epic import Epic
 from src.models.position import Position, PositionState
-from src.utils.tools import euro_per_point
+from src.utils.tools import euro_per_point, euro_per_point_for_one_buy
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,9 @@ async def _refresh_account_balance(app_state, api_queue) -> None:
         app_state.account_balance_refreshing = False
 
 
-def _spread_map(request: Request, epics: list[str]) -> dict[str, dict[str, float]]:
+def _spread_map(
+    request: Request, epics: list[str]
+) -> dict[str, dict[str, float | None]]:
     """Return the cached dealing spread of ``epics`` as ``{epic: {points, euro}}``.
 
     ``euro`` is ``(offer - bid) * euro_per_point(minDealSize, currency)`` — what a
@@ -134,7 +136,9 @@ def _spread_map(request: Request, epics: list[str]) -> dict[str, dict[str, float
     ``offer - bid`` price distance it comes from. The bid/offer used is the live
     dealing spread from the market ``snapshot``, NOT the historical-candle close
     (whose bid and offer are often equal, which is where the misleading ``0`` came
-    from).
+    from). ``euroPerPoint`` is the €/point of the position a real open would take
+    (``euro_per_point_for_one_buy``: integer min size, floored at 1), so the chart
+    can label its price scale with the P&L of a fresh position.
 
     The dealing spread and the contract details live in IG market details, not in
     the price buffer. Like the balance, this is a NON-BLOCKING read: stale/missing
@@ -142,7 +146,7 @@ def _spread_map(request: Request, epics: list[str]) -> dict[str, dict[str, float
     returns whatever is already cached.
     """
     app_state = request.app.state
-    cache: dict[str, tuple[datetime, float, float]] = getattr(
+    cache: dict[str, tuple[datetime, float, float, float | None]] = getattr(
         app_state, "spread_cost_cache", {}
     )
     app_state.spread_cost_cache = cache
@@ -153,7 +157,9 @@ def _spread_map(request: Request, epics: list[str]) -> dict[str, dict[str, float
     if stale:
         _schedule_spread_cost_refresh(app_state, stale)
     return {
-        e: {"euro": cache[e][1], "points": cache[e][2]} for e in epics if e in cache
+        e: {"euro": cache[e][1], "points": cache[e][2], "euroPerPoint": cache[e][3]}
+        for e in epics
+        if e in cache
     }
 
 
@@ -183,7 +189,9 @@ def _schedule_spread_cost_refresh(app_state, stale: list[str]) -> None:
 
 async def _refresh_spread_cost(app_state, api_queue, epics: list[str]) -> None:
     """Fetch market details for ``epics`` and update the spread-cost cache."""
-    cache: dict[str, tuple[datetime, float, float]] = app_state.spread_cost_cache
+    cache: dict[str, tuple[datetime, float, float, float | None]] = (
+        app_state.spread_cost_cache
+    )
     inflight: set[str] = app_state.spread_cost_inflight
     try:
         for start in range(0, len(epics), _MARKET_BATCH_SIZE):
@@ -215,7 +223,12 @@ async def _refresh_spread_cost(app_state, api_queue, epics: list[str]) -> None:
                 currency = (instrument.get("currencies") or [{}])[0].get("code", "EUR")
                 epp = euro_per_point(detail, min_size, currency)
                 points = offer - bid
-                cache[epic] = (now, points * epp, points)
+                cache[epic] = (
+                    now,
+                    points * epp,
+                    points,
+                    euro_per_point_for_one_buy(detail),
+                )
     finally:
         inflight.difference_update(epics)
 
@@ -346,6 +359,9 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
         "flat_cut": ("Flat — cut", "#ef4444"),
         "flat_breakeven": ("Flat — no loss", "#94a3b8"),
         "flat_profit": ("Flat — gain taken", "#4ade80"),
+        # The 10:00 basket closed as a whole (src/exit/zones/basket.py).
+        "basket_win": ("Basket — gain taken", "#4ade80"),
+        "basket_eod": ("Basket — 17:30 close", "#60a5fa"),
     }
     if reason in mapping:
         return mapping[reason]
@@ -358,6 +374,7 @@ def _close_reason_label(reason: str | None) -> tuple[str, str]:
 # plan (a clock, a human, or IG itself) rather than decided by a price level.
 _FORCED_CLOSE_REASONS = {
     "end_of_day",
+    "basket_eod",
     "manual",
     "euro_target",
     "now",

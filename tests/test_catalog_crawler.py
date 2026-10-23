@@ -83,6 +83,7 @@ class FakeClient:
         version: int = 1,
         priority: int = 0,
         label: str | None = None,
+        expect_not_found: bool = False,
     ) -> dict:
         self.calls.append(endpoint)
         # An error is consumed on first use, so a "retry succeeds" case is easy.
@@ -241,6 +242,24 @@ class TestPermanentErrors:
         assert progress.nodes_pending == 0
         assert progress.complete
         assert "/marketnavigation/11" in client.calls
+
+    async def test_missing_navigation_root_ends_the_run_cleanly(self, session_factory):
+        client = FakeClient(errors={"/marketnavigation": _ig_error(404)})
+        crawler = CatalogCrawler(client=client, session_factory=session_factory)
+
+        progress = await crawler.crawl()
+
+        assert client.calls == ["/marketnavigation"]
+        assert progress.nodes_total == 0
+        assert not progress.complete
+        assert "404" in progress.last_error
+
+    async def test_root_server_error_still_raises(self, session_factory):
+        client = FakeClient(errors={"/marketnavigation": _ig_error(503)})
+        crawler = CatalogCrawler(client=client, session_factory=session_factory)
+
+        with pytest.raises(IGAPIError):
+            await crawler.crawl()
 
 
 class TestUpsert:

@@ -659,6 +659,7 @@ class _StubProfile:
         *,
         is_close_hour,
         group_tighten=None,
+        group_close=None,
         day_book=None,
     ):
         from src.exit.base import ACTION_UPDATE_STOP, CloseDecision
@@ -883,6 +884,7 @@ class _ZoneStubProfile:
         *,
         is_close_hour,
         group_tighten=None,
+        group_close=None,
         day_book=None,
     ):
         from src.exit.base import ACTION_UPDATE_STOP, CloseDecision

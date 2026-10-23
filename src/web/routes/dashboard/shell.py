@@ -109,6 +109,26 @@ def _render_modals(settings, frags: dict[str, str]) -> str:
                         attrs='id="chart-arm-custom-btn"',
                     )
                     + " "
+                    # Free stop: move the stop to the price where the position
+                    # would realise a euro P&L the user types (e.g. -30 €). The
+                    # right-edge stop buttons stop at the scale's edges, so with
+                    # the price at the top (a short) or the bottom (a long) there
+                    # is no button left to widen the stop with.
+                    + render_button(
+                        "⛔ Stop @ x €",
+                        cls="close-pos-btn",
+                        style=(
+                            "display:none;background:#2a1f0a;"
+                            "border-color:#5a4210;color:#f59e0b;"
+                        ),
+                        onclick="setChartStopPrompt(this)",
+                        title=(
+                            "Move the stop to where the position would realise "
+                            "a euro P&amp;L you choose (e.g. -30 €)"
+                        ),
+                        attrs='id="chart-stop-custom-btn"',
+                    )
+                    + " "
                     # Opens the market-reading panel (regime, trends, noise,
                     # levels, and the since-open measures when a trade is on) for
                     # the epic currently displayed. Rendered by static/reading.js
@@ -456,7 +476,7 @@ def _render_dashboard(settings, state: dict) -> str:
 </div>
 
 <script src="/static/tables.js?v=2"></script>
-<script src="/static/dashboard.js?v=49"></script>
+<script src="/static/dashboard.js?v=53"></script>
 <script src="/static/reading.js?v=1"></script>
 </body>
 </html>"""

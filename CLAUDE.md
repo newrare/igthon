@@ -34,6 +34,7 @@ process at a time).
 | Align the Markdown  | `make docs`                                                        |
 | Migrations          | `make migrate` · `make revision M="…"`                             |
 | IG tools            | `make trace` · `make adopt` · `make crawl` · `make inspect EPIC=…` |
+| Research            | `make baseline` · `make research ARGS="build"` / `"analyze"`       |
 
 Extra flags go through `ARGS`: `make test ARGS="-k signals"`.
 

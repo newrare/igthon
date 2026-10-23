@@ -212,9 +212,9 @@ class CatalogCrawler:
 
             if reset:
                 await self._reset_frontier()
-            await self._seed_root_if_empty()
+            seeded = await self._seed_root_if_empty()
 
-            while max_nodes is None or self._nodes_visited < max_nodes:
+            while seeded and (max_nodes is None or self._nodes_visited < max_nodes):
                 node = await self._next_pending()
                 if node is None:
                     logger.info("Catalog crawl: frontier drained")
@@ -238,17 +238,37 @@ class CatalogCrawler:
             await session.commit()
         logger.info("Catalog crawl: frontier reset")
 
-    async def _seed_root_if_empty(self) -> None:
-        """Insert the root navigation nodes when no node is known yet."""
+    async def _seed_root_if_empty(self) -> bool:
+        """Insert the root navigation nodes when no node is known yet.
+
+        Returns:
+            False when IG does not serve the navigation tree at all (the demo
+            gateway answers ``404`` on ``/marketnavigation``, whatever the
+            version or auth) — the crawl then has nothing to walk.
+        """
         async with self.session_factory() as session:
             known = int(
                 (await session.scalar(select(func.count()).select_from(CatalogNode)))
                 or 0
             )
         if known:
-            return
+            return True
 
-        data = await self._fetch(self.ROOT_ENDPOINT, label="GET /marketnavigation")
+        try:
+            data = await self._fetch(
+                self.ROOT_ENDPOINT,
+                label="GET /marketnavigation",
+                expect_not_found=True,
+            )
+        except IGAPIError as exc:
+            if exc.response.status_code != 404:
+                raise
+            self._last_error = "IG navigation unavailable (404 on /marketnavigation)"
+            logger.warning(
+                "Catalog crawl: IG does not serve /marketnavigation on this "
+                "environment (404) — nothing to crawl"
+            )
+            return False
         async with self.session_factory() as session:
             added = await self._add_children(
                 session, data.get("nodes") or [], parent=None
@@ -259,6 +279,7 @@ class CatalogCrawler:
             )
             await session.commit()
         logger.info("Catalog crawl: seeded %d root nodes", added)
+        return True
 
     async def _next_pending(self) -> _PendingNode | None:
         """Return the next node to visit — shallowest first (breadth-first).
@@ -495,10 +516,16 @@ class CatalogCrawler:
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _fetch(self, endpoint: str, *, label: str) -> dict:
+    async def _fetch(
+        self, endpoint: str, *, label: str, expect_not_found: bool = False
+    ) -> dict:
         """GET a navigation endpoint through the queue at background priority."""
         return await self.client.get(
-            endpoint, version=1, priority=Priority.LOW, label=label
+            endpoint,
+            version=1,
+            priority=Priority.LOW,
+            label=label,
+            expect_not_found=expect_not_found,
         )
 
     def _is_excluded(self, name: str) -> bool:

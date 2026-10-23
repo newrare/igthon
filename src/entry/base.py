@@ -119,6 +119,13 @@ class EntryStrategy(ABC):
     # always judged on a whole series rather than on a drip of overlapping trades.
     # See :class:`~src.entry.open_five.OpenFive`.
     require_flat_book: bool = False
+    # When True the rolling selector opens **nothing more today** once any
+    # position has been opened today (open or already closed). Paired with
+    # ``require_flat_book`` it makes the basket a once-a-day decision: a basket
+    # closed minutes after its open is not followed by a second one. Any opening
+    # of the day counts, manual dashboard opens included.
+    # See :class:`~src.entry.open_basket.OpenBasket`.
+    one_series_per_day: bool = False
     # When True the rolling selector opens nothing unless **every** currently open
     # position sits in a market the regime calls ``RANGE`` — the move it was opened
     # for is over and the price is chopping inside a contained band. A single open

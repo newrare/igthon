@@ -179,6 +179,7 @@ call must not quietly replay something else:
 | `OPEN_STRATEGY`   | `open_manual`  | waits for a human order — there is no signal to replay                                                                 |
 | `OPEN_STRATEGY`   | `open_testing` | opens unconditionally — replaying it tests nothing                                                                     |
 | `CLOSE_ZONESTART` | `smartgroup`   | decides for the whole book from the scheduler's cross-position pre-pass (`plan_group`), which the engine does not have |
+| `CLOSE_ZONESTART` | `basket`       | closes the whole book from the same pre-pass — a replay would never close the basket                                   |
 
 When one of them *is* the live value, the page still lists it — hiding it would
 leave you wondering why the page disagrees with `.env` — but as a **disabled**
@@ -367,6 +368,136 @@ or when any **resolved** selector name is unknown or untestable — including a 
 inherited from `.env` rather than requested (see *Names the backtest refuses*).
 `/api/backtest/export` returns **503** if the process has no candle store (e.g. a
 web-only deployment).
+
+## Research tools
+
+A backtest answers "what did this strategy earn?". Two offline tools answer the
+questions that come before it. Both read the archive only — no DB, no IG call,
+safe while the bot runs — and are tracked in [TODO.md](TODO.md).
+
+### Random-direction baseline (`make baseline`)
+
+[random_baseline.py](../src/backtest/random_baseline.py) replays a strategy once
+for real and `--seeds` times with every open's **side drawn by a coin flip** —
+same epics, same minutes, same ranking, same close profile, same gates. The flip
+is a hash of `(seed, epic, minute)`, so a seed reproduces exactly and a ranker
+re-evaluating an epic gets the same side every time. A strategy has direction
+skill only when its mean R sits in the upper tail of those coin-flip replays.
+
+```bash
+make baseline ARGS="--strategy open_fade --seeds 20"
+make baseline ARGS="--all --seeds 20 --json baseline.json"   # every strategy
+```
+
+The report gives, per strategy, the real trade count / mean R / euros, the null
+median and 95th percentile, `z` (distance from chance in null standard
+deviations), `p(z)` (its normal p-value, compared with the Bonferroni threshold)
+and the empirical `p` (share of coin flips at least as good, floored at
+`1 / (seeds + 1)` — which is why `p(z)` carries the decision). Each replay is a
+full backtest; they run in parallel worker processes (`--workers`, default
+CPU − 1), so expect roughly *(seeds + 1) × strategies ÷ workers* backtest
+durations.
+
+### Research dataset (`make research`)
+
+[research.py](../src/backtest/research.py) samples every epic every `--step`
+minutes (07:00–17:00 UTC) and writes one row per moment to
+`<CANDLE_DUMP_DIR>/research/dataset.csv`:
+
+- **features**, read on the same day's candles up to that minute only (no
+  look-ahead): `trend60_pct`, `r2_60`, `chan60`, `er60`, `roc30_atr`,
+  `atr_spread` (ATR ÷ spread — movement per unit of cost), `vol_ratio`,
+  `day_move_atr`, `day_pos`, `hour_paris`, `weekday`, `asset_class`;
+- **outcomes** `r_buy` / `r_sell`: the R a BUY and a SELL opened right then would
+  have paid, net of the spread, under a fixed bracket (default stop 2.5 ATR,
+  target 5 ATR, 120-minute horizon, marked to market at the 17:00 UTC
+  force-close; a candle touching both levels counts as a stop).
+
+```bash
+make research ARGS="build"                       # whole archive (~6 s per week)
+make research ARGS="build --stop-atr 2.5 --target-atr 5 --horizon 120 --step 5"
+make research ARGS="analyze"                     # train 60 % / test 40 % of the days
+make research ARGS="analyze --test-from 2026-10-05"   # forward check of a frozen rule
+```
+
+`analyze` cuts the **days** in time order, buckets every numeric feature into
+deciles on the train half only (categorical ones by value) and prints the
+buckets whose mean R is positive on **both** halves, with a day-clustered
+bootstrap p-value on the test half, flagged when below the Bonferroni threshold
+over every bucket × side tested. The unfiltered BUY / SELL mean is printed first:
+it is what any filter has to beat.
+
+### Scale and cost (`--timeframe`, `--overnight`, `markets`)
+
+On the 1-minute scale the median spread is about one ATR, so a 2.5-ATR stop pays
+roughly `1 / 3.5` of its risk at entry — exactly the −0.29 R a random walk loses
+(see [TODO.md](TODO.md)). Three knobs move the bracket away from that cost:
+
+| Option          | Effect                                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--timeframe N` | size the stop/target on the ATR of `N`-minute bars (noise grows ≈ √N, the spread does not)                    |
+| `--horizon M`   | hold for up to `M` **wall-clock** minutes (a feed gap is not walked through as trading time)                  |
+| `--overnight`   | no 17:00 UTC force-close: the trade is held across nights                                                     |
+| `--funding F`   | with `--overnight`, IG's overnight funding: `F / 365` of the price per night held (annual, e.g. `0.04` = 4 %) |
+
+The new `tf_atr_spread` feature is the bracket's ATR ÷ spread (equal to
+`atr_spread` on the 1-minute scale), and `markets` ranks the epics by its median
+on the **train** half, then measures the cheapest 10 / 25 / 50 % on the **test**
+half against the rest:
+
+```bash
+make research ARGS="build --timeframe 15 --horizon 600 --step 15 --path dumps/research/tf15.csv"
+make research ARGS="build --timeframe 60 --overnight --funding 0.04 --horizon 4320 --step 60 --path dumps/research/tf60n.csv"
+make research ARGS="markets --path dumps/research/tf60n.csv"
+make research ARGS="analyze --path dumps/research/tf60n.csv"
+```
+
+The replay engine itself still force-closes every position at the end of the
+day; a multi-day result here is a reason to lift that, not a backtest of it.
+
+### A strategy's signal on the dataset (`--strategy`, `signal`)
+
+`build --strategy NAME` stamps every row with the side that entry strategy
+would have proposed at that minute, read on a live-sized one-minute buffer
+(200 candles, reset each UTC day) — the strategy's own signal, whatever
+`--timeframe` the outcome is measured on. `signal` then scores the signalled rows
+on both halves: **signal R** (following it), **coin R** (a coin flip on the same
+rows: the mean of the BUY and SELL outcomes, so the drift and the cost are the
+same) and **excess** = signal − coin, the direction skill, each with a
+day-clustered p-value — also restricted to the cheapest markets (`--top`).
+
+```bash
+make research ARGS="build --timeframe 15 --horizon 600 --step 5 --strategy open_fade --path dumps/research/fade15.csv"
+make research ARGS="signal --path dumps/research/fade15.csv --top 0.25 0.5 --first"
+```
+
+By default every row where the signal holds is counted (overlapping minutes of
+one episode included); `--first` keeps only the first signalled row of each epic
+and day, the live one-open-per-epic-per-day.
+
+### Forward validation
+
+A bucket that passes `analyze` was still *chosen* on the archive. It becomes a
+rule only once it holds on data that did not exist when it was chosen:
+
+1. **Freeze** the rule (feature, bucket, side, bracket) and the date `D` it was
+   chosen — write them in [TODO.md](TODO.md). No re-tuning afterwards.
+1. **Let new weeks accumulate.** The retention dump archives each week about 7
+   days after it ends; *Snapshot DB now* on `/backtest` adds the recent days.
+1. **Re-score** weekly with `make research ARGS="build"` then
+   `ARGS="analyze --test-from D"`: the train half (and every decile edge) stays
+   the pre-`D` archive, only post-`D` days are scored.
+1. **Decide** on a pre-set criterion — the frozen bucket's test mean R > 0 with a
+   day-clustered `p` below 0.05 over enough days (see the sizing below), not on
+   whichever bucket looks best that week.
+1. **Then live, in notify mode**: implement the rule as an entry module, run it
+   with `OPEN_MODE=notify` on the demo account and compare the signalled fills
+   (spread, slippage) with the replay before any `auto` opening.
+
+Sizing: one trade's R has a standard deviation of about 1.3 R here, so a true
+edge of `e` R needs about `(1.645 × 1.3 / e)²` independent trades to show at
+`p < 0.05` — ~450 trades for +0.1 R, ~110 for +0.2 R. Samples of one day are not
+independent: count days, not rows.
 
 ## Caveats
 

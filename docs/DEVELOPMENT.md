@@ -55,6 +55,8 @@ make help        # list every target, grouped, with the active WEB_PORT
 |              | `adopt`          | `python -m src.scripts.adopt_orphans`                |
 |              | `inspect EPIC=…` | `python -m src.scripts.inspect_market <epic>`        |
 |              | `dump-euro`      | `python -m src.scripts.dump_euro_per_point`          |
+| Research     | `baseline`       | `python -m src.scripts.random_baseline`              |
+|              | `research`       | `python -m src.scripts.research build` / `analyze`   |
 | Housekeeping | `clean`          | drop `__pycache__`, `.pytest_cache`, `.ruff_cache`   |
 
 Conventions:
@@ -110,7 +112,14 @@ make inspect EPIC=CC.D.LCC.UNC.IP   # python -m src.scripts.inspect_market
 make crawl                          # python -m src.scripts.crawl_catalog
 make crawl-status                   # crawl progress, no IG session
 make dump-euro                      # python -m src.scripts.dump_euro_per_point
+make baseline ARGS="--strategy open_fade"   # strategy vs coin-flip replays
+make research ARGS="build"          # research dataset from the archive
+make research ARGS="analyze"        # train/test analysis of that dataset
 ```
+
+`baseline` and `research` read the candle archive only (see
+[BACKTESTING.md](BACKTESTING.md#research-tools)): no IG session, safe while the
+bot runs.
 
 `crawl` and `dump-euro` open their own IG session: run them with the bot stopped
 (`make stop`), or expect the bot's session to be re-authenticated.

@@ -16,6 +16,12 @@ The book is deliberately in-memory and short-lived:
 * a restart clears the book, which is the correct behaviour: the strategy
   re-signals on its next tick if the setup is still there.
 
+The same channel carries one other kind of alert: a **review** (``kind="review"``)
+— not a proposed open but a request for a decision on positions already held,
+raised by the ``basket`` close when the day's basket is still open at 11:00. It
+reuses the notification, the tab badge and the dismiss flow, and is never
+counted as a pending bet.
+
 Per-epic cooldown keeps one setup from flooding the browser: while a signal for
 an epic is still pending (or was dismissed less than ``cooldown`` ago) the same
 epic raises nothing new.
@@ -65,6 +71,9 @@ class EntrySignal:
         dismissed_at: When the user dismissed it (UTC), else ``None``. A
             dismissed signal leaves :meth:`SignalBook.pending` but still holds
             its epic in cooldown.
+        kind: ``"entry"`` for a proposed open, ``"review"`` for a request to
+            decide on positions already held (see the module docstring).
+        note: Free text shown with a review (empty for an entry signal).
     """
 
     id: int
@@ -76,6 +85,8 @@ class EntrySignal:
     name: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     dismissed_at: datetime | None = None
+    kind: str = "entry"
+    note: str = ""
 
     def as_dict(self) -> dict:
         """Return the JSON shape consumed by the dashboard."""
@@ -89,6 +100,8 @@ class EntrySignal:
             "name": self.name or self.epic,
             "created_at": self.created_at.isoformat(),
             "age_seconds": int((datetime.now(UTC) - self.created_at).total_seconds()),
+            "kind": self.kind,
+            "note": self.note,
         }
 
 
@@ -129,6 +142,8 @@ class SignalBook:
         score: float = 0.0,
         price: float = 0.0,
         name: str = "",
+        kind: str = "entry",
+        note: str = "",
     ) -> EntrySignal | None:
         """Raise a signal on ``epic`` unless it is still in cooldown.
 
@@ -147,6 +162,8 @@ class SignalBook:
             score=score,
             price=price,
             name=name,
+            kind=kind,
+            note=note,
         )
         self._signals.append(signal)
         self._version += 1

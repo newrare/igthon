@@ -652,6 +652,7 @@ async function requestSignalNotifications(btn) {
 }
 
 function _showSignalNotification(sig) {
+    if (sig.kind === 'review') { _showReviewNotification(sig); return; }
     const dir   = (sig.direction || 'BUY').toUpperCase();
     const title = dir + ' signal — ' + (sig.name || sig.epic);
     const price = sig.price ? ' @ ' + Number(sig.price).toFixed(2) : '';
@@ -669,6 +670,29 @@ function _showSignalNotification(sig) {
             tag: 'ig-signal-' + sig.id,   // one notification per signal, never stacked
             requireInteraction: true,     // stays until the user acts on it
             silent: true,                 // the chime above is the sound — never double it
+        });
+        notif.onclick = function() {
+            window.focus();
+            notif.close();
+            openSignalChart(sig.epic, sig.id, null);
+        };
+    } catch (_) {}
+}
+
+// A review is not a proposed open: the open book (the 10:00 basket) is still
+// red at 11:00 and the user decides for the day. Same alert chain, other words.
+function _showReviewNotification(sig) {
+    const title = 'Basket review — your call for the day';
+    const body  = sig.note || 'The basket is still open.';
+    showToast(title, body, 'warning');
+    playSignalChime('SELL');
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    try {
+        const notif = new Notification(title, {
+            body: body,
+            tag: 'ig-signal-' + sig.id,
+            requireInteraction: true,
+            silent: true,
         });
         notif.onclick = function() {
             window.focus();
@@ -1158,12 +1182,18 @@ function _positionFundsTip(target) {
     const tip = _ensureFundsTip();
     const r = target.getBoundingClientRect();
     // Anchor above the button, horizontally centered, clamped to the viewport.
+    // Flip below the button when there is no room above (e.g. the chart modal
+    // header sits at the top of the screen), then clamp to the viewport.
     tip.style.display = 'block';
     const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
     let left = r.left + r.width / 2 - tw / 2;
     left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+    let top = r.top - th - 8;
+    if (top < 8) top = r.bottom + 8;
+    top = Math.max(8, Math.min(top, window.innerHeight - th - 8));
     tip.style.left = left + 'px';
-    tip.style.top  = (r.top - tip.offsetHeight - 8) + 'px';
+    tip.style.top  = top + 'px';
 }
 
 function _renderFundsTip(target, data) {
@@ -1514,14 +1544,58 @@ async function _setStop(trade, price, btn) {
             if (_chartModalEpic) _loadChart(_chartModalEpic, false);
         } else {
             showToast('Stop not changed', data.error || 'Rejected', 'error');
-            btn.disabled = false;
-            btn.textContent = orig;
         }
     } catch (e) {
         showToast('Stop not changed', e.message, 'error');
+    } finally {
+        // The right-edge buttons are rebuilt by the repaint anyway; the header
+        // "Stop @ x" button is not, so always hand it back in its idle state.
         btn.disabled = false;
         btn.textContent = orig;
     }
+}
+
+// Header "Stop @ x €": move the stop beyond what the right-edge buttons reach.
+// Those span only the chart's 0-100 % scale, so with the price at the top (a
+// short) or the bottom (a long) there is no button left to widen the stop. The
+// user types the euro P&L the stop should realise ("-30" caps the loss at 30 €),
+// converted to a price with the same math as the euro axis and the stop-line
+// labels (open level, side, €/point). The server still refuses a stop on the
+// wrong side of the price.
+function setChartStopPrompt(btn) {
+    const t = _chartOpenTrade;
+    if (!t || t.state !== 'open') return;
+    const epp = t.euroPerPoint;
+    if (typeof epp !== 'number' || !epp || typeof t.open !== 'number') {
+        showToast('Stop not changed', 'No €/point known for this position yet', 'error');
+        return;
+    }
+    const sell = (t.direction || '').toUpperCase() === 'SELL';
+    // Prefill with the euro value of the live follower stop: the last step of
+    // its ratchet path, else the flat initial level.
+    const steps = t.stopsFollower || [];
+    const last = steps.length ? steps[steps.length - 1].level : t.stopFollower;
+    const preset = typeof last === 'number' && isFinite(last)
+        ? Math.round((sell ? (t.open - last) : (last - t.open)) * epp)
+        : '';
+    const raw = window.prompt(
+        'Stop ' + (_chartModalEpic || 'this position')
+            + ' at a P&L of… (€, e.g. -30)',
+        String(preset)
+    );
+    if (raw === null) return;
+    const euro = parseFloat(String(raw).replace(',', '.').trim());
+    if (!isFinite(euro)) {
+        showToast('Stop not changed', 'Enter a euro figure, e.g. -30', 'error');
+        return;
+    }
+    const move = euro / epp;
+    const price = sell ? t.open - move : t.open + move;
+    if (!isFinite(price) || price <= 0) {
+        showToast('Stop not changed', 'That loss puts the stop below zero', 'error');
+        return;
+    }
+    _setStop(t, price, btn);
 }
 
 // Plotly relayout handler: a manual zoom/pan sets an explicit x-range (freeze);
@@ -1731,7 +1805,7 @@ function _renderChartNoise(candle, spread) {
 function _updateChartCloseControls() {
     const t = _chartOpenTrade;
     const open = !!t && t.state === 'open';
-    ['chart-arm-zero-btn', 'chart-arm-custom-btn'].forEach(function(id) {
+    ['chart-arm-zero-btn', 'chart-arm-custom-btn', 'chart-stop-custom-btn'].forEach(function(id) {
         const b = document.getElementById(id);
         if (b) b.style.display = open ? '' : 'none';
     });
@@ -1855,6 +1929,49 @@ async function closeChartPosition(btn) {
     } finally {
         delete btn.dataset.busy;
     }
+}
+
+// ── Euro P&L on the price scale ──────────────────────────────────────────────
+// The y-axis is a %-of-range scale; each 5 % tick also states the euro P&L the
+// bid reaching that price would realise, so risk and potential gain read at a
+// glance. Reference position:
+//   - the OPEN trade, when there is one (its open level, side and €/point — the
+//     same math as the stop-line suffixes and the running P&L badge);
+//   - otherwise a hypothetical minimum-size BUY opened now on the last offer
+//     (€/point from the spread cache, the quantity a real open takes). Filled on
+//     the offer, exited on the bid: the spread is already counted, so "+0 €" is
+//     break-even.
+// Returns null when no €/point is known yet (plain % ticks are drawn instead).
+function _euroAxisRef(openTrade, spread, lastOffer) {
+    if (openTrade) {
+        const epp = openTrade.euroPerPoint;
+        if (typeof epp !== 'number' || !epp || typeof openTrade.open !== 'number') return null;
+        return { open: openTrade.open, epp: epp, sell: openTrade.direction === 'SELL', live: true };
+    }
+    const epp = spread && typeof spread.euroPerPoint === 'number' ? spread.euroPerPoint : null;
+    if (!epp || typeof lastOffer !== 'number' || !isFinite(lastOffer)) return null;
+    return { open: lastOffer, epp: epp, sell: false, live: false };
+}
+
+function _fmtEuroTick(pnl) {
+    const abs = Math.abs(pnl);
+    const digits = abs >= 10 ? 0 : (abs >= 1 ? 1 : 2);
+    const shown = abs.toFixed(digits);
+    if (Number(shown) === 0) return '<span style="color:#cbd5e1;">0 €</span>';
+    const color = pnl > 0 ? '#4ade80' : '#ef4444';
+    return '<span style="color:' + color + ';">' + (pnl > 0 ? '+' : '−') + shown + ' €</span>';
+}
+
+// Tick values/labels for the %-scale: "85%  +5 €" (green gain, red loss).
+function _euroAxisTicks(lo, range, ref) {
+    const vals = [], text = [];
+    for (let p = 0; p <= 100; p += 5) {
+        vals.push(p);
+        const price = lo + (p / 100) * range;
+        const move = ref.sell ? (ref.open - price) : (price - ref.open);
+        text.push(p + '%  ' + _fmtEuroTick(move * ref.epp));
+    }
+    return { vals: vals, text: text };
 }
 
 // Fetch the whole-day curve for ``epic`` and (re)draw it. ``initial`` paints the
@@ -2312,6 +2429,31 @@ async function _loadChart(epic, initial) {
         }
         const xIsDate = true;
 
+        // Euro P&L next to each %-tick (open trade, else a fresh min-size BUY).
+        const euroRef = (range > 0)
+            ? _euroAxisRef(_chartOpenTrade, data.spread, rawOffers[rawOffers.length - 1])
+            : null;
+        const euroTicks = euroRef ? _euroAxisTicks(lo, range, euroRef) : null;
+        const yaxis = {
+            gridcolor: '#2d2319',
+            zerolinecolor: '#2d2319',
+            ticksuffix: '%',
+            range: [-3, 103],
+            title: ''
+        };
+        if (euroTicks) {
+            yaxis.tickmode = 'array';
+            yaxis.tickvals = euroTicks.vals;
+            yaxis.ticktext = euroTicks.text;
+            yaxis.ticksuffix = '';
+            // States which position the euro figures refer to.
+            yaxis.title = {
+                text: euroRef.live ? '€ P&L of the open trade' : '€ P&L if BUY now (min size)',
+                font: { size: 10, color: '#64748b' },
+                standoff: 4
+            };
+        }
+
         const layout = {
             paper_bgcolor: '#1c1714',
             plot_bgcolor: '#1c1714',
@@ -2319,7 +2461,8 @@ async function _loadChart(epic, initial) {
             // Widen the right margin into a gutter for the stop buttons when the
             // epic has an open position; the price-level labels (anchored at the
             // plot's right edge) then sit just left of that gutter.
-            margin: { l: 55, r: _chartOpenTrade ? 52 : 20, t: 22, b: 50 },
+            // The left margin widens to fit the euro P&L next to each %-tick.
+            margin: { l: euroTicks ? 125 : 55, r: _chartOpenTrade ? 52 : 20, t: 22, b: 50 },
             showlegend: false,
             shapes: shapes,
             annotations: annotations,
@@ -2330,13 +2473,7 @@ async function _loadChart(epic, initial) {
                 tickformat: xIsDate ? '%H:%M' : '',
                 title: ''
             },
-            yaxis: {
-                gridcolor: '#2d2319',
-                zerolinecolor: '#2d2319',
-                ticksuffix: '%',
-                range: [-3, 103],
-                title: ''
-            },
+            yaxis: yaxis,
         };
         const config = { responsive: true, displayModeBar: false };
         // newPlot for the first paint (clears the Loading placeholder); react for

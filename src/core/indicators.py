@@ -182,6 +182,47 @@ def atr_from_series(
     return sum(true_ranges) / period
 
 
+def timeframe_atr(
+    candles: list[Candle], minutes: int, period: int = 14, min_period: int = 8
+) -> float:
+    """ATR measured on ``minutes``-minute bars built from one-minute candles.
+
+    The one-minute ATR is mostly bid churn — about one spread on a typical
+    market — so a stop meant to survive hours of holding is sized on a longer
+    bar instead. Bars are grouped on the clock (``floor(epoch minute /
+    minutes)``), bid OHLC only; the last bar may be partial, which keeps the
+    measure free of look-ahead.
+
+    The live buffer holds ~3 h of candles, i.e. about 13 quarter-hour bars, so
+    the period shrinks to what the history allows (``bars − 1``) as long as at
+    least ``min_period`` true ranges remain.
+
+    Returns:
+        ATR in price points, or 0.0 when fewer than ``min_period`` + 1 bars exist.
+    """
+    if minutes <= 1:
+        return atr(candles, period)
+    highs: list[float] = []
+    lows: list[float] = []
+    closes: list[float] = []
+    current_key = None
+    for candle in candles:
+        key = int(candle.timestamp.timestamp() // 60) // minutes
+        if key != current_key:
+            current_key = key
+            highs.append(candle.bid_high)
+            lows.append(candle.bid_low)
+            closes.append(candle.bid_close)
+            continue
+        highs[-1] = max(highs[-1], candle.bid_high)
+        lows[-1] = min(lows[-1], candle.bid_low)
+        closes[-1] = candle.bid_close
+    usable = min(period, len(closes) - 1)
+    if usable < max(min_period, 1):
+        return 0.0
+    return atr_from_series(highs, lows, closes, usable)
+
+
 def adverse_tick_noise(
     bid_closes: list[float], window: int = 20, std_k: float = 2.0
 ) -> float:

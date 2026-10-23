@@ -151,3 +151,21 @@ class TestSerialisation:
         book.record("E", "BUY")
         book.dismiss(first.id)
         assert len(book) == 1
+
+
+class TestReviewKind:
+    def test_review_carries_its_kind_and_note(self):
+        book = SignalBook()
+
+        signal = book.record("A", "SELL", kind="review", note="decide")
+
+        assert signal is not None
+        payload = book.as_dicts()[0]
+        assert payload["kind"] == "review"
+        assert payload["note"] == "decide"
+
+    def test_entry_is_the_default_kind(self):
+        book = SignalBook()
+        book.record("A", "BUY")
+
+        assert book.as_dicts()[0]["kind"] == "entry"

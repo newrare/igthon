@@ -25,13 +25,14 @@ from src.core.scheduler import (
 )
 from src.entry.base import EntryIntent
 from src.entry.open_allincrease import OpenAllIncrease
+from src.entry.open_basket import OpenBasket
 from src.entry.open_five import OpenFive
 from src.entry.open_momentum import OpenMomentum
 from src.entry.open_ranking import OpenRanking
 from src.entry.open_saferanking import OpenSafeRanking
 from src.entry.open_steady import OpenSteady
 from src.execution.trading import TradeConfig
-from src.exit.zones import GroupPlanReport
+from src.exit.zones import GroupPlanReport, MemberValuation
 from src.feed.price_buffer import Candle, EpicBuffer, PriceBuffer
 from src.markets.market_scanner import MarketInfo
 from src.models.database import Base
@@ -2306,6 +2307,7 @@ class TestRecoveryRevert:
         scheduler._settings.allow_recovery_revert = allow  # real bool, not a Mock
         # Skip building a real close profile from the MagicMock settings.
         scheduler._close_profile_obj = MagicMock()
+        scheduler._close_profile_obj.is_group_aware = False
         # The curve the revert filter reads: one candle per minute from the open.
         # ``first_candle_minute`` shifts the whole series (negative = candles that
         # predate the open, which the filter must not count).
@@ -2722,6 +2724,147 @@ class TestRequireFlatBook:
         await scheduler._select_and_open()
 
         assert strategy.evaluate.call_count == 3
+
+
+class TestOneSeriesPerDay:
+    """``one_series_per_day`` — ``open_basket`` opens one basket a day, no more.
+
+    ``require_flat_book`` alone would open a second basket the moment the first
+    one closed; the once-a-day brake keeps the selector shut for the rest of the
+    day once anything has been opened today, open or closed.
+    """
+
+    def _scheduler(self, session_factory, strategy):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        scheduler._strategy = strategy
+        strategy.min_participation_ratio = 0.0
+        strategy.min_participation_count = 0
+        scheduler._tradable_epics = [f"E{i}" for i in range(3)]
+        strategy.evaluate = MagicMock(return_value=None)
+        base = datetime.now(UTC) - timedelta(minutes=strategy.warmup)
+        for i in range(3):
+            for k in range(strategy.warmup):
+                scheduler._buffer.add_candle(
+                    f"E{i}", _candle(base + timedelta(minutes=k))
+                )
+        return scheduler
+
+    @staticmethod
+    async def _add_closed_today(session_factory) -> None:
+        async with session_factory() as session:
+            session.add(
+                Position(
+                    epic="DONE",
+                    epic_name="DONE",
+                    date=date.today(),
+                    state=PositionState.CLOSE,
+                )
+            )
+            await session.commit()
+
+    async def test_a_fresh_day_runs_the_tournament(self, session_factory):
+        scheduler = self._scheduler(session_factory, OpenBasket())
+
+        await scheduler._select_and_open()
+
+        assert scheduler._strategy.evaluate.call_count == 3
+
+    async def test_a_closed_basket_is_not_replaced_today(self, session_factory):
+        scheduler = self._scheduler(session_factory, OpenBasket())
+        await self._add_closed_today(session_factory)
+
+        await scheduler._select_and_open()
+
+        scheduler._strategy.evaluate.assert_not_called()
+
+    async def test_other_strategies_are_unaffected(self, session_factory):
+        strategy = OpenFive()
+        assert strategy.one_series_per_day is False
+        scheduler = self._scheduler(session_factory, strategy)
+        await self._add_closed_today(session_factory)
+
+        await scheduler._select_and_open()
+
+        assert strategy.evaluate.call_count == 3
+
+
+class TestBasketGroupClose:
+    """The monitor forwards a whole-book close and raises the 11:00 review."""
+
+    def _scheduler(self, session_factory, monkeypatch, report: GroupPlanReport):
+        scheduler = _streaming_scheduler(session_factory, MagicMock())
+        for epic in ("A", "B"):
+            scheduler._buffer.add_candle(epic, _candle(datetime.now(UTC)))
+        profile = MagicMock()
+        profile.is_group_aware = True
+        profile.group_member = MagicMock(side_effect=lambda p, bid, buf: p.id)
+        profile.explain_group = MagicMock(return_value=report)
+        scheduler._close_profile_obj = profile
+
+        seen: list[tuple[str, str | None]] = []
+
+        async def _manage(
+            position, current_bid, buf=None, *, group_close=None, **kwargs
+        ):
+            seen.append((position.epic, group_close))
+            return False
+
+        trading_stub = MagicMock()
+        trading_stub.manage_position = AsyncMock(side_effect=_manage)
+        monkeypatch.setattr(
+            "src.core.scheduler.TradingService", lambda *a, **k: trading_stub
+        )
+        return scheduler, profile, seen
+
+    @staticmethod
+    def _report(**fields) -> GroupPlanReport:
+        values = {
+            "plan": {},
+            "total_euro": -12.0,
+            "gate_euro": 5.0,
+            "armed": False,
+            "valuations": [
+                MemberValuation(1, 1.0, 0.0, False, 1.0, -2.0),
+                MemberValuation(2, 1.0, 0.0, False, 1.0, -10.0),
+            ],
+            "unpriceable": [],
+            "close_only": True,
+        }
+        values.update(fields)
+        return GroupPlanReport(**values)
+
+    async def test_the_close_reaches_every_position(self, session_factory, monkeypatch):
+        report = self._report(armed=True, close_reason="basket_win", total_euro=9.0)
+        scheduler, profile, seen = self._scheduler(session_factory, monkeypatch, report)
+        await TestGroupStopPrePass._add_positions(session_factory, ("A", "B"))
+
+        await scheduler._monitor_positions()
+
+        assert "now" in profile.explain_group.call_args.kwargs
+        assert "day_book" in profile.explain_group.call_args.kwargs
+        assert sorted(seen) == [("A", "basket_win"), ("B", "basket_win")]
+        assert scheduler.signals.as_dicts() == []
+
+    async def test_the_review_is_raised_once_on_the_worst_leg(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, _profile, seen = self._scheduler(
+            session_factory, monkeypatch, self._report(review_due=True)
+        )
+        await TestGroupStopPrePass._add_positions(session_factory, ("A", "B"))
+
+        await scheduler._monitor_positions()
+        await scheduler._monitor_positions()
+
+        signals = scheduler.signals.as_dicts()
+        assert len(signals) == 1
+        assert signals[0]["kind"] == "review"
+        assert signals[0]["epic"] == "B"  # the −10 € leg
+        assert "-12.00" in signals[0]["note"]
+        # Nothing closes: the review only asks the user.
+        assert sorted(seen) == [("A", None), ("A", None), ("B", None), ("B", None)]
+        # A review is not a pending bet for the same-bet gate.
+        assert scheduler._pending_bets() == []
 
 
 class TestRequireRangeBook:

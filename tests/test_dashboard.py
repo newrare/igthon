@@ -951,7 +951,7 @@ class TestRenderDashboard:
         # ``?v=`` query whenever the file changes so browsers don't serve a
         # stale cached copy (the reason a JS change can appear to "not work").
         html = _render_dashboard(_settings(), _base_state())
-        assert "/static/dashboard.js?v=49" in html
+        assert "/static/dashboard.js?v=53" in html
 
     def test_page_has_per_section_refresh_stamps(self):
         html = _render_dashboard(_settings(), _base_state())
@@ -1241,12 +1241,39 @@ class TestChartEndpoint:
         # The chart states what a round trip on the market costs, read from the
         # background-refreshed spread cache (never awaited here).
         app.state.spread_cost_cache = {
-            "IX.D.DAX.IFMM.IP": (datetime.now(UTC), 2.5, 1.25)
+            "IX.D.DAX.IFMM.IP": (datetime.now(UTC), 2.5, 1.25, 2.0)
         }
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             data = (await client.get("/api/chart/IX.D.DAX.IFMM.IP")).json()
-        assert data["spread"] == {"euro": 2.5, "points": 1.25}
+        # ``euroPerPoint`` labels the price scale with a fresh position's P&L.
+        assert data["spread"] == {"euro": 2.5, "points": 1.25, "euroPerPoint": 2.0}
+
+    async def test_spread_refresh_caches_the_open_size_euro_per_point(self):
+        # The chart's euro price scale needs the €/point of the position a real
+        # open takes: integer min size floored at 1 (0.5 → 1), not the raw 0.5.
+        from src.web.routes.dashboard.state import _refresh_spread_cost
+
+        detail = {
+            "instrument": {
+                "epic": "CS.D.EURUSD.MINI.IP",
+                "contractSize": "10",
+                "currencies": [{"code": "EUR"}],
+            },
+            "snapshot": {"bid": 1.1000, "offer": 1.1002},
+            "dealingRules": {"minDealSize": {"value": 0.5}},
+        }
+
+        class _Queue:
+            async def get(self, *_args, **_kwargs):
+                return {"marketDetails": [detail]}
+
+        state = SimpleNamespace(spread_cost_cache={}, spread_cost_inflight=set())
+        await _refresh_spread_cost(state, _Queue(), ["CS.D.EURUSD.MINI.IP"])
+        _, euro, points, epp = state.spread_cost_cache["CS.D.EURUSD.MINI.IP"]
+        assert epp == pytest.approx(10.0)
+        assert points == pytest.approx(0.0002)
+        assert euro == pytest.approx(0.0002 * 5.0)
 
     async def test_chart_payload_spread_is_none_when_uncached(self, app):
         transport = ASGITransport(app=app)
@@ -2125,7 +2152,7 @@ class TestReadingEndpoint:
 
     async def test_spread_is_read_from_the_cache_not_the_api(self):
         app, epic = _reading_app([18000.0] * 40)
-        app.state.spread_cost_cache = {epic: (datetime.now(UTC), 2.5, 1.25)}
+        app.state.spread_cost_cache = {epic: (datetime.now(UTC), 2.5, 1.25, 2.0)}
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             data = (await client.get(f"/api/reading/{epic}")).json()
@@ -2306,3 +2333,38 @@ class TestCatalogEndpoint:
         )
         assert "runAction('crawl_market_catalog'" in frags["actions"]
         assert "toggleJobMode('crawl_market_catalog'" not in frags["actions"]
+
+
+class TestReviewSignalCard:
+    """The basket 11:00 review shows in both open modes, above entry signals."""
+
+    _REVIEW = {
+        "id": 9,
+        "epic": "CS.D.EURUSD.CFD.IP",
+        "name": "EUR/USD",
+        "direction": "SELL",
+        "strategy": "open_basket",
+        "score": -12.0,
+        "price": 0.0,
+        "age_seconds": 30,
+        "kind": "review",
+        "note": "3 position(s) still open, book -12.00€",
+    }
+
+    def test_review_is_shown_in_auto_mode(self):
+        from src.web.routes.dashboard.fragments import _render_signals_section
+
+        html_out = _render_signals_section([self._REVIEW], "auto")
+
+        assert "REVIEW" in html_out
+        assert "book -12.00€" in html_out
+        assert "OPEN_MODE=auto" in html_out
+        assert "openPosition" not in html_out  # no Buy/Sell on a review
+
+    def test_review_does_not_count_as_an_entry_signal(self):
+        from src.web.routes.dashboard.fragments import _render_signals_section
+
+        html_out = _render_signals_section([self._REVIEW], "notify")
+
+        assert "REVIEW" in html_out
+        assert "No pending signal" in html_out

@@ -2134,6 +2134,7 @@ class TradingService:
         buf: EpicBuffer | None = None,
         *,
         group_tighten: float | None = None,
+        group_close: str | None = None,
         day_book: DayBook | None = None,
     ) -> bool:
         """Decoupled close path: let the position's close profile decide.
@@ -2147,7 +2148,8 @@ class TradingService:
         ``group_tighten`` is the pre-resolved stop level from a group-aware
         profile's portfolio pre-pass (``smartgroup``), computed once per monitor
         tick across the whole book and passed straight to the profile; ``None``
-        for the ordinary per-position path.
+        for the ordinary per-position path. ``group_close`` is the whole-book
+        close (a ``reason_close``) the same pre-pass decided (``basket``).
 
         ``day_book`` is the day's running result and flat-cut bill, opened once
         per monitor pass and passed straight to the profile too (see
@@ -2193,6 +2195,7 @@ class TradingService:
             buf,
             is_close_hour=await self._is_epic_close_hour(position.epic),
             group_tighten=group_tighten,
+            group_close=group_close,
             day_book=day_book,
         )
         # A hard close (backstop / end-of-day) is always honoured, even while a

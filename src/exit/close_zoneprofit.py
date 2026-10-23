@@ -70,6 +70,7 @@ from src.exit.zones.base import (
     StopZone,
     classify_zone,
 )
+from src.exit.zones.basket import BasketCloseStop
 from src.exit.zones.breakeven_band import BreakevenBandStop
 from src.exit.zones.secure import SecureHoldStop
 from src.exit.zones.smartgroup import GroupMember, GroupPlanReport, SmartGroupStop
@@ -315,13 +316,14 @@ class CloseZoneProfit(CloseProfile):
 
     @property
     def is_group_aware(self) -> bool:
-        """True when the zone-1 updater manages the book as a whole (smartgroup).
+        """True when the zone-1 updater manages the book as a whole.
 
-        Selected in zone 1, but its decision is applied in **all four** zones (see
-        :meth:`evaluate`): the rule is about the book's total, so the winners are
-        tightened alongside the losers that their gain protects.
+        ``smartgroup`` (a whole-book stop tightening) or ``basket`` (a whole-book
+        close). Selected in zone 1, but the decision is applied in **all four**
+        zones (see :meth:`evaluate`): the rule is about the book's total, so the
+        winners are handled alongside the losers.
         """
-        return isinstance(self.underwater, SmartGroupStop)
+        return isinstance(self.underwater, (SmartGroupStop, BasketCloseStop))
 
     def group_member(
         self, position, current_bid: float, buf: EpicBuffer
@@ -342,9 +344,24 @@ class CloseZoneProfit(CloseProfile):
         last = buf.last if buf is not None else None
         if last is None:
             return None
-        smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
         sign = _sign(getattr(position, "direction", "BUY"))
         spread = float(last.spread or 0)
+        if isinstance(self.underwater, BasketCloseStop):
+            # The basket values each leg at its live close-out price and sizes
+            # its target on the euro risk frozen at open: no noise, no haircut
+            # on a stop that never moves.
+            return GroupMember(
+                position_id=int(position.id),
+                level_open=float(position.level_open or 0),
+                level_follower=float(position.level_follower or 0),
+                euro_per_point=float(position.euro_per_point or 0),
+                current_price=_close_out_price(current_bid, spread, sign),
+                min_stop_distance=float(getattr(position, "min_stop_distance", 0) or 0),
+                noise=0.0,
+                sign=sign,
+                euro_risk=float(getattr(position, "euro_stop", 0) or 0),
+            )
+        smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
         # The adverse direction is a down-move for a long and an up-move for a
         # short: measure the band on the sign-normalised close-out series.
         closes = buf.offer_closes if sign < 0 else buf.bid_closes
@@ -376,19 +393,35 @@ class CloseZoneProfit(CloseProfile):
 
     def plan_group(self, members: list[GroupMember]) -> dict[int, float]:
         """Delegate the whole-book tightening plan to the smartgroup updater."""
-        if not self.is_group_aware:
+        if not isinstance(self.underwater, SmartGroupStop):
             return {}
         smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
         return smart.plan(members)
 
-    def explain_group(self, members: list[GroupMember]) -> GroupPlanReport | None:
+    def explain_group(
+        self,
+        members: list[GroupMember],
+        *,
+        now: datetime | None = None,
+        day_book: DayBook | None = None,
+    ) -> GroupPlanReport | None:
         """The group plan **and** the book arithmetic behind it, or ``None``.
 
         ``None`` when the profile is not group-aware (nothing decided the book). The
         monitor logs this so a tick where no stop moves is distinguishable from the
         pre-pass not running: the report carries the estimated book total, the gate
         it had to clear, and how each position was valued.
+
+        ``now`` and ``day_book`` are read by the ``basket`` close only (its 11:00
+        review and 17:30 close, and the day's banked legs); ``smartgroup`` ignores
+        them.
         """
+        if isinstance(self.underwater, BasketCloseStop):
+            return self.underwater.explain(
+                members,
+                now=now,
+                banked_euro=day_book.realized_euro if day_book is not None else 0.0,
+            )
         if not self.is_group_aware:
             return None
         smart: SmartGroupStop = self.underwater  # type: ignore[assignment]
@@ -402,6 +435,7 @@ class CloseZoneProfit(CloseProfile):
         *,
         is_close_hour: bool,
         group_tighten: float | None = None,
+        group_close: str | None = None,
         day_book: DayBook | None = None,
     ) -> CloseDecision:
         """End-of-day / backstop first, then classify the zone and delegate.
@@ -416,9 +450,15 @@ class CloseZoneProfit(CloseProfile):
         :class:`~src.exit.zones.base.DayBook`); it is threaded into the same context
         for the updaters that price an exit against the day's result (``adaptive``)
         and ignored by every other one.
+
+        ``group_close`` is the whole-book close decided by the group pre-pass
+        (``basket``): when set, the position closes now with that reason, whatever
+        its zone.
         """
         if is_close_hour:
             return CloseDecision(action=ACTION_CLOSE, reason="end_of_day")
+        if group_close and self.is_group_aware:
+            return CloseDecision(action=ACTION_CLOSE, reason=group_close)
 
         last = buf.last
         if last is None:

@@ -156,6 +156,9 @@ class GroupMember:
             the stop rests on — the execution haircut, in the adverse direction.
             Zero means "the fill lands exactly on the stop", which never happens
             in practice (see :attr:`SmartGroupParams.exec_slip_k`).
+        euro_risk: Worst-case euro loss frozen at open (``Position.euro_stop``),
+            0 when unknown. Not read by ``smartgroup``; the ``basket`` close sizes
+            its book target on it (see :mod:`src.exit.zones.basket`).
     """
 
     position_id: int
@@ -167,6 +170,7 @@ class GroupMember:
     noise: float
     sign: float = 1.0
     exec_slip: float = 0.0
+    euro_risk: float = 0.0
 
 
 def candidate_stop(member: GroupMember) -> float:
@@ -269,6 +273,13 @@ class GroupPlanReport:
         unpriceable: Members skipped entirely (no size or no fill level).
         disarmed_by: The position whose missing stop voided the whole plan, if any
             — when set, ``total_euro`` is a partial sum and means nothing.
+        close_reason: Set when the decision is to **close every open position**
+            now, with this ``reason_close`` (the ``basket`` close); ``None`` for a
+            stop-only plan such as ``smartgroup``'s.
+        review_due: True when the book is still open past the point where the
+            user asked to decide by hand (the ``basket`` 11:00 review).
+        close_only: True for a decision that never moves a stop, only closes the
+            book (``basket``); ``gate_euro`` is then the close target.
     """
 
     plan: dict[int, float]
@@ -278,6 +289,9 @@ class GroupPlanReport:
     valuations: list[MemberValuation]
     unpriceable: list[int]
     disarmed_by: int | None = None
+    close_reason: str | None = None
+    review_due: bool = False
+    close_only: bool = False
 
 
 def explain_group_tightening(

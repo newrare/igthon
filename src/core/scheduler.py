@@ -443,6 +443,8 @@ class BotScheduler:
         # market before opening it themselves. In-memory on purpose — a signal is
         # worth nothing once its market has moved on (see src/core/signals.py).
         self._signals = SignalBook()
+        # Day the ``basket`` 11:00 review was last notified (one per day).
+        self._basket_review_day: date | None = None
 
         self._scanner = MarketScanner(
             client=client,
@@ -2316,9 +2318,13 @@ class BotScheduler:
 
         Fed to the same-bet gate next to the open positions, so a signal already
         proposed on one listing of a market is not proposed again on its twin.
-        Empty in auto mode (nothing is ever recorded there).
+        Empty in auto mode (no entry signal is ever recorded there). A review
+        signal (``basket``) concerns positions already open, which the gate
+        already sees, so it is left out.
         """
-        return [(s.epic, s.direction) for s in self._signals.pending()]
+        return [
+            (s.epic, s.direction) for s in self._signals.pending() if s.kind == "entry"
+        ]
 
     def _market_name(self, epic: str) -> str:
         """Return the instrument description for ``epic``, or "" when unknown.
@@ -2657,6 +2663,19 @@ class BotScheduler:
                         open_count,
                     )
                     return
+
+                # Once-a-day brake (``one_series_per_day``, e.g. ``open_basket``):
+                # the day's basket is a single decision, so once anything has been
+                # opened today the selector stays shut until tomorrow — a basket
+                # closed minutes after its open is not replaced by a second one.
+                if getattr(strategy, "one_series_per_day", False):
+                    if await self._traded_today_epics(session):
+                        logger.debug(
+                            "Rolling select [%s]: today's series already opened "
+                            "— nothing more until tomorrow",
+                            strategy.name,
+                        )
+                        return
 
                 target = max(int(strategy.concurrent_positions), 1)
                 wallet_bounded = getattr(strategy, "wallet_bounded", False)
@@ -3237,6 +3256,7 @@ class BotScheduler:
             # An ordinary per-position profile yields an empty plan (no behaviour
             # change) since ``is_group_aware`` is False.
             group_plan: dict[int, float] = {}
+            group_close: str | None = None
             self._group_book = None
             if self.close_profile.is_group_aware:
                 members = [
@@ -3258,9 +3278,16 @@ class BotScheduler:
                 # book look greener than it is, arming a tightening the group
                 # cannot actually afford. Skip the plan entirely for that tick.
                 if len(members) == len(positions):
-                    report = self.close_profile.explain_group(members)
+                    report = self.close_profile.explain_group(
+                        members, now=datetime.now(UTC), day_book=day_book
+                    )
                     if report is not None:
                         group_plan = report.plan
+                        # A whole-book close (``basket``) applies to every open
+                        # position this pass, whichever zone each one sits in.
+                        group_close = report.close_reason
+                        if report.review_due:
+                            self._raise_basket_review(report, resolved)
                         # A disarmed plan leaves ``total_euro`` a partial sum that
                         # means nothing — only publish a full valuation.
                         if report.disarmed_by is None:
@@ -3288,6 +3315,7 @@ class BotScheduler:
                             current_bid,
                             buf=buf,
                             group_tighten=group_plan.get(position.id),
+                            group_close=group_close,
                             day_book=day_book,
                         )
                         if closed:
@@ -3312,6 +3340,41 @@ class BotScheduler:
                             )
                 except Exception as exc:
                     logger.error("Error monitoring position %s: %s", position.epic, exc)
+
+    def _raise_basket_review(self, report, resolved: list[tuple]) -> None:
+        """Notify the user, once a day, that the basket needs their decision.
+
+        The ``basket`` close flags a review when the book is still open past its
+        review time (11:00): the morning did not pay, and the user asked to decide
+        the rest of the day by hand. One review signal per day goes to the
+        dashboard's notification channel; the automatic close keeps running.
+        Its epic is the worst leg, so clicking the notification opens that chart.
+        """
+        today = date.today()
+        if self._basket_review_day == today:
+            return
+        by_id = {v.position_id: v.euro for v in report.valuations}
+        legs = [(by_id.get(p.id, 0.0), p) for p, _bid, _buf in resolved]
+        if not legs:
+            return
+        _worst_euro, worst = min(legs, key=lambda leg: leg[0])
+        note = (
+            f"{len(legs)} position(s) still open, book {report.total_euro:+.2f}€ "
+            f"(target {report.gate_euro:.2f}€) — decide for the day; the basket "
+            "still closes by itself above the target or at 17:30."
+        )
+        signal = self._signals.record(
+            worst.epic,
+            worst.direction or "BUY",
+            strategy=str(getattr(self._strategy, "name", "") or ""),
+            score=report.total_euro,
+            name=self._market_name(worst.epic),
+            kind="review",
+            note=note,
+        )
+        if signal is not None:
+            self._basket_review_day = today
+            self._recorder.info(f"Basket review: {note}")
 
     @staticmethod
     def _log_group_plan(report, resolved: list[tuple]) -> None:
@@ -3338,6 +3401,21 @@ class BotScheduler:
                 report.disarmed_by,
                 epics.get(report.disarmed_by, "?"),
                 live_euro,
+            )
+            return
+
+        if report.close_only:
+            # A close-only group decision (``basket``): there are no stops to
+            # move, only the book total against its target.
+            logger.info(
+                "Group book: %s — book %.2f€ vs target %.2f€ (live %.2f€), "
+                "%d position(s)%s",
+                f"CLOSE ({report.close_reason})" if report.close_reason else "hold",
+                report.total_euro,
+                report.gate_euro,
+                live_euro,
+                len(report.valuations),
+                ", review due" if report.review_due else "",
             )
             return
 

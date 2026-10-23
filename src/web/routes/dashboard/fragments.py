@@ -206,24 +206,30 @@ def _render_signals_section(signals: list[dict], open_mode: str) -> str:
 
     In ``auto`` mode the section states that the bot is opening by itself, so an
     empty list never reads as "the strategy found nothing".
+
+    Review signals (``kind="review"``, the ``basket`` 11:00 review) are shown in
+    both modes, above the entry signals: they concern positions already open.
     """
+    reviews = [s for s in signals if s.get("kind") == "review"]
+    entries = [s for s in signals if s.get("kind", "entry") != "review"]
+    review_cards = "".join(_render_review_card(sig) for sig in reviews)
     if open_mode != "notify":
-        return (
+        return review_cards + (
             '<div class="signal-empty">'
             "OPEN_MODE=auto — the bot opens its own positions. "
             "Set <code>OPEN_MODE=notify</code> in <code>.env</code> to be "
             "notified instead and decide yourself."
             "</div>"
         )
-    if not signals:
-        return (
+    if not entries:
+        return review_cards + (
             '<div class="signal-empty">'
             "No pending signal — nothing worth opening right now."
             "</div>"
         )
 
-    cards = ""
-    for sig in signals:
+    cards = review_cards
+    for sig in entries:
         epic = html.escape(str(sig["epic"]))
         name = html.escape(str(sig.get("name") or sig["epic"]))
         direction = "SELL" if str(sig["direction"]).upper() == "SELL" else "BUY"
@@ -266,6 +272,34 @@ def _render_signals_section(signals: list[dict], open_mode: str) -> str:
             </div>
         </div>"""
     return f'<div class="signals-grid">{cards}</div>'
+
+
+def _render_review_card(sig: dict) -> str:
+    """One review card: positions already open that wait for the user's decision."""
+    epic = html.escape(str(sig["epic"]))
+    name = html.escape(str(sig.get("name") or sig["epic"]))
+    note = html.escape(str(sig.get("note") or ""))
+    strategy = html.escape(str(sig.get("strategy") or "—"))
+    age = int(sig.get("age_seconds") or 0)
+    age_txt = f"{age}s" if age < 60 else f"{age // 60}min"
+    sid = int(sig["id"])
+    return f"""
+        <div class="signal-card signal-sell" data-signal-id="{sid}">
+            <div class="signal-head">
+                <span class="signal-dir signal-dir-sell">REVIEW</span>
+                <span class="signal-epic">{epic}</span>
+                <span class="signal-age">{age_txt} ago</span>
+            </div>
+            <div class="signal-name">{name} — worst leg</div>
+            <div class="signal-meta">
+                <span title="Entry strategy of the open book">{strategy}</span>
+                <span>{note}</span>
+            </div>
+            <div class="signal-actions">
+                {render_button('<i data-lucide="line-chart" class="lc-icon"></i> Chart', cls="signal-btn", onclick=f"openSignalChart('{epic}', {sid}, event)", title="Look at the worst leg — this drops the review from the list")}
+                {render_button('<i data-lucide="x" class="lc-icon"></i>', cls="signal-btn signal-dismiss", onclick=f"dismissSignal({sid}, this)", title="Seen — drop this review")}
+            </div>
+        </div>"""
 
 
 def _render_action_cards(jobs: list[dict]) -> str:

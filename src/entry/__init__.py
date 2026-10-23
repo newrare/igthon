@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from src.entry.base import EntryIntent, EntryStrategy
 from src.entry.open_allincrease import OpenAllIncrease
+from src.entry.open_basket import OpenBasket
 from src.entry.open_donchian import OpenDonchian
 from src.entry.open_fade import OpenFade
 from src.entry.open_five import OpenFive
@@ -37,6 +38,7 @@ from src.entry.open_ultraranking import OpenUltraRanking
 #: Name → class map. Keys are the valid ``OPEN_STRATEGY`` values.
 ENTRY_STRATEGIES: dict[str, type[EntryStrategy]] = {
     OpenAllIncrease.name: OpenAllIncrease,
+    OpenBasket.name: OpenBasket,
     OpenDonchian.name: OpenDonchian,
     OpenFade.name: OpenFade,
     OpenFive.name: OpenFive,
@@ -74,6 +76,7 @@ def get_entry_strategy(name: str, settings) -> EntryStrategy:
 __all__ = [
     "ENTRY_STRATEGIES",
     "OpenAllIncrease",
+    "OpenBasket",
     "OpenDonchian",
     "OpenFade",
     "OpenFive",

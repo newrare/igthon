@@ -134,6 +134,7 @@ class CloseProfile(ABC):
         *,
         is_close_hour: bool,
         group_tighten: float | None = None,
+        group_close: str | None = None,
         day_book: DayBook | None = None,
     ) -> CloseDecision:
         """Decide what to do with an open position on this tick.
@@ -141,6 +142,10 @@ class CloseProfile(ABC):
         ``group_tighten`` is the pre-resolved stop level from a group-aware
         profile's portfolio pre-pass (see :meth:`plan_group`); profiles that make
         only per-position decisions ignore it.
+
+        ``group_close`` is the pre-resolved whole-book close (a ``reason_close``)
+        from the same pre-pass — the ``basket`` close sets it to close every
+        position at once; ``None`` otherwise.
 
         ``day_book`` is what the day has **banked so far** and what the flat cut
         has already spent (:class:`~src.exit.zones.base.DayBook`), opened once per

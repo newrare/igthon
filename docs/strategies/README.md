@@ -183,32 +183,34 @@ a simulated run reports the entry strategy alone.
 
 Registered in [src/entry/\_\_init\_\_.py](../../src/entry/__init__.py):
 
-| Name                | File                             | Doc                                          | Style                                                            |
-| ------------------- | -------------------------------- | -------------------------------------------- | ---------------------------------------------------------------- |
-| `open_donchian`     | `src/entry/open_donchian.py`     | [open_donchian.md](open_donchian.md)         | Breakout gated by trend efficiency                               |
-| `open_projection`   | `src/entry/open_projection.py`   | [open_projection.md](open_projection.md)     | Breakout + multi-model projection gate                           |
-| `open_ranking`      | `src/entry/open_ranking.py`      | [open_ranking.md](open_ranking.md)           | Cross-epic ranker, one rolling position                          |
-| `open_testing`      | `src/entry/open_testing.py`      | [open_testing.md](open_testing.md)           | Diagnostic: open max markets/day at random                       |
-| `open_fade`         | `src/entry/open_fade.py`         | [open_fade.md](open_fade.md)                 | **Two-sided** ranker: fade an extended trend at the channel edge |
-| `open_pullback`     | `src/entry/open_pullback.py`     | [open_pullback.md](open_pullback.md)         | **Two-sided** ranker: join a clean trend on a pause              |
-| `open_steady`       | `src/entry/open_steady.py`       | [open_steady.md](open_steady.md)             | **Two-sided** ranker: the most regular 10-minute curve           |
-| `open_five`         | `src/entry/open_five.py`         | [open_five.md](open_five.md)                 | **Two-sided** ranker: a series of 5 distinct curve shapes        |
-| `open_ultraranking` | `src/entry/open_ultraranking.py` | [open_ultraranking.md](open_ultraranking.md) | `open_saferanking` + a hard veto on a directionless market       |
-| `open_progressive`  | `src/entry/open_progressive.py`  | [open_progressive.md](open_progressive.md)   | One position at a time, euro risk funded by the day's gains      |
-| `open_momentum`     | `src/entry/open_momentum.py`     | [open_momentum.md](open_momentum.md)         | Start of an up leg, only while every open epic is in a range     |
+| Name                | File                             | Doc                                          | Style                                                                      |
+| ------------------- | -------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------- |
+| `open_donchian`     | `src/entry/open_donchian.py`     | [open_donchian.md](open_donchian.md)         | Breakout gated by trend efficiency                                         |
+| `open_projection`   | `src/entry/open_projection.py`   | [open_projection.md](open_projection.md)     | Breakout + multi-model projection gate                                     |
+| `open_ranking`      | `src/entry/open_ranking.py`      | [open_ranking.md](open_ranking.md)           | Cross-epic ranker, one rolling position                                    |
+| `open_testing`      | `src/entry/open_testing.py`      | [open_testing.md](open_testing.md)           | Diagnostic: open max markets/day at random                                 |
+| `open_fade`         | `src/entry/open_fade.py`         | [open_fade.md](open_fade.md)                 | **Two-sided** ranker: fade an extended trend at the channel edge           |
+| `open_pullback`     | `src/entry/open_pullback.py`     | [open_pullback.md](open_pullback.md)         | **Two-sided** ranker: join a clean trend on a pause                        |
+| `open_steady`       | `src/entry/open_steady.py`       | [open_steady.md](open_steady.md)             | **Two-sided** ranker: the most regular 10-minute curve                     |
+| `open_five`         | `src/entry/open_five.py`         | [open_five.md](open_five.md)                 | **Two-sided** ranker: a series of 5 distinct curve shapes                  |
+| `open_basket`       | `src/entry/open_basket.py`       | [open_basket.md](open_basket.md)             | **Two-sided**: once a day at 10:00, the 3 cleanest unrelated morning moves |
+| `open_ultraranking` | `src/entry/open_ultraranking.py` | [open_ultraranking.md](open_ultraranking.md) | `open_saferanking` + a hard veto on a directionless market                 |
+| `open_progressive`  | `src/entry/open_progressive.py`  | [open_progressive.md](open_progressive.md)   | One position at a time, euro risk funded by the day's gains                |
+| `open_momentum`     | `src/entry/open_momentum.py`     | [open_momentum.md](open_momentum.md)         | Start of an up leg, only while every open epic is in a range               |
 
 ## Available stop-distance policies
 
 Registered in [src/stops/\_\_init\_\_.py](../../src/stops/__init__.py):
 
-| Name               | File                            | Doc                                        | Style                                                                       |
-| ------------------ | ------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------- |
-| `stop_support`     | `src/stops/stop_support.py`     | —                                          | Stop below a recency-weighted last-hour support                             |
-| `stop_atr`         | `src/stops/stop_atr.py`         | —                                          | Flat `stop_atr_k × ATR` from the entry                                      |
-| `stop_regression`  | `src/stops/stop_regression.py`  | —                                          | Choppiness-scaled residual-noise band below the entry                       |
-| `stop_linearspeed` | `src/stops/stop_linearspeed.py` | [stop_linearspeed.md](stop_linearspeed.md) | **Two-sided**: noise margin when the last 10 min accelerate, else structure |
-| `stop_hourlow`     | `src/stops/stop_hourlow.py`     | [stop_hourlow.md](stop_hourlow.md)         | **Two-sided**: stop at the last hour's lowest low / highest high            |
-| `stop_shape`       | `src/stops/stop_shape.py`       | [stop_shape.md](stop_shape.md)             | **Two-sided**: picks WHICH recent level to anchor on from the curve's shape |
+| Name               | File                            | Doc                                             | Style                                                                       |
+| ------------------ | ------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------- |
+| `stop_support`     | `src/stops/stop_support.py`     | —                                               | Stop below a recency-weighted last-hour support                             |
+| `stop_atr`         | `src/stops/stop_atr.py`         | —                                               | Flat `stop_atr_k × ATR` from the entry                                      |
+| `stop_far`         | `src/stops/stop_far.py`         | [open_basket.md](open_basket.md#stop--stop_far) | **Two-sided**: catastrophe stop 8 ATRs of 15-minute bars away               |
+| `stop_regression`  | `src/stops/stop_regression.py`  | —                                               | Choppiness-scaled residual-noise band below the entry                       |
+| `stop_linearspeed` | `src/stops/stop_linearspeed.py` | [stop_linearspeed.md](stop_linearspeed.md)      | **Two-sided**: noise margin when the last 10 min accelerate, else structure |
+| `stop_hourlow`     | `src/stops/stop_hourlow.py`     | [stop_hourlow.md](stop_hourlow.md)              | **Two-sided**: stop at the last hour's lowest low / highest high            |
+| `stop_shape`       | `src/stops/stop_shape.py`       | [stop_shape.md](stop_shape.md)                  | **Two-sided**: picks WHICH recent level to anchor on from the curve's shape |
 
 ## Available close profiles
 
@@ -232,6 +234,7 @@ each zone selector takes a name from its own registry.
 | `CLOSE_ZONESTART`  | `trendcut`             | `src/exit/zones/underwater.py`       | Cut a clean, confirmed adverse trend at a fraction of `-1R`                               |
 | `CLOSE_ZONESTART`  | `timedlift`            | `src/exit/zones/timedlift.py`        | Re-read the recent floor every 10 min and move the stop in behind it                      |
 | `CLOSE_ZONESTART`  | `smartgroup`           | `src/exit/zones/smartgroup.py`       | Book-wide: park **every** stop on `price − noise` once the group is green                 |
+| `CLOSE_ZONESTART`  | `basket`               | `src/exit/zones/basket.py`           | Book-wide: close **every** position once the book is +1 ATR15 green, or at 17:30          |
 | `CLOSE_ZONESTART`  | `adaptive`             | `src/exit/zones/adaptive.py`         | Read the market since the open: close a visible reversal, close a flat the day can afford |
 | `CLOSE_ZONEMARGE`  | `hold`                 | `src/exit/zones/breakeven_band.py`   | Keep the stop where it is across the break-even band                                      |
 | `CLOSE_ZONEMARGE`  | `breakeven_lock`       | `src/exit/zones/breakeven_band.py`   | Park the stop behind a confirmed swing low past break-even                                |
@@ -244,6 +247,7 @@ each zone selector takes a name from its own registry.
 | `CLOSE_ZONEPROFIT` | `trailing_ratchet`     | `src/exit/zones/trailing_ratchet.py` | Momentum-gated ATR chandelier trailing price in steps                                     |
 | `CLOSE_ZONEPROFIT` | `trailing_ratchetmore` | `src/exit/zones/trailing_ratchet.py` | Same, plus a give-back cap on the peak gain and a width that narrows as the run extends   |
 | `CLOSE_ZONEPROFIT` | `trailing_noise`       | `src/exit/zones/trailing_noise.py`   | Same, but no stop is ever left closer to price than the deepest recent retracement        |
+| `CLOSE_ZONEPROFIT` | `basket`               | `src/exit/zones/basket.py`           | Hold: a basket leg is never trailed out on its own                                        |
 
 ## Contract
 

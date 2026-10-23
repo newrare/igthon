@@ -210,6 +210,17 @@ inspect: ## Inspect an epic's pricing — make inspect EPIC=CC.D.LCC.UNC.IP
 dump-euro: ## Dump euro-per-point for the archived epics (stop the bot first)
 	$(PYTHON) -m src.scripts.dump_euro_per_point $(ARGS)
 
+##@ Research (archive files only — safe while the bot runs)
+
+.PHONY: baseline
+baseline: ## Strategy vs coin-flip replays — make baseline ARGS="--strategy open_fade --seeds 20"
+	$(PYTHON) -m src.scripts.random_baseline $(ARGS)
+
+.PHONY: research
+research: ## Research dataset — make research ARGS="build" then ARGS="analyze"
+	@test -n "$(ARGS)" || { echo 'Missing sub-command: make research ARGS="build" (then ARGS="analyze")'; exit 1; }
+	$(PYTHON) -m src.scripts.research $(ARGS)
+
 ##@ Housekeeping
 
 .PHONY: clean

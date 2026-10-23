@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from src.stops.base import StopDistance
 from src.stops.stop_atr import StopAtr
+from src.stops.stop_far import StopFar
 from src.stops.stop_hourlow import StopHourLow, noise_floor_distance, window_extreme
 from src.stops.stop_linearspeed import StopLinearSpeed, weighted_resistance
 from src.stops.stop_regression import StopRegression, residual_sigma
@@ -25,6 +26,7 @@ from src.stops.stop_support import StopSupport, weighted_support
 #: Name → class map. Keys are the valid ``STOP_STRATEGY`` values.
 STOP_DISTANCES: dict[str, type[StopDistance]] = {
     StopAtr.name: StopAtr,
+    StopFar.name: StopFar,
     StopSupport.name: StopSupport,
     StopRegression.name: StopRegression,
     StopLinearSpeed.name: StopLinearSpeed,
@@ -50,6 +52,7 @@ def get_stop_distance(name: str, settings) -> StopDistance:
 __all__ = [
     "STOP_DISTANCES",
     "StopAtr",
+    "StopFar",
     "StopSupport",
     "StopRegression",
     "StopLinearSpeed",

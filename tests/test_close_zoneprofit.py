@@ -722,3 +722,83 @@ class TestGroupPrePass:
             pos, current_bid=8020.0, buf=buf, is_close_hour=False, group_tighten=8015.0
         )
         assert decision.action == ACTION_HOLD
+
+
+class TestBasketGroupClose:
+    """``CLOSE_ZONESTART=basket``: a whole-book close, applied in every zone."""
+
+    @staticmethod
+    def _basket():
+        return get_close_profile(
+            _settings(
+                stop_strategy="stop_far",
+                close_zonestart="basket",
+                close_zoneprofit="basket",
+            )
+        )
+
+    def test_is_group_aware_and_plans_no_stop(self):
+        prof = self._basket()
+        assert prof.is_group_aware
+        assert prof.plan_group([]) == {}
+
+    def test_member_carries_the_open_euro_risk(self):
+        buf = _buffer([100.0] * 20, spread=0.5)
+        pos = _position(
+            id=7,
+            direction="SELL",
+            level_open=101.0,
+            level_follower=110.0,
+            euro_per_point=2.0,
+            euro_stop=80.0,
+        )
+
+        member = self._basket().group_member(pos, 100.0, buf)
+
+        assert member.euro_risk == 80.0
+        assert member.sign == -1.0
+        assert member.current_price == 100.5  # a short closes at the offer
+        assert member.noise == 0.0
+
+    def test_explain_group_counts_the_banked_day(self):
+        from src.exit.zones.base import DayBook
+
+        buf = _buffer([100.0] * 20)
+        pos = _position(id=1, level_open=100.0, euro_per_point=1.0, euro_stop=80.0)
+        prof = self._basket()
+        members = [prof.group_member(pos, 115.0, buf)]
+        noon = datetime(2026, 10, 22, 10, 0, tzinfo=UTC)
+
+        green = prof.explain_group(members, now=noon, day_book=DayBook())
+        dragged = prof.explain_group(
+            members, now=noon, day_book=DayBook(realized_euro=-20.0)
+        )
+
+        assert green.close_reason == "basket_win"
+        assert dragged.close_reason is None
+
+    def test_group_close_closes_in_any_zone(self):
+        buf = _buffer([8000.0 + i for i in range(40)])
+        # Far into profit: without the group close the profit zone would hold.
+        pos = _position(level_open=7900.0, level_zero=7900.0, level_follower=7800.0)
+
+        decision = self._basket().evaluate(
+            pos,
+            current_bid=8039.0,
+            buf=buf,
+            is_close_hour=False,
+            group_close="basket_win",
+        )
+
+        assert decision.action == ACTION_CLOSE
+        assert decision.reason == "basket_win"
+
+    def test_profit_zone_holds_without_a_group_close(self):
+        buf = _buffer([8000.0 + i for i in range(40)])
+        pos = _position(level_open=7900.0, level_zero=7900.0, level_follower=7800.0)
+
+        decision = self._basket().evaluate(
+            pos, current_bid=8039.0, buf=buf, is_close_hour=False
+        )
+
+        assert decision.action == ACTION_HOLD

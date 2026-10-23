@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 
 from src.backtest.contract_values import ContractTable
@@ -33,6 +34,7 @@ from src.backtest.simulator import (
     direction_sign,
 )
 from src.entry import ENTRY_STRATEGIES, get_entry_strategy
+from src.entry.base import EntryStrategy
 from src.execution.trading import TradeConfig
 from src.exit import get_close_profile
 from src.exit.zones import (
@@ -167,6 +169,10 @@ UNTESTABLE_NAMES: dict[str, dict[str, str]] = {
             "decides for the whole book from a cross-position pre-pass the "
             "scheduler runs (plan_group), which the replay engine has no "
             "equivalent of — a run would silently apply no group tightening"
+        ),
+        "basket": (
+            "closes the whole book from the same cross-position pre-pass, which "
+            "the replay engine does not run — a run would never close the basket"
         ),
     },
 }
@@ -441,6 +447,7 @@ def run_backtest(
     candles_by_epic: dict[str, list[Candle]],
     config: BacktestConfig,
     selection: StrategySelection | None = None,
+    wrap_entry: Callable[[EntryStrategy], EntryStrategy] | None = None,
 ) -> SimulationResult:
     """Replay one full open/stop/close selection over archived candles.
 
@@ -450,6 +457,10 @@ def run_backtest(
     are then handed to the very same factories the bot uses at startup, so the
     replay is the configuration under test — not the live one, and not a
     hand-assembled approximation of it.
+
+    ``wrap_entry`` decorates the built entry strategy before the replay — the
+    hook the random-direction baseline (:mod:`src.backtest.random_baseline`)
+    uses to replay the very same opens with a coin-flipped side.
     """
     effective = (selection or StrategySelection()).apply(settings)
     kept, dropped = dedupe_correlated_epics(candles_by_epic)
@@ -460,9 +471,12 @@ def run_backtest(
             ", ".join(dropped),
         )
     days = build_days(kept)
+    entry = get_entry_strategy(effective.open_strategy, effective)
+    if wrap_entry is not None:
+        entry = wrap_entry(entry)
     simulator = StrategySimulator(
         trade_config=TradeConfig.from_settings(effective),
-        entry=get_entry_strategy(effective.open_strategy, effective),
+        entry=entry,
         close_profile=get_close_profile(effective),
         sim_config=config.to_simulation_config(),
     )

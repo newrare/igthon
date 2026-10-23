@@ -10,6 +10,10 @@ independently in ``.env``:
 - ``CLOSE_ZONESECURE`` → :data:`ZONESECURE_UPDATERS` (margin → profit trigger);
 - ``CLOSE_ZONEPROFIT`` → :data:`ZONEPROFIT_UPDATERS` (above the profit trigger).
 
+:class:`~src.exit.zones.basket.BasketCloseStop` (``basket``) is registered in
+zone 1, where it makes the profile close the whole book at once, and in the
+profit zone as a plain hold, so a basket leg is never trailed out on its own.
+
 One updater is registered in **three** of the registries at once:
 :class:`~src.exit.zones.adaptive.AdaptiveReadStop` (``adaptive``) reads the market
 since the open and decides hold-or-close, which is a question the first three zones
@@ -33,6 +37,14 @@ from src.exit.zones.base import (
     breakeven_lock_level,
     build_zone_updater,
     classify_zone,
+)
+from src.exit.zones.basket import (
+    BASKET_EOD_REASON,
+    BASKET_WIN_REASON,
+    BasketCloseStop,
+    BasketParams,
+    basket_target_euro,
+    explain_basket,
 )
 from src.exit.zones.breakeven_band import (
     BreakevenBandStop,
@@ -66,6 +78,7 @@ ZONESTART_UPDATERS: dict[str, type[StopUpdater]] = {
     UnderwaterTrendCutStop.name: UnderwaterTrendCutStop,
     UnderwaterTimedLiftStop.name: UnderwaterTimedLiftStop,
     SmartGroupStop.name: SmartGroupStop,
+    BasketCloseStop.name: BasketCloseStop,
 }
 
 #: Zone 2 (break-even → margin). Name → class; keys are valid ``CLOSE_ZONEMARGE``.
@@ -89,6 +102,7 @@ ZONEPROFIT_UPDATERS: dict[str, type[StopUpdater]] = {
     TrailingRatchetStop.name: TrailingRatchetStop,
     TrailingRatchetMoreStop.name: TrailingRatchetMoreStop,
     TrailingNoiseStop.name: TrailingNoiseStop,
+    BasketCloseStop.name: BasketCloseStop,
 }
 
 __all__ = [
@@ -102,6 +116,12 @@ __all__ = [
     "breakeven_lock_level",
     "classify_zone",
     "build_zone_updater",
+    "BASKET_EOD_REASON",
+    "BASKET_WIN_REASON",
+    "BasketCloseStop",
+    "BasketParams",
+    "basket_target_euro",
+    "explain_basket",
     "GroupMember",
     "GroupPlanReport",
     "MemberValuation",
