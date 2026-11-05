@@ -39,7 +39,6 @@ from src.exit.zones.base import (
     classify_zone,
 )
 from src.exit.zones.basket import (
-    BASKET_EOD_REASON,
     BASKET_WIN_REASON,
     BasketCloseStop,
     BasketParams,
@@ -116,7 +115,6 @@ __all__ = [
     "breakeven_lock_level",
     "classify_zone",
     "build_zone_updater",
-    "BASKET_EOD_REASON",
     "BASKET_WIN_REASON",
     "BasketCloseStop",
     "BasketParams",

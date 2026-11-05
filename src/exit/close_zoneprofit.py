@@ -413,7 +413,7 @@ class CloseZoneProfit(CloseProfile):
         it had to clear, and how each position was valued.
 
         ``now`` and ``day_book`` are read by the ``basket`` close only (its 11:00
-        review and 17:30 close, and the day's banked legs); ``smartgroup`` ignores
+        review and 17:30 alert, and the day's banked legs); ``smartgroup`` ignores
         them.
         """
         if isinstance(self.underwater, BasketCloseStop):

@@ -445,6 +445,8 @@ class BotScheduler:
         self._signals = SignalBook()
         # Day the ``basket`` 11:00 review was last notified (one per day).
         self._basket_review_day: date | None = None
+        # Day the ``basket`` 17:30 close alert was last notified (one per day).
+        self._basket_alert_day: date | None = None
 
         self._scanner = MarketScanner(
             client=client,
@@ -3288,6 +3290,8 @@ class BotScheduler:
                         group_close = report.close_reason
                         if report.review_due:
                             self._raise_basket_review(report, resolved)
+                        if report.close_alert_due:
+                            self._raise_basket_close_alert(report, resolved)
                         # A disarmed plan leaves ``total_euro`` a partial sum that
                         # means nothing — only publish a full valuation.
                         if report.disarmed_by is None:
@@ -3353,16 +3357,41 @@ class BotScheduler:
         today = date.today()
         if self._basket_review_day == today:
             return
+        note = (
+            f"{len(resolved)} position(s) still open, book "
+            f"{report.total_euro:+.2f}€ (target {report.gate_euro:.2f}€) — decide "
+            "for the day; the basket still closes by itself above the target."
+        )
+        if self._notify_basket(report, resolved, note, label="Basket review"):
+            self._basket_review_day = today
+
+    def _raise_basket_close_alert(self, report, resolved: list[tuple]) -> None:
+        """Alert the user, once a day, that the basket is still open at 17:30.
+
+        The clock never closes the basket: past its alert time (17:30) the book
+        keeps running to its target or its stops, and the user decides whether to
+        close it by hand before the session ends. Same channel as the review.
+        """
+        today = date.today()
+        if self._basket_alert_day == today:
+            return
+        note = (
+            f"17:30 — {len(resolved)} position(s) still open, book "
+            f"{report.total_euro:+.2f}€ (target {report.gate_euro:.2f}€); nothing "
+            "is closed automatically — close by hand or keep it overnight."
+        )
+        if self._notify_basket(report, resolved, note, label="Basket close alert"):
+            self._basket_alert_day = today
+
+    def _notify_basket(
+        self, report, resolved: list[tuple], note: str, *, label: str
+    ) -> bool:
+        """Record one basket ``review`` signal on the worst leg; True if recorded."""
         by_id = {v.position_id: v.euro for v in report.valuations}
         legs = [(by_id.get(p.id, 0.0), p) for p, _bid, _buf in resolved]
         if not legs:
-            return
+            return False
         _worst_euro, worst = min(legs, key=lambda leg: leg[0])
-        note = (
-            f"{len(legs)} position(s) still open, book {report.total_euro:+.2f}€ "
-            f"(target {report.gate_euro:.2f}€) — decide for the day; the basket "
-            "still closes by itself above the target or at 17:30."
-        )
         signal = self._signals.record(
             worst.epic,
             worst.direction or "BUY",
@@ -3372,9 +3401,10 @@ class BotScheduler:
             kind="review",
             note=note,
         )
-        if signal is not None:
-            self._basket_review_day = today
-            self._recorder.info(f"Basket review: {note}")
+        if signal is None:
+            return False
+        self._recorder.info(f"{label}: {note}")
+        return True
 
     @staticmethod
     def _log_group_plan(report, resolved: list[tuple]) -> None:

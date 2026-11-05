@@ -278,6 +278,8 @@ class GroupPlanReport:
             stop-only plan such as ``smartgroup``'s.
         review_due: True when the book is still open past the point where the
             user asked to decide by hand (the ``basket`` 11:00 review).
+        close_alert_due: True when the book is still open at the end of the
+            session (the ``basket`` 17:30 alert); nothing is closed by the clock.
         close_only: True for a decision that never moves a stop, only closes the
             book (``basket``); ``gate_euro`` is then the close target.
     """
@@ -291,6 +293,7 @@ class GroupPlanReport:
     disarmed_by: int | None = None
     close_reason: str | None = None
     review_due: bool = False
+    close_alert_due: bool = False
     close_only: bool = False
 
 

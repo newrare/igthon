@@ -2,7 +2,7 @@
 
 Places the initial protective stop ``stop_atr_k × ATR`` away from the entry,
 the ATR being measured on **15-minute bars**
-(:func:`~src.core.indicators.timeframe_atr`) rather than on the one-minute
+(:func:`~src.core.indicators.estimated_timeframe_atr`) rather than on the one-minute
 candles :class:`~src.stops.stop_atr.StopAtr` reads.
 At 8 quarter-hour ATRs the stop sits well outside a day's ordinary swing: it is
 not meant to manage the trade, only to cap a market that runs away, while the
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core.indicators import timeframe_atr
+from src.core.indicators import estimated_timeframe_atr
 from src.feed.price_buffer import EpicBuffer
 from src.stops.base import StopDistance
 
@@ -57,7 +57,11 @@ class StopFar(StopDistance):
         day_extreme: float | None = None,  # unused: the window fits in the buffer
     ) -> float:
         last = buf.last
-        atr_value = timeframe_atr(list(buf.candles), self.bar_minutes, self.atr_period)
+        # Same estimate as ``open_basket`` reads, so a short session still gets
+        # a real distance — a zero ATR would park the stop on the entry.
+        atr_value = estimated_timeframe_atr(
+            list(buf.candles), self.bar_minutes, self.atr_period
+        )
         distance = self.stop_atr_k * atr_value
         if direction == "SELL":
             offer = last.offer_close if last else entry_level

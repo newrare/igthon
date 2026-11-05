@@ -1,10 +1,11 @@
 """Tests for the far quarter-hour-ATR stop and its ATR helper."""
 
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from src.core.indicators import timeframe_atr
+from src.core.indicators import atr, estimated_timeframe_atr, timeframe_atr
 from src.feed.price_buffer import Candle, EpicBuffer
 from src.stops import StopFar, get_stop_distance
 
@@ -53,6 +54,18 @@ class TestTimeframeAtr:
 
     def test_one_minute_falls_back_to_plain_atr(self):
         assert timeframe_atr(_candles(30), 1) == 0.0  # flat inside each bar
+
+
+class TestEstimatedTimeframeAtr:
+    def test_measures_five_bars_directly(self):
+        assert estimated_timeframe_atr(_candles(5 * 15), 15) == pytest.approx(1.0)
+
+    def test_scales_the_one_minute_atr_when_bars_are_missing(self):
+        candles = _candles(40, swing=1.0)
+
+        estimate = estimated_timeframe_atr(candles, 15)
+
+        assert estimate == pytest.approx(atr(candles, 14) * math.sqrt(15))
 
 
 class TestStopFar:

@@ -18,7 +18,8 @@ The book is deliberately in-memory and short-lived:
 
 The same channel carries one other kind of alert: a **review** (``kind="review"``)
 — not a proposed open but a request for a decision on positions already held,
-raised by the ``basket`` close when the day's basket is still open at 11:00. It
+raised by the ``basket`` close when the day's basket is still open at 11:00 (the
+review) and again at 17:30 (the close alert, nothing is closed by the clock). It
 reuses the notification, the tab badge and the dismiss flow, and is never
 counted as a pending bet.
 

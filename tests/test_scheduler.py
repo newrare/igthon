@@ -2866,6 +2866,24 @@ class TestBasketGroupClose:
         # A review is not a pending bet for the same-bet gate.
         assert scheduler._pending_bets() == []
 
+    async def test_the_close_alert_is_raised_once_and_closes_nothing(
+        self, session_factory, monkeypatch
+    ):
+        scheduler, _profile, seen = self._scheduler(
+            session_factory, monkeypatch, self._report(close_alert_due=True)
+        )
+        await TestGroupStopPrePass._add_positions(session_factory, ("A", "B"))
+
+        await scheduler._monitor_positions()
+        await scheduler._monitor_positions()
+
+        signals = scheduler.signals.as_dicts()
+        assert len(signals) == 1
+        assert signals[0]["kind"] == "review"
+        assert signals[0]["epic"] == "B"
+        assert signals[0]["note"].startswith("17:30")
+        assert sorted(seen) == [("A", None), ("A", None), ("B", None), ("B", None)]
+
 
 class TestRequireRangeBook:
     """``require_range_book`` — add a bet only into a book that has stopped moving.

@@ -8,15 +8,17 @@ pre-pass; unlike it, the decision is not a stop move but a close.
 
 Per tick, on the Paris wall clock:
 
-1. **17:30 or later** — every position is closed (``basket_eod``): the basket is
-   an intraday bet, never carried overnight.
-2. **The book is green enough** — the open positions valued at their live
+1. **The book is green enough** — the open positions valued at their live
    close-out price (the spread already paid), plus what the day has already
    banked (a leg stopped out earlier stays in the sum), exceed the target: every
    position is closed at once (``basket_win``).
-3. **11:00 or later and still open** — the report flags a review: the scheduler
+2. **11:00 or later and still open** — the report flags a review: the scheduler
    notifies the user once, who decides for the day. The automatic close keeps
    running meanwhile; nothing else changes.
+3. **17:30 or later and still open** — the report flags a close alert: the
+   scheduler notifies the user once that the basket is about to be carried past
+   the session. Nothing is closed by the clock: the user closes by hand or lets
+   the book run to its target or its stops.
 4. Otherwise everything holds — the far initial stop (``stop_far``) is the only
    protection, and :meth:`BasketCloseStop.propose` never moves it.
 
@@ -28,7 +30,7 @@ replay. The replay weighted the three legs equally; live, every leg is opened at
 IG's minimum deal size, so a leg whose ATR15 is worth more euros weighs more in
 the sum. A position whose ``euro_stop`` is unknown (or
 whose size or open level is missing) makes the target unknowable, so the book is
-then never closed on the target, only at 17:30.
+then never closed on the target, only by its stops or by hand.
 
 Each member's euro figure is shaved by a small reconciliation margin, as in
 ``smartgroup``: our ``euro_per_point`` arithmetic never matches what IG books to
@@ -53,8 +55,6 @@ PARIS = ZoneInfo("Europe/Paris")
 
 #: ``reason_close`` of a basket closed on its target.
 BASKET_WIN_REASON = "basket_win"
-#: ``reason_close`` of a basket closed by the 17:30 deadline.
-BASKET_EOD_REASON = "basket_eod"
 
 
 @dataclass(frozen=True)
@@ -68,8 +68,8 @@ class BasketParams:
     stop_atr_k: float = FAR_STOP_ATR_K
     #: Paris time from which a still-open basket asks for the user's decision.
     review_at: time = time(11, 0)
-    #: Paris time at which whatever is still open is closed.
-    close_at: time = time(17, 30)
+    #: Paris time from which a still-open basket raises the close alert.
+    alert_at: time = time(17, 30)
     #: Fraction of each member's absolute euro figure discarded (see
     #: :attr:`~src.exit.zones.smartgroup.SmartGroupParams.reconcile_margin_pct`).
     reconcile_margin_pct: float = 0.02
@@ -116,7 +116,8 @@ def explain_basket(
 
     The report never carries a stop plan (``plan`` is empty): the decision is
     :attr:`~src.exit.zones.smartgroup.GroupPlanReport.close_reason`, set when the
-    book closes, and :attr:`~src.exit.zones.smartgroup.GroupPlanReport.review_due`.
+    book closes, :attr:`~src.exit.zones.smartgroup.GroupPlanReport.review_due` and
+    :attr:`~src.exit.zones.smartgroup.GroupPlanReport.close_alert_due`.
     """
     params = params or BasketParams()
     local = now.astimezone(PARIS).time()
@@ -143,18 +144,6 @@ def explain_basket(
 
     target = basket_target_euro(members, params)
     gate = target if target is not None else 0.0
-    if local >= params.close_at:
-        return GroupPlanReport(
-            plan={},
-            total_euro=total,
-            gate_euro=gate,
-            armed=True,
-            valuations=valuations,
-            unpriceable=unpriceable,
-            close_reason=BASKET_EOD_REASON,
-            close_only=True,
-        )
-
     armed = target is not None and not unpriceable and total > target
     return GroupPlanReport(
         plan={},
@@ -165,6 +154,7 @@ def explain_basket(
         unpriceable=unpriceable,
         close_reason=BASKET_WIN_REASON if armed else None,
         review_due=not armed and local >= params.review_at,
+        close_alert_due=not armed and local >= params.alert_at,
         close_only=True,
     )
 

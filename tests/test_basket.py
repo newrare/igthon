@@ -10,7 +10,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from src.exit.zones import (
-    BASKET_EOD_REASON,
     BASKET_WIN_REASON,
     ZONEPROFIT_UPDATERS,
     ZONESTART_UPDATERS,
@@ -142,13 +141,23 @@ class TestClock:
         assert report.close_reason == BASKET_WIN_REASON
         assert not report.review_due
 
-    def test_half_past_five_closes_whatever_the_book(self):
+    def test_half_past_five_alerts_but_never_closes(self):
         legs = [_leg(1, price=60, euro_risk=0.0)]
 
+        assert not explain_basket(legs, now=_at(17, 29), params=_P).close_alert_due
         report = explain_basket(legs, now=_at(17, 30), params=_P)
 
-        assert report.close_reason == BASKET_EOD_REASON
-        assert report.armed
+        assert report.close_alert_due
+        assert report.close_reason is None
+        assert not report.armed
+
+    def test_target_still_closes_after_half_past_five(self):
+        legs = [_leg(1, price=120)]
+
+        report = explain_basket(legs, now=_at(18, 0), params=_P)
+
+        assert report.close_reason == BASKET_WIN_REASON
+        assert not report.close_alert_due
 
     def test_clock_is_read_in_paris(self):
         # 15:30 UTC is 17:30 in Paris (summer time).
@@ -156,4 +165,5 @@ class TestClock:
 
         report = explain_basket([_leg(1, price=95)], now=utc, params=_P)
 
-        assert report.close_reason == BASKET_EOD_REASON
+        assert report.close_alert_due
+        assert report.close_reason is None
